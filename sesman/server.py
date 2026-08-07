@@ -1,0 +1,375 @@
+"""sesman —— Claude / Codex / Grok 会话统一浏览服务 (纯标准库)。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import re
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+from . import index, live, media, term, wsock
+
+STATIC = Path(__file__).parent / "static"
+ALLOWED_IPS: set[str] = set()
+TERMINAL = False        # 远程终端 = 远程执行, 必须显式 --terminal 打开
+WATCH_POLL = 0.05       # 服务端盯文件的间隔; stat 一个文件是微秒级, 这里很便宜
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "sesman"
+    protocol_version = "HTTP/1.1"
+
+    # ---- 基础设施 ----------------------------------------------------
+    # 这些是秒级轮询, 打出来只会淹没真正有用的日志
+    QUIET = ("/api/live", "/api/term/list", "sig=", "start=")
+
+    def log_message(self, format, *args):
+        line = str(args[0])
+        if "/api/" in line and not any(q in line for q in self.QUIET):
+            print(f"[{self.address_string()}] {format % args}")
+
+    def _allowed(self) -> bool:
+        ip = self.client_address[0]
+        if ip.startswith("::ffff:"):
+            ip = ip[7:]
+        return ip in ALLOWED_IPS
+
+    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _json(self, obj, code: int = 200):
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+
+    # ---- 路由 --------------------------------------------------------
+    def do_POST(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        u = urlparse(self.path)
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._json({"error": "bad body"}, 400)
+        if not TERMINAL:
+            return self._json({"error": "终端未启用, 服务端需加 --terminal"}, 403)
+        try:
+            if u.path == "/api/term/new":
+                name = term.new_session(body.get("name") or "s", body["cmd"],
+                                        body.get("cwd"), int(body.get("cols", 120)),
+                                        int(body.get("rows", 32)))
+                return self._json({"name": name})
+            if u.path == "/api/term/kill":
+                term.kill_session(body["name"])
+                return self._json({"ok": True})
+            if u.path == "/api/term/takeover":
+                return self._takeover(body)
+            if u.path == "/api/term/scroll":
+                name = body["name"]
+                if not any(x["name"] == name for x in term.list_sessions()):
+                    return self._json({"error": "会话不存在"}, 404)
+                if body.get("cancel"):          # 直接回到实时画面
+                    term.leave_copy_mode(name)
+                    return self._json({"pos": 0})
+                at = term.scroll(name, bool(body.get("up")), int(body.get("lines", 3)))
+                return self._json({"pos": at})
+            if u.path == "/api/term/send":
+                name = body["name"]
+                if not any(x["name"] == name for x in term.list_sessions()):
+                    return self._json({"error": "会话不存在"}, 404)
+                term.leave_copy_mode(name)       # 正在翻历史的话先回到实时画面
+                if body.get("keys"):                 # 特殊键: Enter / Escape / C-c …
+                    term.send_keys(name, *body["keys"])
+                else:
+                    text = body.get("text", "")
+                    if text:
+                        term.send_text(name, text)
+                    if body.get("enter", True):
+                        term.send_keys(name, "Enter")
+                return self._json({"ok": True})
+        except Exception as e:
+            return self._json({"error": str(e)}, 400)
+        self._json({"error": "not found"}, 404)
+
+    def do_GET(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/api/term/attach":
+            return self._attach(q)
+        if u.path == "/api/watch":
+            return self._watch(q)
+        try:
+            if u.path.startswith("/api/"):
+                return self._api_get(u.path, q)
+            return self._static(u.path)
+        except KeyError:
+            self._json({"error": "not found"}, 404)
+        except Exception as e:
+            self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+
+    def do_DELETE(self):
+        if not self._allowed():
+            return self._send(403, b"forbidden", "text/plain")
+        u = urlparse(self.path)
+        if not u.path.startswith("/api/session/"):
+            return self._json({"error": "not found"}, 404)
+        uid = unquote(u.path[len("/api/session/"):])
+        try:
+            dest = index.delete(uid)
+        except KeyError:
+            return self._json({"error": "会话不存在"}, 404)
+        except OSError as e:
+            return self._json({"error": str(e)}, 500)
+        self._json({"ok": True, "trash": dest})
+
+    def _api_get(self, path: str, q: dict):
+        if path == "/api/sessions":
+            force = q.get("force", ["0"])[0] == "1"
+            known = q.get("sig", [""])[0]
+            if known and not force and known == index.signature():
+                return self._json({"unchanged": True, "sig": known})
+            sessions = index.load(force=force)
+            return self._json({"sessions": sessions, "sig": index._state["sig"],
+                               "built_at": index._state["built_at"]})
+
+        if path == "/api/live":
+            return self._json({"uids": live.live_uids(index.load())})
+
+        if path == "/api/term/list":
+            return self._json({"enabled": TERMINAL and term.available(),
+                               "sessions": term.list_sessions() if TERMINAL else []})
+
+        if path.startswith("/api/media/"):
+            token = path[len("/api/media/"):]
+            got = media.get(token)
+            if not got:
+                return self._json({"error": "图片不存在或已过期"}, 404)
+            data, mime, name = got
+            return self._send(200, data, mime, {
+                "Cache-Control": "private, max-age=86400, immutable",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": f'inline; filename="{re.sub(r"[^A-Za-z0-9._-]", "_", name)}"',
+            })
+
+        if path == "/api/search":
+            # 别叫 term —— 会把模块 term 遮蔽成局部变量, 同函数里的 term.xxx 全废
+            query = q.get("q", [""])[0]
+            srcs = [s for s in q.get("source", [""])[0].split(",") if s] or None
+            on = lambda k: q.get(k, ["0"])[0] == "1"
+            try:
+                return self._json(index.search(
+                    query, srcs, word=on("word"), case=on("case"), regex=on("regex")))
+            except re.error as e:
+                return self._json({"error": f"正则无效: {e}"}, 400)
+
+        if path.startswith("/api/messages/"):
+            uid = unquote(path[len("/api/messages/"):])
+            return self._json(index.messages(
+                uid,
+                include_agents=q.get("agents", ["0"])[0] == "1",
+                start=int(q.get("start", ["0"])[0]),
+                head=q.get("head", [""])[0],
+                anchor=q.get("anchor", [""])[0],
+            ))
+
+        if path.startswith("/api/version/"):
+            uid = unquote(path[len("/api/version/"):])
+            s = index.get(uid)
+            if not s:
+                raise KeyError(uid)
+            return self._json(index.version(s))
+
+        if path.startswith("/api/export/"):
+            uid = unquote(path[len("/api/export/"):])
+            md = index.to_markdown(uid)
+            name = uid.replace(":", "-") + ".md"
+            return self._send(200, md.encode(), "text/markdown; charset=utf-8",
+                              {"Content-Disposition": f'attachment; filename="{name}"'})
+        raise KeyError(path)
+
+    def _watch(self, q: dict):
+        """SSE: 服务端盯着会话文件, 一有变化立刻把 diff 推过去。
+
+        客户端不再需要轮询。推的内容和 /api/messages 的增量完全一样:
+        追加就推新增消息, 截断/改写就推整份并带 reset。
+        """
+        uid = q.get("uid", [""])[0]
+        s = index.get(uid)
+        if not s:
+            return self._send(404, b"no such session", "text/plain")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        start = int(q.get("start", ["0"])[0])
+        head = q.get("head", [""])[0]
+        anchor = q.get("anchor", [""])[0]
+        last = None
+        beat = time.time()
+        try:
+            while True:
+                ver = index.version(s)
+                if ver != last:
+                    last = ver
+                    # 用 messages_for 而不是 messages: 后者要过一遍索引,
+                    # 而文件刚变过, 签名对不上就会重建整个索引(百毫秒级)
+                    d = index.messages_for(s, start=start, head=head, anchor=anchor)
+                    if d["reset"] or d["messages"]:
+                        payload = json.dumps(d, ensure_ascii=False)
+                        self.wfile.write(f"data: {payload}\n\n".encode())
+                        self.wfile.flush()
+                    start, head, anchor = d["end"], d["version"]["head"], d["anchor"]
+                    beat = time.time()
+                elif time.time() - beat > 20:     # 心跳, 让中间的代理别掐连接
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    beat = time.time()
+                time.sleep(WATCH_POLL)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                                  # 客户端走了
+        finally:
+            self.close_connection = True
+
+    def _takeover(self, body: dict):
+        """接管一个会话: 在 tmux 里把它 resume 起来, 之后网页就能直接输入。
+
+        三种情况:
+          - 已经有对应的 tmux 会话  → 直接连上
+          - 会话没在运行            → 起一个
+          - 正在运行但不在 tmux 里  → 先回 needs_confirm, 确认后杀掉原实例再起
+        """
+        s = index.get(body["uid"])
+        if not s:
+            return self._json({"error": "会话不存在"}, 404)
+
+        name = term.session_name_for(s["source"], s["sid"])
+        if any(x["name"] == name for x in term.list_sessions()):
+            return self._json({"name": name, "action": "reused"})
+
+        pids = live.pids_of(s, force=True)
+        if pids and not term.in_tmux(pids):
+            mains = [p for p in pids if p > 0]
+            if not body.get("force"):
+                return self._json({"needs_confirm": True, "pids": mains,
+                                   "reason": "会话正在运行, 且不在 tmux 里"})
+            term.kill_pids(pids)
+
+        cols, rows = int(body.get("cols", 120)), int(body.get("rows", 32))
+        term.new_session(name, term.resume_command(s["source"], s["sid"]), s["cwd"], cols, rows)
+        return self._json({"name": name, "action": "killed" if pids else "started"})
+
+    def _attach(self, q: dict):
+        """WebSocket ↔ tmux attach 的字节转发。"""
+        if not TERMINAL:
+            return self._send(403, b"terminal disabled", "text/plain")
+        name = q.get("name", [""])[0]
+        if not name or not any(s["name"] == name for s in term.list_sessions()):
+            return self._send(404, b"no such tmux session", "text/plain")
+        if not wsock.handshake(self):
+            return self._send(400, b"expected websocket", "text/plain")
+
+        sock = self.connection
+        att = term.Attach(name, int(q.get("cols", ["120"])[0]), int(q.get("rows", ["32"])[0]))
+        stop = threading.Event()
+
+        def pump():                      # tmux → 浏览器
+            while not stop.is_set():
+                data = att.read(0.05)
+                if data:
+                    try:
+                        wsock.send(sock, data, wsock.OP_BIN)
+                    except OSError:
+                        break
+                elif not att.alive():
+                    break
+            stop.set()
+
+        t = threading.Thread(target=pump, daemon=True)
+        t.start()
+        try:
+            while not stop.is_set():     # 浏览器 → tmux
+                op, payload = wsock.recv(sock)
+                if op == wsock.OP_CLOSE:
+                    break
+                if op == wsock.OP_PING:
+                    wsock.send(sock, payload, wsock.OP_PONG)
+                    continue
+                if op == wsock.OP_TEXT and payload[:1] == b"{":
+                    try:                 # 控制消息只有一种: 改窗口大小
+                        m = json.loads(payload)
+                        if m.get("t") == "resize":
+                            att.resize(int(m["cols"]), int(m["rows"]))
+                            continue
+                    except Exception:
+                        pass
+                att.write(payload)
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            stop.set()
+            att.close()
+            wsock.close(sock)
+            self.close_connection = True
+
+    def _static(self, path: str):
+        rel = "index.html" if path in ("/", "") else path.lstrip("/")
+        f = (STATIC / rel).resolve()
+        if not str(f).startswith(str(STATIC.resolve())) or not f.is_file():
+            return self._send(404, b"not found", "text/plain")
+        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        if ctype.startswith(("text/", "application/javascript")):
+            ctype += "; charset=utf-8"
+        self._send(200, f.read_bytes(), ctype, {"Cache-Control": "no-cache"})
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Claude/Codex/Grok 会话管理服务")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8710)
+    ap.add_argument("--allow", default="192.0.2.134",
+                    help="除本机外允许访问的 IP, 逗号分隔")
+    ap.add_argument("--terminal", action="store_true",
+                    help="开启 tmux 远程终端。这等于给白名单 IP 开放本机 shell, 谨慎使用")
+    args = ap.parse_args()
+
+    global TERMINAL
+    TERMINAL = args.terminal
+    if TERMINAL and not term.available():
+        print("[sesman] 警告: 找不到 tmux, 终端功能不可用")
+        TERMINAL = False
+
+    ALLOWED_IPS.update({"127.0.0.1", "::1", "localhost"})
+    ALLOWED_IPS.update(x.strip() for x in args.allow.split(",") if x.strip())
+
+    threading.Thread(target=index.load, daemon=True).start()  # 后台预热索引
+
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv.daemon_threads = True
+    print(f"[sesman] http://{args.host}:{args.port}  允许: {sorted(ALLOWED_IPS)}"
+          + ("  [终端已开启]" if TERMINAL else ""))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[sesman] 已停止")
+
+
+if __name__ == "__main__":
+    main()

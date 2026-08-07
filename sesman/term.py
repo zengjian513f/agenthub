@@ -1,0 +1,277 @@
+"""把浏览器接到 tmux 会话上 —— 真正的远程控制。
+
+为什么绕 tmux 而不是直接注入已有进程:
+  - 现有会话是 sshd → zsh → claude 直连 pts, 外部无法写入它的输入队列
+  - 内核的 TIOCSTI 注入早已默认关闭 (dev.tty.legacy_tiocsti = 0)
+tmux 提供了合法的输入通道, 而且会话独立于 sesman 存活 —— 关掉浏览器、
+重启 sesman, 会话照常跑。
+
+实现上不用 send-keys + capture-pane 轮询, 而是起一个 pty 跑 `tmux attach`,
+双向转发字节。这样方向键、Ctrl-C、批准提示、鼠标全都原样可用。
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import pty
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import termios
+
+PREFIX = "sesman-"          # sesman 起的会话用这个前缀, 便于识别
+
+# 三家续接已有会话的命令
+RESUME = {
+    "claude": "claude --resume {sid}",
+    "codex": "codex resume {sid}",
+    "grok": "grok --resume {sid}",
+}
+
+
+def resume_command(source: str, sid: str) -> str:
+    """拼续接命令。sid 只允许 UUID 字符, 否则就成了命令注入。"""
+    if source not in RESUME:
+        raise ValueError(f"不支持的来源: {source}")
+    if not sid or not all(c in "0123456789abcdefABCDEF-" for c in sid):
+        raise ValueError(f"会话 id 不合法: {sid!r}")
+    return RESUME[source].format(sid=sid)
+
+
+def session_name_for(source: str, sid: str) -> str:
+    return f"{PREFIX}{source}-{sid[:8]}"
+
+
+def available() -> bool:
+    return shutil.which("tmux") is not None
+
+
+def _tmux(*args, timeout=10) -> str:
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"tmux {args[0]} 失败")
+    return r.stdout
+
+
+def list_sessions() -> list[dict]:
+    if not available():
+        return []
+    fmt = "#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{window_width}\t#{window_height}"
+    try:
+        out = _tmux("list-sessions", "-F", fmt)
+    except Exception:
+        return []                       # 没有任何会话时 tmux 也返回非 0
+    rows = []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) < 8:
+            continue
+        rows.append({
+            "name": p[0], "created": int(p[1] or 0), "attached": p[2] == "1",
+            "pid": int(p[3] or 0), "cwd": p[4], "cmd": p[5],
+            "cols": int(p[6] or 80), "rows": int(p[7] or 24),
+            "owned": p[0].startswith(PREFIX),
+        })
+    return rows
+
+
+def new_session(name: str, cmd: str, cwd: str | None = None,
+                cols: int = 120, rows: int = 32) -> str:
+    """新建一个 detached 会话并返回它的名字。"""
+    full = name if name.startswith(PREFIX) else PREFIX + name
+    args = ["new-session", "-d", "-s", full, "-x", str(cols), "-y", str(rows)]
+    if cwd and os.path.isdir(cwd):
+        args += ["-c", cwd]
+    args += [cmd]
+    _tmux(*args)
+    return full
+
+
+def kill_session(name: str) -> None:
+    _tmux("kill-session", "-t", name)
+
+
+def send_text(name: str, text: str) -> None:
+    """把一段文本当作键盘输入送进去 (不自动回车)。"""
+    _tmux("send-keys", "-t", name, "-l", "--", text)
+
+
+def send_keys(name: str, *keys: str) -> None:
+    """送 tmux 键名, 例如 Enter / Escape / C-c / Up。"""
+    _tmux("send-keys", "-t", name, "--", *keys)
+
+
+def in_copy_mode(name: str) -> bool:
+    try:
+        return _tmux("display", "-p", "-t", name, "#{pane_in_mode}").strip() == "1"
+    except Exception:
+        return False
+
+
+def leave_copy_mode(name: str) -> None:
+    """回到实时画面。用户一开始打字就该退出, 否则按键会被 copy-mode 吃掉。"""
+    if in_copy_mode(name):
+        try:
+            _tmux("send-keys", "-X", "-t", name, "cancel")
+        except Exception:
+            pass
+
+
+def alt_screen(name: str) -> bool:
+    """pane 里跑的是不是全屏应用 (claude/codex 的 TUI、less、vim…)。"""
+    try:
+        return _tmux("display", "-p", "-t", name, "#{alternate_on}").strip() == "1"
+    except Exception:
+        return False
+
+
+def scroll(name: str, up: bool, lines: int = 3) -> int:
+    """像普通终端那样用滚轮翻内容。
+
+    分两种情况, 因为终端本来就是这么两种:
+      - 普通 shell 输出 → 翻 tmux 自己的历史 (copy-mode)。浏览器终端连的是
+        tmux attach, 输出不进 xterm 的 scrollback, 只能这么翻。
+      - 全屏应用 (alternate screen) → tmux 根本不给它存历史, scroll_position
+        恒为 0。这时把滚轮转成方向键交给应用自己滚, 和 iTerm 之类的做法一致。
+    """
+    if alt_screen(name):
+        _tmux("send-keys", "-t", name, "-N", str(min(lines, 10)), "Up" if up else "Down")
+        return 0
+    inm = in_copy_mode(name)
+    if up:
+        if not inm:
+            _tmux("copy-mode", "-t", name)
+        _tmux("send-keys", "-X", "-N", str(lines), "-t", name, "scroll-up")
+    elif inm:
+        _tmux("send-keys", "-X", "-N", str(lines), "-t", name, "scroll-down")
+    else:
+        return 0
+    pos = _tmux("display", "-p", "-t", name, "#{scroll_position}").strip()
+    at = int(pos) if pos.isdigit() else 0
+    if not up and at == 0:
+        leave_copy_mode(name)
+    return at
+
+
+def capture(name: str, lines: int = 200) -> str:
+    return _tmux("capture-pane", "-p", "-e", "-t", name, "-S", f"-{lines}")
+
+
+def in_tmux(pids: list[int]) -> bool:
+    """这些进程是不是跑在 tmux 里 (祖先有 tmux server)。"""
+    for pid in pids:
+        cur = abs(pid)
+        for _ in range(12):
+            try:
+                st = open(f"/proc/{cur}/stat").read()
+                name = st[st.index("(") + 1:st.rindex(")")]
+                ppid = int(st[st.rindex(")") + 2:].split()[1])
+            except (OSError, ValueError):
+                break
+            if name.startswith("tmux"):
+                return True
+            if ppid <= 1:
+                break
+            cur = ppid
+    return False
+
+
+def gone(pid: int) -> bool:
+    """进程是否已经结束。僵尸也算结束 —— 它的 /proc 条目要等父进程收尸才消失。"""
+    try:
+        st = open(f"/proc/{pid}/stat").read()
+        return st[st.rindex(")") + 2] == "Z"
+    except (OSError, ValueError, IndexError):
+        return True
+
+
+def kill_pids(pids: list[int], timeout: float = 6.0) -> list[int]:
+    """先 TERM 让 CLI 有机会存盘, 不退再 KILL。返回真正被结束的 pid。"""
+    import time as _t
+    targets = [p for p in pids if p > 0]        # 只杀 CLI 主进程, 不动它的子 shell
+    killed = []
+    for p in targets:
+        try:
+            os.kill(p, signal.SIGTERM)
+            killed.append(p)
+        except OSError:
+            pass
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if all(gone(p) for p in killed):
+            return killed
+        _t.sleep(0.15)
+    for p in killed:                            # 赖着不走就硬杀
+        if not gone(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    _t.sleep(0.3)
+    return killed
+
+
+class Attach:
+    """一条 pty 上的 `tmux attach`, 供 WebSocket 双向转发。"""
+
+    def __init__(self, name: str, cols: int = 120, rows: int = 32):
+        self.name = name
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:                       # 子进程
+            os.environ["TERM"] = "xterm-256color"
+            os.environ.pop("TMUX", None)        # 否则 tmux 拒绝嵌套 attach
+            try:
+                os.execvp("tmux", ["tmux", "attach-session", "-t", name])
+            finally:
+                os._exit(1)
+        self.resize(cols, rows)
+
+    def resize(self, cols: int, rows: int) -> None:
+        try:
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError:
+            pass
+
+    def read(self, timeout: float = 0.05) -> bytes:
+        try:
+            r, _, _ = select.select([self.fd], [], [], timeout)
+        except (OSError, ValueError):
+            return b""
+        if not r:
+            return b""
+        try:
+            return os.read(self.fd, 65536)
+        except OSError:
+            return b""
+
+    def write(self, data: bytes) -> None:
+        try:
+            os.write(self.fd, data)
+        except OSError:
+            pass
+
+    def alive(self) -> bool:
+        try:
+            return os.waitpid(self.pid, os.WNOHANG) == (0, 0)
+        except ChildProcessError:
+            return False
+
+    def close(self) -> None:
+        # 只结束 attach 这个客户端, tmux 会话本身继续活着
+        try:
+            os.write(self.fd, b"\x02d")         # C-b d, 正常 detach
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        try:
+            os.kill(self.pid, signal.SIGHUP)
+            os.waitpid(self.pid, 0)
+        except (OSError, ChildProcessError):
+            pass

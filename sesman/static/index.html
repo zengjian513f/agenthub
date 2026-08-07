@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sesman · 会话管理</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🗂</text></svg>">
+</head>
+<body>
+<svg style="display:none">
+  <symbol id="i-claude" viewBox="0 0 16 16">
+    <path fill="currentColor" d="M8 .8l1.6 4.2L13.9 3l-2 4.1 4.1 1.6-4.1 1L13.9 14l-4.3-2L8 16.2 6.4 12 2.1 14l2-4.3-4.1-1 4.1-1.6-2-4.1 4.3 2z"/>
+  </symbol>
+  <symbol id="i-codex" viewBox="0 0 16 16">
+    <path fill="none" stroke="currentColor" stroke-width="1.6" d="M8 1.2a6.8 6.8 0 100 13.6A6.8 6.8 0 008 1.2zm0 3.4a3.4 3.4 0 110 6.8 3.4 3.4 0 010-6.8z"/>
+  </symbol>
+  <symbol id="i-grok" viewBox="0 0 16 16">
+    <path fill="currentColor" d="M2 14L9.4 4.2 12.6 2 6.6 11.3 2 14zm7.5-.1l3.6-5.1V2.4L9.5 7.2v6.7z"/>
+  </symbol>
+</svg>
+
+<div id="app">
+  <header>
+    <div class="brand">sesman<small id="stat">加载中…</small><span id="livecount" class="livecount"></span></div>
+    <div class="chips" id="chips"></div>
+    <div class="seg" id="view">
+      <button data-v="tree" class="on">📁 项目树</button>
+      <button data-v="date">🕒 时间轴</button>
+    </div>
+    <div class="qbox">
+        <input id="q" placeholder="搜索标题…  按 Enter 全文搜索会话内容">
+      <div class="opts" id="opts">
+        <button data-o="case" title="大小写敏感">Aa</button>
+        <button data-o="word" title="全词匹配">ab|</button>
+        <button data-o="regex" title="正则表达式">.*</button>
+      </div>
+    </div>
+    <button class="btn" id="reload" title="重新扫描磁盘">↻ 刷新</button>
+  </header>
+  <div id="prog"><div class="bar"></div><span class="txt"></span></div>
+  <main>
+    <div id="side"><div class="spin">正在扫描会话…</div></div>
+    <div id="drag" title="拖动调整宽度，双击复位"></div>
+    <div id="right">
+      <div id="detail"><div class="empty">从左侧选择一个会话</div></div>
+      <div id="composer" class="hidden">
+        <textarea id="cinput" rows="1" placeholder="输入内容，Enter 发送给会话，Shift+Enter 换行"></textarea>
+        <div class="cbtns">
+          <button class="btn" id="cesc" title="发送 Esc（中断）">Esc</button>
+          <button class="btn" id="cterm" title="展开完整终端">⌨</button>
+          <button class="btn go" id="csend">发送</button>
+        </div>
+      </div>
+      <div id="termpane" class="hidden">
+        <div class="thead">
+          <span class="grip" id="tgrip" title="拖动调整高度"></span>
+          <span id="tstatus">未连接</span>
+          <button class="chipbtn" id="tscroll"></button>
+          <span class="spacer"></span>
+          <button class="chipbtn" id="tmouse" title="鼠标交给应用（点击改为框选复制）">🖱 框选</button>
+          <button class="btn" id="tdetach" title="断开但不结束 tmux 会话">收起</button>
+          <button class="btn danger" id="tstop" title="结束这个 tmux 会话">结束会话</button>
+        </div>
+        <div id="xterm"></div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script src="/vendor/katex/katex.min.js"></script>
+<script src="/vendor/katex/auto-render.min.js"></script>
+<script src="/app.js"></script>
+<script src="/term.js"></script>
+</body>
+</html>

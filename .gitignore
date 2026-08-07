@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+# Continuous-memory plugin runtime state is local, not application source.
+.remember/
+
+# Local editor and OS artifacts.
+.DS_Store
+*.swp
+*~

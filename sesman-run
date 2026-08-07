@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# 在 tmux 里启动 CLI 会话, 这样 sesman 网页可以远程接管它。
+# 用法:  ./sesman-run              # 默认 claude
+#        ./sesman-run codex
+#        ./sesman-run claude --resume
+# 本地和网页可以同时连着同一个会话 (tmux 支持多客户端)。
+set -euo pipefail
+CMD=${1:-claude}; shift || true
+NAME="sesman-${CMD##*/}-$(date +%H%M%S)"
+exec tmux new-session -A -s "$NAME" -c "$PWD" "$CMD" "$@"
