@@ -34,11 +34,13 @@ const S = {
   syncing: false,     // 增量同步进行中
   syncGap: 350,       // 当前会话的同步间隔, 随有无新内容自适应
   live: new Set(),    // 仍在运行的会话 uid
+  liveTmux: new Set(),// 其中运行在 tmux 里的会话 uid
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
 
 const $ = s => document.querySelector(s);
+const MOBILE = matchMedia('(max-width: 720px)');
 const el = (tag, cls, html) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -47,6 +49,20 @@ const el = (tag, cls, html) => {
 };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const icon = src => `<svg class="ico" style="color:${SOURCES[src].color}"><use href="#${SOURCES[src].icon}"/></svg>`;
+const uiIcon = name => `<svg class="ui-icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+
+function showMobileDetail() {
+  if (MOBILE.matches) {
+    document.body.classList.add('mobile-detail');
+    store.set('mobilePage', 'detail');
+  }
+}
+
+function showMobileList() {
+  if (typeof T !== 'undefined' && !$('#termpane').classList.contains('hidden')) closeTermPane();
+  document.body.classList.remove('mobile-detail');
+  if (MOBILE.matches) store.set('mobilePage', 'list');
+}
 
 function fmtSize(n) {
   if (n < 1024) return n + 'B';
@@ -184,6 +200,11 @@ async function applyDiff(uid, data, bytes = 0) {
   mark.remove();
   const c = $('#mcount-total');
   if (c) c.textContent = `${e.msgs.length} 条消息`;
+  const mc = $('.mobile-msg-count');
+  if (mc) {
+    mc.textContent = e.msgs.length;
+    mc.setAttribute('aria-label', `${e.msgs.length} 条消息`);
+  }
   newBadge(data.messages.length);
   return data.messages.length;
 }
@@ -263,19 +284,27 @@ function tickSync() {
 setInterval(tickSync, TICK_MS);
 
 // ---- 活跃会话 ----
-async function pollLive() {
+async function refreshLive(force = false) {
+  const d = await (await fetch('/api/live' + (force ? '?force=1' : ''))).json();
+  const next = new Set(d.uids);
+  const nextTmux = new Set((d.tmux_uids || []).filter(u => next.has(u)));
+  const changed = (a, b) => a.size !== b.size || [...a].some(u => !b.has(u));
+  if (changed(next, S.live) || changed(nextTmux, S.liveTmux)) {
+    S.live = next;
+    S.liveTmux = nextTmux;
+    paintLive();
+  }
+}
+
+async function pollLive(force = false) {
   if (document.hidden) return;
   try {
-    const d = await (await fetch('/api/live')).json();
-    const next = new Set(d.uids);
-    if (next.size !== S.live.size || [...next].some(u => !S.live.has(u))) {
-      S.live = next;
-      paintLive();
-    }
+    await refreshLive(force);
     if (typeof loadTermList === 'function') {   // tmux 会话可能在外部被结束
       const before = (T.list || []).map(x => x.name).join();
       await loadTermList();
       if ((T.list || []).map(x => x.name).join() !== before) {
+        await refreshLive(true);                // 绕过 3 秒缓存，绿点立即跟着 tmux 消失
         renderTakeoverBtn();
         if (T.name && !T.list.some(x => x.name === T.name)) closeTermPane();
       }
@@ -287,12 +316,28 @@ async function pollLive() {
 function paintLive() {
   for (const n of document.querySelectorAll('.item')) {
     n.classList.toggle('live', S.live.has(n.dataset.uid));
+    n.classList.toggle('live-tmux', S.liveTmux.has(n.dataset.uid));
   }
   const h = $('#dlive');
-  if (h) h.classList.toggle('on', S.live.has(S.sel));
+  if (h) {
+    const tmux = S.liveTmux.has(S.sel);
+    h.classList.toggle('on', S.live.has(S.sel));
+    h.classList.toggle('tmux', tmux);
+    h.textContent = tmux ? '● tmux 中' : '● 进行中';
+  }
+  const termButton = $('#a-term');
+  if (termButton) {
+    termButton.classList.toggle('session-live', S.live.has(S.sel));
+    termButton.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
+  }
   const c = $('#livecount');
   if (c) {
-    c.textContent = S.live.size ? `${S.live.size} 个进行中` : '';
+    const tmux = S.liveTmux.size, direct = S.live.size - tmux;
+    c.innerHTML = S.live.size
+      ? `${direct ? `<span class="live-direct">● ${direct}</span>` : ''}`
+        + `${tmux ? `<span class="live-tmux-count">● ${tmux}<span class="live-kind"> tmux</span></span>` : ''}` : '';
+    c.ariaLabel = `${S.live.size} 个进行中：${direct} 个非 tmux，${tmux} 个 tmux`;
+    c.title = '绿色：非 tmux · 蓝色：tmux';
     c.classList.toggle('on', S.live.size > 0);
   }
 }
@@ -305,6 +350,10 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---------------------------------------------------------------- 数据加载
+function showSessionCount(n) {
+  $('#stat').innerHTML = `${n}<span class="stat-unit"> 个会话</span>`;
+}
+
 async function loadSessions(force) {
   $('#stat').textContent = force ? ' 重新扫描…' : ' 加载中…';
   const r = await fetch('/api/sessions' + (force ? '?force=1' : ''));
@@ -313,7 +362,7 @@ async function loadSessions(force) {
   S.sessions = d.sessions;
   renderChips();
   renderSide();
-  $('#stat').textContent = ` ${d.sessions.length} 个会话`;
+  showSessionCount(d.sessions.length);
 }
 
 /** 列表自动跟进磁盘变化。签名没变时服务端只回一个 unchanged, 成本约 3ms。 */
@@ -326,7 +375,7 @@ async function pollSessions() {
     S.sessions = d.sessions;
     renderChips();
     if (S.results) return;              // 搜索态下, 列表和顶栏文案都不能动
-    $('#stat').textContent = ` ${d.sessions.length} 个会话`;
+    showSessionCount(d.sessions.length);
     if (patchSide(visible())) return;   // 能就地更新就不重建, 否则会一直闪
     const side = $('#side');
     const top = side.scrollTop;
@@ -353,6 +402,8 @@ function renderChips() {
     const n = S.sessions.filter(s => s.source === k).length;
     const c = el('div', 'chip' + (S.off.has(k) ? ' off' : ''),
       `${icon(k)}<span>${v.name}</span><b>${n}</b>`);
+    c.title = v.name;
+    c.setAttribute('aria-label', `${v.name}，${n} 个会话`);
     c.onclick = () => {
       S.off.has(k) ? S.off.delete(k) : S.off.add(k);
       store.set('off', [...S.off]);
@@ -441,7 +492,8 @@ function renderSide() {
     for (const s of items) {
       const meta = itemMeta(s);
       const it = el('div', 'item' + (S.sel === s.uid ? ' sel' : '')
-                              + (S.live.has(s.uid) ? ' live' : ''),
+                              + (S.live.has(s.uid) ? ' live' : '')
+                              + (S.liveTmux.has(s.uid) ? ' live-tmux' : ''),
         `<span class="ico">${icon(s.source)}</span>
          <div class="body">
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
@@ -487,9 +539,9 @@ function markMatches(root) {
   if (!S.term) return 0;
   const re = reTerm(true);
   if (!re) return 0;
-  // 只高亮正文: 标题栏预览是正文副本, 展开后会被隐藏, 高亮在那里等于跳转到看不见的地方
+  // 只高亮正文: 折叠预览是正文副本, 高亮在那里会造成重复计数。
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode: n => n.parentElement.closest('.mh, .katex')
+    acceptNode: n => n.parentElement.closest('.fold-preview, .katex')
       ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
   });
   const targets = [];
@@ -534,6 +586,7 @@ function jumpMark(delta) {
 let inflight = null;
 
 async function openSession(uid, agents) {
+  showMobileDetail();
   inflight?.abort();            // 连点列表时, 放弃上一个还没回来的请求
   const ac = inflight = new AbortController();
   closeWatch();
@@ -725,44 +778,71 @@ async function renderSession(meta, msgs) {
 
 function head(m, total) {
   const h = el('div', 'dhead');
+  const tmuxLive = S.liveTmux.has(m.uid);
   h.innerHTML = `
-    <h2>${icon(m.source)} ${esc(m.title)}</h2>
-    <div class="dmeta">
-      <span>${SOURCES[m.source].name}</span>
-      <span id="mcount-total">${total} 条消息</span>
-      <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}">● 进行中</span>
-      <span id="newmsg" class="newmsg"></span>
-      <span>${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
-      <span>${fmtSize(m.size)}</span>
-      ${m.model ? `<span>${esc(m.model)}</span>` : ''}
-      ${m.branch ? `<span>⑂ ${esc(m.branch)}</span>` : ''}
-      <span><code>${esc(m.cwd)}</code></span>
-      <span><code>${esc(m.sid)}</code></span>
+    <div class="dtitle">
+      <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
+      <h2>${icon(m.source)} ${esc(m.title)}</h2>
+      <div class="dhead-actions" aria-label="会话操作">
+        <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
+        ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
+          (typeof T !== 'undefined' && T.enabled)
+            ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
+        <button class="iconbtn mobile-more" id="a-more" title="更多操作" aria-label="更多操作"
+          aria-expanded="false">${uiIcon('more')}</button>
+        <div class="mobile-action-menu">
+          <a class="iconbtn" id="a-export" href="/api/export/${encodeURIComponent(m.uid)}" download
+             title="导出 Markdown" aria-label="导出 Markdown">${uiIcon('download')}</a>
+          <button class="iconbtn" id="a-fold" title="折叠工具输出" aria-label="折叠工具输出">${uiIcon('fold')}</button>
+          ${S.term ? `<span class="mnav"><b id="mcount">…</b>
+            <button class="iconbtn" id="m-prev" title="上一处" aria-label="上一处">↑</button>
+            <button class="iconbtn" id="m-next" title="下一处" aria-label="下一处">↓</button></span>` : ''}
+          ${m.agents ? `<button class="iconbtn${S.agents ? ' on' : ''}" id="a-agents"
+            title="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理" aria-label="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理"
+            aria-pressed="${S.agents}">${uiIcon('agents')}<span class="action-badge">${m.agents}</span></button>` : ''}
+          <button class="iconbtn danger" id="a-del" title="删除会话" aria-label="删除会话">${uiIcon('trash')}</button>
+        </div>
+      </div>
     </div>
-    <div class="dactions">
-      <button class="btn" id="a-copy">复制路径</button>
-      <a class="btn" href="/api/export/${encodeURIComponent(m.uid)}" download>导出 Markdown</a>
-      ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
-        (typeof T !== 'undefined' && T.enabled)
-          ? '<button class="btn go" id="a-term">⌨ 接管</button>' : ''}
-      <button class="btn" id="a-fold">全部折叠</button>
-      ${S.term ? `<span class="mnav"><b id="mcount">…</b>
-        <button class="btn" id="m-prev" title="上一处">↑</button>
-        <button class="btn" id="m-next" title="下一处">↓</button></span>` : ''}
-      ${m.agents ? `<button class="btn" id="a-agents">${S.agents ? '✓ ' : ''}合并 ${m.agents} 个子代理</button>` : ''}
-      <button class="btn danger" id="a-del">删除会话</button>
+    <div class="dmeta">
+      <span class="meta-source">${SOURCES[m.source].name}</span>
+      <span id="mcount-total">${total} 条消息</span>
+      <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}">${tmuxLive ? '● tmux 中' : '● 进行中'}</span>
+      <span id="newmsg" class="newmsg"></span>
+      <span class="meta-secondary">${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
+      <span class="meta-secondary">${fmtSize(m.size)}</span>
+      ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
+      ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
+      <span class="meta-secondary"><code>${esc(m.cwd)}</code></span>
     </div>`;
+  h.querySelector('.mobile-back').onclick = showMobileList;
+  const actions = h.querySelector('.dhead-actions');
+  const more = h.querySelector('#a-more');
+  const closeActions = () => {
+    actions.classList.remove('menu-open');
+    more.setAttribute('aria-expanded', 'false');
+  };
+  more.onclick = e => {
+    e.stopPropagation();
+    const open = actions.classList.toggle('menu-open');
+    more.setAttribute('aria-expanded', String(open));
+    if (open) setTimeout(() => document.addEventListener('click', e => {
+      if (!actions.contains(e.target)) closeActions();
+    }, { once: true }), 0);
+  };
+  h.querySelector('.mobile-action-menu').onclick = e => {
+    if (e.target.closest('a, button')) setTimeout(closeActions, 0);
+  };
   const ag = h.querySelector('#a-agents');
   if (ag) ag.onclick = () => openSession(m.uid, !S.agents);
-  h.querySelector('#a-copy').onclick = e => {
-    navigator.clipboard.writeText(m.path); e.target.textContent = '已复制 ✓';
-    setTimeout(() => e.target.textContent = '复制路径', 1200);
-  };
   const tb = h.querySelector('#a-term');
   if (tb) {
     tb.onclick = () => {
       const name = takenOver(m.uid);
-      if (name) { T.uid = m.uid; openTermPane(name); }   // 已接管: 直接打开输入
+      if (name) {
+        T.uid = m.uid;
+        toggleTermPane(name);
+      }
       else takeover(m.uid, tb);
     };
     setTimeout(renderTakeoverBtn, 0);
@@ -770,9 +850,11 @@ function head(m, total) {
   const fb = h.querySelector('#a-fold');
   fb.onclick = () => {
     const fold = fb.dataset.state !== 'folded';   // 按状态判断, 不能靠按钮文案
-    document.querySelectorAll('.msg').forEach(n => n.classList.toggle('folded', fold));
+    document.querySelectorAll('.msg.foldable').forEach(n => fold ? n._fold() : n._open());
     fb.dataset.state = fold ? 'folded' : 'open';
-    fb.textContent = fold ? '全部展开' : '全部折叠';
+    const label = fold ? '展开工具输出' : '折叠工具输出';
+    fb.innerHTML = uiIcon(fold ? 'expand' : 'fold');
+    fb.title = fb.ariaLabel = label;
   };
   h.querySelector('#a-del').onclick = () => del(m);
   return h;
@@ -793,6 +875,7 @@ async function del(m) {
   store.set('sel', null);
   renderChips(); renderSide();
   $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(d.trash)}</code></div>`;
+  showMobileList();
 }
 
 const ROLE_LABEL = {
@@ -800,8 +883,6 @@ const ROLE_LABEL = {
   'assistant·subagent': '🤖 子代理', thinking: '💭 思考', system: '⚙️ 系统',
   tool: '🔧 工具调用', tool_result: '📄 工具输出', context: '📎 注入上下文',
 };
-const FOLD_DEFAULT = new Set(['thinking', 'system', 'tool', 'tool_result', 'context']);
-
 // 连续 3 条以上的工具调用/输出合并成一个可折叠的组, 避免刷屏
 const TOOL_ROLES = new Set(['tool', 'tool_result']);
 const GROUP_MIN = 3;
@@ -833,6 +914,51 @@ function buildPlan(box, plan, before) {
 
 const appendMessages = (box, msgs, before) => buildPlan(box, planMessages(msgs), before);
 
+// 折叠态只是一行正文预览，不显示角色/时间 header。
+function addFoldPreview(n, text, aria, hasHiddenHit = false) {
+  n.classList.add('foldable');
+  const preview = el('button', 'fold-preview');
+  preview.type = 'button';
+  preview.title = '展开';
+  preview.setAttribute('aria-label', `展开${aria}`);
+  const peek = el('span', 'peek');
+  peek.textContent = text;
+  preview.appendChild(peek);
+  if (hasHiddenHit) preview.appendChild(el('i', 'dot', '●'));
+  n.appendChild(preview);
+  return preview;
+}
+
+function addAction(n) {
+  const action = el('button', 'more disclosure');
+  action.type = 'button';
+  action.hidden = true;
+  n.appendChild(action);
+  return (label, fn) => {
+    action.hidden = !label;
+    action.textContent = label || '';
+    action.onclick = fn || null;
+  };
+}
+
+function toolEntry(m) {
+  const entry = el('div', 'tool-entry');
+  entry.dataset.role = m.role;
+  const pre = el('pre');
+  const text = m.name ? `${m.name}\n${m.text}` : m.text;
+  const paint = full => { pre.textContent = full ? text : clipText(text); };
+  paint(false);
+  entry.appendChild(pre);
+  if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
+  if (text.length > CLIP) {
+    const more = el('button', 'more', `展开全文 (${text.length.toLocaleString()} 字符)`);
+    more.onclick = () => { pre.classList.remove('clip'); paint(true); more.remove(); };
+    pre.classList.add('clip');
+    entry.appendChild(more);
+  }
+  return entry;
+}
+
 function groupNode(items) {
   // 组里有命中就默认展开, 否则高亮藏在折叠层里看不见
   const n = el('div', 'msg grp' + (items.some(m => hasTerm(m.text)) ? '' : ' folded'));
@@ -841,15 +967,15 @@ function groupNode(items) {
   const tally = {};
   calls.forEach(m => { const k = m.name || 'tool'; tally[k] = (tally[k] || 0) + 1; });
   const summary = Object.entries(tally).map(([k, v]) => v > 1 ? `${k} ×${v}` : k).join(' · ');
-  const h = el('div', 'mh',
-    `<span class="role">🔧 ${calls.length} 次工具调用</span>
-     <span class="peek">${esc(summary)}</span>
-     <span>${items[0].ts ? esc(fmtTime(items[0].ts)) : ''}</span>`);
-  h.onclick = () => n.classList.toggle('folded');
-  n.appendChild(h);
-  const body = el('div', 'mb grp-body');
-  items.forEach(m => body.appendChild(msgNode(m)));
-  n.appendChild(body);
+  const preview = addFoldPreview(n, `🔧 ${calls.length} 次工具调用 · ${summary}`, '工具调用组');
+  items.forEach(m => n.appendChild(toolEntry(m))); // 直接铺在组内，不再套 grp-body + 内层 msg
+  const setAction = addAction(n);
+  const fold = () => { n.classList.add('folded'); setAction(); };
+  const open = () => { n.classList.remove('folded'); setAction('收起', fold); };
+  n._fold = fold;
+  n._open = open;
+  preview.onclick = open;
+  if (!n.classList.contains('folded')) open();
   return n;
 }
 
@@ -903,30 +1029,41 @@ function msgNode(m) {
   const found = hasTerm(m.text);
   const hit = found && S.autoOpen < AUTO_OPEN_MAX;
   if (hit) S.autoOpen++;
-  const n = el('div', 'msg' + (FOLD_DEFAULT.has(m.role) && !hit ? ' folded' : '')
+  const raw = TOOL_ROLES.has(m.role);
+  // 只有多行工具内容允许整条折叠；所有对话内容只可能出现“展开全文”。
+  const foldable = raw && String(m.text || '').includes('\n');
+  const n = el('div', 'msg' + (foldable && !hit ? ' folded' : '')
                             + (found && !hit ? ' hashit' : ''));
   n.dataset.role = m.role;
-  const label = (ROLE_LABEL[m.role] || m.role) + (m.name ? ` · ${esc(m.name)}` : '')
-                + (found && !hit ? ' <i class="dot" title="含匹配, 点开查看">●</i>' : '');
+  const label = (ROLE_LABEL[m.role] || m.role) + (m.name ? ` · ${m.name}` : '');
   const peek = m.text.replace(/\s+/g, ' ').slice(0, 200);
-  const h = el('div', 'mh',
-    `<span class="role">${label}</span><span class="peek">${esc(peek)}</span>
-     <span>${m.ts ? esc(fmtTime(m.ts)) : ''}</span>`);
-  h.onclick = () => n.classList.toggle('folded');
-  n.appendChild(h);
+  const preview = foldable ? addFoldPreview(n, peek, label, found && !hit) : null;
   const body = el('div', 'mb');
-  const raw = m.role === 'tool' || m.role === 'tool_result';
   const render = full => (raw
     ? `<pre>${esc(full ? m.text : clipText(m.text))}</pre>`
     : md(m.text, full, m.media)) + mediaGallery(m.media);
   const paint = full => { body.innerHTML = render(full); renderFormulae(body); };
   paint(hit);
   n.appendChild(body);
-  if (!hit && m.text.length > CLIP) {
-    body.classList.add('clip');
-    const b = el('button', 'more', `展开全文 (${m.text.length.toLocaleString()} 字符)`);
-    b.onclick = () => { body.classList.remove('clip'); paint(true); b.remove(); };
-    n.appendChild(b);
+  const setAction = addAction(n);
+  const long = m.text.length > CLIP;
+  const fold = () => { n.classList.add('folded'); body.classList.remove('clip'); setAction(); };
+  const full = () => {
+    n.classList.remove('folded'); body.classList.remove('clip'); paint(true);
+    setAction(foldable ? '收起' : '', foldable ? fold : null);
+  };
+  const clipped = () => {
+    n.classList.remove('folded'); body.classList.add('clip'); paint(false);
+    setAction(`展开全文 (${m.text.length.toLocaleString()} 字符)`, full);
+  };
+  const open = () => long ? clipped() : full();
+  if (foldable) {
+    n._fold = fold;
+    n._open = open;
+    preview.onclick = open;
+    if (hit) full();
+  } else if (long) {
+    hit ? full() : clipped();
   }
   return n;
 }
@@ -1047,8 +1184,13 @@ function renderView() {
 const SIDE_DEFAULT = 340;
 
 function setSideWidth(px, save) {
+  if (MOBILE.matches) {
+    $('#side').style.removeProperty('width');
+    return;
+  }
   const w = Math.round(Math.max(200, Math.min(px, window.innerWidth - 320)));
   $('#side').style.width = w + 'px';
+  document.documentElement.style.setProperty('--side-width', w + 'px');
   if (save) store.set('width', w);
 }
 
@@ -1066,7 +1208,17 @@ document.addEventListener('mouseup', () => {
   setSideWidth(parseInt($('#side').style.width, 10), true);
 });
 $('#drag').addEventListener('dblclick', () => setSideWidth(SIDE_DEFAULT, true));
-window.addEventListener('resize', () => setSideWidth(parseInt($('#side').style.width, 10) || SIDE_DEFAULT));
+window.addEventListener('resize', () => setSideWidth(
+  parseInt($('#side').style.width, 10) || store.get('width', SIDE_DEFAULT)));
+MOBILE.addEventListener?.('change', e => {
+  if (e.matches) {
+    document.body.classList.toggle('mobile-detail',
+      !!S.sel && store.get('mobilePage', 'list') === 'detail');
+  } else {
+    document.body.classList.remove('mobile-detail');
+  }
+  setSideWidth(store.get('width', SIDE_DEFAULT));
+});
 
 $('#q').oninput = e => {
   if (S.results) { S.results = null; }     // 改动输入即退出全文搜索态
@@ -1143,5 +1295,6 @@ renderView();
 pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
 loadSessions(false).then(() => {
   const last = store.get('sel', null);       // 恢复上次看的会话
-  if (last && S.sessions.some(s => s.uid === last)) openSession(last);
+  const restoreDetail = !MOBILE.matches || store.get('mobilePage', 'list') === 'detail';
+  if (restoreDetail && last && S.sessions.some(s => s.uid === last)) openSession(last);
 });

@@ -76,6 +76,10 @@ def make_fake_session():
         {"type": "user", "message": {"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>注入的</INSTRUCTIONS>"},
          "uuid": "u3", "timestamp": "2026-08-06T12:00:07.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "单行工具输出不折叠"}]},
+         "uuid": "u4", "timestamp": "2026-08-06T12:00:08.000Z", "cwd": "/tmp/sesman-selftest",
+         "sessionId": sid},
     ]
     # 确定性覆盖前端两层限流：前 40 条命中消息自动展开、前 3000 处命中高亮。
     # 不能拿用户真实会话的文件大小推断命中消息数；大文件也可能只有一条超长消息。
@@ -100,7 +104,7 @@ def cleanup():
 
 def run(pw):
     b = pw.chromium.launch()
-    ctx = b.new_context(permissions=["clipboard-read", "clipboard-write"])
+    ctx = b.new_context()
     p = ctx.new_page()
     errors = []
     p.on("pageerror", lambda e: errors.append(str(e)))
@@ -275,7 +279,8 @@ def run(pw):
           p.locator("#msgs mark").first.inner_text())
     check("显示匹配计数", "处匹配" in p.locator("#mcount").inner_text(), p.locator("#mcount").inner_text())
     check("首个匹配已定位", p.locator("#msgs mark.cur").count() == 1)
-    check("高亮只落在正文里", p.locator("#msgs .mh mark").count() == 0, p.locator("#msgs .mh mark").count())
+    check("高亮只落在正文里", p.locator("#msgs .fold-preview mark").count() == 0,
+          p.locator("#msgs .fold-preview mark").count())
     check("每个高亮都可见",
           all(p.locator("#msgs mark").nth(i).is_visible() for i in range(p.locator("#msgs mark").count())))
     n_marks = p.locator("#msgs mark").count()
@@ -306,7 +311,7 @@ def run(pw):
     check("选中项高亮", p.locator(".item.sel").count() == 1)
     check("详情标题正确", "SESMAN自测会话请删除" in p.locator(".dhead h2").inner_text())
     check("详情元信息含 cwd", "/tmp/sesman-selftest" in p.locator(".dmeta").inner_text())
-    roles = p.locator(".msg").evaluate_all("ns => ns.map(n => n.dataset.role)")
+    roles = p.locator("#msgs [data-role]").evaluate_all("ns => ns.map(n => n.dataset.role)")
     check("消息角色齐全", {"user", "assistant", "thinking", "tool", "tool_result", "context"} <= set(roles), roles)
 
     # ---- 8. 默认折叠规则 ----
@@ -314,9 +319,93 @@ def run(pw):
         return p.locator(f'.msg[data-role="{role}"] .mb').first.is_visible()
     check("user 默认展开", body_visible("user"))
     check("assistant 默认展开", body_visible("assistant"))
-    check("thinking 默认折叠", not body_visible("thinking"))
-    check("tool 默认折叠", not body_visible("tool"))
-    check("注入上下文默认折叠", not body_visible("context"))
+    check("thinking 从不折叠", body_visible("thinking"))
+    check("注入上下文从不折叠", body_visible("context"))
+    check("对话内容没有折叠入口",
+          p.locator('.msg[data-role="user"] > .fold-preview, '
+                    '.msg[data-role="assistant"] > .fold-preview, '
+                    '.msg[data-role="thinking"] > .fold-preview, '
+                    '.msg[data-role="context"] > .fold-preview').count() == 0)
+    single_tool = p.locator('.msg[data-role="tool_result"]').filter(has_text="单行工具输出不折叠")
+    check("单行工具输出也不折叠",
+          single_tool.locator(".mb").is_visible() and single_tool.locator(".fold-preview").count() == 0)
+    single_tool_skin = single_tool.evaluate("""n => {
+      const body = n.querySelector(':scope > .mb'), pre = body.querySelector(':scope > pre');
+      const ns = getComputedStyle(n), bs = getComputedStyle(body), ps = getComputedStyle(pre);
+      return { bodyPadding: bs.padding, preBackground: ps.backgroundColor,
+               preBorder: ps.borderTopWidth, preMargin: ps.margin,
+               bubbleBackground: ns.backgroundColor, textColor: ps.color,
+               scrollbarWidth: ps.scrollbarWidth, scrollbarColor: ps.scrollbarColor };
+    }""")
+    check("单条工具输出没有外黄里灰的双层气泡",
+          all(single_tool_skin[k] == v for k, v in {
+              "bodyPadding": "0px", "preBackground": "rgba(0, 0, 0, 0)",
+              "preBorder": "0px", "preMargin": "0px"}.items()), single_tool_skin)
+    terminal_theme = p.evaluate("termTheme()")
+    check("工具输出与终端使用同一套纯黑底柔和灰字",
+          single_tool_skin["bubbleBackground"] == "rgb(0, 0, 0)"
+          and single_tool_skin["textColor"] == "rgb(184, 190, 201)"
+          and terminal_theme["background"] == "#000000"
+          and terminal_theme["foreground"] == "#b8bec9", (single_tool_skin, terminal_theme))
+    font_pair = p.evaluate("""() => ({
+      tool: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .mb > pre')).fontFamily,
+      toolSize: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .mb > pre')).fontSize,
+      terminal: termFont(), terminalSize: termFontSize()
+    })""")
+    check("工具输出与 tmux 终端共用 Cascadia/系统等宽字体栈",
+          "Sesman Cascadia Mono" in font_pair["tool"] and "Adwaita Mono" in font_pair["tool"]
+          and "Ubuntu Mono" in font_pair["tool"] and "Consola" in font_pair["tool"]
+          and "Microsoft YaHei" in font_pair["tool"] and "Noto Sans Mono CJK SC" in font_pair["tool"]
+          and "Sesman Cascadia Mono" in font_pair["terminal"] and "Consola" in font_pair["terminal"]
+          and "Microsoft YaHei" in font_pair["terminal"]
+          and font_pair["toolSize"] == "12.96px" and font_pair["terminalSize"] == 14.04, font_pair)
+    p.wait_for_function("document.fonts.check('12px \\\"Sesman Cascadia Mono\\\"')", timeout=15000)
+    bundled_font = p.evaluate("""() => ({
+      loaded: document.fonts.check('12px "Sesman Cascadia Mono"'),
+      requested: performance.getEntriesByName(location.origin + '/fonts/CascadiaMono.woff2').length
+    })""")
+    check("Cascadia Mono 网页字体由项目自带且已加载", bundled_font["loaded"] and bundled_font["requested"] > 0,
+          bundled_font)
+    check("滚动条使用细圆角低对比样式且轨道不是纯黑",
+          single_tool_skin["scrollbarWidth"] == "thin"
+          and "rgba(0, 0, 0, 0)" not in single_tool_skin["scrollbarColor"]
+          and "rgb(0, 0, 0)" not in single_tool_skin["scrollbarColor"], single_tool_skin)
+
+    # 所有状态都没有角色/时间 header；左右留白和背景色构成聊天气泡层级。
+    check("所有消息都没有 header", p.locator("#msgs .mh").count() == 0)
+    bubble_geo = p.evaluate("""() => {
+      const box = document.querySelector('#msgs'), cs = getComputedStyle(box), br = box.getBoundingClientRect();
+      const left = br.left + parseFloat(cs.paddingLeft), right = br.right - parseFloat(cs.paddingRight);
+      const width = right - left;
+      const u = document.querySelector('#msgs > .msg[data-role="user"]:not(.folded)').getBoundingClientRect();
+      const a = document.querySelector('#msgs > .msg[data-role="assistant"]:not(.folded)').getBoundingClientRect();
+      return { userLeft: (u.left-left)/width, userRight: right-u.right,
+               otherLeft: a.left-left, otherRight: (right-a.right)/width };
+    }""")
+    check("用户气泡靠右且左侧至少留 10%",
+          bubble_geo["userRight"] <= 2 and bubble_geo["userLeft"] >= .095, bubble_geo)
+    check("其他气泡靠左且右侧至少留 10%",
+          bubble_geo["otherLeft"] <= 2 and bubble_geo["otherRight"] >= .095, bubble_geo)
+    colors = p.locator('#msgs > .msg[data-role="user"], #msgs > .msg[data-role="assistant"]').evaluate_all(
+        "ns => ns.slice(0, 2).map(n => getComputedStyle(n).backgroundColor)")
+    check("用户与助手用不同背景色区分", len(colors) == 2 and colors[0] != colors[1], colors)
+    content_widths = p.evaluate("""() => ({
+      messages: getComputedStyle(document.querySelector('#msgs')).maxWidth,
+      composer: getComputedStyle(document.querySelector('#composer')).maxWidth,
+      header: getComputedStyle(document.querySelector('.dhead')).maxWidth,
+      terminal: getComputedStyle(document.querySelector('#termpane')).maxWidth
+    })""")
+    check("详情头、消息区、输入区与终端右边缘使用相同最大宽度",
+          all(v == "1150px" for v in content_widths.values()), content_widths)
+    folded_geo = p.locator("#msgs > .msg.folded").first.evaluate("""n => {
+      const box = document.querySelector('#msgs').getBoundingClientRect();
+      const r = n.getBoundingClientRect();
+      return {ratio: r.width / box.width, radius: getComputedStyle(n).borderRadius,
+              preview: !!n.querySelector(':scope > .fold-preview > .peek')};
+    }""")
+    check("工具折叠态是纯正文预览短胶囊",
+          folded_geo["ratio"] <= .74 and folded_geo["radius"] == "999px"
+          and folded_geo["preview"], folded_geo)
 
     # ---- 8a. markdown 渲染 ----
     check("表格渲染成 table", p.locator(".mb table").count() == 1, p.locator(".mb table").count())
@@ -355,50 +444,41 @@ def run(pw):
     grp = p.locator('.msg[data-role="toolgroup"]').first
     check("连续工具调用合并成组", grp.count() > 0)
     if grp.count():
-        check("组头显示调用次数", re.search(r"\d+ 次工具调用", grp.locator("> .mh .role").inner_text()),
-              grp.locator("> .mh .role").inner_text())
-        check("组头显示工具名摘要", grp.locator("> .mh .peek").inner_text().strip() != "")
-        check("组默认折叠", not grp.locator("> .grp-body").is_visible())
-        inner = grp.locator(".msg").count()
+        check("组预览显示调用次数", re.search(r"\d+ 次工具调用", grp.locator("> .fold-preview").inner_text()),
+              grp.locator("> .fold-preview").inner_text())
+        check("组预览显示工具名摘要", grp.locator("> .fold-preview .peek").inner_text().strip() != "")
+        check("组默认折叠", not grp.locator("> .tool-entry").first.is_visible())
+        inner = grp.locator("> .tool-entry").count()
         check("组内至少 3 条", inner >= 3, inner)
-        grp.locator("> .mh").click()
+        grp.locator("> .fold-preview").click()
         p.wait_for_timeout(200)
-        check("点组头展开", grp.locator("> .grp-body").is_visible())
-        check("展开后组头摘要仍可见", grp.locator("> .mh .peek").is_visible())
-        first_in = grp.locator(".msg").first
-        check("组内条目默认仍折叠", not first_in.locator(".mb").is_visible())
-        check("组内条目保留预览", first_in.locator(".peek").is_visible())
-        first_in.locator(".mh").click()
+        check("点组预览展开", grp.locator("> .tool-entry").first.is_visible())
+        check("展开后预览不再占垂直空间", not grp.locator("> .fold-preview").is_visible())
+        check("工具组不再包 grp-body", grp.locator("> .grp-body").count() == 0)
+        check("工具组内不再嵌套 msg 气泡", grp.locator("> .msg").count() == 0)
+        grp.locator("> .disclosure").click()
         p.wait_for_timeout(150)
-        check("组内条目可单独展开", first_in.locator(".mb").is_visible())
-        grp.locator("> .mh").click()
-        p.wait_for_timeout(150)
-        check("组可再折叠", not grp.locator("> .grp-body").is_visible())
+        check("组可再折叠", not grp.locator("> .tool-entry").first.is_visible())
 
-    # ---- 9. 点消息标题栏切换 ----
-    th = p.locator('.msg[data-role="thinking"]').first
-    th.locator(".mh").click()
-    p.wait_for_timeout(120)
-    check("点 bar 展开思考", th.locator(".mb").is_visible())
-    th.locator(".mh").click()
-    p.wait_for_timeout(120)
-    check("点 bar 再折叠", not th.locator(".mb").is_visible())
-
-    # ---- 10. 全部折叠 / 全部展开 ----
+    # ---- 9/10. 仅批量折叠 / 展开工具输出 ----
     fold_btn = p.locator("#a-fold")
     fold_btn.click()
     p.wait_for_timeout(200)
-    check("全部折叠: 用户消息也收起", not body_visible("user"))
-    check("按钮文案变为全部展开", fold_btn.inner_text() == "全部展开", fold_btn.inner_text())
+    check("批量折叠只收起工具输出",
+          not grp.locator("> .tool-entry").first.is_visible()
+          and body_visible("thinking") and body_visible("user"))
+    check("折叠图标变为展开工具输出", fold_btn.get_attribute("title") == "展开工具输出",
+          fold_btn.get_attribute("title"))
     fold_btn.click()
     p.wait_for_timeout(200)
-    check("全部展开: 思考也打开", body_visible("thinking"), )
-    check("按钮文案变回全部折叠", fold_btn.inner_text() == "全部折叠", fold_btn.inner_text())
+    check("批量展开后工具内容打开", grp.locator("> .tool-entry").first.is_visible())
+    check("展开图标变回折叠工具输出", fold_btn.get_attribute("title") == "折叠工具输出",
+          fold_btn.get_attribute("title"))
 
     # ---- 11. 展开全文 ----
-    more = p.locator(".msg .more:visible").first
+    more = p.locator(".msg .more:visible").filter(has_text="展开全文").first
     check("长消息出现展开全文按钮", more.count() > 0 and "展开全文" in more.inner_text())
-    # 按钮点击后会被移除, 先取到稳定的元素句柄再操作
+    # 对话长文只有这一个展开入口，展开后按钮消失。
     target = more.evaluate_handle("n => n.closest('.msg')").as_element()
     mb = target.query_selector(".mb")
     h_before = mb.bounding_box()["height"]
@@ -408,15 +488,11 @@ def run(pw):
     p.wait_for_timeout(400)
     h_after = mb.bounding_box()["height"]
     check("展开全文后高度变大", h_after > h_before + 100, f"{h_before}->{h_after}")
-    check("展开后按钮消失", target.query_selector(".more") is None)
+    check("展开后没有可见按钮", not target.query_selector(".more").is_visible())
     check("展开后内容完整", "点下方按钮展开全文" not in mb.inner_text())
 
-    # ---- 12. 复制路径 / 导出 ----
-    p.locator("#a-copy").click()
-    p.wait_for_timeout(200)
-    clip = p.evaluate("navigator.clipboard.readText()")
-    check("复制路径写入剪贴板", clip.endswith(".jsonl"), clip)
-    href = p.locator('a.btn[download]').get_attribute("href")
+    # ---- 12. 导出 ----
+    href = p.locator('#a-export').get_attribute("href")
     r = ctx.request.get(BASE + href)
     check("导出 Markdown 可下载", r.status == 200 and len(r.body()) > 100, r.status)
 
@@ -433,7 +509,7 @@ def run(pw):
         p.wait_for_selector("#a-agents", timeout=30000)
         after_n = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
         check("合并子代理后消息变多", after_n > before, f"{before}->{after_n}")
-        check("合并按钮显示勾选", p.locator("#a-agents").inner_text().startswith("✓"))
+        check("合并按钮显示选中态", p.locator("#a-agents").get_attribute("aria-pressed") == "true")
     else:
         check("找到带子代理的会话", False, "无")
 
@@ -451,8 +527,8 @@ def run(pw):
     # 先等上一次载入彻底结束, 否则它的 cachePut 会在 clear 之后落地
     p.wait_for_function("!document.querySelector('#prog').classList.contains('on')", timeout=60000)
     big = p.locator(".item").evaluate_all(
-        "ns => ns.map((n, i) => [i, n.querySelector('.m').textContent])"
-        "      .filter(([, t]) => /(\\d+(\\.\\d+)?)M/.test(t)).map(([i]) => i)[0]")
+        "ns => ns.map((n, i) => [i, n.querySelector('.m').textContent, n.classList.contains('live')])"
+        "      .filter(([, t, live]) => !live && /(\\d+(\\.\\d+)?)M/.test(t)).map(([i]) => i)[0]")
     # 上一段可能还有没落地的载入, 清两次并等一拍, 否则它的 cachePut 会落在 clear 之后
     p.evaluate("cache.clear()")
     p.wait_for_load_state("networkidle")
@@ -465,8 +541,8 @@ def run(pw):
     total = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
     check("一次载入全部消息, 不再分页", p.locator(".more-page").count() == 0)
     check("载入时显示过进度条", p.evaluate("window.__prog"))
-    # 组本身也是 .msg, 数消息要排掉组容器
-    dom_msgs = p.locator("#msgs .msg:not(.grp)").count()
+    # 工具组本身不算原始消息，组内扁平 tool-entry 各算一条。
+    dom_msgs = p.locator("#msgs .msg:not(.grp), #msgs .tool-entry").count()
     check("消息数与顶部计数一致", dom_msgs == total, f"dom={dom_msgs} meta={total}")
     geo = p.evaluate("""() => { const b = document.querySelector('#msgs'), r = b.getBoundingClientRect();
       return { right: Math.round(r.right), win: innerWidth, scrollable: b.scrollHeight > b.clientHeight,
@@ -493,7 +569,7 @@ def run(pw):
         viewport(1400, 860)
         check("放大窗口后仍停在最新", at_bottom())
         p.evaluate("""() => { const n = [...document.querySelectorAll('#msgs .msg.folded')].pop();
-                              if (n) n.querySelector('.mh').click(); }""")
+                              if (n) n.querySelector('.fold-preview').click(); }""")
         p.wait_for_timeout(600)
         check("展开消息后仍停在最新", at_bottom())
         p.mouse.move(700, 400)
@@ -512,10 +588,8 @@ def run(pw):
     # 只看第一个请求 —— 之后的自动增量同步本来就该带 start
     check("首次打开是整份请求", reqs and "start=" not in reqs[0], reqs[:2])
 
-    # 换一个会话再切回来 —— 应命中缓存, 只发增量请求
-    other = 0 if big != 0 else 1
-    p.locator(".item").nth(other).click()
-    p.wait_for_selector(".msg", timeout=60000)
+    # 重新打开当前会话 —— 应命中缓存, 只发增量请求。不要先载入另一个任意
+    # 大会话，否则两者超过 64 MB 时触发正常的 LRU 淘汰，反而测不到命中路径。
     reqs.clear()
     p.locator(".item").nth(big).click()
     p.wait_for_selector(".msg", timeout=60000)
@@ -610,23 +684,27 @@ def run(pw):
     p.fill("#q", "")
     p.wait_for_timeout(200)
     api = json.loads(urllib.request.urlopen(BASE + "/api/live", timeout=60).read())
-    check("活跃检测接口可用", isinstance(api.get("uids"), list), api)
+    check("活跃检测接口可用", isinstance(api.get("uids"), list)
+          and isinstance(api.get("tmux_uids"), list)
+          and set(api["tmux_uids"]).issubset(api["uids"]), api)
     # 跑测试的这个进程本身就是活的 Claude 会话, 至少应检出一个
     check("检出正在运行的会话", len(api["uids"]) >= 1, api["uids"])
     p.evaluate("pollLive()")
     p.wait_for_timeout(600)
     check("前端拿到活跃集合",
-          p.evaluate("S.live.size") == len(api["uids"]), p.evaluate("S.live.size"))
+          p.evaluate("[S.live.size, S.liveTmux.size]")
+          == [len(api["uids"]), len(api["tmux_uids"])],
+          p.evaluate("[S.live.size, S.liveTmux.size]"))
     if api["uids"]:
-        check("活跃会话标绿点", p.evaluate(
+        check("活跃会话标状态点", p.evaluate(
             "[...document.querySelectorAll('.item.live')].map(n => n.dataset.uid)"
             ".every(u => S.live.has(u))"))
         marked = p.locator(".item.live").count()
         shown = p.evaluate("[...S.live].filter(u => document.querySelector(`.item[data-uid=\"${u}\"]`)).length")
         check("列表里可见的活跃会话都标了", marked == shown, f"{marked} vs {shown}")
-    check("顶栏显示进行中计数",
-          "进行中" in p.locator("#livecount").inner_text() if api["uids"] else True,
-          p.locator("#livecount").inner_text())
+    check("顶栏显示分类后的进行中计数",
+          "进行中" in (p.locator("#livecount").get_attribute("aria-label") or "") if api["uids"] else True,
+          p.locator("#livecount").get_attribute("aria-label"))
     # 活跃标记不该重渲染列表 (会打断滚动/选中)
     p.locator(".item").first.click()
     p.wait_for_selector(".msg", timeout=30000)
@@ -808,11 +886,10 @@ def run(pw):
     p.wait_for_timeout(300)
     check("清空输入退出搜索态", p.locator(".item").count() == n_before, p.locator(".item").count())
 
-    # ---- 14d. 展开态不再重复显示预览 ----
+    # ---- 14d. 折叠预览不冒充 header ----
     p.locator(".item").first.click()
     p.wait_for_selector(".msg", timeout=20000)
-    peek_vis = p.locator('.msg:not(.folded) .peek').first.is_visible()
-    check("展开的消息不重复显示预览", not peek_vis)
+    check("消息 DOM 中没有 header", p.locator("#msgs .mh").count() == 0)
     check("折叠的消息仍显示预览", p.locator('.msg.folded .peek').first.is_visible())
 
     # ---- 15. 快捷键 ----
@@ -852,8 +929,8 @@ def run(pw):
             raise RuntimeError("没有可安全接管的 Claude 历史会话")
         p.evaluate("u => openSession(u)", target)
         p.wait_for_selector("#a-term", timeout=60000)
-        check("会话详情有接管按钮", p.locator("#a-term").inner_text().strip() == "⌨ 接管",
-              p.locator("#a-term").inner_text())
+        check("会话详情有接管按钮", p.locator("#a-term").get_attribute("title") == "接管会话",
+              p.locator("#a-term").get_attribute("title"))
         check("终端面板初始不显示", p.locator("#termpane").is_hidden())
 
         p.click("#a-term")
@@ -864,8 +941,8 @@ def run(pw):
         check("接管未弹确认框(会话本来就没在跑)", not dialogs, dialogs[:1])
         check("终端出现在会话底部", p.locator("#termpane").is_visible())
         check("消息流还在上方", p.locator("#msgs .msg").count() > 0)
-        check("按钮变成打开输入", "打开输入" in p.locator("#a-term").inner_text(),
-              p.locator("#a-term").inner_text())
+        check("按钮变成收起终端", p.locator("#a-term").get_attribute("title") == "收起终端",
+              p.locator("#a-term").get_attribute("title"))
         check("状态显示已接管", "已接管" in p.locator("#tstatus").inner_text(),
               p.locator("#tstatus").inner_text())
         p.wait_for_timeout(3500)
@@ -877,13 +954,15 @@ def run(pw):
         check("终端里 CLI 已经在跑", got > 40, got)
 
         # 收起只是断开, tmux 会话必须还在 —— 这是选 tmux 承载的意义
-        p.click("#tdetach")
+        p.click("#a-term")
         p.wait_for_timeout(600)
         check("收起后面板隐藏", p.locator("#termpane").is_hidden())
+        check("按钮变成展开终端", p.locator("#a-term").get_attribute("title") == "展开终端",
+              p.locator("#a-term").get_attribute("title"))
         after = json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())
         check("收起后 tmux 会话仍存活", any(s["name"] == tname for s in after["sessions"]))
 
-        # 再点一次: 已接管的会话直接打开输入, 不重复起
+        # 再点一次: 已接管的会话直接展开终端, 不重复起
         p.click("#a-term")
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=60000)
         n_now = len(json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())["sessions"])
@@ -902,15 +981,26 @@ def run(pw):
             p.fill("#cinput", "1")
             p.press("#cinput", "Enter")
             p.wait_for_timeout(3500)
+        # 历史会话可能恢复在补全菜单或弹层里；先回到普通输入态再测斜杠命令。
+        p.click("#cesc")
+        p.wait_for_timeout(700)
         p.fill("#cinput", "/help")                  # 本地命令, 不消耗额度但能证明 CLI 收到了
         p.press("#cinput", "Enter")
-        p.wait_for_timeout(4000)
-        pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", tname],
-                              capture_output=True, text=True).stdout
+        # Claude TUI 启动后还可能刷新插件/状态，固定 sleep 4 秒偶尔只截到主界面。
+        # 轮询真实帮助页，仍然要求 CLI 确实处理了命令，而不只看发送接口 200。
+        help_words = ("code.claude.com", "keybindings", "resets in", "CLAUDE.md",
+                      "Keyboard shortcuts", "slash commands", "Available commands")
+        pane = ""
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", tname],
+                                  capture_output=True, text=True).stdout
+            if any(k in pane for k in help_words):
+                break
+            # 让 Playwright 同时派发 fetch response 事件；time.sleep 会阻塞它的事件泵。
+            p.wait_for_timeout(500)
         check("输入框内容送进了会话", sent and all(x == 200 for x in sent), sent)
-        check("CLI 确实响应了输入",
-              any(k in pane for k in ("code.claude.com", "keybindings", "resets in", "CLAUDE.md")),
-              pane.strip()[-90:])
+        check("CLI 确实响应了输入", any(k in pane for k in help_words), pane.strip()[-90:])
         check("发送后输入框清空", p.input_value("#cinput") == "")
 
         # 终端要像普通终端: 滚轮翻历史、鼠标能框选。
@@ -1020,8 +1110,8 @@ def run(pw):
         gone = json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())
         check("可以结束接管的会话", not any(s["name"] == tname for s in gone["sessions"]))
         check("外部结束后输入框自动收起", p.locator("#composer").is_hidden())
-        check("按钮变回可接管", "接管" in p.locator("#a-term").inner_text(),
-              p.locator("#a-term").inner_text())
+        check("按钮变回可接管", p.locator("#a-term").get_attribute("title") == "接管会话",
+              p.locator("#a-term").get_attribute("title"))
         p.evaluate("closeTermPane()")
         p.wait_for_timeout(300)
         p.remove_listener("dialog", _dlg)

@@ -6,6 +6,7 @@
 <title>sesman · 会话管理</title>
 <link rel="stylesheet" href="/vendor/xterm.css">
 <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<link rel="preload" href="/fonts/CascadiaMono.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🗂</text></svg>">
 </head>
@@ -20,15 +21,50 @@
   <symbol id="i-grok" viewBox="0 0 16 16">
     <path fill="currentColor" d="M2 14L9.4 4.2 12.6 2 6.6 11.3 2 14zm7.5-.1l3.6-5.1V2.4L9.5 7.2v6.7z"/>
   </symbol>
+  <symbol id="i-download" viewBox="0 0 16 16">
+    <path d="M8 1.8v8.5m-3.2-3L8 10.6l3.2-3.3M2.5 13.7h11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-terminal" viewBox="0 0 16 16">
+    <rect x="1.5" y="2" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <path d="M4 5l2.3 2L4 9m4 1h3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-fold" viewBox="0 0 16 16">
+    <path d="M2.5 2h11M8 2v4.5m0 0L5.5 4M8 6.5L10.5 4M2.5 14h11M8 14V9.5m0 0L5.5 12M8 9.5l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-expand" viewBox="0 0 16 16">
+    <path d="M2.5 7h11M8 7V2.5m0 0L5.5 5M8 2.5L10.5 5M2.5 9h11M8 9v4.5m0 0L5.5 11M8 13.5l2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-agents" viewBox="0 0 16 16">
+    <circle cx="4" cy="4" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <circle cx="12" cy="4" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <circle cx="8" cy="12" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <path d="M5.5 4.8l1.7 5.4m3.3-5.4l-1.7 5.4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 16 16">
+    <path d="M2.5 4h11M6 4V2h4v2m2 0l-.6 9.5h-6.8L4 4m2.5 2.5v4.5m3-4.5v4.5" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-more" viewBox="0 0 16 16">
+    <circle cx="3" cy="8" r="1.25" fill="currentColor"/>
+    <circle cx="8" cy="8" r="1.25" fill="currentColor"/>
+    <circle cx="13" cy="8" r="1.25" fill="currentColor"/>
+  </symbol>
+  <symbol id="i-select" viewBox="0 0 16 16">
+    <path d="M2.5 5V2.5H5m6 0h2.5V5m0 6v2.5H11m-6 0H2.5V11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M6 5.8l4.8 2.1-2 .9-.9 2z" fill="currentColor"/>
+  </symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16">
+    <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/>
+    <rect x="5.2" y="5.2" width="5.6" height="5.6" rx=".7" fill="currentColor"/>
+  </symbol>
 </svg>
 
 <div id="app">
   <header>
-    <div class="brand">sesman<small id="stat">加载中…</small><span id="livecount" class="livecount"></span></div>
+    <div class="brand"><span class="brand-name">sesman</span><small id="stat">加载中…</small><span id="livecount" class="livecount"></span></div>
     <div class="chips" id="chips"></div>
     <div class="seg" id="view">
-      <button data-v="tree" class="on">📁 项目树</button>
-      <button data-v="date">🕒 时间轴</button>
+      <button data-v="tree" class="on" title="项目树" aria-label="项目树">📁 <span class="mobile-label">项目树</span></button>
+      <button data-v="date" title="时间轴" aria-label="时间轴">🕒 <span class="mobile-label">时间轴</span></button>
     </div>
     <div class="qbox">
         <input id="q" placeholder="搜索标题…  按 Enter 全文搜索会话内容">
@@ -38,7 +74,7 @@
         <button data-o="regex" title="正则表达式">.*</button>
       </div>
     </div>
-    <button class="btn" id="reload" title="重新扫描磁盘">↻ 刷新</button>
+    <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">↻ <span class="mobile-label">刷新</span></button>
   </header>
   <div id="prog"><div class="bar"></div><span class="txt"></span></div>
   <main>
@@ -50,19 +86,28 @@
         <textarea id="cinput" rows="1" placeholder="输入内容，Enter 发送给会话，Shift+Enter 换行"></textarea>
         <div class="cbtns">
           <button class="btn" id="cesc" title="发送 Esc（中断）">Esc</button>
-          <button class="btn" id="cterm" title="展开完整终端">⌨</button>
           <button class="btn go" id="csend">发送</button>
         </div>
       </div>
       <div id="termpane" class="hidden">
+        <div class="term-resizer" id="tgrip" title="拖动终端上边界调整高度"></div>
         <div class="thead">
-          <span class="grip" id="tgrip" title="拖动调整高度"></span>
           <span id="tstatus">未连接</span>
           <button class="chipbtn" id="tscroll"></button>
           <span class="spacer"></span>
-          <button class="chipbtn" id="tmouse" title="鼠标交给应用（点击改为框选复制）">🖱 框选</button>
-          <button class="btn" id="tdetach" title="断开但不结束 tmux 会话">收起</button>
-          <button class="btn danger" id="tstop" title="结束这个 tmux 会话">结束会话</button>
+          <button class="iconbtn" id="tmouse" title="鼠标交给应用（点击改为框选复制）" aria-label="启用框选复制" aria-pressed="false">
+            <svg class="ui-icon" aria-hidden="true"><use href="#i-select"/></svg>
+          </button>
+          <button class="iconbtn danger" id="tstop" title="结束这个 tmux 会话" aria-label="结束会话">
+            <svg class="ui-icon" aria-hidden="true"><use href="#i-stop"/></svg>
+          </button>
+        </div>
+        <div class="term-keys" aria-label="终端方向与翻页键">
+          <button data-term-key="Up" title="方向键上" aria-label="方向键上">↑</button>
+          <button data-term-key="Down" title="方向键下" aria-label="方向键下">↓</button>
+          <button data-term-key="PPage" title="Page Up" aria-label="Page Up">Pg↑</button>
+          <button data-term-key="NPage" title="Page Down" aria-label="Page Down">Pg↓</button>
+          <button data-term-key="Escape" title="Escape" aria-label="Escape">Esc</button>
         </div>
         <div id="xterm"></div>
       </div>

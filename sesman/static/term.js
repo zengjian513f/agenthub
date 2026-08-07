@@ -11,6 +11,7 @@ const T = {
   uid: null,       // 对应的 sesman 会话
   enabled: false,
   height: store.get('termh', 320),
+  mode: store.get('termmode', 'normal'), // normal | collapsed | full
   localMouse: store.get('tmouse', false),   // true = 鼠标归浏览器, 可以框选复制
   scrollPos: 0,                             // tmux 里往上翻了多少行
 };
@@ -21,11 +22,28 @@ const MOUSE_ON = /\x1b\[\?(1000|1002|1003|1005|1006|1015)h/g;
 const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
 
 function termTheme() {
-  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
-  return dark
-    ? { background: '#16181d', foreground: '#dfe3ea', cursor: '#6d95ff', selectionBackground: '#2b3550' }
-    : { background: '#ffffff', foreground: '#1c2024', cursor: '#3b6ef6', selectionBackground: '#dbe6ff' };
+  const css = getComputedStyle(document.documentElement);
+  const read = name => css.getPropertyValue(name).trim();
+  return {
+    background: read('--terminal-bg'), foreground: read('--terminal-fg'),
+    cursor: read('--terminal-cursor'), selectionBackground: read('--terminal-selection'),
+  };
 }
+
+function termFont() {
+  return getComputedStyle(document.documentElement).getPropertyValue('--terminal-font').trim();
+}
+
+function termFontSize() {
+  const value = parseFloat(getComputedStyle(document.documentElement)
+    .getPropertyValue('--terminal-font-size'));
+  return Number.isFinite(value) ? value : 14.04;
+}
+
+// xterm 用 canvas 绘字；先等网页字体就绪，避免它按回退字体计算字符宽度。
+const terminalFontReady = document.fonts
+  ? document.fonts.load(`${termFontSize()}px ${termFont()}`, 'MW0il')
+  : Promise.resolve();
 
 async function loadTermList() {
   try {
@@ -48,7 +66,9 @@ function takenOver(uid) {
 
 // ---------------------------------------------------------------- 接管
 async function takeover(uid, btn) {
-  const setBtn = (t, dis) => { if (btn) { btn.textContent = t; btn.disabled = dis; } };
+  const setBtn = (t, dis) => {
+    if (btn) { btn.title = btn.ariaLabel = t; btn.disabled = dis; }
+  };
   setBtn('接管中…', true);
   try {
     let d = await post('/api/term/takeover', { uid, cols: 120, rows: termRows() });
@@ -65,10 +85,13 @@ async function takeover(uid, btn) {
     if (d.error) return alert('接管失败: ' + d.error);
     await loadTermList();
     T.uid = uid;
+    S.live.add(uid);
+    S.liveTmux.add(uid);
+    paintLive();
     openTermPane(d.name);
     if (d.action === 'killed') newBadge('已结束原实例并接管');
   } finally {
-    setBtn(takenOver(uid) ? '⌨ 打开输入' : '⌨ 接管', false);
+    setBtn('接管会话', false);
     renderTakeoverBtn();
     renderComposer();
   }
@@ -82,15 +105,25 @@ async function post(url, body) {
   return r.json();
 }
 
-const termRows = () => Math.max(10, Math.floor((T.height - 34) / 17));
+const termRows = () => Math.max(10, Math.floor((T.height - 34) / (termFontSize() * 1.31)));
 
 /** 详情页头部那个按钮的文案随状态变。 */
 function renderTakeoverBtn() {
   const b = $('#a-term');
   if (!b) return;
   const name = takenOver(S.sel);
-  b.textContent = name ? '⌨ 打开输入' : '⌨ 接管';
+  const paneOpen = !!name && !$('#termpane').classList.contains('hidden');
+  const snapped = !MOBILE.matches && paneOpen && (T.mode === 'collapsed' || T.mode === 'full');
+  const terminalVisible = paneOpen && (MOBILE.matches || T.mode !== 'collapsed');
+  const label = !name ? '接管会话'
+    : snapped ? (T.mode === 'collapsed' ? '切换到终端' : '切换到对话')
+      : (paneOpen ? '收起终端' : '展开终端');
+  b.innerHTML = uiIcon('terminal');
+  b.title = b.ariaLabel = label;
+  b.setAttribute('aria-expanded', String(terminalVisible));
   b.classList.toggle('on', !!name);
+  b.classList.toggle('session-live', S.live.has(S.sel));
+  b.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
   renderComposer();
 }
 
@@ -98,8 +131,8 @@ function renderTakeoverBtn() {
 function ensureTerm() {
   if (T.term) return T.term;
   T.term = new Terminal({
-    fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
-    fontSize: 13, cursorBlink: true, scrollback: 8000, theme: termTheme(),
+    fontFamily: termFont(),
+    fontSize: termFontSize(), cursorBlink: true, scrollback: 8000, theme: termTheme(),
   });
   T.fit = new FitAddon.FitAddon();
   T.term.loadAddon(T.fit);
@@ -130,7 +163,7 @@ function ensureTerm() {
     wheelBy(e.deltaY);
     return false;
   });
-  addEventListener('resize', fitTerm);
+  addEventListener('resize', () => { layoutTermPane(); fitTerm(); });
   return T.term;
 }
 
@@ -142,19 +175,67 @@ function fitTerm() {
   }
 }
 
-function openTermPane(name) {
+async function openTermPane(name) {
   const pane = $('#termpane');
   pane.classList.remove('hidden');
-  pane.style.height = T.height + 'px';
+  layoutTermPane();
+  renderTakeoverBtn();
+  try { await terminalFontReady; } catch { /* 字体失败时继续用 Consola/monospace */ }
+  if (pane.classList.contains('hidden')) return;
   ensureTerm();
   setTimeout(fitTerm, 20);
   if (T.name !== name) attachTerm(name);
   else T.term.focus();
 }
 
+/** 普通高度下按钮仍是展开/收起；吸附到边缘后改为纯对话/纯终端切换。 */
+function toggleTermPane(name) {
+  const pane = $('#termpane');
+  if (pane.classList.contains('hidden')) {
+    if (!MOBILE.matches && T.mode === 'collapsed') {
+      T.mode = 'full';
+      store.set('termmode', T.mode);
+    }
+    openTermPane(name);
+    return;
+  }
+  if (!MOBILE.matches && (T.mode === 'collapsed' || T.mode === 'full')) {
+    T.mode = T.mode === 'collapsed' ? 'full' : 'collapsed';
+    store.set('termmode', T.mode);
+    layoutTermPane();
+    renderTakeoverBtn();
+    if (T.mode === 'full') setTimeout(fitTerm, 0);
+    return;
+  }
+  closeTermPane();
+}
+
 function closeTermPane() {
   detachTerm();
-  $('#termpane').classList.add('hidden');
+  const pane = $('#termpane');
+  pane.classList.add('hidden');
+  pane.classList.remove('term-collapsed');
+  $('#right').classList.remove('term-full');
+  renderTakeoverBtn();
+}
+
+function layoutTermPane() {
+  const pane = $('#termpane');
+  const right = $('#right');
+  const desktop = !MOBILE.matches;
+  right.classList.toggle('term-full', desktop && T.mode === 'full');
+  pane.classList.toggle('term-collapsed', desktop && T.mode === 'collapsed');
+  if (MOBILE.matches) {
+    pane.style.removeProperty('height');
+    pane.style.setProperty('--mobile-terminal-top', `${$('.dhead')?.offsetHeight || 0}px`);
+  } else {
+    pane.style.removeProperty('--mobile-terminal-top');
+    if (T.mode === 'collapsed') pane.style.height = '0px';
+    else if (T.mode === 'full') {
+      pane.style.height = Math.max(0, right.clientHeight - $('#detail').offsetHeight) + 'px';
+    }
+    else pane.style.height = Math.min(T.height, right.clientHeight) + 'px';
+  }
 }
 
 function attachTerm(name) {
@@ -176,13 +257,18 @@ function attachTerm(name) {
     T.term.write(s);
   };
   ws.onopen = () => {
-    setTermStatus(`已接管 · ${name}`, true);
+    setTermStatus(`已接管 · ${name}`, true, name);
     fitTerm();
     setScrollPos(0);
     if (T.localMouse) T.term.write(MOUSE_OFF);
     T.term.focus();
   };
-  ws.onclose = () => { if (T.ws === ws) { setTermStatus('已断开', false); T.ws = null; } };
+  ws.onclose = () => {
+    if (T.ws !== ws) return;             // 用户主动收起时 detachTerm 已经清掉引用
+    setTermStatus('已断开', false);
+    T.ws = null;
+    pollLive(true);                      // tmux 内程序退出时立即清理绿点和输入区
+  };
   ws.onerror = () => setTermStatus('连接失败', false);
 }
 
@@ -242,6 +328,8 @@ function setLocalMouse(on) {
   if (b) {
     b.classList.toggle('on', on);
     b.title = on ? '鼠标用于框选复制（点击切回交给应用）' : '鼠标交给应用（点击改为框选复制）';
+    b.setAttribute('aria-label', on ? '关闭框选复制，把鼠标交给应用' : '启用框选复制');
+    b.setAttribute('aria-pressed', String(on));
   }
   if (!T.term) return;
   if (on) T.term.write(MOUSE_OFF);        // 直接告诉 xterm: 应用不要鼠标了
@@ -265,9 +353,14 @@ async function stopTermSession() {
   renderComposer();
 }
 
-function setTermStatus(text, on) {
+function setTermStatus(text, on, mobileText) {
   const s = $('#tstatus');
-  if (s) { s.textContent = text; s.classList.toggle('on', on); }
+  if (s) {
+    s.textContent = text;
+    s.classList.toggle('on', on);
+    if (mobileText == null) delete s.dataset.mobileText;
+    else s.dataset.mobileText = mobileText;
+  }
 }
 
 // ---------------------------------------------------------------- 输入框
@@ -290,6 +383,8 @@ async function sendToSession(text, keys) {
   const d = await post('/api/term/send', keys ? { name, keys } : { name, text });
   if (d.error) return alert('发送失败: ' + d.error);
   S.live.add(S.sel);            // 发完立刻按最快节奏拉新消息
+  S.liveTmux.add(S.sel);
+  paintLive();
   S.syncGap = FAST_MIN;
   S.lastSync = 0;
 }
@@ -315,36 +410,55 @@ $('#csend').onclick = () => {
   sendToSession(text);
 };
 $('#cesc').onclick = () => sendToSession(null, ['Escape']);
-$('#cterm').onclick = () => {
-  const name = takenOver(S.sel);
-  if (name) { T.uid = S.sel; openTermPane(name); }
+$('.term-keys').onclick = e => {
+  const b = e.target.closest('[data-term-key]');
+  if (b) sendToSession(null, [b.dataset.termKey]);
 };
 
 // ---- 高度拖动 ----
 let tdrag = false;
-$('#tgrip').addEventListener('mousedown', e => {
+let tdragPointer = null;
+let tdragTopSnap = 48;
+$('#tgrip').addEventListener('pointerdown', e => {
   tdrag = true;
+  tdragPointer = e.pointerId;
+  const composer = $('#composer');
+  tdragTopSnap = Math.max(48, composer.offsetHeight || 0);
+  e.currentTarget.setPointerCapture?.(e.pointerId);
   document.body.classList.add('dragging-v');
   e.preventDefault();
 });
-document.addEventListener('mousemove', e => {
-  if (!tdrag) return;
-  const top = $('#right').getBoundingClientRect().top;
-  const h = Math.max(120, Math.min($('#right').clientHeight - 120, $('#right').clientHeight - (e.clientY - top)));
-  T.height = Math.round(h);
-  $('#termpane').style.height = T.height + 'px';
+document.addEventListener('pointermove', e => {
+  if (!tdrag || e.pointerId !== tdragPointer) return;
+  const right = $('#right');
+  const top = right.getBoundingClientRect().top;
+  const y = Math.max(0, Math.min(right.clientHeight, e.clientY - top));
+  const h = right.clientHeight - y;
+  if (h <= 32) {
+    T.mode = 'collapsed';
+  } else if (y <= tdragTopSnap) {
+    T.mode = 'full';
+  } else {
+    T.mode = 'normal';
+    T.height = Math.round(h);
+  }
+  layoutTermPane();
 });
-document.addEventListener('mouseup', () => {
-  if (!tdrag) return;
+function finishTermDrag(e) {
+  if (!tdrag || e.pointerId !== tdragPointer) return;
   tdrag = false;
+  tdragPointer = null;
   document.body.classList.remove('dragging-v');
   store.set('termh', T.height);
+  store.set('termmode', T.mode);
+  renderTakeoverBtn();
   fitTerm();
-});
+}
+document.addEventListener('pointerup', finishTermDrag);
+document.addEventListener('pointercancel', finishTermDrag);
 
 $('#tmouse').onclick = () => setLocalMouse(!T.localMouse);
 $('#tscroll').onclick = () => leaveScroll();
-$('#tdetach').onclick = () => closeTermPane();
 $('#tstop').onclick = () => stopTermSession();
 
 loadTermList();

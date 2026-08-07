@@ -77,14 +77,21 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
             continue
         main = _is_cli(cmd)
 
-        for m in _CMD_SID.finditer(cmd):
-            note(sids, (m.group(1) or m.group(2)).lower(), pid)
+        # resume 命令里的 ID 是这个 CLI 进程的权威身份。sesman 若本身从另一个
+        # Claude 会话启动，tmux 子进程会继承旧的 CLAUDE_CODE_SESSION_ID；不能
+        # 因此把新旧两个会话都标成活跃。
+        cmd_sids = {(m.group(1) or m.group(2)).lower() for m in _CMD_SID.finditer(cmd)}
+        for sid in cmd_sids:
+            note(sids, sid, pid)
 
         try:
             for e in open(f"/proc/{pid}/environ", "rb").read().decode("utf8", "replace").split("\0"):
                 if e.startswith(_ENV_SID):
+                    env_sid = e.split("=", 1)[1].strip().lower()
+                    if main and cmd_sids and env_sid not in cmd_sids:
+                        continue
                     owner = pid if main else (_cli_ancestor(pid) or -pid)
-                    note(sids, e.split("=", 1)[1].strip().lower(), owner)
+                    note(sids, env_sid, owner)
         except OSError:
             pass
 
@@ -142,6 +149,8 @@ def is_live(session: dict, force: bool = False) -> bool:
                 or f'{session["path"]}/chat_history.jsonl' in paths)
 
 
-def live_uids(sessions: list[dict]) -> list[str]:
+def live_uids(sessions: list[dict], force: bool = False) -> list[str]:
     """在已知会话里挑出还活着的。"""
+    if force:
+        snapshot(True)
     return [s["uid"] for s in sessions if is_live(s)]

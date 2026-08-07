@@ -148,7 +148,13 @@ class Handler(BaseHTTPRequestHandler):
                                "built_at": index._state["built_at"]})
 
         if path == "/api/live":
-            return self._json({"uids": live.live_uids(index.load())})
+            force = q.get("force", ["0"])[0] == "1"
+            sessions = index.load()
+            uids = live.live_uids(sessions, force=force)
+            live_set = set(uids)
+            tmux_uids = [s["uid"] for s in sessions
+                         if s["uid"] in live_set and term.in_tmux(live.pids_of(s))]
+            return self._json({"uids": uids, "tmux_uids": tmux_uids})
 
         if path == "/api/term/list":
             return self._json({"enabled": TERMINAL and term.available(),
