@@ -47,7 +47,7 @@ const terminalFontReady = document.fonts
 
 async function loadTermList() {
   try {
-    const d = await (await fetch('/api/term/list')).json();
+    const d = await (await fetch(appUrl('api/term/list'))).json();
     T.enabled = !!d.enabled;
     T.list = d.sessions || [];
   } catch {
@@ -71,7 +71,7 @@ async function takeover(uid, btn) {
   };
   setBtn('接管中…', true);
   try {
-    let d = await post('/api/term/takeover', { uid, cols: 120, rows: termRows() });
+    let d = await post('api/term/takeover', { uid, cols: 120, rows: termRows() });
     if (d.needs_confirm) {
       const n = (d.pids || []).length;
       const ok = confirm(
@@ -80,7 +80,7 @@ async function takeover(uid, btn) {
         + `未保存的输入会丢失，已完成的对话不受影响。\n\n继续吗？`);
       if (!ok) return;
       setBtn('结束旧实例…', true);
-      d = await post('/api/term/takeover', { uid, force: true, cols: 120, rows: termRows() });
+      d = await post('api/term/takeover', { uid, force: true, cols: 120, rows: termRows() });
     }
     if (d.error) return alert('接管失败: ' + d.error);
     await loadTermList();
@@ -98,7 +98,7 @@ async function takeover(uid, btn) {
 }
 
 async function post(url, body) {
-  const r = await fetch(url, {
+  const r = await fetch(appUrl(url), {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
@@ -147,7 +147,7 @@ function ensureTerm() {
       setScrollPos(0);
       const name = T.name;
       const before = _resumeInput || Promise.allSettled([..._wheelRequests]);
-      const job = before.then(() => post('/api/term/send', { name, text: d, enter: false }));
+      const job = before.then(() => post('api/term/send', { name, text: d, enter: false }));
       _resumeInput = job;
       job.then(
         () => { if (_resumeInput === job) _resumeInput = null; },
@@ -244,10 +244,11 @@ function attachTerm(name) {
   T.name = name;
   T.term.reset();
   setTimeout(() => T.fit?.fit(), 0);
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = new URL(appUrl('api/term/attach'));
+  wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const cols = T.term.cols || 120, rows = T.term.rows || termRows();
-  const ws = new WebSocket(`${proto}://${location.host}/api/term/attach`
-    + `?name=${encodeURIComponent(name)}&cols=${cols}&rows=${rows}`);
+  wsUrl.search = `name=${encodeURIComponent(name)}&cols=${cols}&rows=${rows}`;
+  const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   T.ws = ws;
   const dec = new TextDecoder();
@@ -285,7 +286,7 @@ function wheelBy(deltaY) {
     const up = _wheelAcc < 0;
     _wheelAcc = 0;
     const seq = ++_wheelSeq;
-    const req = post('/api/term/scroll', { name: T.name, up, lines });
+    const req = post('api/term/scroll', { name: T.name, up, lines });
     _wheelRequests.add(req);
     let d;
     try { d = await req; }
@@ -316,7 +317,7 @@ async function leaveScroll() {
   if (!T.name) return;
   abortWheel();
   // 一路 scroll-down 不靠谱(tmux 不吃很大的 -N), 直接退出 copy-mode 就回到实时画面
-  await post('/api/term/scroll', { name: T.name, cancel: true });
+  await post('api/term/scroll', { name: T.name, cancel: true });
   setScrollPos(0);
 }
 
@@ -347,7 +348,7 @@ async function stopTermSession() {
   if (!confirm(`结束「${T.name}」？\n\n里面运行的 CLI 会被终止，会话记录保留。`)) return;
   const name = T.name;
   closeTermPane();
-  await post('/api/term/kill', { name });
+  await post('api/term/kill', { name });
   await loadTermList();
   renderTakeoverBtn();
   renderComposer();
@@ -380,7 +381,7 @@ function autoGrow(ta) {
 async function sendToSession(text, keys) {
   const name = takenOver(S.sel);
   if (!name) return;
-  const d = await post('/api/term/send', keys ? { name, keys } : { name, text });
+  const d = await post('api/term/send', keys ? { name, keys } : { name, text });
   if (d.error) return alert('发送失败: ' + d.error);
   S.live.add(S.sel);            // 发完立刻按最快节奏拉新消息
   S.liveTmux.add(S.sel);

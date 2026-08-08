@@ -238,3 +238,12 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload && systemctl --user enable --now sesman
 ```
+
+### hub-host 反向代理
+
+线上入口为 `https://example.com/sesman/`。页面资源、API、SSE 和 WebSocket 都使用当前页面的相对基路径，因此根目录直连与 `/sesman/` 子路径可同时工作。
+
+- 本机服务由 [`deploy/sesman.service`](deploy/sesman.service) 托管，只允许局域网管理端和 WireGuard 对端 `10.0.0.1`。
+- UFW 仅放行 `wg0` 上 `10.0.0.1 → 10.0.0.2:8710/tcp`。
+- ECS 使用 [`deploy/nginx-sesman.conf`](deploy/nginx-sesman.conf) 反代，并复用 `snippets/auth.conf` 的 hub-host 统一鉴权。
+- Nginx 关闭代理缓冲并保留 Upgrade 头，以支持会话推送和 tmux WebSocket。

@@ -41,6 +41,9 @@ const S = {
 
 const $ = s => document.querySelector(s);
 const MOBILE = matchMedia('(max-width: 720px)');
+// 页面既可挂在站点根目录，也可由反代放到 /sesman/ 之类的子路径。
+const APP_BASE = new URL('.', location.href);
+const appUrl = path => new URL(String(path).replace(/^\//, ''), APP_BASE).toString();
 const el = (tag, cls, html) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -135,7 +138,7 @@ async function fetchMessages(uid, opts = {}) {
     p.set('anchor', opts.anchor || '');     // 没有锚点服务端会拒绝续读, 直接给整份
   }
   if (opts.agents) p.set('agents', '1');
-  const r = await fetch(`/api/messages/${encodeURIComponent(uid)}?${p}`, { signal: opts.signal });
+  const r = await fetch(appUrl(`api/messages/${encodeURIComponent(uid)}?${p}`), { signal: opts.signal });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const total = +r.headers.get('Content-Length') || 0;
   const reader = r.body.getReader();
@@ -235,7 +238,7 @@ function watchSession(uid) {
   const e = cache.get(uid);
   if (!e || !window.EventSource) return;
   const p = new URLSearchParams({ uid, start: e.end, head: e.version.head, anchor: e.anchor || '' });
-  const es = new EventSource('/api/watch?' + p);
+  const es = new EventSource(appUrl('api/watch?' + p));
   _es = es;
   _esUid = uid;
   es.onmessage = ev => {
@@ -285,7 +288,7 @@ setInterval(tickSync, TICK_MS);
 
 // ---- 活跃会话 ----
 async function refreshLive(force = false) {
-  const d = await (await fetch('/api/live' + (force ? '?force=1' : ''))).json();
+  const d = await (await fetch(appUrl('api/live' + (force ? '?force=1' : '')))).json();
   const next = new Set(d.uids);
   const nextTmux = new Set((d.tmux_uids || []).filter(u => next.has(u)));
   const changed = (a, b) => a.size !== b.size || [...a].some(u => !b.has(u));
@@ -356,7 +359,7 @@ function showSessionCount(n) {
 
 async function loadSessions(force) {
   $('#stat').textContent = force ? ' 重新扫描…' : ' 加载中…';
-  const r = await fetch('/api/sessions' + (force ? '?force=1' : ''));
+  const r = await fetch(appUrl('api/sessions' + (force ? '?force=1' : '')));
   const d = await r.json();
   S.sig = d.sig;
   S.sessions = d.sessions;
@@ -369,7 +372,7 @@ async function loadSessions(force) {
 async function pollSessions() {
   if (document.hidden || !S.sig) return;
   try {
-    const d = await (await fetch('/api/sessions?sig=' + encodeURIComponent(S.sig))).json();
+    const d = await (await fetch(appUrl('api/sessions?sig=' + encodeURIComponent(S.sig)))).json();
     if (d.unchanged || !d.sessions) return;
     S.sig = d.sig;
     S.sessions = d.sessions;
@@ -791,7 +794,7 @@ function head(m, total) {
         <button class="iconbtn mobile-more" id="a-more" title="更多操作" aria-label="更多操作"
           aria-expanded="false">${uiIcon('more')}</button>
         <div class="mobile-action-menu">
-          <a class="iconbtn" id="a-export" href="/api/export/${encodeURIComponent(m.uid)}" download
+          <a class="iconbtn" id="a-export" href="${appUrl(`api/export/${encodeURIComponent(m.uid)}`)}" download
              title="导出 Markdown" aria-label="导出 Markdown">${uiIcon('download')}</a>
           <button class="iconbtn" id="a-fold" title="折叠工具输出" aria-label="折叠工具输出">${uiIcon('fold')}</button>
           ${S.term ? `<span class="mnav"><b id="mcount">…</b>
@@ -863,7 +866,7 @@ function head(m, total) {
 async function del(m) {
   if (!confirm(`删除会话「${m.title}」?\n\n文件会移入回收站 ~/.local/share/sesman/trash/, 不会真删。`)) return;
   closeWatch();                         // 先停 SSE，避免文件移走后 EventSource 自动重连 404
-  const r = await fetch('/api/session/' + encodeURIComponent(m.uid), { method: 'DELETE' });
+  const r = await fetch(appUrl('api/session/' + encodeURIComponent(m.uid)), { method: 'DELETE' });
   const d = await r.json();
   if (!r.ok) {
     watchSession(m.uid);                // 删除失败，会话仍在，恢复实时同步
@@ -981,7 +984,7 @@ function groupNode(items) {
 
 function safeMediaSrc(src) {
   src = String(src || '');
-  if (/^\/api\/media\/[0-9a-f]{32}$/.test(src)) return src;
+  if (/^\/api\/media\/[0-9a-f]{32}$/.test(src)) return appUrl(src);
   if (!/^https?:\/\//i.test(src)) return '';
   try {
     const u = new URL(src);
@@ -1248,7 +1251,7 @@ async function runSearch() {
   $('#stat').textContent = ' 全文搜索中…';
   const p = new URLSearchParams({ q });
   for (const k of ['case', 'word', 'regex']) if (S.opts[k]) p.set(k, '1');
-  const r = await fetch('/api/search?' + p);
+  const r = await fetch(appUrl('api/search?' + p));
   const d = await r.json();
   if (!r.ok) {                       // 兜底: 前端漏判的非法模式
     S.results = [];
