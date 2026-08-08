@@ -432,6 +432,7 @@ class CodexAdapter:
     def __init__(self):
         self._names = None
         self._names_key = None
+        self._sid_paths: dict[str, Path] = {}
 
     def _thread_names(self):
         try:
@@ -450,14 +451,23 @@ class CodexAdapter:
                         except Exception:
                             continue
                         if r.get("id") and r.get("thread_name"):
-                            self._names[r["id"]] = r["thread_name"]
+                            self._names[r["id"]] = {
+                                "name": str(r["thread_name"]),
+                                "updated": _norm_ts(r.get("updated_at")),
+                            }
         return self._names
+
+    def _name_event(self, sid: str) -> dict | None:
+        """session_index 只保留最终名称和更新时间，不保留原始 /rename 输入。"""
+        row = self._thread_names().get(sid)
+        return row if row and row.get("updated") else None
 
     def list_sessions(self):
         if not CODEX_ROOT.is_dir():
             return []
         names = self._thread_names()
         out = []
+        self._sid_paths = {}
         for f in CODEX_ROOT.rglob("*.jsonl"):
             try:
                 st = f.stat()
@@ -477,24 +487,124 @@ class CodexAdapter:
                     txt = "\n".join(x["text"] for x in _flatten_content(p.get("content")) if x["kind"] == "text")
                     if txt.strip() and not _is_injected(txt):
                         first_user = txt
-            sid = meta.get("session_id") or meta.get("id") or f.stem
-            title = names.get(sid) or (_title_from_text(first_user) if first_user
-                                       else "(无标题) " + f.stem.replace("rollout-", "")[:16])
+            sid = str(meta.get("session_id") or meta.get("id") or f.stem)
+            self._sid_paths[sid] = f
+            created = _norm_ts(meta.get("timestamp")) or _iso(st.st_mtime)
+            named = names.get(sid)
+            title = (named or {}).get("name") or (_title_from_text(first_user) if first_user
+                                                   else "(无标题) " + f.stem.replace("rollout-", "")[:16])
+            name_event = self._name_event(sid)
             out.append({
                 "uid": _uid("codex", str(f)), "source": "codex", "sid": sid,
                 "title": _clip(title, 110), "cwd": meta.get("cwd") or "(未知)",
-                "created": _norm_ts(meta.get("timestamp")) or _iso(st.st_mtime),
+                "created": created,
                 "updated": _iso(st.st_mtime), "size": st.st_size, "path": str(f),
                 "model": model, "branch": None,
+                "forked_from_id": str(meta.get("forked_from_id") or ""),
+                "history_base": meta.get("history_base")
+                    if isinstance(meta.get("history_base"), dict) else None,
+                "renamed_at": name_event.get("updated") if name_event else None,
+                "renamed_to": name_event.get("name") if name_event else None,
+                "_named": bool(named), "_local_size": st.st_size,
             })
-        return out
+        by_sid = {str(s["sid"]): s for s in out}
+        superseded = {s["forked_from_id"] for s in out
+                      if s.get("forked_from_id") in by_sid}
 
-    def read(self, path: str, start: int = 0):
+        # 双 Esc 回退会创建一个新 UUID，但新 rollout 只保存分叉点之后的增量，
+        # history_base 指向父文件的有效前缀。列表里用当前叶子替代被回退的父项；
+        # 历史仍由 read() 按链补齐，不能把两个分支的尾部直接拼在一起。
+        for s in out:
+            chain, seen = [], {str(s["sid"])}
+            cur = s
+            while cur.get("forked_from_id"):
+                parent = by_sid.get(cur["forked_from_id"])
+                if not parent or str(parent["sid"]) in seen:
+                    break
+                seen.add(str(parent["sid"]))
+                chain.append(parent)
+                cur = parent
+            if chain:
+                root = chain[-1]
+                s["created"] = root["created"]
+                s["root_sid"] = root["sid"]
+                s["fork_depth"] = len(chain)
+                if not s["_named"]:
+                    titled = next((p for p in chain if p["_named"]), root)
+                    s["title"] = titled["title"]
+                history_size = 0
+                cur = s
+                for parent in chain:
+                    base = cur.get("history_base") or {}
+                    try:
+                        limit = max(0, int(base.get("end_byte_offset") or 0))
+                    except (TypeError, ValueError):
+                        limit = 0
+                    history_size += min(limit, parent["_local_size"])
+                    cur = parent
+                s["size"] = s["_local_size"] + history_size
+        for s in out:
+            s.pop("_named", None)
+            s.pop("_local_size", None)
+        return [s for s in out if str(s["sid"]) not in superseded]
+
+    @staticmethod
+    def _session_meta(path: str | Path) -> dict:
+        return next((rec.get("payload") or {} for rec in _head_lines(Path(path), 120)
+                     if rec.get("type") == "session_meta"), {})
+
+    def _find_session_path(self, sid: str) -> Path | None:
+        path = self._sid_paths.get(sid)
+        if path and path.is_file():
+            return path
+        if not CODEX_ROOT.is_dir():
+            return None
+        for candidate in CODEX_ROOT.rglob(f"*-{sid}.jsonl"):
+            meta = self._session_meta(candidate)
+            got = str(meta.get("session_id") or meta.get("id") or "")
+            if got == sid:
+                self._sid_paths[sid] = candidate
+                return candidate
+        return None
+
+    def _history_segments(self, path: str | Path,
+                          seen: set[str] | None = None) -> list[tuple[Path, int]]:
+        """返回当前 rollout 继承的父文件前缀，顺序从最老祖先到直接父项。"""
+        path = Path(path)
+        seen = set() if seen is None else seen
+        key = str(path)
+        if key in seen:
+            return []
+        seen.add(key)
+        meta = self._session_meta(path)
+        base = meta.get("history_base") if isinstance(meta.get("history_base"), dict) else {}
+        parent_sid = str(base.get("thread_id") or meta.get("forked_from_id") or "")
+        try:
+            limit = max(0, int(base.get("end_byte_offset") or 0))
+        except (TypeError, ValueError):
+            limit = 0
+        parent = self._find_session_path(parent_sid) if parent_sid and limit else None
+        if not parent or str(parent) in seen:
+            return []
+        return [*self._history_segments(parent, seen), (parent, limit)]
+
+    def _read_file(self, path: str | Path, start: int = 0,
+                   stop: int | None = None):
         msgs, calls, end = [], {}, start
+        session_meta = {}
         for rec, off in _iter_records(path, start):
+            if stop is not None and off > stop:
+                break
             end = off
             ts = _norm_ts(rec.get("timestamp"))
             p = rec.get("payload") or {}
+            if rec.get("type") == "session_meta" and not session_meta:
+                session_meta = p
+            if rec.get("type") == "compacted":
+                event_id = rec.get("ordinal") or ts or off
+                msgs.append(_msg("event", "上下文已压缩", ts, counted=False,
+                                 event_id=f"compact:{event_id}"))
+                continue
             if rec.get("type") == "event_msg":
                 event = p.get("type")
                 if event == "task_started":
@@ -543,6 +653,34 @@ class CodexAdapter:
                     msgs.append(_status("working", ts))
             elif k in ("web_search_call", "tool_search_call"):
                 msgs.append(_msg("tool", _pretty_json(p.get("arguments") or {}), ts, name=k))
+
+        return msgs, end, session_meta
+
+    def read(self, path: str, start: int = 0):
+        # 增量偏移始终属于当前叶子文件；父历史是不可变前缀，只在首次整读时补。
+        if start:
+            msgs, end, _ = self._read_file(path, start=start)
+            return msgs, end
+
+        msgs = []
+        for parent, limit in self._history_segments(path):
+            inherited, _, _ = self._read_file(parent, stop=limit)
+            msgs.extend(inherited)
+        current, end, session_meta = self._read_file(path)
+        msgs.extend(current)
+
+        # /rename 是 TUI 本地命令，不进入 rollout。session_index 只证明名称在此时
+        # 被设置过，因此显示成不计数的会话事件，不能伪装成原始 user 消息。
+        if session_meta:
+            sid = session_meta.get("session_id") or session_meta.get("id")
+            name_event = self._name_event(str(sid or ""))
+            if name_event:
+                event = _msg("command", f'/rename {name_event["name"]}',
+                             name_event["updated"], counted=False, inferred=True,
+                             event_id=f'rename:{sid}:{name_event["updated"]}')
+                at = next((i for i, msg in enumerate(msgs)
+                           if msg.get("ts") and msg["ts"] > name_event["updated"]), len(msgs))
+                msgs.insert(at, event)
         return msgs, end
 
 

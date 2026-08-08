@@ -15,6 +15,7 @@ from . import media
 
 CACHE_DIR = Path.home() / ".cache" / "sesman"
 CACHE_FILE = CACHE_DIR / "index.json"
+CACHE_VERSION = 2
 TRASH_DIR = Path.home() / ".local" / "share" / "sesman" / "trash"
 
 _lock = threading.Lock()
@@ -72,7 +73,7 @@ def load(force: bool = False) -> list[dict]:
         if not force and not _state["sessions"] and CACHE_FILE.exists():
             try:
                 cached = json.loads(CACHE_FILE.read_text())
-                if cached.get("sig") == sig:
+                if cached.get("version") == CACHE_VERSION and cached.get("sig") == sig:
                     _state.update(sessions=cached["sessions"], sig=sig, built_at=cached.get("built_at", 0))
                     return _state["sessions"]
             except Exception:
@@ -83,7 +84,8 @@ def load(force: bool = False) -> list[dict]:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         try:
             CACHE_FILE.write_text(json.dumps(
-                {"sig": sig, "built_at": _state["built_at"], "sessions": sessions}, ensure_ascii=False))
+                {"version": CACHE_VERSION, "sig": sig,
+                 "built_at": _state["built_at"], "sessions": sessions}, ensure_ascii=False))
         except OSError:
             pass
         print(f"[sesman] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")

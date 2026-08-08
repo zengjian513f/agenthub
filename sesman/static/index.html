@@ -4,6 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>sesman · 会话管理</title>
+<script>
+  // 在样式表加载前确定明暗，避免刷新时先闪出另一套颜色。
+  (() => {
+    let choice = 'system';
+    try { choice = JSON.parse(localStorage.getItem('sesman.theme')) || 'system'; } catch {}
+    document.documentElement.dataset.theme = choice === 'system'
+      ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : choice;
+  })();
+</script>
 <link rel="stylesheet" href="vendor/xterm.css">
 <link rel="stylesheet" href="vendor/katex/katex.min.css">
 <link rel="preload" href="fonts/CascadiaMono.woff2" as="font" type="font/woff2" crossorigin>
@@ -11,7 +20,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🗂</text></svg>">
 </head>
 <body>
-<svg style="display:none">
+<svg aria-hidden="true" width="0" height="0" style="position:absolute;overflow:hidden">
   <symbol id="i-claude" viewBox="0 0 16 16">
     <path fill="currentColor" d="M8 .8l1.6 4.2L13.9 3l-2 4.1 4.1 1.6-4.1 1L13.9 14l-4.3-2L8 16.2 6.4 12 2.1 14l2-4.3-4.1-1 4.1-1.6-2-4.1 4.3 2z"/>
   </symbol>
@@ -35,35 +44,48 @@
     <path d="M2.5 5V2.5H5m6 0h2.5V5m0 6v2.5H11m-6 0H2.5V11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
     <path d="M6 5.8l4.8 2.1-2 .9-.9 2z" fill="currentColor"/>
   </symbol>
-  <symbol id="i-stop" viewBox="0 0 16 16">
-    <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/>
-    <rect x="5.2" y="5.2" width="5.6" height="5.6" rx=".7" fill="currentColor"/>
-  </symbol>
   <symbol id="i-plus" viewBox="0 0 16 16">
     <path d="M8 2.5v11M2.5 8h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
   </symbol>
   <symbol id="i-refresh" viewBox="0 0 16 16">
-    <path d="M13.2 5.8A5.6 5.6 0 103.4 11M13.2 2.8v3h-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M13.5 5.8A5.8 5.8 0 003 4.1L2 6.5h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M2.5 10.2A5.8 5.8 0 0013 11.9l1-2.4h-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
   </symbol>
   <symbol id="i-chat" viewBox="0 0 16 16">
     <path d="M2 2.5h12v8.3H7l-3.7 2.7v-2.7H2z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-settings" viewBox="0 0 16 16">
+    <path d="M6.8 1.7h2.4l.5 1.7 1.2.7 1.7-.4 1.2 2.1-1.2 1.3v1.4l1.2 1.3-1.2 2.1-1.7-.4-1.2.7-.5 1.7H6.8l-.5-1.7-1.2-.7-1.7.4-1.2-2.1 1.2-1.3V7.1L2.2 5.8l1.2-2.1 1.7.4 1.2-.7z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+    <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.2"/>
+  </symbol>
+  <symbol id="i-sidebar" viewBox="0 0 16 16">
+    <rect x="1.5" y="2" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.35"/>
+    <path d="M5.4 2.5v11" fill="none" stroke="currentColor" stroke-width="1.35"/>
   </symbol>
 </svg>
 
 <div id="app">
   <header>
     <div class="brand"><span class="brand-name">sesman</span><small id="stat">加载中…</small><button type="button" id="livecount" class="livecount" aria-pressed="false"></button></div>
+    <button class="btn" id="side-toggle" title="收起会话列表" aria-label="收起会话列表" aria-expanded="true">
+      <svg class="ui-icon" aria-hidden="true"><use href="#i-sidebar"/></svg>
+    </button>
     <div class="chips" id="chips"></div>
     <div class="seg" id="view">
       <button data-v="tree" class="on" title="项目树" aria-label="项目树">📁 <span class="mobile-label">项目树</span></button>
       <button data-v="date" title="时间轴" aria-label="时间轴">🕒 <span class="mobile-label">时间轴</span></button>
     </div>
-    <button class="btn hidden" id="new-session" title="新建会话" aria-label="新建会话">
-      <svg class="ui-icon" aria-hidden="true"><use href="#i-plus"/></svg>
-    </button>
-    <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">
-      <svg class="ui-icon" aria-hidden="true"><use href="#i-refresh"/></svg>
-    </button>
+    <div class="header-actions">
+      <button class="btn hidden" id="new-session" title="新建会话" aria-label="新建会话">
+        <svg class="ui-icon" aria-hidden="true"><use href="#i-plus"/></svg>
+      </button>
+      <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">
+        <svg class="ui-icon" aria-hidden="true"><use href="#i-refresh"/></svg>
+      </button>
+      <button class="btn" id="settings" title="设置" aria-label="设置">
+        <svg class="ui-icon" aria-hidden="true"><use href="#i-settings"/></svg>
+      </button>
+    </div>
   </header>
   <div id="prog"><div class="bar"></div><span class="txt"></span></div>
   <main>
@@ -85,43 +107,45 @@
       <div id="side"><div class="spin">正在扫描会话…</div></div>
     </div>
     <div id="drag" title="拖动调整宽度，双击复位"></div>
-    <div id="right">
+      <div id="right">
       <div id="detail"><div class="empty">从左侧选择一个会话</div></div>
       <div id="composer" class="hidden">
-        <textarea id="cinput" rows="1" enterkeyhint="enter" placeholder="输入内容"></textarea>
-        <div class="cbtns">
-          <button class="btn" id="cesc" title="发送 Esc（中断）">Esc</button>
-          <button class="btn go" id="csend">发送</button>
+        <div id="compose-items" aria-live="polite"></div>
+        <div class="composer-row">
+          <div class="attach-picker">
+            <button class="btn" id="cadd" type="button" title="添加附件或引用" aria-label="添加附件或引用" aria-expanded="false">
+              <svg class="ui-icon" aria-hidden="true"><use href="#i-plus"/></svg>
+            </button>
+            <div class="attach-menu hidden" id="attach-menu" role="menu">
+              <button type="button" data-attach="image" role="menuitem"><span>▧</span>图片</button>
+              <button type="button" data-attach="video" role="menuitem"><span>▶</span>视频</button>
+              <button type="button" data-attach="audio" role="menuitem"><span>♪</span>音频</button>
+              <button type="button" data-attach="file" role="menuitem"><span>⌑</span>文件</button>
+              <button type="button" data-attach="quote" role="menuitem"><span>❝</span>引用文字</button>
+            </div>
+            <input id="cfile" type="file" multiple hidden>
+          </div>
+          <textarea id="cinput" rows="1" enterkeyhint="enter" placeholder="输入内容"></textarea>
+          <div class="cbtns">
+            <button class="btn" id="cesc" title="发送 Esc（中断）">Esc</button>
+            <button class="btn go" id="csend">发送</button>
+          </div>
         </div>
       </div>
       <div id="termpane" class="hidden">
         <div class="term-resizer" id="tgrip" title="拖动终端上边界调整高度"></div>
-        <div class="thead">
-          <button class="iconbtn mobile-term-chat" id="tchat" title="切换到对话" aria-label="切换到对话">
-            <svg class="ui-icon" aria-hidden="true"><use href="#i-chat"/></svg>
-          </button>
-          <span id="tstatus">未连接</span>
-          <button class="chipbtn" id="tscroll"></button>
-          <span class="spacer"></span>
-          <button class="iconbtn" id="tmouse" title="鼠标交给应用（点击改为框选复制）" aria-label="启用框选复制" aria-pressed="false">
-            <svg class="ui-icon" aria-hidden="true"><use href="#i-select"/></svg>
-          </button>
-          <button class="iconbtn danger" id="tstop" title="结束这个 tmux 会话" aria-label="结束会话">
-            <svg class="ui-icon" aria-hidden="true"><use href="#i-stop"/></svg>
-          </button>
-          <div class="term-keys" aria-label="终端快捷键">
-            <button data-term-modifier="ctrl" title="Ctrl（下一键生效）" aria-label="Ctrl，下一键生效" aria-pressed="false">Ctrl</button>
-            <button data-term-key="Escape" title="Escape" aria-label="Escape">Esc</button>
-            <button data-term-key="Tab" title="Tab" aria-label="Tab">Tab</button>
-            <button data-term-key="Left" title="方向键左" aria-label="方向键左">←</button>
-            <button data-term-key="Up" title="方向键上" aria-label="方向键上">↑</button>
-            <button data-term-key="Down" title="方向键下" aria-label="方向键下">↓</button>
-            <button data-term-key="Right" title="方向键右" aria-label="方向键右">→</button>
-            <button data-term-key="PPage" title="Page Up" aria-label="Page Up">Pg↑</button>
-            <button data-term-key="NPage" title="Page Down" aria-label="Page Down">Pg↓</button>
-          </div>
-        </div>
         <div id="xterm"></div>
+        <div class="term-keys" aria-label="终端快捷键">
+          <button data-term-modifier="ctrl" title="Ctrl（下一键生效）" aria-label="Ctrl，下一键生效" aria-pressed="false">Ctrl</button>
+          <button data-term-key="Escape" title="Escape" aria-label="Escape">Esc</button>
+          <button data-term-key="Tab" title="Tab" aria-label="Tab">Tab</button>
+          <button data-term-key="Left" title="方向键左" aria-label="方向键左">←</button>
+          <button data-term-key="Up" title="方向键上" aria-label="方向键上">↑</button>
+          <button data-term-key="Down" title="方向键下" aria-label="方向键下">↓</button>
+          <button data-term-key="Right" title="方向键右" aria-label="方向键右">→</button>
+          <button data-term-key="PPage" title="Page Up" aria-label="Page Up">Pg↑</button>
+          <button data-term-key="NPage" title="Page Down" aria-label="Page Down">Pg↓</button>
+        </div>
       </div>
     </div>
   </main>
@@ -150,11 +174,48 @@
     </div>
   </form>
 </dialog>
-<script src="vendor/xterm.js"></script>
-<script src="vendor/addon-fit.js"></script>
-<script src="vendor/katex/katex.min.js"></script>
-<script src="vendor/katex/auto-render.min.js"></script>
-<script src="app.js"></script>
-<script src="term.js"></script>
+<dialog id="settings-dialog" class="app-dialog" aria-labelledby="settings-title">
+  <form method="dialog" class="settings-form">
+    <div class="modal-head">
+      <div><h2 id="settings-title">设置</h2><p>这些选项只保存在当前浏览器</p></div>
+      <button type="submit" class="modal-close" title="关闭" aria-label="关闭">×</button>
+    </div>
+    <label class="setting-row" for="setting-font">
+      <span><b>等宽字体</b><small>终端与工具输出共同使用</small></span>
+      <select id="setting-font">
+        <option value="cascadia">Cascadia Mono（内置）</option>
+        <option value="system">系统等宽字体</option>
+        <option value="consolas">Consolas / Consola</option>
+      </select>
+    </label>
+    <label class="setting-row" for="setting-theme">
+      <span><b>颜色方案</b><small>可跟随操作系统自动切换</small></span>
+      <select id="setting-theme">
+        <option value="system">跟随系统</option>
+        <option value="light">浅色</option>
+        <option value="dark">深色</option>
+      </select>
+    </label>
+    <label class="setting-row" for="setting-cache">
+      <span><b>历史缓存</b><small>tmux 对话固定驻留，不计入此上限</small></span>
+      <select id="setting-cache">
+        <option value="64">64 MB</option>
+        <option value="128">128 MB</option>
+        <option value="256">256 MB</option>
+        <option value="512">512 MB</option>
+        <option value="1024">1 GB</option>
+        <option value="0">不限制</option>
+      </select>
+    </label>
+    <div class="modal-actions"><button type="submit" class="btn go">完成</button></div>
+  </form>
+</dialog>
+<!-- 列表是首屏核心，必须先执行；终端和公式库较大，延后加载且不能阻塞扫描。 -->
+<script defer src="app.js"></script>
+<script defer src="vendor/xterm.js"></script>
+<script defer src="vendor/addon-fit.js"></script>
+<script defer src="term.js"></script>
+<script defer src="vendor/katex/katex.min.js"></script>
+<script defer src="vendor/katex/auto-render.min.js" onload="refreshFormulae()"></script>
 </body>
 </html>

@@ -23,6 +23,7 @@ import struct
 import subprocess
 import termios
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -32,6 +33,8 @@ LEGACY_SERVER = "default"   # 兼容改造前已经启动的 sesman-* 会话
 TMUX_CONF = Path(__file__).with_name("tmux.conf")
 _config_lock = threading.Lock()
 _managed_configured = False
+_submit_locks: dict[str, threading.Lock] = {}
+_submit_locks_guard = threading.Lock()
 
 # 三家续接已有会话的参数。可执行文件必须另外解析成绝对路径，因为 systemd
 # 服务的 PATH 通常不含 ~/.local/bin 和 ~/.grok/bin。
@@ -265,6 +268,39 @@ def send_text(name: str, text: str) -> None:
     _session_tmux(name, "send-keys", "-t", name, "-l", "--", text)
 
 
+def submit_text(name: str, text: str) -> None:
+    """按一次终端标准粘贴提交整段文本，避免 CLI 把末尾 Enter 吞进粘贴批次。
+
+    `send-keys -l` 会以机器速度逐字注入。Codex 等 TUI 有粘贴突发检测，紧随其后的
+    Enter 偶尔会被识别成多行粘贴的一部分。tmux `paste-buffer -p` 会显式包上
+    bracketed-paste 起止序列，让应用先得到一个完整 Paste 事件，再收到提交键。
+    """
+    with _submit_locks_guard:
+        lock = _submit_locks.setdefault(name, threading.Lock())
+    with lock:
+        row = session_info(name)
+        if not row:
+            raise RuntimeError(f"tmux 会话不存在: {name}")
+        buffer_name = f"sesman-submit-{uuid.uuid4().hex}"
+        _tmux("set-buffer", "-b", buffer_name, "--", text,
+              server=row["server"], no_start=True)
+        try:
+            _tmux("paste-buffer", "-p", "-d", "-b", buffer_name, "-t", name,
+                  server=row["server"], no_start=True)
+        except Exception:
+            try:
+                _tmux("delete-buffer", "-b", buffer_name,
+                      server=row["server"], no_start=True)
+            except Exception:
+                pass
+            raise
+        # 给全屏 TUI 一个事件循环间隔来消费 bracketed-paste 的结束序列；
+        # 否则紧随其后的 Enter 偶尔会被并入粘贴，文字留到下一次提交。
+        time.sleep(0.04)
+        _tmux("send-keys", "-t", name, "--", "Enter",
+              server=row["server"], no_start=True)
+
+
 def send_keys(name: str, *keys: str) -> None:
     """送 tmux 键名, 例如 Enter / Escape / C-c / Up。"""
     _session_tmux(name, "send-keys", "-t", name, "--", *keys)
@@ -382,6 +418,38 @@ def kill_pids(pids: list[int], timeout: float = 6.0) -> list[int]:
             except OSError:
                 pass
     _t.sleep(0.3)
+    return killed
+
+
+def graceful_stop(name: str, pids: list[int], timeout: float = 2.4) -> list[int]:
+    """先退出 pane 内最深的 CLI，让单 pane tmux session 自然随前台命令结束。
+
+    Claude/Codex 的空输入提示通常用 Ctrl-D 退出，部分状态需要按第二次。只有两次
+    EOF 都无效时才向 CLI 主进程发 TERM/KILL；tmux 残壳最后才作为兜底清理。
+    """
+    targets = [p for p in pids if p > 0]
+
+    def settled() -> bool:
+        return not has_session(name) and all(gone(p) for p in targets)
+
+    each = max(0.0, timeout) / 2
+    for _ in range(2):
+        if settled():
+            return targets
+        try:
+            send_keys(name, "C-d")
+        except RuntimeError:
+            if settled():
+                return targets
+        deadline = time.monotonic() + each
+        while time.monotonic() < deadline:
+            if settled():
+                return targets
+            time.sleep(0.1)
+
+    killed = kill_pids(targets)
+    if has_session(name):
+        kill_session(name)
     return killed
 
 

@@ -14,10 +14,14 @@ import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sesman import pending as pending_store, term
 
 BASE = os.environ.get("SESMAN_BASE", "http://127.0.0.1:8710")
 FAKE_PROJ = Path.home() / ".claude" / "projects" / "-tmp-sesman-selftest"
 FAKE_IMG = Path("/tmp/sesman-selftest-image.png")
+FAKE_CWD = Path("/tmp/sesman-selftest")
+PENDING_TERM = "sesman-claude-e2epending"
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 PASS, FAIL = [], []
 
@@ -46,6 +50,7 @@ def term_server(name):
 def make_fake_session():
     """造一个一次性会话, 用来安全地测删除。"""
     FAKE_PROJ.mkdir(parents=True, exist_ok=True)
+    FAKE_CWD.mkdir(parents=True, exist_ok=True)
     f = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
     sid = f.stem
     long_text = "长文本测试 " + "x" * 9000
@@ -162,7 +167,10 @@ def make_fake_session():
 
 
 def cleanup():
+    tmux_run("sesman", "kill-session", "-t", PENDING_TERM, capture_output=True)
+    pending_store.discard(PENDING_TERM)
     shutil.rmtree(FAKE_PROJ, ignore_errors=True)
+    shutil.rmtree(FAKE_CWD, ignore_errors=True)
     FAKE_IMG.unlink(missing_ok=True)
     trash = Path.home() / ".local" / "share" / "sesman" / "trash" / "claude"
     if trash.is_dir():
@@ -172,7 +180,9 @@ def cleanup():
 
 def run(pw):
     b = pw.chromium.launch()
-    ctx = b.new_context()
+    # 主题相关断言从确定的亮色起步，随后验证运行中切换到暗色再切回。
+    ctx = b.new_context(color_scheme="light")
+    ctx.grant_permissions(["clipboard-read", "clipboard-write"], origin=BASE)
     p = ctx.new_page()
     errors = []
     p.on("pageerror", lambda e: errors.append(str(e)))
@@ -191,6 +201,78 @@ def run(pw):
     check("顶栏统计显示数量", re.search(r"\d+", p.locator("#stat").inner_text()), p.locator("#stat").inner_text())
     check("三个来源 chip 都在", p.locator(".chip").count() == 3)
     check("图标 SVG 渲染", p.locator(".item .ico svg").count() > 0)
+    script_order = p.locator("script[src]").evaluate_all(
+        "nodes => nodes.map(n => n.getAttribute('src'))")
+    check("会话列表脚本不再被大型终端和公式库阻塞",
+          script_order.index("app.js") < script_order.index("vendor/xterm.js")
+          and all(p.locator(f'script[src="{src}"]').get_attribute("defer") is not None
+                  for src in ("app.js", "vendor/xterm.js", "vendor/katex/katex.min.js")),
+          script_order)
+    check("首次会话列表已替换静态扫描占位", p.locator("#side > .spin").count() == 0)
+    action_styles = p.evaluate("""() => ['new-session', 'reload', 'settings'].map(id => {
+      const s = getComputedStyle(document.getElementById(id));
+      return [s.width, s.height, s.padding, s.borderRadius];
+    })""")
+    check("新建刷新设置使用相同按钮尺寸",
+          action_styles[1:] == [action_styles[0], action_styles[0]], action_styles)
+
+    p.set_viewport_size({"width": 390, "height": 780})
+    p.evaluate("dispatchEvent(new Event('resize'))")
+    p.wait_for_timeout(300)
+    mobile_header = p.evaluate("""() => {
+      const box = id => { const r = document.querySelector(id).getBoundingClientRect();
+                          return {top: r.top, height: r.height}; };
+      return {brand: box('.brand'), chips: box('.chips'), view: box('#view'),
+              actions: box('.header-actions'), header: box('header')};
+    }""")
+    check("手机列表顶栏分为信息和操作两排",
+          abs(mobile_header["brand"]["top"] - mobile_header["chips"]["top"]) < 8
+          and mobile_header["view"]["top"] > mobile_header["brand"]["top"]
+          and abs(mobile_header["view"]["top"] - mobile_header["actions"]["top"]) < 4
+          and mobile_header["header"]["height"] >= 70,
+          mobile_header)
+    check("手机顶栏恢复品牌、会话单位和视图文字",
+          p.locator(".brand-name").is_visible()
+          and p.locator(".stat-unit").is_visible()
+          and p.locator(".mobile-label").evaluate_all(
+              "nodes => nodes.length === 2 && nodes.every(n => n.getClientRects().length > 0)")
+          and "sesman" in p.locator(".brand").inner_text()
+          and "个会话" in p.locator("#stat").inner_text()
+          and p.locator(".mobile-label").all_inner_texts() == ["项目树", "时间轴"])
+
+    # 上传目录只能由服务端根据 uid 决定，原始二进制不走 Base64。
+    fake_uid = p.evaluate("() => S.sessions.find(s => s.title === 'SESMAN自测会话请删除').uid")
+    attachment_payload = b"sesman attachment raw bytes\x00\x01"
+    attachment_responses = p.evaluate("""async ({uid, bytes}) => {
+      async function upload(payload) {
+        const url = new URL(appUrl('api/session/attachment'));
+        url.searchParams.set('uid', uid); url.searchParams.set('name', '测试 attachment.txt');
+        const file = new File([new Uint8Array(payload)], '测试 attachment.txt', {type:'text/plain'});
+        const response = await fetch(url, {method:'POST', headers:{'Content-Type':file.type}, body:file});
+        return response.json();
+      }
+      return [await upload(bytes), await upload(bytes), await upload([...bytes, 2])];
+    }""", {"uid": fake_uid, "bytes": list(attachment_payload)})
+    attachment_response, same_response, different_response = attachment_responses
+    attachment_path = Path(attachment_response["path"])
+    check("附件以原文件名保存到当前目录的受控子目录",
+          attachment_path == FAKE_CWD / ".sesman_attachments" / "测试 attachment.txt"
+          and attachment_response["relative_path"] == ".sesman_attachments/测试 attachment.txt",
+          attachment_response)
+    check("附件按原始二进制流完整落盘",
+          attachment_path.read_bytes() == attachment_payload
+          and attachment_response["mime"] == "text/plain", attachment_response)
+    check("同名且内容相同的附件直接复用",
+          same_response["path"] == attachment_response["path"]
+          and same_response["reused"] is True, same_response)
+    different_path = Path(different_response["path"])
+    check("同名但内容不同的附件添加 Windows 式编号",
+          different_path.name == "测试 attachment (1).txt"
+          and different_path.read_bytes() == attachment_payload + b"\x02"
+          and different_response["reused"] is False, different_response)
+    p.set_viewport_size({"width": 1280, "height": 720})
+    p.evaluate("dispatchEvent(new Event('resize'))")
+    p.wait_for_timeout(300)
 
     # ---- 2. 来源筛选 ----
     counts = {}
@@ -460,6 +542,7 @@ def run(pw):
       return { bodyPadding: bs.padding, preBackground: ps.backgroundColor,
                preBorder: ps.borderTopWidth, preMargin: ps.margin,
                bubbleBackground: ns.backgroundColor, textColor: ps.color,
+               fontWeight: ps.fontWeight, fontSynthesis: ps.fontSynthesis,
                scrollbarWidth: ps.scrollbarWidth, scrollbarColor: ps.scrollbarColor };
     }""")
     check("单条工具输出没有外黄里灰的双层气泡",
@@ -467,23 +550,74 @@ def run(pw):
               "bodyPadding": "0px", "preBackground": "rgba(0, 0, 0, 0)",
               "preBorder": "0px", "preMargin": "0px"}.items()), single_tool_skin)
     terminal_theme = p.evaluate("termTheme()")
-    check("工具输出与终端使用同一套纯黑底柔和灰字",
-          single_tool_skin["bubbleBackground"] == "rgb(0, 0, 0)"
-          and single_tool_skin["textColor"] == "rgb(184, 190, 201)"
-          and terminal_theme["background"] == "#000000"
-          and terminal_theme["foreground"] == "#b8bec9", (single_tool_skin, terminal_theme))
+    light_terminal_surface = p.locator("#xterm").evaluate("""n => ({
+      filter: getComputedStyle(n).filter,
+      sourceBackground: getComputedStyle(n).backgroundColor
+    })""")
+    check("亮色模式下工具输出使用明亮浅底深字主题",
+          single_tool_skin["bubbleBackground"] == "rgb(244, 246, 248)"
+          and single_tool_skin["textColor"] == "rgb(37, 42, 50)"
+          and single_tool_skin["fontWeight"] == "400"
+          and single_tool_skin["fontSynthesis"] == "none"
+          and terminal_theme["background"] == "#f4f6f8"
+          and terminal_theme["foreground"] == "#252a32"
+          and terminal_theme["red"] == "#a8323b", (single_tool_skin, terminal_theme))
+    check("亮色终端直接绘制目标颜色，不再滤镜处理字体边缘",
+          light_terminal_surface["filter"] == "none"
+          and light_terminal_surface["sourceBackground"] == "rgb(244, 246, 248)",
+          light_terminal_surface)
+    ansi_colors = p.evaluate("""() => {
+      const values = s => [...s.matchAll(/(?:38|48);2;(\d+);(\d+);(\d+)/g)]
+        .map(m => m.slice(1).map(Number));
+      return {
+        truecolor: values(lightTerminalAnsi('\x1b[38;2;255;123;114m'))[0],
+        background: values(lightTerminalAnsi('\x1b[48;2;0;0;0m'))[0],
+        indexed: values(lightTerminalAnsi('\x1b[38;5;231m'))[0],
+        ansi16: lightTerminalAnsi('\x1b[38;5;1m'),
+      };
+    }""")
+    check("浅色终端在 ANSI 层反射真彩色和 256 色亮度",
+          sum(ansi_colors["truecolor"]) < 255 + 123 + 114
+          and max(ansi_colors["background"]) <= 245
+          and ansi_colors["indexed"] == [0, 0, 0]
+          and "38;5;1" in ansi_colors["ansi16"], ansi_colors)
+    p.emulate_media(color_scheme="dark")
+    p.wait_for_timeout(50)
+    dark_tool_skin = single_tool.evaluate("""n => ({
+      background: getComputedStyle(n).backgroundColor,
+      color: getComputedStyle(n.querySelector(':scope > .mb > pre')).color
+    })""")
+    dark_terminal_theme = p.evaluate("termTheme()")
+    terminal_curve = p.locator("#xterm").evaluate("""n => ({
+      filter: getComputedStyle(n).filter,
+      sourceBackground: getComputedStyle(n).backgroundColor
+    })""")
+    check("暗色模式下工具输出与终端共用纯黑底柔和灰字主题",
+          dark_tool_skin == {"background": "rgb(0, 0, 0)", "color": "rgb(157, 165, 176)"}
+          and dark_terminal_theme["background"] == "#000000"
+          and dark_terminal_theme["foreground"] == "#9da5b0"
+          and dark_terminal_theme["brightWhite"] == "#b9c0ca"
+          and dark_terminal_theme["red"] == "#ff7b72", (dark_tool_skin, dark_terminal_theme))
+    check("暗色模式终端不反色，保留黑底与原生字体抗锯齿",
+          terminal_curve["filter"] == "none"
+          and terminal_curve["sourceBackground"] == "rgb(0, 0, 0)", terminal_curve)
+    p.emulate_media(color_scheme="light")
+    p.wait_for_timeout(50)
     font_pair = p.evaluate("""() => ({
       tool: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .mb > pre')).fontFamily,
       toolSize: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .mb > pre')).fontSize,
       terminal: termFont(), terminalSize: termFontSize()
     })""")
     check("工具输出与 tmux 终端共用 Cascadia/系统等宽字体栈",
-          "Sesman Cascadia Mono" in font_pair["tool"] and "Adwaita Mono" in font_pair["tool"]
+          "Sesman CJK Sans" in font_pair["tool"] and "Sesman Cascadia Mono" in font_pair["tool"]
+          and "Adwaita Mono" in font_pair["tool"]
           and "Ubuntu Mono" in font_pair["tool"] and "Consola" in font_pair["tool"]
-          and "Microsoft YaHei" in font_pair["tool"] and "Noto Sans Mono CJK SC" in font_pair["tool"]
+          and "Sesman CJK Sans" in font_pair["terminal"]
           and "Sesman Cascadia Mono" in font_pair["terminal"] and "Consola" in font_pair["terminal"]
-          and "Microsoft YaHei" in font_pair["terminal"]
           and font_pair["toolSize"] == "12.96px" and font_pair["terminalSize"] == 14.04, font_pair)
+    p.evaluate("document.fonts.load('12px \\\"Sesman CJK Sans\\\"', '中文字体')")
+    check("三套等宽选项的汉字固定回退到无衬线 CJK 字体",
+          p.evaluate("document.fonts.check('12px \\\"Sesman CJK Sans\\\"', '中文字体')"))
     p.wait_for_function("document.fonts.check('12px \\\"Sesman Cascadia Mono\\\"')", timeout=15000)
     bundled_font = p.evaluate("""() => ({
       loaded: document.fonts.check('12px "Sesman Cascadia Mono"'),
@@ -491,6 +625,36 @@ def run(pw):
     })""")
     check("Cascadia Mono 网页字体由项目自带且已加载", bundled_font["loaded"] and bundled_font["requested"] > 0,
           bundled_font)
+    p.click("#settings")
+    check("设置窗口集中提供字体、颜色和缓存选项",
+          p.locator("#settings-dialog").is_visible()
+          and p.locator("#setting-font").input_value() == "cascadia"
+          and p.locator("#setting-theme").input_value() == "system"
+          and p.locator("#setting-cache").input_value() == "256")
+    p.select_option("#setting-font", "system")
+    p.select_option("#setting-theme", "dark")
+    p.select_option("#setting-cache", "512")
+    settings_applied = p.evaluate("""() => ({
+      font: getComputedStyle(document.documentElement).getPropertyValue('--terminal-font'),
+      theme: document.documentElement.dataset.theme,
+      cache: CACHE_MAX_BYTES,
+      saved: [store.get('font', ''), store.get('theme', ''), store.get('cacheMb', 0)],
+    })""")
+    check("设置修改后立即生效并保存在浏览器",
+          "ui-monospace" in settings_applied["font"]
+          and settings_applied["theme"] == "dark"
+          and settings_applied["cache"] == 512 * 1024 * 1024
+          and settings_applied["saved"] == ["system", "dark", 512], settings_applied)
+    p.select_option("#setting-font", "consolas")
+    consolas_stack = p.evaluate("termFont()")
+    check("Consola 选项不会让汉字落入 generic monospace 宋体",
+          consolas_stack.startswith('"Sesman CJK Sans", Consolas, Consola')
+          and consolas_stack.endswith('sans-serif') and 'monospace' not in consolas_stack,
+          consolas_stack)
+    p.select_option("#setting-font", "cascadia")
+    p.select_option("#setting-theme", "system")
+    p.select_option("#setting-cache", "256")
+    p.locator("#settings-dialog .modal-actions button").click()
     check("滚动条使用细圆角低对比样式且轨道不是纯黑",
           single_tool_skin["scrollbarWidth"] == "thin"
           and "rgba(0, 0, 0, 0)" not in single_tool_skin["scrollbarColor"]
@@ -515,14 +679,19 @@ def run(pw):
     colors = p.locator('#msgs > .msg[data-role="user"], #msgs > .msg[data-role="assistant"]').evaluate_all(
         "ns => ns.slice(0, 2).map(n => getComputedStyle(n).backgroundColor)")
     check("用户与助手用不同背景色区分", len(colors) == 2 and colors[0] != colors[1], colors)
-    content_widths = p.evaluate("""() => ({
-      messages: getComputedStyle(document.querySelector('#msgs')).maxWidth,
-      composer: getComputedStyle(document.querySelector('#composer')).maxWidth,
-      header: getComputedStyle(document.querySelector('.dhead')).maxWidth,
-      terminal: getComputedStyle(document.querySelector('#termpane')).maxWidth
-    })""")
-    check("详情头、消息区、输入区与终端右边缘使用相同最大宽度",
-          all(v == "1150px" for v in content_widths.values()), content_widths)
+    content_widths = p.evaluate("""() => {
+      const nodes = {messages: '#msgs', composer: '#composer', detailHeader: '.dhead',
+                     terminal: '#termpane', pageHeader: 'header', progress: '#prog'};
+      return {win: innerWidth, boxes: Object.fromEntries(Object.entries(nodes).map(([k, sel]) => {
+        const n = document.querySelector(sel), r = n.getBoundingClientRect();
+        return [k, {max: getComputedStyle(n).maxWidth, right: r.right}];
+      }))};
+    }""")
+    check("右侧内容、顶栏和进度条延伸到网页尽头",
+          all(v["max"] == "none" for v in content_widths["boxes"].values())
+          and all(abs(content_widths["boxes"][k]["right"] - content_widths["win"]) <= 1
+                  for k in ("messages", "detailHeader", "pageHeader", "progress")),
+          content_widths)
     folded_geo = p.locator("#msgs > .msg.folded").first.evaluate("""n => {
       const box = document.querySelector('#msgs').getBoundingClientRect();
       const r = n.getBoundingClientRect();
@@ -625,6 +794,49 @@ def run(pw):
           "子代理一的独立结论" not in p.locator("#msgs").inner_text())
 
     # ---- 14. 整份载入 + 进度条 + LRU 缓存 ----
+    pinned_cache = p.evaluate("""() => {
+      const oldLiveTmux = S.liveTmux;
+      const oldTermList = T.list;
+      const oldCache = [...cache];
+      const oldLimit = CACHE_MAX_BYTES;
+      try {
+        cache.clear();
+        CACHE_MAX_BYTES = 64 * 1024 * 1024;
+        S.liveTmux = new Set(['tmux-live']);
+        T.list = [{ name: 'tmux-mapped', uid: 'tmux-by-list' }];
+        const mb = 1024 * 1024;
+        cachePut('tmux-live', {
+          meta: { uid: 'tmux-live' }, msgs: [], bytes: 80 * mb,
+        });
+        cachePut('plain-old', {
+          meta: { uid: 'plain-old' }, msgs: [], bytes: 40 * mb,
+        });
+        cachePut('tmux-by-list::child', {
+          meta: { uid: 'tmux-by-list' }, msgs: [], bytes: 80 * mb,
+        });
+        cachePut('plain-new', {
+          meta: { uid: 'plain-new' }, msgs: [], bytes: 40 * mb,
+        });
+        const whileRunning = [...cache.keys()];
+
+        S.liveTmux = new Set();
+        T.list = [];
+        trimCache();
+        return { whileRunning, afterStop: [...cache.keys()] };
+      } finally {
+        S.liveTmux = oldLiveTmux;
+        T.list = oldTermList;
+        CACHE_MAX_BYTES = oldLimit;
+        cache.clear();
+        for (const [key, entry] of oldCache) cache.set(key, entry);
+      }
+    }""")
+    check("tmux 会话缓存不受 LRU 容量淘汰",
+          pinned_cache["whileRunning"] ==
+          ["tmux-live", "tmux-by-list::child", "plain-new"], pinned_cache)
+    check("tmux 结束后缓存重新参与 LRU",
+          pinned_cache["afterStop"] == ["plain-new"], pinned_cache)
+
     p.fill("#q", "")
     p.wait_for_timeout(200)
     p.evaluate("""() => {
@@ -652,8 +864,11 @@ def run(pw):
     total = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
     check("一次载入全部消息, 不再分页", p.locator(".more-page").count() == 0)
     check("载入时显示过进度条", p.evaluate("window.__prog"))
-    # 工具组本身不算原始消息，组内扁平 tool-entry 各算一条。
-    dom_msgs = p.locator("#msgs .msg:not(.grp), #msgs .tool-entry").count()
+    # 工具组本身不算原始消息，组内扁平 tool-entry 各算一条；rename/compact
+    # 结果会显示在时间线里，但它们是辅助事件，不进入标题栏的“消息”计数。
+    dom_msgs = p.locator(
+        '#msgs .msg:not(.grp):not([data-counted="false"]), '
+        '#msgs .tool-entry:not([data-counted="false"])').count()
     check("消息数与顶部计数一致", dom_msgs == total, f"dom={dom_msgs} meta={total}")
     geo = p.evaluate("""() => { const b = document.querySelector('#msgs'), r = b.getBoundingClientRect();
       return { right: Math.round(r.right), win: innerWidth, scrollable: b.scrollHeight > b.clientHeight,
@@ -700,7 +915,7 @@ def run(pw):
     check("首次打开是整份请求", reqs and "start=" not in reqs[0], reqs[:2])
 
     # 重新打开当前会话 —— 应命中缓存, 只发增量请求。不要先载入另一个任意
-    # 大会话，否则两者超过 64 MB 时触发正常的 LRU 淘汰，反而测不到命中路径。
+    # 大会话，否则两者超过所设容量时触发正常的 LRU 淘汰，反而测不到命中路径。
     reqs.clear()
     p.locator(".item").nth(big).click()
     p.wait_for_selector(".msg", timeout=60000)
@@ -734,8 +949,28 @@ def run(pw):
 
     check("新消息出现在末尾", "追加的新消息ZZQ" in p.locator("#msgs > .msg").last.inner_text(),
           p.locator("#msgs > .msg").last.inner_text()[:40])
-    check("提示新消息条数", p.locator("#newmsg").is_visible() and "+1" in p.locator("#newmsg").inner_text(),
-          p.locator("#newmsg").inner_text())
+    check("对话页不显示新消息数", p.locator(".dhead .newmsg, .dmeta .newmsg").count() == 0)
+
+    # 手机停在列表时，代理的新内容积累在来源图标右上角；打开会话即视为已读。
+    viewport(390, 780)
+    p.evaluate("showMobileList()")
+    with open(fake, "a") as fh:
+        fh.write(json.dumps({
+            "type": "assistant", "message": {"role": "assistant", "content": "助手追加的新内容AAQ"},
+            "uuid": "a9", "timestamp": "2026-08-06T12:30:01.000Z",
+            "cwd": "/tmp/sesman-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
+    p.evaluate("syncSession(S.sel)")
+    p.wait_for_function("document.querySelector('.item.sel .item-status')?.textContent === '1'",
+                        timeout=30000)
+    n1a = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
+    status = p.locator(".item.sel .item-status")
+    check("代理新内容显示在列表图标右上角",
+          "counted" in (status.get_attribute("class") or "") and status.inner_text() == "1",
+          status.get_attribute("class"))
+    p.locator(".item.sel").click()
+    p.wait_for_function("!document.querySelector('.item.sel .item-status')?.classList.contains('counted')")
+    check("打开会话后清除列表未读数", status.inner_text() == "")
+    viewport(1280, 800)
     inc = [u for u in reqs if "start=" in u]
     check("同步走的是增量请求", len(inc) > 0)
 
@@ -750,7 +985,7 @@ def run(pw):
     p.evaluate("syncSession(S.sel)")
     p.wait_for_function("document.querySelector('#msgs').textContent.includes('改写后追加YYQ')", timeout=30000)
     n2 = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
-    check("文件改写后整份重载, 消息不重复", n2 == n1 + 1, f"{n1}->{n2}")
+    check("文件改写后整份重载, 消息不重复", n2 == n1a + 1, f"{n1a}->{n2}")
     check("重载后旧消息仍在一次", p.locator("#msgs").inner_text().count("追加的新消息ZZQ") == 1,
           p.locator("#msgs").inner_text().count("追加的新消息ZZQ"))
     # 更新靠服务端推送(SSE), 不是客户端轮询
@@ -996,6 +1231,9 @@ def run(pw):
     # ---- 14b. 刷新按钮 ----
     p.fill("#q", "")
     p.wait_for_timeout(200)
+    check("刷新使用完整的双箭头环形图标",
+          p.locator("#i-refresh path").count() == 2
+          and p.locator("#reload use").get_attribute("href") == "#i-refresh")
     n_before = p.locator(".item").count()
     p.click("#reload")
     p.wait_for_function(
@@ -1061,6 +1299,76 @@ def run(pw):
         check("新建弹窗列出常用目录", p.locator("#new-cwd-list option").count() >= 1)
         check("启动目录可手工输入", p.locator("#new-cwd").input_value().startswith("/"))
         p.click("#new-session-dialog .modal-cancel")
+
+        # 新建 CLI 写出第一条正式记录前只有 pending tmux：手机也必须能切到空
+        # 对话页、添加附件，并直接按 tmux 名关机。
+        tmux_run("sesman", "kill-session", "-t", PENDING_TERM, capture_output=True)
+        tmux_run("sesman", "new-session", "-d", "-s", PENDING_TERM,
+                 "-x", "100", "-y", "30", "-c", str(FAKE_CWD),
+                 "bash --noprofile --norc", check=True)
+        pending_store.put({
+            "name": PENDING_TERM, "source": "claude",
+            "sid": "00000000-dead-beef-0000-000000000002", "cwd": str(FAKE_CWD),
+            "token": "e2e-pending", "before": [], "started": time.time(),
+            "cols": 100, "rows": 30,
+        })
+        p.evaluate("async () => { await loadTermList(); }")
+        viewport(390, 780)
+        p.evaluate("""n => openPendingSession(
+          pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n))""", PENDING_TERM)
+        p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
+        check("手机新建临时会话显示关机按钮",
+              p.locator("#a-session-action").is_visible()
+              and p.locator("#a-session-action").get_attribute("title") == "停止会话"
+              and p.locator("#a-session-action use").get_attribute("href") == "#i-power")
+        check("手机新建临时会话可从终端切换到对话",
+              p.locator("#a-term").get_attribute("title") == "切换到对话")
+        p.click("#a-term")
+        p.wait_for_timeout(200)
+        check("尚无首条消息也显示输入框和附件入口",
+              p.locator("#composer").is_visible() and p.locator("#cadd").is_visible())
+        pending_upload = p.evaluate("""async n => {
+          const uid = pendingUid(n), url = new URL(appUrl('api/session/attachment'));
+          url.searchParams.set('uid', uid); url.searchParams.set('name', 'pending.png');
+          const file = new File([new Uint8Array([1, 2, 3])], 'pending.png', {type:'image/png'});
+          const response = await fetch(url, {method:'POST', headers:{'Content-Type':file.type}, body:file});
+          return {status:response.status, data:await response.json()};
+        }""", PENDING_TERM)
+        check("临时会话第一条消息前即可上传附件",
+              pending_upload["status"] == 200
+              and pending_upload["data"]["relative_path"] == ".sesman_attachments/pending.png",
+              pending_upload)
+        migrated_draft = p.evaluate("""() => {
+          const from = 'tmux:e2e-draft', to = 'claude:e2e-draft';
+          composerDrafts.set(from, {text:'待发送', quotes:[{id:'q', text:'引用'}],
+            attachments:[{id:'a', uploaded:{uid:from, path:'/tmp/a'}}]});
+          migrateComposerDraft(from, to);
+          const draft = composerDrafts.get(to);
+          const result = {old:composerDrafts.has(from), text:draft.text,
+            quotes:draft.quotes.length, files:draft.attachments.length,
+            uploadUid:draft.attachments[0].uploaded.uid};
+          composerDrafts.delete(to);
+          return result;
+        }""")
+        check("临时会话关联正式 uid 时迁移未发送草稿",
+              migrated_draft == {"old": False, "text": "待发送", "quotes": 1,
+                                 "files": 1, "uploadUid": "claude:e2e-draft"},
+              migrated_draft)
+        p.once("dialog", lambda d: d.accept())
+        p.click("#a-session-action")
+        p.wait_for_function("n => !T.pending.some(x => x.name === n)", arg=PENDING_TERM,
+                            timeout=30000)
+        check("手机关机按临时 tmux 名结束并移出列表",
+              tmux_run("sesman", "has-session", "-t", PENDING_TERM,
+                       capture_output=True).returncode != 0
+              and pending_store.get(PENDING_TERM) is None)
+        p.wait_for_timeout(900)
+        check("关机同时取消临时会话关联轮询",
+              not any(PENDING_TERM in error for error in errors), errors[-3:])
+        viewport(1280, 720)
+        p.wait_for_function("!MOBILE.matches")
+        p.wait_for_timeout(200)
+
         dialogs = []
         def _dlg(d):                 # 用完必须摘掉, 否则后面删除会话的确认框也会被它吃掉
             dialogs.append(d.message)
@@ -1102,15 +1410,66 @@ def run(pw):
         check("消息流还在上方", p.locator("#msgs .msg").count() > 0)
         check("按钮变成收起终端", p.locator("#a-term").get_attribute("title") == "收起终端",
               p.locator("#a-term").get_attribute("title"))
-        check("状态显示已接管", "已接管" in p.locator("#tstatus").inner_text(),
-              p.locator("#tstatus").inner_text())
-        p.wait_for_timeout(3500)
-        got = p.evaluate("""() => {
+        check("终端不再增加已接管状态栏",
+              p.locator(".thead, #tstatus").count() == 0
+              and p.locator(".dhead-actions #tmouse").is_visible())
+        p.wait_for_function("""() => {
           const b = T.term.buffer.active; let s = '';
-          for (let i = 0; i < T.term.rows; i++) s += (b.getLine(i)?.translateToString(true) || '');
-          return s.trim().length;
+          for (let i = 0; i < b.length; i++) s += (b.getLine(i)?.translateToString(true) || '');
+          return s.trim().length > 40;
+        }""", timeout=30000)
+        check("终端里 CLI 已经在跑", True)
+        render_batch = p.evaluate("""async () => {
+          const writes = [];
+          const view = {outputBuffer:'', outputTimer:null, ansiTail:'',
+            term:{write:s => writes.push(s)}};
+          queueTermOutput(view, '先清除');
+          queueTermOutput(view, '再重画');
+          await new Promise(resolve => setTimeout(resolve, TERM_RENDER_BATCH_MS + 30));
+          return {writes, pending:view.outputBuffer, timer:!!view.outputTimer};
         }""")
-        check("终端里 CLI 已经在跑", got > 40, got)
+        check("Claude 同一帧的分段重画合并后再交给 xterm",
+              render_batch == {"writes": ["先清除再重画"], "pending": "", "timer": False},
+              render_batch)
+        history_flush = p.evaluate("""() => {
+          const writes = [];
+          const view = {outputBuffer:'', outputTimer:null, ansiTail:'',
+            term:{write:s => writes.push(s)}};
+          queueTermOutput(view, 'x'.repeat(TERM_RENDER_BATCH_MAX));
+          return {count:writes.length, size:writes[0]?.length || 0,
+            pending:view.outputBuffer, timer:!!view.outputTimer};
+        }""")
+        check("大段终端历史绕过合帧缓冲立即回放",
+              history_flush == {"count": 1, "size": 32768, "pending": "", "timer": False},
+              history_flush)
+        resize_dedup = p.evaluate("""() => {
+          const view = currentTermViewObject(), ws = view.ws;
+          const original = ws.send, sent = [];
+          ws.send = data => sent.push(JSON.parse(data));
+          view.lastResizeWs = null; view.lastResizeKey = '';
+          try { fitTerm(true); fitTerm(true); } finally { ws.send = original; }
+          return sent.filter(x => x.t === 'resize');
+        }""")
+        check("相同终端尺寸只向 tmux 通知一次", len(resize_dedup) == 1, resize_dedup)
+        smooth_fit = p.evaluate("""async () => {
+          const view = currentTermViewObject();
+          const service = view.term._core._renderService;
+          const originalClear = service.clear.bind(service);
+          const originalPropose = view.fit.proposeDimensions.bind(view.fit);
+          let clears = 0, proposals = 0;
+          service.clear = () => { clears += 1; return originalClear(); };
+          view.fit.proposeDimensions = () => { proposals += 1; return originalPropose(); };
+          try {
+            fitTerm(); fitTerm(); fitTerm(); fitTerm();
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          } finally {
+            service.clear = originalClear;
+            view.fit.proposeDimensions = originalPropose;
+          }
+          return {clears, proposals};
+        }""")
+        check("同一动画帧的终端适配只执行一次且从不先清屏",
+              smooth_fit == {"clears": 0, "proposals": 1}, smooth_fit)
 
         # 收起只是断开, tmux 会话必须还在 —— 这是选 tmux 承载的意义
         p.click("#a-term")
@@ -1128,10 +1487,97 @@ def run(pw):
         check("再次打开复用同一会话", p.evaluate("T.name") == tname and n_now == len(after["sessions"]),
               f'{p.evaluate("T.name")} {n_now}')
 
+        # 切会话只隐藏当前网页视图，xterm 和 WebSocket 都应继续存活；回来直接复用。
+        p.evaluate("""n => {
+          const v = T.views.get(n);
+          window.__keptTerm = v.term;
+          window.__keptSocket = v.ws;
+        }""", tname)
+        other = p.evaluate("""u => S.sessions.find(x => x.uid !== u && x.size < 2_000_000)?.uid
+          || S.sessions.find(x => x.uid !== u)?.uid""", target)
+        p.evaluate("u => openSession(u)", other)
+        p.wait_for_function("u => S.sel === u && !!document.querySelector('.dhead')", arg=other,
+                            timeout=60000)
+        check("切走后只暂时隐藏终端视图",
+              p.locator("#termpane").is_hidden()
+              and p.evaluate("""n => {
+                const v = T.views.get(n);
+                return T.openViews.has(n) && v?.term === window.__keptTerm
+                  && v?.ws === window.__keptSocket && v.ws.readyState === 1;
+              }""", tname))
+        p.evaluate("u => openSession(u)", target)
+        p.wait_for_function("n => T.name === n && T.ws && T.ws.readyState === 1", arg=tname,
+                            timeout=60000)
+        check("切回会话自动恢复原 tmux 状态",
+              p.locator("#termpane").is_visible() and p.evaluate("T.uid") == target
+              and p.evaluate("""n => T.views.get(n)?.term === window.__keptTerm
+                && T.views.get(n)?.ws === window.__keptSocket""", tname),
+              {"name": p.evaluate("T.name"), "uid": p.evaluate("T.uid")})
+
         # 输入框: 接管后才出现, 内容直接送进 tmux
         p.evaluate("closeTermPane()")
         p.wait_for_timeout(400)
         check("接管后消息流底部出现输入框", p.locator("#composer").is_visible())
+        check("输入框左侧提供附件加号", p.locator("#cadd").is_visible())
+        p.click("#cadd")
+        check("加号菜单提供图片视频音频文件和引用",
+              p.locator("#attach-menu button").evaluate_all(
+                  "nodes => nodes.map(n => n.dataset.attach)")
+              == ["image", "video", "audio", "file", "quote"]
+              and all(label in "".join(p.locator("#attach-menu").all_inner_texts())
+                      for label in ("图片", "视频", "音频", "文件", "引用文字")))
+        p.click('#attach-menu button[data-attach="quote"]')
+        p.fill("#compose-items .draft-quote textarea", "被引用的上下文")
+        check("引用文字显示为可编辑独立卡片",
+              p.locator("#compose-items .draft-quote").count() == 1
+              and p.locator("#compose-items .draft-quote textarea").input_value() == "被引用的上下文")
+        paste_prevented = p.evaluate("""() => {
+          const file = new File([new Uint8Array([137, 80, 78, 71])], '粘贴图片.png', {type:'image/png'});
+          const transfer = new DataTransfer(); transfer.items.add(file);
+          transfer.setData('text/plain', '剪贴板伴随文字不应再次进入正文');
+          const event = new Event('paste', {bubbles:true, cancelable:true});
+          Object.defineProperty(event, 'clipboardData', {value:transfer});
+          document.querySelector('#cinput').dispatchEvent(event);
+          return event.defaultPrevented;
+        }""")
+        check("粘贴附件会拦截剪贴板伴随文字以免正文重复",
+              paste_prevented and p.locator("#cinput").input_value() == "")
+        check("输入框可直接粘贴图片或文件",
+              p.locator("#compose-items .draft-card:not(.draft-quote)").count() == 1
+              and p.locator("#compose-items .draft-thumb img").count() == 1
+              and "[附件1]" in p.locator("#compose-items .draft-info small").inner_text())
+        p.click("#compose-items .draft-card:not(.draft-quote)")
+        check("点击附件卡在正文光标处插入稳定引用",
+              p.locator("#cinput").input_value() == "[附件1]")
+        p.evaluate("""() => addComposerFiles([
+          new File([new Uint8Array([1])], '第二个.txt', {type:'text/plain'})
+        ])""")
+        p.locator("#compose-items .draft-card:not(.draft-quote) .draft-remove").first.click()
+        p.evaluate("""() => addComposerFiles([
+          new File([new Uint8Array([2])], '第三个.txt', {type:'text/plain'})
+        ])""")
+        remaining_refs = p.locator(
+            "#compose-items .draft-card:not(.draft-quote) .draft-info small").all_inner_texts()
+        check("删除附件后不重排编号且新附件不复用旧编号",
+              len(remaining_refs) == 2
+              and "[附件2]" in remaining_refs[0] and "[附件3]" in remaining_refs[1]
+              and p.locator("#cinput").input_value() == "[附件1]", remaining_refs)
+        converted_prompt = p.evaluate("""() => buildComposerPrompt(
+          '请分析 [附件1]，原样保留 @2', [{
+            number:1, relative_path:'.sesman_attachments/图.png'
+          }, {
+            number:3, relative_path:'.sesman_attachments/数据.csv'
+          }], [])""")
+        check("正文原样保留并在空行后追加精简附件清单",
+              converted_prompt == "请分析 [附件1]，原样保留 @2\n\n"
+              "附件1:./.sesman_attachments/图.png\n"
+              "附件3:./.sesman_attachments/数据.csv",
+              converted_prompt)
+        check("纯文字 prompt 保持原样以兼容斜杠命令",
+              p.evaluate("buildComposerPrompt('/rename abc', [], [])") == "/rename abc")
+        p.locator("#compose-items .draft-remove").evaluate_all("nodes => nodes.forEach(n => n.click())")
+        p.fill("#cinput", "")
+        check("附件与引用可以在发送前移除", p.locator("#compose-items .draft-card").count() == 0)
         sent = []
         p.on("response", lambda r: sent.append(r.status) if "/api/term/send" in r.url else None)
         # 手机 Enter 只换行，发送必须点按钮；短 placeholder 不把单行输入框撑高。
@@ -1149,7 +1595,6 @@ def run(pw):
             whiteSpace: hs.whiteSpace, overflow: hs.overflow, textOverflow: ts.textOverflow,
             noOverlap: hr.right <= ar.left + 1};
           title.textContent = old;
-          newBadge(7);
           return result;
         }""")
         check("手机详情标题保持单行省略",
@@ -1158,21 +1603,15 @@ def run(pw):
               and mobile_head["textOverflow"] == "ellipsis"
               and mobile_head["height"] <= mobile_head["lineHeight"] + 2
               and mobile_head["noOverlap"], mobile_head)
-        mobile_badge = p.evaluate("""() => {
+        mobile_summary = p.evaluate("""() => {
           const count = document.querySelector('.mobile-msg-count');
-          const badge = document.querySelector('.mobile-newmsg');
-          const c = count.getBoundingClientRect(), b = badge.getBoundingClientRect();
-          const s = getComputedStyle(badge);
-          return {text: badge.textContent, visible: b.width > 0 && b.height > 0,
-            after: badge.previousElementSibling === count && b.left >= c.right,
-            width: b.width, height: b.height, radius: parseFloat(s.borderRadius)};
+          const c = count.getBoundingClientRect();
+          return {text: count.textContent, visible: c.width > 0 && c.height > 0,
+            unread: document.querySelectorAll('.dhead .newmsg, .dmeta .newmsg').length};
         }""")
-        check("手机新消息以总数后的数字圆标显示",
-              mobile_badge["text"] == "7" and mobile_badge["visible"]
-              and mobile_badge["after"]
-              and abs(mobile_badge["width"] - mobile_badge["height"]) <= 1
-              and mobile_badge["radius"] >= mobile_badge["height"] / 2,
-              mobile_badge)
+        check("手机详情只显示消息总数，不显示未读数",
+              mobile_summary["text"].isdigit() and mobile_summary["visible"]
+              and mobile_summary["unread"] == 0, mobile_summary)
         p.fill("#cinput", "手机第一行")
         mobile_single_line_height = p.locator("#cinput").bounding_box()["height"]
         sent_before_enter = len(sent)
@@ -1185,11 +1624,33 @@ def run(pw):
               p.input_value("#cinput") == "手机第一行\n" and len(sent) == sent_before_enter,
               repr(p.input_value("#cinput")))
         p.fill("#cinput", "")
-        p.evaluate("document.querySelectorAll('.newmsg').forEach(n => n.classList.remove('on'))")
         viewport(1280, 800)
         p.wait_for_timeout(100)
         check("桌面仍提示 Enter 与 Shift+Enter",
               "Shift+Enter" in p.locator("#cinput").get_attribute("placeholder"))
+
+        # 输入内容要等服务端确认后再清空；网络失败时必须保留草稿，不能假装发出。
+        p.evaluate("""() => {
+          window.__sesmanRealPost = post;
+          post = () => new Promise(resolve => setTimeout(() => resolve({ok: true}), 300));
+        }""")
+        p.fill("#cinput", "等待发送确认")
+        p.click("#csend")
+        check("发送确认前保留输入内容",
+              p.input_value("#cinput") == "等待发送确认" and p.locator("#csend").is_disabled())
+        p.wait_for_timeout(400)
+        check("发送确认后才清空输入内容",
+              p.input_value("#cinput") == "" and p.locator("#csend").is_enabled())
+        p.evaluate("post = async () => ({error: '模拟发送失败'})")
+        p.fill("#cinput", "失败后保留草稿")
+        # 本段已安装 _dlg；不要再给同一个 alert 注册第二个处理器。
+        p.click("#csend")
+        p.wait_for_timeout(100)
+        check("发送失败时不丢草稿", p.input_value("#cinput") == "失败后保留草稿")
+        p.wait_for_function("!composerSending", timeout=5000)
+        p.fill("#cinput", "")
+        p.evaluate("post = window.__sesmanRealPost; delete window.__sesmanRealPost")
+
         pane_before = tmux_run(tserver, "capture-pane", "-p", "-t", tname,
                                capture_output=True, text=True).stdout
         if "trust this folder" in pane_before:      # 新起的 TUI 可能停在信任确认页
@@ -1216,15 +1677,14 @@ def run(pw):
             p.wait_for_timeout(500)
         check("输入框内容送进了会话", sent and all(x == 200 for x in sent), sent)
         check("CLI 确实响应了输入", any(k in pane for k in help_words), pane.strip()[-90:])
-        check("发送后输入框清空", p.input_value("#cinput") == "")
+        p.wait_for_function("!composerSending", timeout=5000)
+        composer_after_send = p.input_value("#cinput")
+        check("发送后输入框清空", composer_after_send == "", repr(composer_after_send))
 
         # 专用 server 只做托管：无状态栏/前缀/鼠标接管，滚动留给 xterm。
         for server in ("sesman", "default"):
             tmux_run(server, "kill-session", "-t", "sesman-wheeltest", capture_output=True)
-        wname = json.loads(urllib.request.urlopen(urllib.request.Request(
-            BASE + "/api/term/new",
-            json.dumps({"name": "wheeltest", "cmd": "bash --noprofile --norc", "cwd": "/tmp"}).encode(),
-            {"Content-Type": "application/json"}), timeout=30).read())["name"]
+        wname = term.new_session("wheeltest", "bash --noprofile --norc", "/tmp")
         wserver = term_server(wname)
         check("测试终端位于专用 server", wserver == "sesman", wserver)
         transparent = {
@@ -1260,6 +1720,44 @@ def run(pw):
         check("连接时已把 tmux 历史送入 xterm scrollback",
               p.evaluate("T.term.buffer.normal.baseY") > 100,
               p.evaluate("T.term.buffer.normal.baseY"))
+
+        # 对话气泡和 xterm 都响应颜色方案；两套终端颜色直接交给 xterm 绘制，
+        # 不再滤整张 Canvas，以免浅色模式的抗锯齿像素发粗、出毛边。
+        p.emulate_media(color_scheme="dark")
+        p.wait_for_function("T.term.options.theme.background === '#000000'")
+        check("已打开的 tmux 使用统一黑底源主题且不套反色滤镜",
+              p.evaluate("T.term.options.theme.foreground === '#9da5b0'"
+                         " && T.term.options.theme.brightWhite === '#b9c0ca'"
+                         " && getComputedStyle(document.querySelector('#xterm')).filter === 'none'"))
+        p.emulate_media(color_scheme="light")
+        p.wait_for_function("T.term.options.theme.background === '#f4f6f8'")
+        check("亮色页面切换为明亮原生浅色终端",
+              p.evaluate("T.term.options.theme.foreground === '#252a32'"
+                         " && T.term.options.theme.brightWhite === '#252a32'"
+                         " && getComputedStyle(document.querySelector('#xterm')).filter === 'none'"))
+
+        # 手机锁屏/切后台会冻结 WebSocket，但 tmux 本体仍在。模拟 pagehide/pageshow，
+        # 恢复后必须换一条 socket，并且输入、输出都继续工作。
+        p.evaluate("""() => {
+          window.__termWsBeforeSleep = T.ws;
+          window.dispatchEvent(new PageTransitionEvent('pagehide'));
+        }""")
+        check("页面进入后台时只暂停传输、不丢 tmux 关联",
+              p.evaluate("T.ws === null && T.name") == wname, p.evaluate("T.name"))
+        p.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}))")
+        p.wait_for_function(
+            "T.ws && T.ws !== window.__termWsBeforeSleep && T.ws.readyState === 1", timeout=30000)
+        check("锁屏恢复后自动重建终端连接",
+              p.locator(".thead, #tstatus").count() == 0
+              and p.locator(".dhead-actions #tmouse").is_visible())
+        p.keyboard.type("echo SESMAN_LOCK_RESUME_OK")
+        p.keyboard.press("Enter")
+        p.wait_for_function("""() => { const b = T.term.buffer.active; let s = '';
+          for (let i = b.viewportY; i < b.viewportY + T.term.rows; i++)
+            s += (b.getLine(i)?.translateToString(true) || '');
+          return s.includes('SESMAN_LOCK_RESUME_OK'); }""", timeout=15000)
+        check("重连后终端输入输出均恢复", True)
+
         scroll_urls = []
         def _scroll_req(req):
             if "/api/term/scroll" in req.url:
@@ -1327,10 +1825,61 @@ def run(pw):
         key_labels = p.locator(".term-keys button").all_inner_texts()
         key_tops = [round(p.locator(".term-keys button").nth(i).bounding_box()["y"])
                     for i in range(p.locator(".term-keys button").count())]
+        key_bar = p.locator(".term-keys").bounding_box()
+        terminal_box = p.locator("#xterm").bounding_box()
+        detail_head = p.locator(".dhead").bounding_box()
+        terminal_pane = p.locator("#termpane").bounding_box()
         check("手机终端补齐 Ctrl、Tab、左右、上下、翻页和 Esc",
               all(k in key_labels for k in ("Ctrl", "Tab", "←", "→", "↑", "↓", "Pg↑", "Pg↓", "Esc")),
               key_labels)
         check("手机终端快捷键保持单排", max(key_tops) - min(key_tops) <= 1, key_tops)
+        check("手机终端快捷键位于终端底部",
+              key_bar["y"] >= terminal_box["y"] + terminal_box["height"] - 1,
+              {"keys": key_bar, "terminal": terminal_box})
+        check("手机终端复用对话顶栏而不再增加第二条顶栏",
+              p.locator(".dhead").is_visible() and p.locator(".thead").count() == 0
+              and abs(terminal_pane["y"] - detail_head["y"] - detail_head["height"]) <= 1,
+              {"head": detail_head, "terminal": terminal_pane})
+        keyboard_resize = p.evaluate("""async () => {
+          const root = document.documentElement.style;
+          const view = currentTermViewObject();
+          const service = view.term._core._renderService;
+          const originalClear = service.clear.bind(service);
+          const originalViewportHeight = root.getPropertyValue('--visual-viewport-height');
+          const nextFrame = () => new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          const rowText = () => view.host.querySelector('.xterm-rows')?.textContent.trim().length || 0;
+          let clears = 0;
+          service.clear = () => { clears += 1; return originalClear(); };
+          const rows = [view.term.rows], texts = [rowText()];
+          try {
+            for (const delta of [90, 150, 210, 240]) {
+              root.setProperty('--visual-viewport-height', `${window.innerHeight - delta}px`);
+              layoutTermPane(); fitTerm();
+              await nextFrame();
+              rows.push(view.term.rows); texts.push(rowText());
+            }
+          } finally {
+            root.setProperty('--visual-viewport-height', originalViewportHeight);
+            layoutTermPane(); fitTerm(true);
+            service.clear = originalClear;
+          }
+          return {clears, rows, texts};
+        }""")
+        check("手机键盘动画期间终端逐帧改变行数且不清屏",
+              keyboard_resize["clears"] == 0
+              and len(set(keyboard_resize["rows"])) >= 3,
+              keyboard_resize)
+        check("手机键盘动画的每一帧都保留终端正文",
+              all(x > 0 for x in keyboard_resize["texts"]),
+              keyboard_resize)
+        check("共用顶栏的终端按钮切换回对话",
+              p.locator("#a-term").get_attribute("title") == "切换到对话"
+              and p.locator("#a-term use").get_attribute("href") == "#i-chat")
+        check("终端停止使用会话顶栏的关机图标",
+              p.locator("#a-session-action use").get_attribute("href") == "#i-power"
+              and p.locator("#tstop").count() == 0
+              and p.locator("#i-stop").count() == 0)
         p.click('[data-term-modifier="ctrl"]')
         check("Ctrl 点亮为下一键待用",
               p.locator('[data-term-modifier="ctrl"]').get_attribute("aria-pressed") == "true")
@@ -1344,8 +1893,65 @@ def run(pw):
             p.wait_for_timeout(100)
         check("Ctrl 后输入 c 实际发送 Ctrl+C", pane_command() != "sleep", pane_command())
         viewport(1280, 800)
-        p.wait_for_timeout(200)
-        p.evaluate("fitTerm()")
+        p.evaluate("""() => {
+          const view = currentTermViewObject(), service = view.term._core._renderService;
+          window.__resizeClearService = service;
+          window.__resizeOriginalClear = service.clear.bind(service);
+          window.__resizeClearCount = 0;
+          service.clear = () => { window.__resizeClearCount += 1;
+                                  return window.__resizeOriginalClear(); };
+        }""")
+        desktop_resize_texts = []
+        for width, height in ((1160, 720), (1200, 750), (1240, 775), (1280, 800)):
+            p.set_viewport_size({"width": width, "height": height})
+            p.evaluate("dispatchEvent(new Event('resize'))")
+            p.wait_for_timeout(50)
+            desktop_resize_texts.append(p.evaluate(
+                "T.term.element.querySelector('.xterm-rows').textContent.trim().length"))
+        desktop_resize_clears = p.evaluate("""() => {
+          const count = window.__resizeClearCount;
+          window.__resizeClearService.clear = window.__resizeOriginalClear;
+          delete window.__resizeClearService; delete window.__resizeOriginalClear;
+          delete window.__resizeClearCount;
+          return count;
+        }""")
+        check("电脑连续缩放终端时不调用 renderer.clear",
+              desktop_resize_clears == 0, desktop_resize_clears)
+        check("电脑连续缩放的每一帧都保留终端正文",
+              all(x > 0 for x in desktop_resize_texts), desktop_resize_texts)
+
+        previous_term_layout = p.evaluate("currentTermView()")
+        p.evaluate("T.mode = 'full'; layoutTermPane(); fitTerm(true)")
+        page_overflow_frames = []
+        for height in (800, 740, 680, 620, 680, 740, 800):
+            p.set_viewport_size({"width": 1280, "height": height})
+            p.evaluate("dispatchEvent(new Event('resize'))")
+            # 故意不等 xterm 下一帧 fit，检查旧行 DOM 仍然较高的最危险时刻。
+            page_overflow_frames.append(p.evaluate("""() => {
+              const app = document.querySelector('#app');
+              const right = document.querySelector('#right');
+              const pane = document.querySelector('#termpane');
+              return {inner: innerHeight, document: document.documentElement.scrollHeight,
+                      app: [app.scrollHeight, app.clientHeight],
+                      right: [right.scrollHeight, right.clientHeight],
+                      rootOverflow: getComputedStyle(document.documentElement).overflowY,
+                      bodyOverflow: getComputedStyle(document.body).overflowY,
+                      paneOverflow: getComputedStyle(pane).overflowY};
+            }"""))
+        p.evaluate("""layout => {
+          T.mode = layout.mode; T.height = layout.height;
+          layoutTermPane(); fitTerm(true);
+        }""", previous_term_layout)
+        check("纯终端垂直缩放时根页面始终没有滚动条",
+              all(x["document"] == x["inner"]
+                  and x["rootOverflow"] == "hidden"
+                  and x["bodyOverflow"] == "hidden"
+                  for x in page_overflow_frames), page_overflow_frames)
+        check("旧终端行重排前也不会撑高应用和右栏",
+              all(x["app"][0] == x["app"][1]
+                  and x["right"][0] == x["right"][1]
+                  and x["paneOverflow"] == "hidden"
+                  for x in page_overflow_frames), page_overflow_frames)
 
         was = p.evaluate("T.localMouse")
         p.click("#tmouse")
@@ -1358,6 +1964,18 @@ def run(pw):
         p.wait_for_timeout(400)
         check("鼠标能框选文本", len(p.evaluate("T.term.getSelection()").strip()) > 0,
               repr(p.evaluate("T.term.getSelection()")[:30]))
+        selected_text = p.evaluate("T.term.getSelection()")
+        p.evaluate("T.term.clearSelection()")       # 模拟 Claude 一次 TUI 重绘清掉选区
+        p.wait_for_timeout(100)
+        check("Claude 重绘清除选区后会自动恢复",
+              bool(selected_text) and p.evaluate("T.term.getSelection()") == selected_text,
+              repr(p.evaluate("T.term.getSelection()")[:30]))
+        p.keyboard.press("Control+Shift+C")
+        p.wait_for_timeout(150)
+        copied_text = p.evaluate("navigator.clipboard.readText()")
+        check("终端有选区时 Ctrl+Shift+C 复制而不是发送中断",
+              bool(selected_text) and copied_text == selected_text,
+              {"selected": selected_text[:30], "copied": copied_text[:30]})
         if p.evaluate("T.localMouse") != was:
             p.click("#tmouse")
             p.wait_for_timeout(300)
@@ -1404,28 +2022,44 @@ def run(pw):
         p.remove_listener("dialog", _dlg)
 
     # ---- 15b. 栏宽拖动 + 状态持久化 ----
-    w0 = p.locator("#side").bounding_box()["width"]
+    left_open_width = p.locator("#left").bounding_box()["width"]
+    right_open_width = p.locator("#right").bounding_box()["width"]
+    p.click("#side-toggle")
+    check("电脑端可收起会话列表",
+          p.locator("#left").is_hidden() and p.locator("#drag").is_hidden()
+          and p.locator("#side-toggle").get_attribute("aria-expanded") == "false"
+          and p.locator("#right").bounding_box()["width"] > right_open_width)
+    p.reload(wait_until="networkidle")
+    check("侧栏收起状态跨刷新保留",
+          p.locator("#left").is_hidden()
+          and p.locator("#side-toggle").get_attribute("title") == "展开会话列表")
+    p.click("#side-toggle")
+    check("展开后恢复原侧栏宽度",
+          p.locator("#left").is_visible()
+          and abs(p.locator("#left").bounding_box()["width"] - left_open_width) < 2)
+
+    w0 = p.locator("#left").bounding_box()["width"]
     d = p.locator("#drag").bounding_box()
     p.mouse.move(d["x"] + 2, 400)
     p.mouse.down()
     p.mouse.move(d["x"] + 2 + 130, 400, steps=6)
     p.mouse.up()
-    w1 = p.locator("#side").bounding_box()["width"]
+    w1 = p.locator("#left").bounding_box()["width"]
     check("拖动改变侧栏宽度", abs(w1 - (w0 + 130)) < 10, f"{w0}->{w1}")
     check("详情区跟着收窄", p.locator("#detail").bounding_box()["width"] < 1600 - w1 + 10)
     p.reload(wait_until="networkidle")
     p.wait_for_selector(".item", timeout=15000)
-    check("刷新后宽度保持", abs(p.locator("#side").bounding_box()["width"] - w1) < 2,
-          p.locator("#side").bounding_box()["width"])
+    check("刷新后宽度保持", abs(p.locator("#left").bounding_box()["width"] - w1) < 2,
+          p.locator("#left").bounding_box()["width"])
     p.dblclick("#drag")
     p.wait_for_timeout(200)
-    check("双击复位到默认宽度", abs(p.locator("#side").bounding_box()["width"] - 340) < 2,
-          p.locator("#side").bounding_box()["width"])
+    check("双击复位到默认宽度", abs(p.locator("#left").bounding_box()["width"] - 340) < 2,
+          p.locator("#left").bounding_box()["width"])
     # 拖不出可用区间
     d = p.locator("#drag").bounding_box()
     p.mouse.move(d["x"] + 2, 400); p.mouse.down(); p.mouse.move(5, 400, steps=4); p.mouse.up()
-    check("宽度有下限", p.locator("#side").bounding_box()["width"] >= 200,
-          p.locator("#side").bounding_box()["width"])
+    check("宽度有下限", p.locator("#left").bounding_box()["width"] >= 200,
+          p.locator("#left").bounding_box()["width"])
     p.dblclick("#drag")
     p.wait_for_timeout(200)
 

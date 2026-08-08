@@ -17,13 +17,40 @@ const store = {
   set: (k, v) => localStorage.setItem('sesman.' + k, JSON.stringify(v)),
 };
 
+const FONT_CHOICES = {
+  cascadia: '"Sesman CJK Sans", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
+  system: '"Sesman CJK Sans", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", "Liberation Mono", Consolas, sans-serif',
+  consolas: '"Sesman CJK Sans", Consolas, Consola, "Cascadia Mono", "Liberation Mono", sans-serif',
+};
+const themeMedia = matchMedia('(prefers-color-scheme: dark)');
+
+function applyTheme(choice = store.get('theme', 'system'), persist = false) {
+  if (!['system', 'light', 'dark'].includes(choice)) choice = 'system';
+  if (persist) store.set('theme', choice);
+  document.documentElement.dataset.theme = choice === 'system'
+    ? (themeMedia.matches ? 'dark' : 'light') : choice;
+  if (typeof refreshTerminalPreferences === 'function') refreshTerminalPreferences(true);
+}
+
+function applyFont(choice = store.get('font', 'cascadia'), persist = false) {
+  if (!FONT_CHOICES[choice]) choice = 'cascadia';
+  if (persist) store.set('font', choice);
+  document.documentElement.style.setProperty('--terminal-font', FONT_CHOICES[choice]);
+  if (typeof refreshTerminalPreferences === 'function') refreshTerminalPreferences(false);
+}
+
+themeMedia.addEventListener('change', () => {
+  if (store.get('theme', 'system') === 'system') applyTheme('system');
+});
+applyTheme();
+applyFont();
+
 const S = {
   sessions: [],
   view: store.get('view', 'tree'),
   off: new Set(store.get('off', [])),
   closed: new Set(store.get('closed', [])),
   sel: null,
-  filter: '',
   term: '',           // 当前要高亮的词 (= 搜索框内容)
   opts: Object.assign({ case: false, word: false, regex: false }, store.get('opts', {})),
   cur: -1,            // 匹配跳转游标
@@ -37,6 +64,7 @@ const S = {
   liveTmux: new Set(),// 其中运行在 tmux 里的会话 uid
   liveStarted: new Map(), // uid → 当前 CLI 主进程启动时间（Unix 秒）
   activeOnly: store.get('activeOnly', false), // 左栏只显示仍在运行的会话
+  unread: new Map(store.get('unread', [])),   // uid → {count, tmux}; 只计代理产生的新内容
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -92,7 +120,7 @@ function showMobileDetail() {
 }
 
 function showMobileList() {
-  if (typeof T !== 'undefined' && !$('#termpane').classList.contains('hidden')) closeTermPane();
+  if (typeof T !== 'undefined' && !$('#termpane').classList.contains('hidden')) closeTermPane(true);
   document.body.classList.remove('mobile-detail');
   if (MOBILE.matches) store.set('mobilePage', 'list');
 }
@@ -129,7 +157,8 @@ const dayKey = iso => {
 // ---------------------------------------------------------------- 消息缓存
 // 一次读完整个会话, 结果按 LRU 留在内存; 会话是 append-only 的,
 // 再次打开时只向服务端要新追加的部分。
-const CACHE_MAX_BYTES = 64 * 1024 * 1024;
+let cacheLimitMb = Math.max(0, +store.get('cacheMb', 256) || 0);
+let CACHE_MAX_BYTES = cacheLimitMb ? cacheLimitMb * 1024 * 1024 : Infinity;
 const RENDER_BATCH = 250;
 const SYNC_MS = 10000;      // 没在运行的会话, 偶尔看一眼就行
 const LIVE_MS = 3000;       // 活跃探测(扫 /proc)的间隔
@@ -141,6 +170,11 @@ const BACKUP_MS = 20000;    // SSE 正常时的兜底对账间隔
 const LIST_MS = 8000;       // 会话列表跟进磁盘变化的间隔
 const cache = new Map();          // viewKey → {meta, msgs, version, end, bytes}
 const viewKey = (uid, agent = null) => agent ? `${uid}::${agent}` : uid;
+const INCOMING_ROLES = new Set([
+  'assistant', 'assistant·subagent', 'thinking', 'tool', 'tool_result', 'question',
+]);
+const incomingCount = msgs => msgs.filter(m => m.counted !== false && INCOMING_ROLES.has(m.role)).length;
+const messageCount = msgs => msgs.filter(m => m.counted !== false).length;
 
 function cacheGet(uid) {
   const e = cache.get(uid);
@@ -148,16 +182,35 @@ function cacheGet(uid) {
   return e;
 }
 
+function cacheEntryUid(key, entry) {
+  // 子代理视图的 key 是 uid::agent，但它和主会话共用同一个 tmux 生命周期。
+  return entry?.meta?.uid || String(key).split('::', 1)[0];
+}
+
+function cacheEntryPinned(key, entry) {
+  const uid = cacheEntryUid(key, entry);
+  return S.liveTmux.has(uid)
+    || (typeof T !== 'undefined' && T.list?.some(x => x.uid === uid));
+}
+
+function trimCache() {
+  // tmux 对话必须随时切回即见，因此不计入容量、也不参与淘汰。
+  // 普通历史对话单独共享用户设置的容量，并延续“至少保留最新一份”的旧行为。
+  const evictable = [...cache].filter(([key, entry]) => !cacheEntryPinned(key, entry));
+  let total = evictable.reduce((n, [, entry]) => n + (+entry.bytes || 0), 0);
+  let remaining = evictable.length;
+  for (const [key, entry] of evictable) {
+    if (total <= CACHE_MAX_BYTES || remaining <= 1) break;
+    cache.delete(key);
+    total -= +entry.bytes || 0;
+    remaining--;
+  }
+}
+
 function cachePut(uid, e) {
   cache.delete(uid);
   cache.set(uid, e);
-  let total = 0;
-  for (const v of cache.values()) total += v.bytes;
-  while (total > CACHE_MAX_BYTES && cache.size > 1) {
-    const oldest = cache.keys().next().value;
-    total -= cache.get(oldest).bytes;
-    cache.delete(oldest);
-  }
+  trimCache();
 }
 
 /** 带下载进度的取消息。start/head 给定时服务端只回新增部分。 */
@@ -239,6 +292,10 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     return 0;
   }
   e.msgs = e.msgs.concat(data.messages);
+  const incoming = incomingCount(data.messages);
+  const detailVisible = S.sel === uid && S.agent === agent
+    && (!MOBILE.matches || document.body.classList.contains('mobile-detail'));
+  if (incoming && !detailVisible) addUnread(uid, incoming);
   if (S.sel !== uid || S.agent !== agent) return data.messages.length;
   const box = $('#msgs');
   if (!box) return data.messages.length;
@@ -250,13 +307,13 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   mark.remove();
   renderActivity(e.activity);
   const c = $('#mcount-total');
-  if (c) c.textContent = `${e.msgs.length} 条消息`;
+  const total = messageCount(e.msgs);
+  if (c) c.textContent = `${total} 条消息`;
   const mc = $('.mobile-msg-count');
   if (mc) {
-    mc.textContent = e.msgs.length;
-    mc.setAttribute('aria-label', `${e.msgs.length} 条消息`);
+    mc.textContent = total;
+    mc.setAttribute('aria-label', `${total} 条消息`);
   }
-  newBadge(data.messages.length);
   return data.messages.length;
 }
 
@@ -312,15 +369,48 @@ function closeWatch() {
   if (_es) { _es.close(); _es = null; _esUid = null; }
 }
 
-function newBadge(n) {
-  for (const b of document.querySelectorAll('.newmsg')) {
-    const mobile = b.classList.contains('mobile-newmsg');
-    b.textContent = mobile ? String(n) : `+${n} 条新消息`;
-    b.setAttribute('aria-label', `${n} 条新消息`);
-    b.classList.add('on');
-    clearTimeout(b._t);
-    b._t = setTimeout(() => b.classList.remove('on'), 4000);
-  }
+function unreadRow(uid) {
+  const value = S.unread.get(uid);
+  if (typeof value === 'number') return { count: value, tmux: false };
+  return value && typeof value === 'object'
+    ? { count: Math.max(0, +value.count || 0), tmux: !!value.tmux }
+    : { count: 0, tmux: false };
+}
+
+function saveUnread() {
+  store.set('unread', [...S.unread].filter(([, row]) => (+row?.count || +row || 0) > 0));
+}
+
+function paintItemStatus(node) {
+  if (!node) return;
+  const badge = node.querySelector(':scope > .ico > .item-status');
+  if (!badge) return;
+  const row = unreadRow(node.dataset.uid);
+  const pending = !!node.dataset.tmuxName;
+  const active = pending || S.live.has(node.dataset.uid);
+  const tmux = pending || S.liveTmux.has(node.dataset.uid) || (row.count > 0 && row.tmux);
+  badge.textContent = row.count > 99 ? '99+' : (row.count || '');
+  badge.classList.toggle('visible', active || row.count > 0);
+  badge.classList.toggle('counted', row.count > 0);
+  badge.classList.toggle('tmux', tmux);
+  badge.title = badge.ariaLabel = row.count
+    ? `${row.count} 条新内容${tmux ? '，tmux 会话' : ''}`
+    : (tmux ? 'tmux 会话运行中' : '会话运行中');
+}
+
+function addUnread(uid, count) {
+  if (!uid || count <= 0) return;
+  const row = unreadRow(uid);
+  S.unread.set(uid, { count: row.count + count, tmux: S.liveTmux.has(uid) || row.tmux });
+  saveUnread();
+  paintItemStatus(document.querySelector(`.item[data-uid="${CSS.escape(uid)}"]`));
+}
+
+function clearUnread(uid) {
+  if (!uid || !S.unread.has(uid)) return;
+  S.unread.delete(uid);
+  saveUnread();
+  paintItemStatus(document.querySelector(`.item[data-uid="${CSS.escape(uid)}"]`));
 }
 
 /** 兜底轮询: SSE 连着的时候只是很慢地对一下账, 断了才回到自适应的快节奏。 */
@@ -354,6 +444,7 @@ async function refreshLive(force = false) {
   S.live = next;
   S.liveTmux = nextTmux;
   S.liveStarted = nextStarted;
+  trimCache();
   if (changed) {
     paintLive();
   }
@@ -382,6 +473,7 @@ function paintLive() {
       && typeof T !== 'undefined' && T.list?.some(t => t.name === n.dataset.tmuxName);
     n.classList.toggle('live', !!pendingRunning || S.live.has(n.dataset.uid));
     n.classList.toggle('live-tmux', !!pendingRunning || S.liveTmux.has(n.dataset.uid));
+    paintItemStatus(n);
   }
   const h = $('#dlive');
   if (h) {
@@ -472,6 +564,19 @@ function pendingTmuxSessions() {
 
 const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions];
 
+function mergeSessionMetaEvent(entry, session) {
+  if (entry.meta.agent_id || !session.renamed_at || !session.renamed_to) return false;
+  const eventId = `rename:${session.sid}:${session.renamed_at}`;
+  if (entry.msgs.some(m => m.event_id === eventId)) return false;
+  const event = {
+    role: 'command', text: `/rename ${session.renamed_to}`, ts: session.renamed_at,
+    counted: false, inferred: true, event_id: eventId,
+  };
+  const at = entry.msgs.findIndex(m => m.ts && m.ts > event.ts);
+  entry.msgs.splice(at < 0 ? entry.msgs.length : at, 0, event);
+  return true;
+}
+
 /** 列表元数据变更后同步缓存和当前详情标题，不重绘消息正文。 */
 function refreshSessionMeta() {
   const headerKey = m => JSON.stringify([
@@ -480,12 +585,14 @@ function refreshSessionMeta() {
   ]);
   const before = cache.get(viewKey(S.sel, S.agent));
   const beforeKey = before ? headerKey(before.meta) : '';
+  let currentEventAdded = false;
   for (const s of S.sessions) {
     for (const e of cache.values()) {
       if (e.meta.uid !== s.uid) continue;
       const agent = e.meta.agent_id;
       if (!agent) {
         e.meta = { ...e.meta, ...s };
+        if (mergeSessionMetaEvent(e, s) && e === before) currentEventAdded = true;
         continue;
       }
       const item = (s.agent_items || []).find(a => a.id === agent);
@@ -500,21 +607,49 @@ function refreshSessionMeta() {
   }
   const current = cache.get(viewKey(S.sel, S.agent));
   const oldHead = $('#detail > .dhead');
-  if (current && oldHead && headerKey(current.meta) !== beforeKey) {
-    oldHead.replaceWith(head(current.meta, current.msgs.length));
+  if (currentEventAdded && current) {
+    renderSession(current.meta, current.msgs, current.activity);
+  } else if (current && oldHead && headerKey(current.meta) !== beforeKey) {
+    oldHead.replaceWith(head(current.meta, messageCount(current.msgs)));
   }
 }
 
+let sessionLoadRun = 0;
+let sessionLoadRetry = null;
+
 async function loadSessions(force) {
+  const run = ++sessionLoadRun;
+  clearTimeout(sessionLoadRetry);
   $('#stat').textContent = force ? ' 重新扫描…' : ' 加载中…';
-  const r = await fetch(appUrl('api/sessions' + (force ? '?force=1' : '')));
-  const d = await r.json();
+  const ac = new AbortController();
+  const timeout = setTimeout(() => ac.abort(), 15000);
+  let d;
+  try {
+    const r = await fetch(appUrl('api/sessions' + (force ? '?force=1' : '')), { signal: ac.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    d = await r.json();
+    if (!Array.isArray(d.sessions)) throw new Error('会话列表格式错误');
+  } catch (e) {
+    if (run !== sessionLoadRun) return false;
+    $('#stat').textContent = ' 加载失败';
+    $('#stat').classList.add('err');
+    $('#side').innerHTML = `<div class="empty load-failed">
+      <p>会话列表暂时无法加载</p><button class="btn load-retry">重试</button></div>`;
+    $('.load-retry').onclick = () => loadSessions(false);
+    sessionLoadRetry = setTimeout(() => loadSessions(false), 3000);
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (run !== sessionLoadRun) return false;
+  $('#stat').classList.remove('err');
   S.sig = d.sig;
   S.sessions = d.sessions;
   refreshSessionMeta();
   renderChips();
   renderSide();
   showSessionCount(sidebarSessions().length);
+  return true;
 }
 
 /** 列表自动跟进磁盘变化。签名没变时服务端只回一个 unchanged, 成本为个位数毫秒。 */
@@ -664,7 +799,7 @@ function renderSide() {
                               + (s.pending ? ' pending live live-tmux' : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
                               + (!s.pending && S.liveTmux.has(s.uid) ? ' live-tmux' : ''),
-        `<span class="ico">${icon(s.source)}</span>
+        `<span class="ico">${icon(s.source)}<span class="item-status"></span></span>
          <div class="body">
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
            <div class="m">${esc(meta)}</div>
@@ -675,6 +810,7 @@ function renderSide() {
       it.dataset.uid = s.uid;
       if (s.pending) it.dataset.tmuxName = s.tmuxName;
       it.onclick = () => s.pending ? openPendingSession(s) : openSession(s.uid);
+      paintItemStatus(it);
       ul.appendChild(it);
     }
     g.appendChild(ul);
@@ -767,11 +903,12 @@ async function openSession(uid, agent = null) {
   const ac = inflight = new AbortController();
   closeWatch();
   if (typeof T !== 'undefined') {
-    if (T.uid && (T.uid !== uid || selectedAgent)) closeTermPane();
+    if (T.uid && (T.uid !== uid || selectedAgent)) closeTermPane(true);
     $('#composer').classList.add('hidden');    // 先收起, 渲染完再按新会话的状态决定
   }
   S.sel = uid;
   S.agent = selectedAgent;
+  clearUnread(uid);
   store.set('sel', uid);
   store.set('agent', S.agent ? { uid, id: S.agent } : null);
   renderSide();
@@ -917,7 +1054,7 @@ async function renderSession(meta, msgs, activity = null) {
   if (S.sel !== uid || S.agent !== agent) return;
   const d = $('#detail');
   d.innerHTML = '';
-  d.appendChild(head(meta, msgs.length));
+  d.appendChild(head(meta, messageCount(msgs)));
   const box = el('div', 'msgs');
   box.id = 'msgs';
   d.appendChild(box);
@@ -960,6 +1097,7 @@ async function renderSession(meta, msgs, activity = null) {
   }
   if (seq === renderSeq && S.sel === uid && S.agent === agent) {
     watchSession(meta.uid, agent); // 之后的更新由服务端推过来
+    if (typeof restoreTermPane === 'function') restoreTermPane(uid, agent);
   }
 }
 
@@ -992,7 +1130,6 @@ function head(m, total) {
       <div class="dhead-actions" aria-label="会话操作">
         <span class="mobile-msg-summary">
           <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
-          <span class="newmsg mobile-newmsg" aria-live="polite"></span>
         </span>
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
           (!m.agent_id && typeof T !== 'undefined' && T.enabled)
@@ -1008,7 +1145,6 @@ function head(m, total) {
       <span id="mcount-total">${total} 条消息</span>
       <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}"
         title="${tmuxLive ? '运行于 tmux' : '运行中'}" aria-label="${tmuxLive ? '运行于 tmux' : '运行中'}">●</span>
-      <span id="newmsg" class="newmsg" aria-live="polite"></span>
       <span class="meta-secondary">${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
       <span class="meta-secondary">${fmtSize(m.size)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
@@ -1103,11 +1239,12 @@ const ROLE_LABEL = {
   user: '👤 用户', assistant: '🤖 助手', 'user·subagent': '👤 子代理输入',
   'assistant·subagent': '🤖 子代理', thinking: '💭 思考', system: '⚙️ 系统',
   tool: '🔧 工具调用', tool_result: '📄 工具输出', context: '📎 注入上下文',
-  question: '❓ 询问', answer: '💬 回答',
+  question: '❓ 询问', answer: '💬 回答', command: '⌘ 命令', event: '⚙️ 会话事件',
 };
 // 连续 3 条以上的工具调用/输出合并成一个可折叠的组, 避免刷屏
 const TOOL_ROLES = new Set(['tool', 'tool_result']);
-const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent', 'thinking', 'question', 'answer']);
+const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent',
+                              'thinking', 'question', 'answer', 'command']);
 const GROUP_MIN = 3;
 
 /** 先算分组(纯计算, 很快), 再分批建 DOM —— 分批不会把一个组切成两半。 */
@@ -1247,6 +1384,13 @@ function renderFormulae(root) {
   } catch { /* 单个坏公式按原文保留，不能拖垮整条消息 */ }
 }
 
+/** KaTeX 延后加载；库就绪时补渲染首屏期间已经打开的消息。 */
+function refreshFormulae() {
+  for (const root of document.querySelectorAll('#msgs .mb')) {
+    if (!root.querySelector('.katex')) renderFormulae(root);
+  }
+}
+
 function msgNode(m) {
   if (m.role === 'question') return questionNode(m);
   // 命中的消息展开且不截断, 保证高亮可见; 但设上限, 否则搜 "a" 会把整个会话全量展开
@@ -1259,6 +1403,7 @@ function msgNode(m) {
   const n = el('div', 'msg' + (foldable && !hit ? ' folded' : '')
                             + (found && !hit ? ' hashit' : ''));
   n.dataset.role = m.role;
+  if (m.counted === false) n.dataset.counted = 'false';
   const label = (ROLE_LABEL[m.role] || m.role) + (m.name ? ` · ${m.name}` : '');
   const peek = m.text.replace(/\s+/g, ' ').slice(0, 200);
   const preview = foldable ? addFoldPreview(n, peek, label, found && !hit) : null;
@@ -1463,9 +1608,28 @@ function setSideWidth(px, save) {
   }
   const w = Math.round(Math.max(200, Math.min(px, window.innerWidth - 320)));
   $('#left').style.width = w + 'px';
-  document.documentElement.style.setProperty('--side-width', w + 'px');
+  document.documentElement.style.setProperty('--side-width',
+    document.body.classList.contains('side-collapsed') ? '0px' : w + 'px');
   if (save) store.set('width', w);
 }
+
+function setSideCollapsed(collapsed, save = true) {
+  collapsed = !!collapsed && !MOBILE.matches;
+  document.body.classList.toggle('side-collapsed', collapsed);
+  const button = $('#side-toggle');
+  const label = collapsed ? '展开会话列表' : '收起会话列表';
+  button.title = button.ariaLabel = label;
+  button.setAttribute('aria-expanded', String(!collapsed));
+  if (save) store.set('sideCollapsed', collapsed);
+  const width = parseInt($('#left').style.width, 10) || store.get('width', SIDE_DEFAULT);
+  document.documentElement.style.setProperty('--side-width', collapsed ? '0px' : width + 'px');
+  requestAnimationFrame(() => {
+    if (typeof fitTerm === 'function' && T?.term) fitTerm();
+  });
+}
+
+$('#side-toggle').onclick = () => setSideCollapsed(
+  !document.body.classList.contains('side-collapsed'));
 
 let dragging = false;
 $('#drag').addEventListener('mousedown', e => {
@@ -1492,11 +1656,12 @@ MOBILE.addEventListener?.('change', e => {
   }
   syncMobileViewport();
   setSideWidth(store.get('width', SIDE_DEFAULT));
+  setSideCollapsed(store.get('sideCollapsed', false), false);
 });
 
 $('#q').oninput = e => {
   if (S.results) { S.results = null; }     // 改动输入即退出全文搜索态
-  S.filter = S.term = e.target.value.trim();
+  S.term = e.target.value.trim();
   renderSide();
 };
 
@@ -1614,16 +1779,38 @@ function renderOpts() {
 
 $('#reload').onclick = () => { S.results = null; loadSessions(true); };
 
+function openSettings() {
+  $('#setting-font').value = store.get('font', 'cascadia');
+  $('#setting-theme').value = store.get('theme', 'system');
+  $('#setting-cache').value = String(cacheLimitMb);
+  $('#settings-dialog').showModal();
+}
+
+$('#settings').onclick = openSettings;
+$('#settings-dialog').addEventListener('click', e => {
+  if (e.target === $('#settings-dialog')) $('#settings-dialog').close();
+});
+$('#setting-font').onchange = e => applyFont(e.target.value, true);
+$('#setting-theme').onchange = e => applyTheme(e.target.value, true);
+$('#setting-cache').onchange = e => {
+  cacheLimitMb = Math.max(0, +e.target.value || 0);
+  CACHE_MAX_BYTES = cacheLimitMb ? cacheLimitMb * 1024 * 1024 : Infinity;
+  store.set('cacheMb', cacheLimitMb);
+  trimCache();
+};
+
 document.addEventListener('keydown', e => {
   if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); }
   if (e.key === 'Escape') { $('#q').blur(); }
 });
 
 setSideWidth(store.get('width', SIDE_DEFAULT));
+setSideCollapsed(store.get('sideCollapsed', false), false);
 renderOpts();
 renderView();
 pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
-loadSessions(false).then(() => {
+loadSessions(false).then(ok => {
+  if (!ok) return;
   const last = store.get('sel', null);       // 恢复上次看的会话
   const savedAgent = store.get('agent', null);
   const restoreDetail = !MOBILE.matches || store.get('mobilePage', 'list') === 'detail';

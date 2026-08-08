@@ -2,23 +2,26 @@
 
 // 接管会话: 在服务端把它用 tmux resume 起来, 然后把终端嵌在会话详情底部。
 // 会话跑在 tmux 里, 所以关掉页面/重启 sesman 都不会打断它。
+const TERM_RENDER_BATCH_MS = 20;
+const TERM_RENDER_BATCH_MAX = 32 * 1024;
 
 const T = {
   term: null,      // xterm 实例
-  fit: null,
   ws: null,
   name: null,      // 当前挂着的 tmux 会话名
   uid: null,       // 对应的 sesman 会话
+  views: new Map(), // 已打开过且仍存活的 tmux → xterm/WebSocket；切会话只隐藏
   enabled: false,
   height: store.get('termh', 320),
   mode: store.get('termmode', 'normal'), // normal | collapsed | full
   localMouse: store.get('tmouse', false),   // true = 鼠标归浏览器, 可以框选复制
-  scrollPos: 0,                             // tmux 里往上翻了多少行
   ctrlArmed: false,                         // 手机 Ctrl：只修饰下一次输入
   sources: {},
   home: '',
   pending: [],
   resolving: new Set(),
+  resolveControllers: new Map(),
+  openViews: new Map(store.get('termviews', [])), // tmux 名 → {mode, height}
 };
 
 // 应用(claude/codex 的 TUI)申请接管鼠标的那些序列。选择模式下要拦掉,
@@ -27,11 +30,19 @@ const MOUSE_ON = /\x1b\[\?(1000|1002|1003|1005|1006|1015)h/g;
 const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
 
 function termTheme() {
-  const css = getComputedStyle(document.documentElement);
+  const css = getComputedStyle(document.querySelector('#xterm') || document.documentElement);
   const read = name => css.getPropertyValue(name).trim();
   return {
     background: read('--terminal-bg'), foreground: read('--terminal-fg'),
     cursor: read('--terminal-cursor'), selectionBackground: read('--terminal-selection'),
+    black: read('--terminal-black'), red: read('--terminal-red'),
+    green: read('--terminal-green'), yellow: read('--terminal-yellow'),
+    blue: read('--terminal-blue'), magenta: read('--terminal-magenta'),
+    cyan: read('--terminal-cyan'), white: read('--terminal-white'),
+    brightBlack: read('--terminal-bright-black'), brightRed: read('--terminal-bright-red'),
+    brightGreen: read('--terminal-bright-green'), brightYellow: read('--terminal-bright-yellow'),
+    brightBlue: read('--terminal-bright-blue'), brightMagenta: read('--terminal-bright-magenta'),
+    brightCyan: read('--terminal-bright-cyan'), brightWhite: read('--terminal-bright-white'),
   };
 }
 
@@ -45,10 +56,95 @@ function termFontSize() {
   return Number.isFinite(value) ? value : 14.04;
 }
 
-// xterm 用 canvas 绘字；先等网页字体就绪，避免它按回退字体计算字符宽度。
+function reflectedLightRgb(r, g, b, background = false) {
+  r /= 255; g /= 255; b /= 255;
+  const hi = Math.max(r, g, b), lo = Math.min(r, g, b);
+  const sourceLight = (hi + lo) / 2;
+  let h = 0, s = 0;
+  if (hi !== lo) {
+    const d = hi - lo;
+    s = d / (1 - Math.abs(2 * sourceLight - 1));
+    if (hi === r) h = ((g - b) / d) % 6;
+    else if (hi === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h = (h * 60 + 360) % 360;
+  }
+  // 保持色相、反射亮度；轻微曲线把中间色拉回 50%，避免彩色文字过艳。
+  const reflected = 1 - sourceLight;
+  const sign = Math.sign(reflected - .5);
+  let l = .5 + sign * .5 * Math.pow(Math.abs(reflected - .5) / .5, 1.35);
+  if (background) l = Math.min(l, .96);   // 显式黑底随亮色方案恢复为接近白色
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let rr = 0, gg = 0, bb = 0;
+  if (h < 60) [rr, gg, bb] = [c, x, 0];
+  else if (h < 120) [rr, gg, bb] = [x, c, 0];
+  else if (h < 180) [rr, gg, bb] = [0, c, x];
+  else if (h < 240) [rr, gg, bb] = [0, x, c];
+  else if (h < 300) [rr, gg, bb] = [x, 0, c];
+  else [rr, gg, bb] = [c, 0, x];
+  return [rr, gg, bb].map(v => Math.max(0, Math.min(255, Math.round((v + m) * 255))));
+}
+
+function indexedTerminalRgb(n) {
+  if (n >= 232 && n <= 255) {
+    const v = 8 + (n - 232) * 10;
+    return [v, v, v];
+  }
+  if (n < 16 || n > 231) return null;    // 前 16 色直接由 xterm theme 精确控制
+  const steps = [0, 95, 135, 175, 215, 255];
+  n -= 16;
+  return [steps[Math.floor(n / 36)], steps[Math.floor(n / 6) % 6], steps[n % 6]];
+}
+
+function lightTerminalAnsi(s) {
+  const rgb = (kind, r, g, b) => {
+    const out = reflectedLightRgb(+r, +g, +b, kind === '48');
+    return `${kind};2;${out.join(';')}`;
+  };
+  s = s.replace(/(38|48);2;(\d{1,3});(\d{1,3});(\d{1,3})/g, (_, ...v) => rgb(...v.slice(0, 4)));
+  s = s.replace(/(38|48):2(?::\d*)?:(\d{1,3}):(\d{1,3}):(\d{1,3})/g,
+    (_, ...v) => rgb(...v.slice(0, 4)));
+  return s.replace(/(38|48);5;(\d{1,3})/g, (all, kind, value) => {
+    const source = indexedTerminalRgb(+value);
+    if (!source) return all;
+    return rgb(kind, ...source);
+  });
+}
+
+function terminalColorChunk(view, s) {
+  s = (view.ansiTail || '') + s;
+  view.ansiTail = '';
+  if (document.documentElement.dataset.theme !== 'light') return s;
+  // PTY/WebSocket 可能恰好在 CSI 中间断包，留下不完整尾巴等下一块再处理。
+  const tail = s.match(/\x1b\[[0-9;:]*$/)?.[0] || '';
+  if (tail) {
+    view.ansiTail = tail;
+    s = s.slice(0, -tail.length);
+  }
+  return lightTerminalAnsi(s);
+}
+
+async function refreshTerminalPreferences(redraw = false) {
+  try { await document.fonts?.load(`${termFontSize()}px ${termFont()}`, 'MW0il'); } catch {}
+  const views = T.views ? T.views.values() : (T.term ? [{ term: T.term }] : []);
+  const redrawNames = [];
+  for (const view of views) {
+    view.term.options.fontFamily = termFont();
+    view.term.options.theme = termTheme();
+    if (redraw && view.name) redrawNames.push(view.name);
+  }
+  for (const name of redrawNames) attachTerm(name);
+  if (redraw && !redrawNames.length && T.name) attachTerm(T.name);
+  setTimeout(() => { fitTerm(); }, 0);
+}
+
+// xterm 先测量网页字体再创建 DOM 行，避免按回退字体计算出错误的字符宽度。
 const terminalFontReady = document.fonts
   ? document.fonts.load(`${termFontSize()}px ${termFont()}`, 'MW0il')
   : Promise.resolve();
+addEventListener('resize', () => { layoutTermPane(); fitTerm(); });
 
 async function loadTermList() {
   const fingerprint = () => [
@@ -56,8 +152,10 @@ async function loadTermList() {
     ...(T.pending || []).map(x => `pending\t${x.name}\t${x.cwd}`),
   ].join('\n');
   const before = fingerprint();
+  let loaded = false;
   try {
     const d = await (await fetch(appUrl('api/term/list'))).json();
+    loaded = true;
     T.enabled = !!d.enabled;
     T.list = d.sessions || [];
     T.sources = d.sources || {};
@@ -69,9 +167,29 @@ async function loadTermList() {
     T.sources = {};
     T.pending = [];
   }
+  if (loaded) {
+    const valid = new Set([...T.list, ...T.pending].map(x => x.name));
+    const kept = new Map([...T.openViews].filter(([name]) => valid.has(name)));
+    if (kept.size !== T.openViews.size) {
+      T.openViews = kept;
+      store.set('termviews', [...kept]);
+    }
+    for (const name of T.views.keys()) {
+      if (!valid.has(name)) disposeTermView(name);
+    }
+    // tmux 结束后，对应的消息缓存才重新回到普通 LRU 容量池。
+    if (typeof trimCache === 'function') trimCache();
+  }
   $('#new-session')?.classList.toggle('hidden', !T.enabled);
+  // app.js 先于体积较大的终端库执行。若详情已在终端库就绪前打开，
+  // 重新生成一次标题栏，把接管/切换入口补上。
+  const current = typeof cache !== 'undefined' ? cache.get(viewKey(S.sel, S.agent)) : null;
+  const oldHead = $('#detail > .dhead');
+  if (T.enabled && current && oldHead && !S.agent && !oldHead.querySelector('#a-term')) {
+    oldHead.replaceWith(head(current.meta, messageCount(current.msgs)));
+  }
   const after = fingerprint();
-  if (after !== before && typeof renderSide === 'function') {
+  if (after !== before && S.sig && typeof renderSide === 'function') {
     const side = $('#side'), top = side?.scrollTop || 0;
     renderChips();
     if (!S.results) showSessionCount(sidebarSessions().length);
@@ -81,14 +199,20 @@ async function loadTermList() {
   }
   // 刷新页面后仍从持久化 meta 恢复关联轮询；Set 防止重复启动。
   for (const pending of pendingTmuxSessions()) resolveNewSession(pending);
+  restoreTermPane(S.sel, S.agent);
 }
 
 /** 某个会话是否已经被接管 (存在对应的 tmux 会话)。 */
 function takenOver(uid) {
+  if (String(uid || '').startsWith('tmux:')) {
+    const name = String(uid).slice(5);
+    return [...(T.list || []), ...(T.pending || [])].some(x => x.name === name) ? name : null;
+  }
   const s = S.sessions.find(x => x.uid === uid);
   if (!s || !T.list) return null;
   const name = `sesman-${s.source}-${String(s.sid).slice(0, 8)}`;
-  return T.list.some(x => x.name === name) ? name : null;
+  return T.list.find(x => x.uid === uid)?.name
+    || (T.list.some(x => x.name === name) ? name : null);
 }
 
 // ---------------------------------------------------------------- 接管
@@ -116,7 +240,6 @@ async function takeover(uid, btn) {
     S.liveTmux.add(uid);
     paintLive();
     openTermPane(d.name);
-    if (d.action === 'killed') newBadge('已结束原实例并接管');
   } finally {
     setBtn('接管会话', false);
     renderTakeoverBtn();
@@ -182,24 +305,64 @@ function openNewSessionDialog() {
 }
 
 function showNewSessionStage(info) {
+  // create 返回后 term/list 可能还没拉完；先把服务端刚确认的新 tmux 放进本地
+  // pending，详情页的终端切换、输入框和附件可以立即使用。
+  if (!T.pending.some(x => x.name === info.name)) T.pending.push({ ...info, started: Date.now() / 1000 });
   S.results = null;
-  S.filter = S.term = '';
+  S.term = '';
   $('#q').value = '';
   S.sel = pendingUid(info.name);
   store.set('sel', S.sel);
   renderSide();
   showSessionCount(sidebarSessions().length);
-  $('#composer').classList.add('hidden');
   const src = SOURCES[info.source];
   $('#detail').innerHTML = `<div class="dhead"><div class="dtitle">
     <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
-    <h2>${icon(info.source)}<span>新建 ${esc(src.name)} 会话</span></h2></div>
-    <div class="dmeta"><span class="meta-source">${esc(src.name)}</span><span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>
+    <h2>${icon(info.source)}<span>新建 ${esc(src.name)} 会话</span></h2>
+    <div class="dhead-actions" aria-label="会话操作">
+      <span class="mobile-msg-summary"><span class="mobile-msg-count" aria-label="0 条消息">0</span></span>
+      <button class="iconbtn" id="a-term" title="切换到终端" aria-label="切换到终端">${uiIcon('terminal')}</button>
+      <button class="iconbtn danger" id="a-session-action" title="停止会话" aria-label="停止会话">${uiIcon('power')}</button>
+    </div></div>
+    <div class="dmeta"><span class="meta-source">${esc(src.name)}</span><span id="mcount-total">0 条消息</span>
+      <span id="dlive" class="dlive on tmux" title="运行于 tmux" aria-label="运行于 tmux">●</span>
+      <span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>
   </div><div class="empty new-session-wait">终端已启动，正在等待会话记录落盘…</div>`;
   $('#detail .mobile-back').onclick = showMobileList;
+  $('#a-term').onclick = () => {
+    T.uid = S.sel;
+    toggleTermPane(info.name);
+  };
+  $('#a-session-action').onclick = () => stopPendingSession(info, $('#a-session-action'));
   showMobileDetail();
-  T.uid = null;
-  T.mode = 'full';
+  T.uid = S.sel;
+  if (!MOBILE.matches) T.mode = 'full';   // 手机本来就是终端覆盖层，不污染桌面保存的高度模式
+  renderComposer();
+  renderTakeoverBtn();
+}
+
+async function stopPendingSession(info, button) {
+  if (!confirm(`停止并移除「新建 ${SOURCES[info.source].name} 会话」?`)) return;
+  button.disabled = true;
+  try {
+    T.resolveControllers.get(info.name)?.abort();
+    const d = await post('api/term/kill', { name: info.name });
+    if (d.error) return alert('停止失败: ' + d.error);
+    const uid = pendingUid(info.name);
+    if (S.sel === uid) {
+      closeTermPane();
+      S.sel = null;
+      store.set('sel', null);
+      $('#composer').classList.add('hidden');
+      $('#detail').innerHTML = '<div class="empty">会话已停止</div>';
+      showMobileList();
+    }
+    await loadTermList();
+    renderSide();
+    showSessionCount(sidebarSessions().length);
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
 }
 
 async function openPendingSession(info) {
@@ -213,13 +376,20 @@ async function resolveNewSession(info) {
   const pendingId = pendingUid(info.name);
   if (T.resolving.has(info.name)) return;
   T.resolving.add(info.name);
+  const controller = new AbortController();
+  T.resolveControllers.set(info.name, controller);
   try {
     for (let i = 0; i < 160; i++) {         // TUI 等用户首次输入时可能较久，最多等两分钟
       await new Promise(r => setTimeout(r, 750));
       let d;
       try {
-        d = await (await fetch(appUrl(`api/term/new-status?name=${encodeURIComponent(info.name)}`))).json();
-      } catch { continue; }
+        const response = await fetch(appUrl(`api/term/new-status?name=${encodeURIComponent(info.name)}`),
+          { signal: controller.signal });
+        d = await response.json();
+      } catch {
+        if (controller.signal.aborted) return;
+        continue;
+      }
       if (d.error) {
         const wait = $('.new-session-wait');
         if (wait && S.sel === pendingId) wait.textContent = `会话关联失败：${d.error}`;
@@ -234,6 +404,7 @@ async function resolveNewSession(info) {
       await loadSessions(true);
       await loadTermList();
       if (!active) return;                  // 用户已看别处，只更新列表，不抢走右侧页面
+      migrateComposerDraft(pendingId, d.uid);
       T.uid = d.uid;
       if (d.running) {
         S.live.add(d.uid);
@@ -249,6 +420,7 @@ async function resolveNewSession(info) {
     if (wait && S.sel === pendingId) wait.textContent = '会话仍在终端中运行；产生首条记录后会出现在列表里';
   } finally {
     T.resolving.delete(info.name);
+    if (T.resolveControllers.get(info.name) === controller) T.resolveControllers.delete(info.name);
   }
 }
 
@@ -290,7 +462,7 @@ $('#new-session-dialog').addEventListener('click', e => {
   if (e.target === $('#new-session-dialog')) $('#new-session-dialog').close();
 });
 
-const termRows = () => Math.max(10, Math.floor((T.height - 34) / (termFontSize() * 1.31)));
+const termRows = () => Math.max(10, Math.floor(T.height / (termFontSize() * 1.31)));
 
 /** 详情页头部那个按钮的文案随状态变。 */
 function renderTakeoverBtn() {
@@ -298,41 +470,169 @@ function renderTakeoverBtn() {
   if (!b) return;
   const name = takenOver(S.sel);
   const paneOpen = !!name && !$('#termpane').classList.contains('hidden');
+  const mobileSwitch = MOBILE.matches && paneOpen;
   const snapped = !MOBILE.matches && paneOpen && (T.mode === 'collapsed' || T.mode === 'full');
   const terminalVisible = paneOpen && (MOBILE.matches || T.mode !== 'collapsed');
   const label = !name ? '接管会话'
+    : MOBILE.matches ? (paneOpen ? '切换到对话' : '切换到终端')
     : snapped ? (T.mode === 'collapsed' ? '切换到终端' : '切换到对话')
       : (paneOpen ? '收起终端' : '展开终端');
-  b.innerHTML = uiIcon('terminal');
+  b.innerHTML = uiIcon(mobileSwitch ? 'chat' : 'terminal');
   b.title = b.ariaLabel = label;
   b.setAttribute('aria-expanded', String(terminalVisible));
   b.classList.toggle('on', !!name);
   b.classList.toggle('session-live', S.live.has(S.sel));
   b.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
+  renderTermMouseButton(name, b);
   renderComposer();
 }
 
+/** 终端不再另设状态栏；框选开关跟切换/停止按钮共用会话顶栏。 */
+function renderTermMouseButton(name, takeoverButton = $('#a-term')) {
+  let b = $('#tmouse');
+  if (!name || !takeoverButton) {
+    b?.remove();
+    return;
+  }
+  if (!b) {
+    b = document.createElement('button');
+    b.className = 'iconbtn';
+    b.id = 'tmouse';
+    b.innerHTML = uiIcon('select');
+    takeoverButton.after(b);
+    b.onclick = () => setLocalMouse(!T.localMouse);
+  }
+  paintTermMouseButton(b);
+}
+
 // ---------------------------------------------------------------- 终端面板
-function ensureTerm() {
-  if (T.term) return T.term;
-  T.term = new Terminal({
+function currentTermViewObject() {
+  return T.name ? T.views.get(T.name) || null : null;
+}
+
+function syncTermAliases(view = null) {
+  T.term = view?.term || null;
+  T.ws = view?.ws || null;
+}
+
+function activateTermView(view) {
+  for (const cached of T.views.values()) cached.host.hidden = cached !== view;
+  view.host.hidden = false;
+  T.name = view.name;
+  syncTermAliases(view);
+  setScrollPos(view.scrollPos);
+}
+
+function legacyCopyText(text, term) {
+  const input = document.createElement('textarea');
+  input.value = text;
+  input.setAttribute('readonly', '');
+  Object.assign(input.style, {
+    position: 'fixed', left: '-10000px', top: '0', opacity: '0',
+  });
+  document.body.appendChild(input);
+  input.select();
+  try { document.execCommand('copy'); } finally {
+    input.remove();
+    term.focus();
+  }
+}
+
+function copyTermSelection(term) {
+  const text = term.getSelection();
+  if (!text) return false;
+  try {
+    const copying = navigator.clipboard?.writeText(text);
+    if (copying) copying.catch(() => legacyCopyText(text, term));
+    else legacyCopyText(text, term);
+  } catch {
+    legacyCopyText(text, term);
+  }
+  return true;
+}
+
+function rememberTermSelection(view) {
+  const position = view.term.getSelectionPosition();
+  if (!position || !view.term.getSelection()) return;
+  view.selectionSnapshot = {
+    start: { ...position.start }, end: { ...position.end },
+  };
+}
+
+function restoreTermSelection(view) {
+  if (!view.selectionLocked || !view.selectionSnapshot || view.term.hasSelection()
+      || view.restoringSelection) return;
+  view.restoringSelection = true;
+  queueMicrotask(() => {
+    try {
+      if (!view.selectionLocked || view.term.hasSelection()) return;
+      const { start, end } = view.selectionSnapshot;
+      const length = (end.y - start.y) * view.term.cols - start.x + end.x;
+      if (length > 0) view.term.select(start.x, start.y, length);
+    } catch {
+      // scrollback 已被裁掉时旧坐标可能失效，此时正常放弃锁定。
+      view.selectionLocked = false;
+      view.selectionSnapshot = null;
+    } finally {
+      view.restoringSelection = false;
+    }
+  });
+}
+
+function ensureTerm(name) {
+  let view = T.views.get(name);
+  if (view) return view;
+  const host = el('div', 'xterm-view');
+  host.hidden = true;
+  $('#xterm').appendChild(host);
+  const term = new Terminal({
     fontFamily: termFont(),
-    fontSize: termFontSize(), cursorBlink: true, scrollback: 10000,
+    fontSize: termFontSize(), fontWeight: '400', fontWeightBold: '600',
+    cursorBlink: true, scrollback: 10000,
     scrollOnUserInput: true, theme: termTheme(),
   });
-  T.fit = new FitAddon.FitAddon();
-  T.term.loadAddon(T.fit);
-  T.term.open($('#xterm'));
-  T.term.onData(d => {
+  const fit = new FitAddon.FitAddon();
+  view = {
+    name, host, term, fit, ws: null, reconnectTimer: null,
+    reconnectDelay: 500, scrollPos: 0, ansiTail: '',
+    outputBuffer: '', outputTimer: null, fitFrame: null,
+    lastResizeKey: '', lastResizeWs: null,
+    selectionLocked: false, selectionSnapshot: null, restoringSelection: false,
+  };
+  T.views.set(name, view);
+  term.loadAddon(fit);
+  term.open(host);
+  host.addEventListener('mousedown', e => {
+    const selecting = e.shiftKey || T.localMouse;
+    view.selectionLocked = selecting;
+    if (selecting) view.selectionSnapshot = null;
+  }, true);
+  term.onSelectionChange(() => {
+    if (term.hasSelection()) rememberTermSelection(view);
+    else restoreTermSelection(view);       // Claude 重绘清选区时，恢复刚才的框选
+  });
+  term.attachCustomKeyEventHandler(e => {
+    const copy = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'c';
+    if (copy && term.hasSelection()) {
+      if (e.type === 'keydown' && !e.repeat) copyTermSelection(term);
+      return false;                       // 有选区时绝不能把 Ctrl+C 送给 Claude/Codex
+    }
+    if (e.type === 'keydown' && !['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) {
+      view.selectionLocked = false;
+      view.selectionSnapshot = null;
+    }
+    return true;
+  });
+  term.onData(d => {
+    if (T.name !== name) return;
     d = applyTermCtrl(d);
-    if (T.ws?.readyState !== 1) return;
-    if (T.scrollPos || _wheelRequests.size || _resumeInput) {
+    if (view.ws?.readyState !== 1) return;
+    if (view.scrollPos || _wheelRequests.size || _resumeInput) {
       // 等所有已经发出的滚轮请求落地，再由一个服务端请求原子执行
       // 「退出 copy-mode → 写入字符」。直接向 attach 发 q 不可靠，而把
       // cancel 和字符分走 HTTP/WS 两条通道又会乱序。
       abortWheel();
       setScrollPos(0);
-      const name = T.name;
       const before = _resumeInput || Promise.allSettled([..._wheelRequests]);
       const job = before.then(() => post('api/term/send', { name, text: d, enter: false }));
       _resumeInput = job;
@@ -342,39 +642,135 @@ function ensureTerm() {
       );
       return;
     }
-    T.ws.send(new TextEncoder().encode(d));
+    view.ws.send(new TextEncoder().encode(d));
   });
   // 专用 server 不让 tmux 接管滚动：外层不进 alternate screen，直接使用
   // xterm 的正常 scrollback。改造前遗留在默认 server 的会话仍走旧兼容路径。
-  T.term.attachCustomWheelEventHandler(e => {
-    if (!T.name) return true;
-    if (T.list?.find(x => x.name === T.name)?.server === 'sesman') return true;
+  term.attachCustomWheelEventHandler(e => {
+    if (T.name !== name) return true;
+    if (T.list?.find(x => x.name === name)?.server === 'sesman') return true;
     wheelBy(e.deltaY);
     return false;
   });
-  addEventListener('resize', () => { layoutTermPane(); fitTerm(); });
-  return T.term;
+  return view;
 }
 
-function fitTerm() {
-  if (!T.fit || $('#termpane').classList.contains('hidden')) return;
-  try { T.fit.fit(); } catch { return; }
-  if (T.ws?.readyState === 1) {
-    T.ws.send(JSON.stringify({ t: 'resize', cols: T.term.cols, rows: T.term.rows }));
+function flushTermOutput(view) {
+  if (!view) return;
+  if (view.outputTimer) clearTimeout(view.outputTimer);
+  view.outputTimer = null;
+  let s = view.outputBuffer;
+  view.outputBuffer = '';
+  if (!s) return;
+  if (T.localMouse) s = s.replace(MOUSE_ON, '');
+  view.term.write(terminalColorChunk(view, s));
+}
+
+function queueTermOutput(view, chunk) {
+  if (!chunk) return;
+  view.outputBuffer += chunk;
+  // 重连时可能一次回放上万行历史；大块数据立即交给 xterm 分片解析，不能让
+  // 随后的实时输入输出排在一个巨型合帧后面。
+  if (view.outputBuffer.length >= TERM_RENDER_BATCH_MAX) {
+    flushTermOutput(view);
+    return;
+  }
+  if (view.outputTimer) return;
+  // Claude TUI 的一次重画常拆成多个 PTY 包（先清行、再写新内容）。合并到同一
+  // 浏览器帧，避免把清除后的中间态画出来，看上去像终端忽宽忽窄。
+  view.outputTimer = setTimeout(() => flushTermOutput(view), TERM_RENDER_BATCH_MS);
+}
+
+function clearTermOutput(view) {
+  if (!view) return;
+  if (view.outputTimer) clearTimeout(view.outputTimer);
+  view.outputTimer = null;
+  view.outputBuffer = '';
+}
+
+function performTermFit(view) {
+  if (!view || view !== currentTermViewObject()
+      || $('#termpane').classList.contains('hidden')) return;
+  let dimensions;
+  try { dimensions = view.fit.proposeDimensions(); } catch { return; }
+  if (!dimensions || !Number.isFinite(dimensions.cols) || !Number.isFinite(dimensions.rows)) return;
+  // FitAddon.fit() 会先调用私有 _renderService.clear()，DOM renderer 因而在每次
+  // 窗口缩放时先变空再重画。直接使用公开 resize API 保留旧行，并平滑增删行列。
+  if (view.term.cols !== dimensions.cols || view.term.rows !== dimensions.rows) {
+    view.term.resize(dimensions.cols, dimensions.rows);
+  }
+  const ws = view.ws;
+  const key = `${view.term.cols}x${view.term.rows}`;
+  // 同一个 socket 的相同尺寸不再反复通知 tmux，避免 TUI 收到无效 SIGWINCH。
+  if (ws?.readyState === 1 && (view.lastResizeWs !== ws || view.lastResizeKey !== key)) {
+    ws.send(JSON.stringify({ t: 'resize', cols: view.term.cols, rows: view.term.rows }));
+    view.lastResizeWs = ws;
+    view.lastResizeKey = key;
   }
 }
 
+function fitTerm(immediate = false) {
+  const view = currentTermViewObject();
+  if (!view || $('#termpane').classList.contains('hidden')) return;
+  if (view.fitFrame) cancelAnimationFrame(view.fitFrame);
+  view.fitFrame = null;
+  if (immediate) {
+    performTermFit(view);
+    return;
+  }
+  // 浏览器最大化、拖边界和软键盘动画都会连续发 resize；每个动画帧最多 fit
+  // 一次，既跟手又不在同一帧重复测量和重排。
+  view.fitFrame = requestAnimationFrame(() => {
+    view.fitFrame = null;
+    performTermFit(view);
+  });
+}
+
+function currentTermView() {
+  return { mode: T.mode, height: T.height };
+}
+
+function rememberTermLayout(name = T.name) {
+  if (!name || !T.openViews.has(name)) return;
+  T.openViews.set(name, currentTermView());
+  store.set('termviews', [...T.openViews]);
+}
+
+function rememberTermOpen(name, open) {
+  if (!name) return;
+  const changed = open ? !T.openViews.has(name) : T.openViews.has(name);
+  if (!changed) return;
+  if (open) T.openViews.set(name, currentTermView());
+  else T.openViews.delete(name);
+  store.set('termviews', [...T.openViews]);
+}
+
+function restoreTermPane(uid, agent = null) {
+  if (!uid || agent || S.sel !== uid || !T.enabled || !$('#a-term')) return;
+  const name = takenOver(uid);
+  if (!name || !T.openViews.has(name)) return;
+  T.uid = uid;
+  openTermPane(name);
+}
+
 async function openTermPane(name) {
+  const saved = T.openViews.get(name);
+  if (saved) {
+    if (['normal', 'collapsed', 'full'].includes(saved.mode)) T.mode = saved.mode;
+    if (Number.isFinite(saved.height) && saved.height > 0) T.height = saved.height;
+  }
+  rememberTermOpen(name, true);
   const pane = $('#termpane');
   pane.classList.remove('hidden');
   layoutTermPane();
   renderTakeoverBtn();
   try { await terminalFontReady; } catch { /* 字体失败时继续用 Consola/monospace */ }
   if (pane.classList.contains('hidden')) return;
-  ensureTerm();
-  setTimeout(fitTerm, 20);
-  if (T.name !== name) attachTerm(name);
-  else T.term.focus();
+  const view = ensureTerm(name);
+  activateTermView(view);
+  fitTerm(true);                         // 连接前先确定尺寸，避免 80×24 → 实际尺寸的首屏跳变
+  if (view.ws?.readyState !== 1) attachTerm(name);
+  else view.term.focus();
 }
 
 /** 普通高度下按钮仍是展开/收起；吸附到边缘后改为纯对话/纯终端切换。 */
@@ -391,6 +787,7 @@ function toggleTermPane(name) {
   if (!MOBILE.matches && (T.mode === 'collapsed' || T.mode === 'full')) {
     T.mode = T.mode === 'collapsed' ? 'full' : 'collapsed';
     store.set('termmode', T.mode);
+    rememberTermLayout(name);
     layoutTermPane();
     renderTakeoverBtn();
     if (T.mode === 'full') setTimeout(fitTerm, 0);
@@ -399,8 +796,10 @@ function toggleTermPane(name) {
   closeTermPane();
 }
 
-function closeTermPane() {
-  detachTerm();
+function closeTermPane(preserveView = false) {
+  if (preserveView) rememberTermLayout();
+  else rememberTermOpen(T.name, false);
+  deactivateTermView();
   const pane = $('#termpane');
   pane.classList.add('hidden');
   pane.classList.remove('term-collapsed');
@@ -416,7 +815,9 @@ function layoutTermPane() {
   pane.classList.toggle('term-collapsed', desktop && T.mode === 'collapsed');
   if (MOBILE.matches) {
     pane.style.removeProperty('height');
-    pane.style.removeProperty('--mobile-terminal-top');
+    const rightTop = right.getBoundingClientRect().top;
+    const headBottom = $('#detail > .dhead')?.getBoundingClientRect().bottom ?? rightTop;
+    pane.style.setProperty('--mobile-terminal-top', `${Math.max(0, Math.round(headBottom - rightTop))}px`);
   } else {
     pane.style.removeProperty('--mobile-terminal-top');
     if (T.mode === 'collapsed') pane.style.height = '0px';
@@ -428,38 +829,53 @@ function layoutTermPane() {
 }
 
 function attachTerm(name) {
-  detachTerm();
-  ensureTerm();
-  T.name = name;
-  T.term.reset();
-  setTimeout(() => T.fit?.fit(), 0);
+  const view = ensureTerm(name);
+  const active = !$('#termpane').classList.contains('hidden') && T.name === name;
+  if (active) activateTermView(view);
+  cancelTermReconnect(view);
+  dropTermSocket(view);
+  clearTermOutput(view);
+  view.ansiTail = '';
+  view.selectionLocked = false;
+  view.selectionSnapshot = null;
+  view.term.reset();
+  setTimeout(() => { if (T.name === name) fitTerm(); }, 0);
   const wsUrl = new URL(appUrl('api/term/attach'));
   wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const cols = T.term.cols || 120, rows = T.term.rows || termRows();
+  const cols = view.term.cols || 120, rows = view.term.rows || termRows();
   wsUrl.search = `name=${encodeURIComponent(name)}&cols=${cols}&rows=${rows}`;
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
-  T.ws = ws;
+  view.ws = ws;
+  if (T.name === name) T.ws = ws;
   const dec = new TextDecoder();
   ws.onmessage = e => {
-    let s = typeof e.data === 'string' ? e.data : dec.decode(e.data);
-    if (T.localMouse) s = s.replace(MOUSE_ON, '');   // 别让应用把鼠标要回去
-    T.term.write(s);
+    if (view.ws !== ws) return;           // 已替换连接的尾包不能重画新终端
+    const s = typeof e.data === 'string' ? e.data : dec.decode(e.data, { stream: true });
+    queueTermOutput(view, s);
   };
   ws.onopen = () => {
-    setTermStatus(`已接管 · ${name}`, true, name);
-    fitTerm();
-    setScrollPos(0);
-    if (T.localMouse) T.term.write(MOUSE_OFF);
-    T.term.focus();
+    view.reconnectDelay = 500;
+    if (T.name === name) {
+      syncTermAliases(view);
+      fitTerm(true);
+      setScrollPos(0);
+      if (T.localMouse) view.term.write(MOUSE_OFF);
+      view.term.focus();
+    }
   };
   ws.onclose = () => {
-    if (T.ws !== ws) return;             // 用户主动收起时 detachTerm 已经清掉引用
-    setTermStatus('已断开', false);
-    T.ws = null;
+    if (view.ws !== ws) return;           // 主动换 socket 后，旧 close 事件作废
+    queueTermOutput(view, dec.decode());
+    flushTermOutput(view);
+    view.ws = null;
+    if (T.name === name) {
+      T.ws = null;
+    }
     pollLive(true);                      // tmux 内程序退出时立即清理绿点和输入区
+    scheduleTermReconnect(view);
   };
-  ws.onerror = () => setTermStatus('连接失败', false);
+  ws.onerror = () => {};
 }
 
 // ---- 滚轮翻历史 ----
@@ -495,71 +911,194 @@ function abortWheel() {
 }
 
 function setScrollPos(n) {
-  T.scrollPos = n;
-  const b = $('#tscroll');
-  if (!b) return;
-  b.classList.toggle('on', n > 0);
-  b.textContent = n > 0 ? `↑ 已上翻 ${n} 行 · 点此回到最新` : '';
-}
-
-async function leaveScroll() {
-  if (!T.name) return;
-  abortWheel();
-  // 一路 scroll-down 不靠谱(tmux 不吃很大的 -N), 直接退出 copy-mode 就回到实时画面
-  await post('api/term/scroll', { name: T.name, cancel: true });
-  setScrollPos(0);
+  const view = currentTermViewObject();
+  if (view) view.scrollPos = n;
 }
 
 // ---- 鼠标: 交给应用 还是 用来框选 ----
 function setLocalMouse(on) {
   T.localMouse = on;
   store.set('tmouse', on);
-  const b = $('#tmouse');
-  if (b) {
-    b.classList.toggle('on', on);
-    b.title = on ? '鼠标用于框选复制（点击切回交给应用）' : '鼠标交给应用（点击改为框选复制）';
-    b.setAttribute('aria-label', on ? '关闭框选复制，把鼠标交给应用' : '启用框选复制');
-    b.setAttribute('aria-pressed', String(on));
-  }
+  paintTermMouseButton();
   if (!T.term) return;
   if (on) T.term.write(MOUSE_OFF);        // 直接告诉 xterm: 应用不要鼠标了
   else if (T.name) attachTerm(T.name);    // 恢复应用的真实状态最省事的办法是重连
 }
 
-function detachTerm() {
-  if (T.ws) { try { T.ws.close(); } catch {} T.ws = null; }
+function paintTermMouseButton(b = $('#tmouse')) {
+  if (b) {
+    b.classList.toggle('on', T.localMouse);
+    b.title = T.localMouse ? '鼠标用于框选复制（点击切回交给应用）' : '鼠标交给应用（点击改为框选复制）';
+    b.setAttribute('aria-label', T.localMouse ? '关闭框选复制，把鼠标交给应用' : '启用框选复制');
+    b.setAttribute('aria-pressed', String(T.localMouse));
+  }
+}
+
+function cancelTermReconnect(view = currentTermViewObject()) {
+  if (!view) return;
+  clearTimeout(view.reconnectTimer);
+  view.reconnectTimer = null;
+}
+
+function dropTermSocket(view = currentTermViewObject()) {
+  if (!view) return;
+  const ws = view.ws;
+  view.ws = null;                        // 先失效引用，close 回调便不会误判成意外断线
+  if (T.name === view.name) T.ws = null;
+  if (ws) { try { ws.close(); } catch {} }
+}
+
+/** 网络短断后自动恢复。tmux 才是会话本体，WebSocket 只是可随时重建的视图。 */
+function scheduleTermReconnect(view = currentTermViewObject()) {
+  if (!view || document.hidden || !navigator.onLine || view.reconnectTimer) return;
+  const stillAlive = [...(T.list || []), ...(T.pending || [])].some(x => x.name === view.name);
+  if (!stillAlive) return;
+  const delay = view.reconnectDelay;
+  view.reconnectTimer = setTimeout(() => {
+    view.reconnectTimer = null;
+    if (!T.views.has(view.name) || document.hidden) return;
+    view.reconnectDelay = Math.min(8000, Math.round(view.reconnectDelay * 1.8));
+    attachTerm(view.name);
+  }, delay);
+}
+
+/** 手机锁屏会冻结一个看似仍 OPEN、实际已经失效的 socket；恢复时必须强制换新。 */
+function reconnectTerm(view = currentTermViewObject()) {
+  if (!view || document.hidden || !navigator.onLine) return;
+  attachTerm(view.name);
+  if (T.name === view.name) setTimeout(() => { layoutTermPane(); fitTerm(); }, 20);
+}
+
+function suspendTerm() {
+  for (const view of T.views.values()) {
+    cancelTermReconnect(view);
+    dropTermSocket(view);
+  }
+}
+
+function deactivateTermView() {
+  const view = currentTermViewObject();
+  if (view) view.host.hidden = true;
   T.name = null;
+  syncTermAliases();
   setTermCtrl(false);
-  setTermStatus('未连接', false);
 }
 
-async function stopTermSession() {
-  if (!T.name) return;
-  if (!confirm(`结束「${T.name}」？\n\n里面运行的 CLI 会被终止，会话记录保留。`)) return;
-  const name = T.name;
-  closeTermPane();
-  await post('api/term/kill', { name });
-  await loadTermList();
-  renderTakeoverBtn();
-  renderComposer();
-}
-
-function setTermStatus(text, on, mobileText) {
-  const s = $('#tstatus');
-  if (s) {
-    s.textContent = text;
-    s.classList.toggle('on', on);
-    if (mobileText == null) delete s.dataset.mobileText;
-    else s.dataset.mobileText = mobileText;
+function disposeTermView(name) {
+  const view = T.views.get(name);
+  if (!view) return;
+  const active = T.name === name;
+  cancelTermReconnect(view);
+  dropTermSocket(view);
+  try { view.term.dispose(); } catch { /* 已被浏览器清理 */ }
+  view.host.remove();
+  T.views.delete(name);
+  if (active) {
+    deactivateTermView();
+    $('#termpane').classList.add('hidden');
+    $('#termpane').classList.remove('term-collapsed');
+    $('#right').classList.remove('term-full');
   }
 }
 
 // ---------------------------------------------------------------- 输入框
 // 已接管的会话在消息流底部给个输入框, 不必展开整个终端就能说话。
+const COMPOSER_MAX_FILES = 12;
+const COMPOSER_MAX_FILE_BYTES = 512 * 1024 * 1024;
+const ATTACH_ACCEPT = { image: 'image/*', video: 'video/*', audio: 'audio/*', file: '' };
+const composerDrafts = new Map();
+let composerUid = null;
+let composerDraftSeq = 0;
+let lastMessageSelection = '';
+let lastMessageSelectionUid = null;
+
+const newComposerDraft = () => ({ text: '', attachments: [], quotes: [], nextAttachmentNumber: 1 });
+function composerDraft(uid = composerUid, create = true) {
+  if (!uid) return null;
+  if (!composerDrafts.has(uid) && create) composerDrafts.set(uid, newComposerDraft());
+  const draft = composerDrafts.get(uid) || null;
+  if (draft) ensureComposerAttachmentNumbers(draft);
+  return draft;
+}
+
+function ensureComposerAttachmentNumbers(draft) {
+  draft.attachments ||= [];
+  const used = new Set();
+  let next = Number.isInteger(draft.nextAttachmentNumber) && draft.nextAttachmentNumber > 0
+    ? draft.nextAttachmentNumber : 1;
+  for (const attachment of draft.attachments) {
+    if (!Number.isInteger(attachment.number) || attachment.number < 1 || used.has(attachment.number)) {
+      while (used.has(next)) next++;
+      attachment.number = next++;
+    }
+    used.add(attachment.number);
+    next = Math.max(next, attachment.number + 1);
+  }
+  draft.nextAttachmentNumber = next;
+  return draft;
+}
+
+function remapAttachmentReferences(text, remap) {
+  if (!remap.size) return text;
+  return String(text || '').replace(/\[附件([1-9]\d*)\]/g, (token, raw) => {
+    const number = remap.get(Number(raw));
+    return number ? `[附件${number}]` : token;
+  });
+}
+
+function migrateComposerDraft(fromUid, toUid) {
+  if (!fromUid || !toUid || fromUid === toUid) return;
+  const draft = composerDrafts.get(fromUid);
+  if (!draft) return;
+  const target = composerDrafts.get(toUid);
+  if (target) {
+    ensureComposerAttachmentNumbers(target);
+    ensureComposerAttachmentNumbers(draft);
+    const used = new Set(target.attachments.map(x => x.number));
+    const remap = new Map();
+    for (const attachment of draft.attachments) {
+      if (used.has(attachment.number)) {
+        let number = target.nextAttachmentNumber;
+        while (used.has(number)) number++;
+        remap.set(attachment.number, number);
+        attachment.number = number;
+        target.nextAttachmentNumber = number + 1;
+      }
+      used.add(attachment.number);
+    }
+    draft.text = remapAttachmentReferences(draft.text, remap);
+    if (draft.text) target.text = target.text ? `${target.text}\n${draft.text}` : draft.text;
+    target.attachments.push(...draft.attachments);
+    target.quotes.push(...draft.quotes);
+    ensureComposerAttachmentNumbers(target);
+  } else {
+    ensureComposerAttachmentNumbers(draft);
+    composerDrafts.set(toUid, draft);
+  }
+  for (const attachment of draft.attachments) {
+    // pending 与正式会话只有 cwd 一致时才会关联，已经落盘的路径仍然有效。
+    if (attachment.uploaded?.uid === fromUid) attachment.uploaded.uid = toUid;
+  }
+  composerDrafts.delete(fromUid);
+  if (composerUid === fromUid) composerUid = toUid;
+}
+
+function switchComposerDraft(uid) {
+  const ta = $('#cinput');
+  if (composerUid && ta) composerDraft(composerUid).text = ta.value;
+  if (composerUid === uid) return;
+  composerUid = uid;
+  const draft = composerDraft(uid, !!uid);
+  ta.value = draft?.text || '';
+  renderComposerItems();
+  autoGrow(ta);
+}
+
 function renderComposer() {
   const name = T.enabled ? takenOver(S.sel) : null;
   const box = $('#composer');
   box.classList.toggle('hidden', !name);
+  switchComposerDraft(name ? S.sel : null);
   if (name) syncComposerMode();
 }
 
@@ -576,42 +1115,362 @@ function syncComposerMode() {
   autoGrow(ta);
 }
 
-async function sendToSession(text, keys) {
-  const name = takenOver(S.sel);
-  if (!name) return;
-  const d = await post('api/term/send', keys ? { name, keys } : { name, text });
-  if (d.error) return alert('发送失败: ' + d.error);
-  S.live.add(S.sel);            // 发完立刻按最快节奏拉新消息
-  S.liveTmux.add(S.sel);
+async function sendToSession(text, keys, uid = S.sel) {
+  const name = takenOver(uid);
+  if (!name) return false;
+  let d;
+  try {
+    d = await post('api/term/send', keys ? { name, keys } : { name, text });
+  } catch (e) {
+    alert('发送失败: ' + (e.message || e));
+    return false;
+  }
+  if (d.error) {
+    alert('发送失败: ' + d.error);
+    return false;
+  }
+  S.live.add(uid);            // 发完立刻按最快节奏拉新消息
+  S.liveTmux.add(uid);
   paintLive();
   S.syncGap = FAST_MIN;
   S.lastSync = 0;
+  return true;
 }
 
-$('#cinput').addEventListener('input', e => autoGrow(e.target));
+function composerFileKind(file) {
+  const prefix = String(file.type || '').split('/', 1)[0];
+  return ['image', 'video', 'audio'].includes(prefix) ? prefix : 'file';
+}
+
+function composerKindIcon(kind) {
+  return { image: '▧', video: '▶', audio: '♪', file: '⌑' }[kind] || '⌑';
+}
+
+function closeAttachMenu() {
+  $('#attach-menu').classList.add('hidden');
+  $('#cadd').classList.remove('on');
+  $('#cadd').setAttribute('aria-expanded', 'false');
+}
+
+function renderComposerItems() {
+  const box = $('#compose-items');
+  box.replaceChildren();
+  const draft = composerDraft();
+  if (!draft) return;
+  for (const attachment of draft.attachments) {
+    const card = el('div', `draft-card ${attachment.status || ''}`);
+    card.dataset.draftId = attachment.id;
+    card.title = `点击插入 [附件${attachment.number}]`;
+    card.onclick = e => {
+      if (!e.target.closest('.draft-remove')) insertComposerReference(attachment.number);
+    };
+    const thumb = el('span', 'draft-thumb');
+    if (attachment.kind === 'image') {
+      const image = document.createElement('img');
+      image.src = attachment.preview;
+      image.alt = '';
+      thumb.appendChild(image);
+    } else {
+      thumb.textContent = composerKindIcon(attachment.kind);
+    }
+    const info = el('span', 'draft-info');
+    const name = document.createElement('b');
+    name.textContent = attachment.uploaded?.name || attachment.file.name || 'attachment';
+    const meta = document.createElement('small');
+    const ref = `[附件${attachment.number}]`;
+    meta.textContent = attachment.status === 'uploading' ? `${ref} · 正在上传…`
+      : attachment.status === 'failed' ? `${ref} · ${attachment.error || '上传失败'}`
+        : `${ref} · ${attachment.kind === 'file' ? '文件' : ({ image: '图片', video: '视频', audio: '音频' }[attachment.kind])} · ${fmtSize(attachment.file.size)}`;
+    info.append(name, meta);
+    const remove = el('button', 'draft-remove', '×');
+    remove.type = 'button';
+    remove.title = remove.ariaLabel = '移除附件';
+    remove.disabled = composerSending;
+    remove.onclick = e => {
+      e.stopPropagation();
+      removeComposerAttachment(attachment.id);
+    };
+    card.append(thumb, info, remove);
+    box.appendChild(card);
+  }
+  for (const quote of draft.quotes) {
+    const card = el('div', 'draft-card draft-quote');
+    card.dataset.draftId = quote.id;
+    const mark = el('span', '', '❝');
+    const text = document.createElement('textarea');
+    text.value = quote.text;
+    text.maxLength = 16000;
+    text.placeholder = '粘贴或输入要引用的文字';
+    text.setAttribute('aria-label', '引用文字');
+    text.oninput = () => { quote.text = text.value; };
+    const remove = el('button', 'draft-remove', '×');
+    remove.type = 'button';
+    remove.title = remove.ariaLabel = '移除引用';
+    remove.disabled = composerSending;
+    remove.onclick = () => removeComposerQuote(quote.id);
+    card.append(mark, text, remove);
+    box.appendChild(card);
+  }
+}
+
+function addComposerFiles(files) {
+  const draft = composerDraft();
+  if (!draft) return;
+  for (const file of files) {
+    if (draft.attachments.length >= COMPOSER_MAX_FILES) {
+      alert(`一次最多添加 ${COMPOSER_MAX_FILES} 个附件`);
+      break;
+    }
+    if (!file.size || file.size > COMPOSER_MAX_FILE_BYTES) {
+      alert(`「${file.name || '附件'}」为空或超过 512 MB`);
+      continue;
+    }
+    const kind = composerFileKind(file);
+    draft.attachments.push({
+      id: `attachment-${++composerDraftSeq}`, number: draft.nextAttachmentNumber++, file, kind,
+      preview: kind === 'image' ? URL.createObjectURL(file) : '',
+      status: '', uploaded: null, error: '',
+    });
+  }
+  renderComposerItems();
+}
+
+function insertComposerReference(number) {
+  const ta = $('#cinput');
+  if (!ta) return;
+  const token = `[附件${number}]`;
+  ta.focus();
+  const start = Number.isInteger(ta.selectionStart) ? ta.selectionStart : ta.value.length;
+  const end = Number.isInteger(ta.selectionEnd) ? ta.selectionEnd : start;
+  ta.setRangeText(token, start, end, 'end');
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function removeComposerAttachment(id, draft = composerDraft()) {
+  if (!draft || composerSending) return;
+  const at = draft.attachments.findIndex(x => x.id === id);
+  if (at < 0) return;
+  const [removed] = draft.attachments.splice(at, 1);
+  if (removed.preview) URL.revokeObjectURL(removed.preview);
+  renderComposerItems();
+}
+
+function addComposerQuote(text = '') {
+  const draft = composerDraft();
+  if (!draft) return;
+  if (draft.quotes.length >= 4) return alert('一次最多添加 4 段引用');
+  draft.quotes.push({ id: `quote-${++composerDraftSeq}`, text: String(text).trim().slice(0, 16000) });
+  renderComposerItems();
+  boxFocusLastQuote();
+}
+
+function boxFocusLastQuote() {
+  requestAnimationFrame(() => {
+    const nodes = document.querySelectorAll('#compose-items .draft-quote textarea');
+    nodes[nodes.length - 1]?.focus();
+  });
+}
+
+function removeComposerQuote(id, draft = composerDraft()) {
+  if (!draft || composerSending) return;
+  const at = draft.quotes.findIndex(x => x.id === id);
+  if (at >= 0) draft.quotes.splice(at, 1);
+  renderComposerItems();
+}
+
+function buildComposerPrompt(text, attachments = [], quotes = []) {
+  const attachmentPath = attachment => {
+    const relative = String(attachment.relative_path || '').replace(/^\.\//, '');
+    return relative ? `./${relative}` : attachment.path;
+  };
+  const body = String(text || '');
+  const quoted = quotes.map(x => String(x.text ?? x).trim()).filter(Boolean);
+  if (!attachments.length && !quoted.length) return text;
+  const blocks = [];
+  if (attachments.length) {
+    blocks.push(attachments.map((a, i) =>
+      `附件${Number.isInteger(a.number) ? a.number : i + 1}:${attachmentPath(a)}`).join('\n'));
+  }
+  if (quoted.length) blocks.push(quoted.map((q, i) => `引用${i + 1}:\n${q}`).join('\n'));
+  let prompt = body;
+  for (const block of blocks) {
+    if (prompt) {
+      const trailingNewlines = prompt.match(/\n*$/)?.[0].length || 0;
+      prompt += '\n'.repeat(Math.max(0, 2 - trailingNewlines));
+    }
+    prompt += block;
+  }
+  return prompt;
+}
+
+async function uploadComposerAttachment(attachment, uid) {
+  if (attachment.uploaded?.uid === uid) return attachment.uploaded;
+  attachment.status = 'uploading';
+  attachment.error = '';
+  renderComposerItems();
+  const url = new URL(appUrl('api/session/attachment'));
+  url.searchParams.set('uid', uid);
+  url.searchParams.set('name', attachment.file.name || 'attachment');
+  try {
+    const response = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': attachment.file.type || 'application/octet-stream' },
+      body: attachment.file,
+    });
+    const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+    if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+    attachment.uploaded = { ...data, uid };
+    attachment.status = 'ready';
+    renderComposerItems();
+    return attachment.uploaded;
+  } catch (error) {
+    attachment.status = 'failed';
+    attachment.error = error.message || String(error);
+    renderComposerItems();
+    throw error;
+  }
+}
+
+let composerSending = false;
+async function submitComposer() {
+  const ta = $('#cinput');
+  const button = $('#csend');
+  const add = $('#cadd');
+  const uid = composerUid;
+  const draft = composerDraft(uid);
+  const text = ta.value;
+  const attachments = [...(draft?.attachments || [])];
+  const quotes = (draft?.quotes || []).map(x => ({ id: x.id, text: x.text })).filter(x => x.text.trim());
+  if (composerSending || (!text.trim() && !attachments.length && !quotes.length)) return;
+  composerSending = true;
+  button.disabled = true;
+  add.disabled = true;
+  renderComposerItems();
+  try {
+    const uploaded = [];
+    for (let i = 0; i < attachments.length; i++) {
+      button.textContent = `上传 ${i + 1}/${attachments.length}`;
+      uploaded.push({ ...(await uploadComposerAttachment(attachments[i], uid)),
+        number: attachments[i].number });
+    }
+    button.textContent = '发送中…';
+    const prompt = buildComposerPrompt(text, uploaded, quotes);
+    const sent = await sendToSession(prompt, null, uid);
+    // 请求失败时保留草稿；等待响应期间若用户继续编辑，也不能抹掉新内容。
+    if (sent) {
+      if (draft.text === text || (composerUid === uid && ta.value === text)) draft.text = '';
+      const sentFiles = new Set(attachments.map(x => x.id));
+      const sentQuotes = new Map(quotes.map(x => [x.id, x.text]));
+      for (const attachment of draft.attachments.filter(x => sentFiles.has(x.id))) {
+        if (attachment.preview) URL.revokeObjectURL(attachment.preview);
+      }
+      draft.attachments = draft.attachments.filter(x => !sentFiles.has(x.id));
+      draft.quotes = draft.quotes.filter(x => sentQuotes.get(x.id) !== x.text);
+      if (!draft.text && !draft.attachments.length && !draft.quotes.length) {
+        draft.nextAttachmentNumber = 1;
+      }
+      if (composerUid === uid) {
+        ta.value = draft.text;
+        renderComposerItems();
+      }
+    }
+  } catch (error) {
+    alert('附件上传失败: ' + (error.message || error));
+  } finally {
+    composerSending = false;
+    button.disabled = false;
+    add.disabled = false;
+    button.textContent = '发送';
+    renderComposerItems();
+    autoGrow(ta);
+  }
+}
+
+$('#cinput').addEventListener('input', e => {
+  const draft = composerDraft();
+  if (draft) draft.text = e.target.value;
+  autoGrow(e.target);
+});
 $('#cinput').addEventListener('keydown', e => {
   // 手机软键盘没有方便的 Shift+Enter：Enter 始终换行，只允许按钮发送。
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !MOBILE.matches) {
     e.preventDefault();
-    const ta = e.target;
-    const text = ta.value;
-    if (!text.trim()) return;
-    ta.value = '';
-    autoGrow(ta);
-    sendToSession(text);
+    submitComposer();
   }
 });
-MOBILE.addEventListener('change', syncComposerMode);
+MOBILE.addEventListener('change', () => {
+  syncComposerMode();
+  renderTakeoverBtn();
+});
 syncComposerMode();
 $('#csend').onclick = () => {
-  const ta = $('#cinput');
-  if (!ta.value.trim()) return;
-  const text = ta.value;
-  ta.value = '';
-  autoGrow(ta);
-  sendToSession(text);
+  submitComposer();
 };
 $('#cesc').onclick = () => sendToSession(null, ['Escape']);
+
+$('#cadd').onclick = e => {
+  e.stopPropagation();
+  const menu = $('#attach-menu');
+  const open = menu.classList.toggle('hidden');
+  $('#cadd').classList.toggle('on', !open);
+  $('#cadd').setAttribute('aria-expanded', String(!open));
+};
+$('#attach-menu').onclick = e => {
+  const button = e.target.closest('button[data-attach]');
+  if (!button) return;
+  const type = button.dataset.attach;
+  closeAttachMenu();
+  if (type === 'quote') {
+    addComposerQuote(lastMessageSelectionUid === composerUid ? lastMessageSelection : '');
+    lastMessageSelection = '';
+    lastMessageSelectionUid = null;
+    return;
+  }
+  const input = $('#cfile');
+  input.accept = ATTACH_ACCEPT[type];
+  input.dataset.kind = type;
+  input.click();
+};
+$('#cfile').onchange = e => {
+  addComposerFiles([...e.target.files]);
+  e.target.value = '';
+};
+document.addEventListener('click', e => {
+  if (!e.target.closest('.attach-picker')) closeAttachMenu();
+});
+document.addEventListener('selectionchange', () => {
+  const selection = getSelection();
+  if (!selection || selection.isCollapsed || !selection.anchorNode || !selection.focusNode) return;
+  const messages = $('#msgs');
+  if (messages?.contains(selection.anchorNode) && messages.contains(selection.focusNode)) {
+    lastMessageSelection = selection.toString().trim().slice(0, 16000);
+    lastMessageSelectionUid = S.sel;
+  }
+});
+$('#cinput').addEventListener('paste', e => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (!files.length) return;
+  // 带附件的剪贴板常同时携带 text/plain；交给浏览器会把那份文字再粘贴一次。
+  e.preventDefault();
+  addComposerFiles(files);
+});
+$('#composer').addEventListener('dragenter', e => {
+  if (e.dataTransfer?.types?.includes('Files')) $('#composer').classList.add('dragover');
+});
+$('#composer').addEventListener('dragover', e => {
+  if (!e.dataTransfer?.types?.includes('Files')) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+$('#composer').addEventListener('dragleave', e => {
+  if (!$('#composer').contains(e.relatedTarget)) $('#composer').classList.remove('dragover');
+});
+$('#composer').addEventListener('drop', e => {
+  $('#composer').classList.remove('dragover');
+  const files = [...(e.dataTransfer?.files || [])];
+  if (!files.length) return;
+  e.preventDefault();
+  addComposerFiles(files);
+});
 
 function setTermCtrl(on) {
   T.ctrlArmed = !!on;
@@ -687,15 +1546,31 @@ function finishTermDrag(e) {
   document.body.classList.remove('dragging-v');
   store.set('termh', T.height);
   store.set('termmode', T.mode);
+  rememberTermLayout();
   renderTakeoverBtn();
   fitTerm();
 }
 document.addEventListener('pointerup', finishTermDrag);
 document.addEventListener('pointercancel', finishTermDrag);
 
-$('#tmouse').onclick = () => setLocalMouse(!T.localMouse);
-$('#tscroll').onclick = () => leaveScroll();
-$('#tchat').onclick = () => closeTermPane();
-$('#tstop').onclick = () => stopTermSession();
+// 移动浏览器锁屏后常保留一个 readyState=OPEN 的僵尸 WebSocket。进入后台时主动
+// 放弃这条传输，回到前台/pageshow/网络恢复时重新 attach；tmux 进程不会受影响。
+let termWasBackgrounded = false;
+function backgroundTerm() {
+  termWasBackgrounded = true;
+  suspendTerm();
+}
+function foregroundTerm(force = false) {
+  if (document.hidden || (!force && !termWasBackgrounded)) return;
+  termWasBackgrounded = false;
+  for (const view of T.views.values()) reconnectTerm(view);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) backgroundTerm();
+  else foregroundTerm();
+});
+addEventListener('pagehide', backgroundTerm);
+addEventListener('pageshow', e => foregroundTerm(e.persisted));
+addEventListener('online', () => foregroundTerm(true));
 
 loadTermList();

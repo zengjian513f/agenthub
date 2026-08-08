@@ -6,6 +6,7 @@ import argparse
 import gzip
 import json
 import mimetypes
+import os
 import re
 import threading
 import time
@@ -21,6 +22,25 @@ TERMINAL = False        # 远程终端 = 远程执行, 必须显式 --terminal �
 WATCH_POLL = 0.05       # 服务端盯文件的间隔; stat 一个文件是微秒级, 这里很便宜
 JSON_GZIP_MIN = 1024    # 小响应省不了多少，避免反而增加压缩 CPU 和头部体积
 JSON_GZIP_LEVEL = 4     # 实测 4.5 MiB → 1.20 MiB / 75 ms，继续加级收益很小
+ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
+ATTACHMENT_DIR = ".sesman_attachments"
+
+
+def _pane_for_session(session: dict, panes: list[dict],
+                      pids: list[int] | None = None) -> dict | None:
+    """按规范名或真实进程树找会话所在的 sesman tmux pane。
+
+    Codex 双 Esc 会换新 UUID，但进程仍留在旧 UUID 命名的 tmux session 中；
+    这时名称不再可靠，pane 祖先进程才是权威关联。
+    """
+    name = term.session_name_for(session["source"], session["sid"])
+    exact = next((pane for pane in panes if pane["name"] == name), None)
+    if exact:
+        return exact
+    pids = live.pids_of(session) if pids is None else pids
+    return next((pane for pane in panes if pane.get("owned") and any(
+        pid > 0 and term.process_belongs_to(pid, pane["pid"]) for pid in pids
+    )), None)
 
 
 def _accepts_gzip(value: str) -> bool:
@@ -93,21 +113,25 @@ class Handler(BaseHTTPRequestHandler):
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
         u = urlparse(self.path)
+        if not TERMINAL:
+            return self._json({"error": "终端未启用, 服务端需加 --terminal"}, 403)
+        if u.path == "/api/session/attachment":
+            try:
+                return self._upload_attachment(parse_qs(u.query))
+            except (KeyError, ValueError) as e:
+                self.close_connection = True
+                return self._json({"error": str(e)}, 400)
+            except OSError as e:
+                self.close_connection = True
+                return self._json({"error": str(e)}, 500)
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._json({"error": "bad body"}, 400)
-        if not TERMINAL:
-            return self._json({"error": "终端未启用, 服务端需加 --terminal"}, 403)
         try:
             if u.path == "/api/term/create":
                 return self._create_session(body)
-            if u.path == "/api/term/new":
-                name = term.new_session(body.get("name") or "s", body["cmd"],
-                                        body.get("cwd"), int(body.get("cols", 120)),
-                                        int(body.get("rows", 32)))
-                return self._json({"name": name})
             if u.path == "/api/term/kill":
                 term.kill_session(body["name"])
                 pending_store.discard(body["name"])
@@ -134,14 +158,131 @@ class Handler(BaseHTTPRequestHandler):
                     term.send_keys(name, *body["keys"])
                 else:
                     text = body.get("text", "")
-                    if text:
+                    enter = body.get("enter", True)
+                    if text and enter:
+                        term.submit_text(name, text)
+                    elif text:
                         term.send_text(name, text)
-                    if body.get("enter", True):
+                    elif enter:
                         term.send_keys(name, "Enter")
                 return self._json({"ok": True})
         except Exception as e:
             return self._json({"error": str(e)}, 400)
         self._json({"error": "not found"}, 404)
+
+    @staticmethod
+    def _attachment_name(raw: str) -> str:
+        """保留可读文件名，但不能让名称参与路径解析或突破文件系统上限。"""
+        name = Path(str(raw).replace("\\", "/")).name.strip(" .")
+        name = re.sub(r"[\x00-\x1f\x7f/\\]+", "_", name)
+        name = re.sub(r"\s+", " ", name)
+        if not name or name in {".", ".."}:
+            name = "attachment"
+        suffix = Path(name).suffix[:20]
+        stem = name[:-len(suffix)] if suffix else name
+        while len(stem.encode("utf-8")) > 150:
+            stem = stem[:-1]
+        return (stem or "attachment") + suffix
+
+    @staticmethod
+    def _same_file_content(left: Path, right: Path) -> bool:
+        """同名附件内容相同就复用，逐块比较避免把大文件读进内存。"""
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        with left.open("rb") as a, right.open("rb") as b:
+            while True:
+                ac = a.read(1024 * 1024)
+                bc = b.read(1024 * 1024)
+                if ac != bc:
+                    return False
+                if not ac:
+                    return True
+
+    def _upload_attachment(self, q: dict):
+        """把一个原始二进制附件流写入会话 cwd 下的受控子目录。"""
+        uid = str(q.get("uid", [""])[0])
+        original = self._attachment_name(q.get("name", ["attachment"])[0])
+        # 新建 CLI 在写出第一条正式会话记录前只有 tmux 名，没有普通 uid。
+        # pending 记录同样由服务端创建并保存可信 cwd，允许它先接收附件。
+        session = None
+        if uid.startswith("tmux:"):
+            pending = pending_store.get(uid.removeprefix("tmux:"))
+            if pending:
+                session = {"cwd": pending.get("cwd")}
+        else:
+            session = index.get(uid)
+        if not session:
+            return self._json({"error": "会话不存在"}, 404)
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            size = -1
+        if size <= 0:
+            return self._json({"error": "附件为空或缺少 Content-Length"}, 400)
+        if size > ATTACHMENT_MAX_BYTES:
+            self.close_connection = True
+            return self._json({"error": "单个附件不能超过 512 MB"}, 413)
+
+        cwd = Path(str(session.get("cwd") or "")).expanduser()
+        if not cwd.is_absolute() or not cwd.is_dir():
+            return self._json({"error": "会话当前目录不存在"}, 409)
+        cwd = cwd.resolve()
+        base = cwd / ATTACHMENT_DIR
+        if base.exists() and (base.is_symlink() or not base.is_dir()):
+            return self._json({"error": f"{ATTACHMENT_DIR} 不是安全目录"}, 409)
+        base.mkdir(mode=0o700, exist_ok=True)
+        stamp = f"{time.strftime('%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}"
+        temp = base / f".{stamp}-{threading.get_ident()}.upload"
+        left = size
+        target = None
+        reused = False
+        try:
+            with temp.open("xb") as out:
+                while left:
+                    chunk = self.rfile.read(min(left, 1024 * 1024))
+                    if not chunk:
+                        raise OSError("附件传输中断")
+                    out.write(chunk)
+                    left -= len(chunk)
+            temp.chmod(0o600)
+
+            suffix = Path(original).suffix
+            stem = original[:-len(suffix)] if suffix else original
+            # 第一个使用原文件名；仅在同名但内容不同时添加 Windows 风格编号。
+            for number in range(10_000):
+                name = original if number == 0 else f"{stem} ({number}){suffix}"
+                candidate = base / name
+                if candidate.is_symlink():
+                    continue
+                try:
+                    exists = candidate.exists()
+                    if exists and candidate.is_file() and self._same_file_content(temp, candidate):
+                        target = candidate
+                        reused = True
+                        break
+                    if exists:
+                        continue
+                    # hard link 带 O_EXCL 语义：并发上传不能覆盖刚创建的同名文件。
+                    os.link(temp, candidate)
+                    target = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if target is None:
+                raise OSError("同名附件过多，无法分配文件名")
+        finally:
+            temp.unlink(missing_ok=True)
+
+        supplied = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        guessed = mimetypes.guess_type(original)[0]
+        mime = guessed or (supplied if re.fullmatch(r"[\w.+-]+/[\w.+-]+", supplied) else None)
+        mime = mime or "application/octet-stream"
+        kind = mime.split("/", 1)[0] if mime.split("/", 1)[0] in {"image", "video", "audio"} else "file"
+        return self._json({
+            "ok": True, "name": target.name, "original_name": original, "path": str(target),
+            "relative_path": str(target.relative_to(cwd)),
+            "mime": mime, "kind": kind, "size": size, "reused": reused,
+        })
 
     def do_GET(self):
         if not self._allowed():
@@ -211,6 +352,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/term/list":
             tmux_sessions = term.list_sessions() if TERMINAL else []
+            if tmux_sessions:
+                # 把 tmux pane 映射回当前列表 uid。前端不能只从 pane 名猜 UUID，
+                # 因为 Codex 回退分支会沿用父会话启动时的旧名字。
+                linked: dict[str, dict] = {}
+                for session in index.load():
+                    pane = _pane_for_session(session, tmux_sessions)
+                    if pane and (pane["name"] not in linked
+                                 or session["updated"] > linked[pane["name"]]["updated"]):
+                        linked[pane["name"]] = session
+                for pane in tmux_sessions:
+                    if pane["name"] in linked:
+                        pane["uid"] = linked[pane["name"]]["uid"]
             pending = pending_store.active({x["name"] for x in tmux_sessions}) if TERMINAL else []
             public_pending = [{k: row.get(k) for k in
                                ("name", "source", "sid", "cwd", "started", "cols", "rows")}
@@ -259,13 +412,6 @@ class Handler(BaseHTTPRequestHandler):
                 head=q.get("head", [""])[0],
                 anchor=q.get("anchor", [""])[0],
             ))
-
-        if path.startswith("/api/version/"):
-            uid = unquote(path[len("/api/version/"):])
-            s = index.get(uid)
-            if not s:
-                raise KeyError(uid)
-            return self._json(index.version(s))
 
         raise KeyError(path)
 
@@ -364,10 +510,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "会话不存在"}, 404)
 
         name = term.session_name_for(s["source"], s["sid"])
-        if any(x["name"] == name for x in term.list_sessions()):
-            return self._json({"name": name, "action": "reused"})
-
         pids = live.pids_of(s, force=True)
+        panes = term.list_sessions()
+        pane = _pane_for_session(s, panes, pids)
+        if pane:
+            return self._json({"name": pane["name"], "action": "reused"})
+
         if pids and not term.in_tmux(pids):
             mains = [p for p in pids if p > 0]
             if not body.get("force"):
@@ -389,19 +537,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "会话不存在"}, 404)
 
         pids = live.pids_of(s, force=True)
-        name = term.session_name_for(s["source"], s["sid"])
         panes = term.list_sessions()
-        pane = next((x for x in panes if x["name"] == name), None)
-        if not pane:
-            # 会话可能在网页里改过 tmux 名，用 pane 进程树找回 sesman 所属 tmux。
-            pane = next((x for x in panes if x["owned"] and any(
-                p > 0 and term.process_belongs_to(p, x["pid"]) for p in pids
-            )), None)
+        pane = _pane_for_session(s, panes, pids)
 
         if pane:
-            term.kill_session(pane["name"])
+            # 先退出最里面的 CLI；它是 pane 的前台命令，退出后 tmux 会自然收掉。
+            # Ctrl-D 无效时 graceful_stop 才依次升级到 TERM/KILL 和清理 tmux 残壳。
+            killed = term.graceful_stop(pane["name"], pids)
             pending_store.discard(pane["name"])
-            killed = [p for p in pids if p > 0]
         else:
             killed = term.kill_pids(pids)
         live.snapshot(force=True)
