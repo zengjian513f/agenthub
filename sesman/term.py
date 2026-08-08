@@ -16,20 +16,26 @@ import fcntl
 import os
 import pty
 import select
+import shlex
 import shutil
 import signal
 import struct
 import subprocess
 import termios
+import uuid
+from pathlib import Path
 
 PREFIX = "sesman-"          # sesman 起的会话用这个前缀, 便于识别
 
-# 三家续接已有会话的命令
+# 三家续接已有会话的参数。可执行文件必须另外解析成绝对路径，因为 systemd
+# 服务的 PATH 通常不含 ~/.local/bin 和 ~/.grok/bin。
 RESUME = {
-    "claude": "claude --resume {sid}",
-    "codex": "codex resume {sid}",
-    "grok": "grok --resume {sid}",
+    "claude": ("--resume",),
+    "codex": ("resume",),
+    "grok": ("--resume",),
 }
+
+SOURCES = ("claude", "codex", "grok")
 
 
 def resume_command(source: str, sid: str) -> str:
@@ -38,7 +44,10 @@ def resume_command(source: str, sid: str) -> str:
         raise ValueError(f"不支持的来源: {source}")
     if not sid or not all(c in "0123456789abcdefABCDEF-" for c in sid):
         raise ValueError(f"会话 id 不合法: {sid!r}")
-    return RESUME[source].format(sid=sid)
+    exe = _which_cli(source)
+    if not exe:
+        raise ValueError(f"找不到 {source} 命令")
+    return _clean_cli_command(exe, *RESUME[source], sid)
 
 
 def session_name_for(source: str, sid: str) -> str:
@@ -47,6 +56,64 @@ def session_name_for(source: str, sid: str) -> str:
 
 def available() -> bool:
     return shutil.which("tmux") is not None
+
+
+def _which_cli(source: str) -> str | None:
+    found = shutil.which(source)
+    if found:
+        return found
+    home = Path.home()
+    for p in (home / ".local" / "bin" / source, home / ".grok" / "bin" / source):
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def available_sources() -> dict[str, bool]:
+    return {source: _which_cli(source) is not None for source in SOURCES}
+
+
+def _clean_cli_command(exe: str, *args: str) -> str:
+    """用绝对 CLI 路径启动，并清掉可能由 tmux server 继承的旧会话身份。"""
+    return shlex.join([
+        "env", "-u", "CLAUDE_CODE_SESSION_ID", "-u", "CODEX_COMPANION_SESSION_ID",
+        "-u", "GROK_SESSION_ID", exe, *args,
+    ])
+
+
+def new_cli_session(source: str, cwd: str, cols: int = 120, rows: int = 32) -> dict:
+    """在经过校验的目录中新建一条 CLI 会话。
+
+    命令只能来自固定白名单，浏览器不能借这个接口拼任意 shell。Claude/Grok
+    支持预先指定 UUID；Codex 启动后再由服务端根据新落盘的会话完成关联。
+    """
+    if source not in SOURCES:
+        raise ValueError(f"不支持的会话类型: {source}")
+    exe = _which_cli(source)
+    if not exe:
+        raise ValueError(f"找不到 {source} 命令")
+    raw = str(cwd or "").strip()
+    if not raw:
+        raise ValueError("请选择启动目录")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("启动目录必须是绝对路径")
+    try:
+        path = path.resolve(strict=True)
+    except OSError:
+        raise ValueError("启动目录不存在") from None
+    if not path.is_dir():
+        raise ValueError("启动路径不是目录")
+
+    sid = str(uuid.uuid4()) if source in ("claude", "grok") else None
+    args = [exe]
+    if sid:
+        args += ["--session-id", sid]
+    command = _clean_cli_command(args[0], *args[1:])
+    token = sid or str(uuid.uuid4())
+    suffix = sid[:8] if sid else f"new-{token[:8]}"
+    name = new_session(f"{source}-{suffix}", command, str(path), cols, rows)
+    return {"name": name, "source": source, "sid": sid, "cwd": str(path), "token": token}
 
 
 def _tmux(*args, timeout=10) -> str:
@@ -78,6 +145,10 @@ def list_sessions() -> list[dict]:
     return rows
 
 
+def has_session(name: str) -> bool:
+    return any(row["name"] == name for row in list_sessions())
+
+
 def new_session(name: str, cmd: str, cwd: str | None = None,
                 cols: int = 120, rows: int = 32) -> str:
     """新建一个 detached 会话并返回它的名字。"""
@@ -92,6 +163,29 @@ def new_session(name: str, cmd: str, cwd: str | None = None,
 
 def kill_session(name: str) -> None:
     _tmux("kill-session", "-t", name)
+
+
+def rename_session(old: str, new: str) -> str:
+    full = new if new.startswith(PREFIX) else PREFIX + new
+    _tmux("rename-session", "-t", old, full)
+    return full
+
+
+def process_belongs_to(pid: int, root_pid: int) -> bool:
+    """pid 是否等于或派生自指定 tmux pane 的根进程。"""
+    cur = abs(int(pid))
+    root = abs(int(root_pid))
+    for _ in range(16):
+        if cur == root:
+            return True
+        try:
+            st = open(f"/proc/{cur}/stat").read()
+            cur = int(st[st.rindex(")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if cur <= 1:
+            return cur == root
+    return False
 
 
 def send_text(name: str, text: str) -> None:

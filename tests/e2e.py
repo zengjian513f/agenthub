@@ -265,7 +265,7 @@ def run(pw):
     check("超限的命中消息标 ●", p.locator(".msg.hashit").count() > 0, p.locator(".msg.hashit").count())
     check("命中数显示为 N+", "+ 处匹配" in p.locator("#mcount").inner_text(),
           p.locator("#mcount").inner_text())
-    check("页面仍可交互", p.locator("#a-fold").is_enabled())
+    check("页面仍可交互", p.locator("#a-session-action").is_enabled())
     p.fill("#q", "")
     p.wait_for_timeout(400)
 
@@ -375,7 +375,7 @@ def run(pw):
           and "rgba(0, 0, 0, 0)" not in single_tool_skin["scrollbarColor"]
           and "rgb(0, 0, 0)" not in single_tool_skin["scrollbarColor"], single_tool_skin)
 
-    # 所有状态都没有角色/时间 header；左右留白和背景色构成聊天气泡层级。
+    # 所有状态都没有角色/时间 header；对齐方向和背景色构成聊天气泡层级。
     check("所有消息都没有 header", p.locator("#msgs .mh").count() == 0)
     bubble_geo = p.evaluate("""() => {
       const box = document.querySelector('#msgs'), cs = getComputedStyle(box), br = box.getBoundingClientRect();
@@ -383,13 +383,13 @@ def run(pw):
       const width = right - left;
       const u = document.querySelector('#msgs > .msg[data-role="user"]:not(.folded)').getBoundingClientRect();
       const a = document.querySelector('#msgs > .msg[data-role="assistant"]:not(.folded)').getBoundingClientRect();
-      return { userLeft: (u.left-left)/width, userRight: right-u.right,
-               otherLeft: a.left-left, otherRight: (right-a.right)/width };
+      return { userRight: right-u.right, otherLeft: a.left-left,
+               userMax: getComputedStyle(u).maxWidth, otherMax: getComputedStyle(a).maxWidth };
     }""")
-    check("用户气泡靠右且左侧至少留 10%",
-          bubble_geo["userRight"] <= 2 and bubble_geo["userLeft"] >= .095, bubble_geo)
-    check("其他气泡靠左且右侧至少留 10%",
-          bubble_geo["otherLeft"] <= 2 and bubble_geo["otherRight"] >= .095, bubble_geo)
+    check("用户气泡靠右", bubble_geo["userRight"] <= 2, bubble_geo)
+    check("其他气泡靠左", bubble_geo["otherLeft"] <= 2, bubble_geo)
+    check("长气泡可以铺满内容区",
+          bubble_geo["userMax"] == "100%" and bubble_geo["otherMax"] == "100%", bubble_geo)
     colors = p.locator('#msgs > .msg[data-role="user"], #msgs > .msg[data-role="assistant"]').evaluate_all(
         "ns => ns.slice(0, 2).map(n => getComputedStyle(n).backgroundColor)")
     check("用户与助手用不同背景色区分", len(colors) == 2 and colors[0] != colors[1], colors)
@@ -464,22 +464,7 @@ def run(pw):
         p.wait_for_timeout(150)
         check("组可再折叠", not grp.locator("> .tool-entry").first.is_visible())
 
-    # ---- 9/10. 仅批量折叠 / 展开工具输出 ----
-    fold_btn = p.locator("#a-fold")
-    fold_btn.click()
-    p.wait_for_timeout(200)
-    check("批量折叠只收起工具输出",
-          not grp.locator("> .tool-entry").first.is_visible()
-          and body_visible("thinking") and body_visible("user"))
-    check("折叠图标变为展开工具输出", fold_btn.get_attribute("title") == "展开工具输出",
-          fold_btn.get_attribute("title"))
-    fold_btn.click()
-    p.wait_for_timeout(200)
-    check("批量展开后工具内容打开", grp.locator("> .tool-entry").first.is_visible())
-    check("展开图标变回折叠工具输出", fold_btn.get_attribute("title") == "折叠工具输出",
-          fold_btn.get_attribute("title"))
-
-    # ---- 11. 展开全文 ----
+    # ---- 9. 展开全文 ----
     more = p.locator(".msg .more:visible").filter(has_text="展开全文").first
     check("长消息出现展开全文按钮", more.count() > 0 and "展开全文" in more.inner_text())
     # 对话长文只有这一个展开入口，展开后按钮消失。
@@ -495,12 +480,7 @@ def run(pw):
     check("展开后没有可见按钮", not target.query_selector(".more").is_visible())
     check("展开后内容完整", "点下方按钮展开全文" not in mb.inner_text())
 
-    # ---- 12. 导出 ----
-    href = p.locator('#a-export').get_attribute("href")
-    r = ctx.request.get(BASE + href)
-    check("导出 Markdown 可下载", r.status == 200 and len(r.body()) > 100, r.status)
-
-    # ---- 13. 子代理合并 (换一个有子代理的真实会话) ----
+    # ---- 10. 子代理合并 (换一个有子代理的真实会话) ----
     p.fill("#q", "")
     p.wait_for_timeout(300)
     idx = p.locator(".item").evaluate_all("ns => ns.findIndex(n => n.querySelector('.m').textContent.includes('⑂'))")
@@ -907,7 +887,14 @@ def run(pw):
     tl = json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())
     if not tl.get("enabled"):
         check("终端未启用时不显示接管入口", p.locator("#a-term").count() == 0)
+        check("终端未启用时不显示新建入口", p.locator("#new-session").is_hidden())
     else:
+        p.click("#new-session")
+        p.wait_for_selector("#new-session-dialog[open]")
+        check("新建弹窗有三种会话类型", p.locator('input[name="new-source"]').count() == 3)
+        check("新建弹窗列出常用目录", p.locator("#new-cwd-list option").count() >= 1)
+        check("启动目录可手工输入", p.locator("#new-cwd").input_value().startswith("/"))
+        p.click("#new-session-dialog .modal-cancel")
         dialogs = []
         def _dlg(d):                 # 用完必须摘掉, 否则后面删除会话的确认框也会被它吃掉
             dialogs.append(d.message)
@@ -1180,9 +1167,9 @@ def run(pw):
     p.fill("#q", "SESMAN自测")
     p.wait_for_timeout(300)
     p.locator(".item").first.click()
-    p.wait_for_selector("#a-del", timeout=10000)
+    p.wait_for_selector("#a-session-action[title='删除会话']", timeout=10000)
     p.once("dialog", lambda d: d.accept())
-    p.locator("#a-del").click()
+    p.locator("#a-session-action").click()
     p.wait_for_timeout(1200)
     check("删除后提示回收站", "回收站" in p.locator("#detail").inner_text())
     p.fill("#q", "SESMAN自测")

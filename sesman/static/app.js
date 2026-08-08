@@ -54,6 +54,34 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 const icon = src => `<svg class="ico" style="color:${SOURCES[src].color}"><use href="#${SOURCES[src].icon}"/></svg>`;
 const uiIcon = name => `<svg class="ui-icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 
+// Android 默认只缩小 visual viewport；iOS 也不会让 100dvh 可靠地避开软键盘。
+// 把应用高度钉到真正可见区域，并在 Safari 产生 viewport 偏移时跟着移动。
+let viewportFrame = 0;
+function syncMobileViewport() {
+  cancelAnimationFrame(viewportFrame);
+  viewportFrame = requestAnimationFrame(() => {
+    const root = document.documentElement.style;
+    if (!MOBILE.matches) {
+      root.removeProperty('--visual-viewport-height');
+      root.removeProperty('--visual-viewport-top');
+      return;
+    }
+    const viewport = window.visualViewport;
+    const height = Math.max(1, Math.round(viewport?.height || window.innerHeight));
+    const top = Math.max(0, Math.round(viewport?.offsetTop || 0));
+    root.setProperty('--visual-viewport-height', `${height}px`);
+    root.setProperty('--visual-viewport-top', `${top}px`);
+    if (typeof layoutTermPane === 'function') {
+      layoutTermPane();
+      fitTerm();
+    }
+  });
+}
+window.visualViewport?.addEventListener('resize', syncMobileViewport);
+window.visualViewport?.addEventListener('scroll', syncMobileViewport);
+window.addEventListener('resize', syncMobileViewport);
+syncMobileViewport();
+
 function showMobileDetail() {
   if (MOBILE.matches) {
     document.body.classList.add('mobile-detail');
@@ -318,8 +346,10 @@ async function pollLive(force = false) {
 /** 只改小圆点, 不重渲染整个列表 —— 否则每几秒就会打断滚动和选中。 */
 function paintLive() {
   for (const n of document.querySelectorAll('.item')) {
-    n.classList.toggle('live', S.live.has(n.dataset.uid));
-    n.classList.toggle('live-tmux', S.liveTmux.has(n.dataset.uid));
+    const pendingRunning = n.dataset.tmuxName
+      && typeof T !== 'undefined' && T.list?.some(t => t.name === n.dataset.tmuxName);
+    n.classList.toggle('live', !!pendingRunning || S.live.has(n.dataset.uid));
+    n.classList.toggle('live-tmux', !!pendingRunning || S.liveTmux.has(n.dataset.uid));
   }
   const h = $('#dlive');
   if (h) {
@@ -333,6 +363,8 @@ function paintLive() {
     termButton.classList.toggle('session-live', S.live.has(S.sel));
     termButton.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
   }
+  const selected = S.sessions.find(x => x.uid === S.sel);
+  if (selected) renderSessionAction(selected);
   const c = $('#livecount');
   if (c) {
     const tmux = S.liveTmux.size, direct = S.live.size - tmux;
@@ -357,6 +389,27 @@ function showSessionCount(n) {
   $('#stat').innerHTML = `${n}<span class="stat-unit"> 个会话</span>`;
 }
 
+const pendingUid = name => `tmux:${name}`;
+
+/** sesman 自己启动、但还没有对话文件的 tmux，也是一条可重新进入的临时会话。 */
+function pendingTmuxSessions() {
+  if (typeof T === 'undefined' || !Array.isArray(T.pending)) return [];
+  return T.pending.flatMap(t => {
+    if (!SOURCES[t.source] || (t.sid && S.sessions.some(s =>
+      s.source === t.source && String(s.sid) === String(t.sid)))) return [];
+    const source = t.source;
+    return [{
+      uid: pendingUid(t.name), pending: true, name: t.name, tmuxName: t.name, source,
+      title: `新建 ${SOURCES[source].name} 会话`, cwd: t.cwd || '(未知)',
+      created: new Date((t.started || Date.now() / 1000) * 1000).toISOString(),
+      updated: new Date((t.started || Date.now() / 1000) * 1000).toISOString(),
+      size: 0,
+    }];
+  });
+}
+
+const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions];
+
 /** 列表元数据变更后同步缓存和当前详情标题，不重绘消息正文。 */
 function refreshSessionMeta() {
   for (const s of S.sessions) {
@@ -379,7 +432,7 @@ async function loadSessions(force) {
   refreshSessionMeta();
   renderChips();
   renderSide();
-  showSessionCount(d.sessions.length);
+  showSessionCount(sidebarSessions().length);
 }
 
 /** 列表自动跟进磁盘变化。签名没变时服务端只回一个 unchanged, 成本约 3ms。 */
@@ -399,7 +452,7 @@ async function pollSessions() {
       if (!patchSide(visible())) renderSide();
       return;
     }
-    showSessionCount(d.sessions.length);
+    showSessionCount(sidebarSessions().length);
     if (patchSide(visible())) return;   // 能就地更新就不重建, 否则会一直闪
     const side = $('#side');
     const top = side.scrollTop;
@@ -413,7 +466,7 @@ setInterval(pollSessions, LIST_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSessions(); });
 
 function visible() {
-  const pool = (S.results || S.sessions).filter(s => !S.off.has(s.source));
+  const pool = (S.results || sidebarSessions()).filter(s => !S.off.has(s.source));
   if (!S.term || S.results) return pool;          // 搜索态下服务端已经筛过
   return pool.filter(s => hasTerm(s.title) || hasTerm(s.cwd));
 }
@@ -423,7 +476,7 @@ function renderChips() {
   const box = $('#chips');
   box.innerHTML = '';
   for (const [k, v] of Object.entries(SOURCES)) {
-    const n = S.sessions.filter(s => s.source === k).length;
+    const n = sidebarSessions().filter(s => s.source === k).length;
     const c = el('div', 'chip' + (S.off.has(k) ? ' off' : ''),
       `${icon(k)}<span>${v.name}</span><b>${n}</b>`);
     c.title = v.name;
@@ -455,7 +508,8 @@ function groupBy(list) {
   return keys.map(k => [k, m.get(k)]);
 }
 
-const itemMeta = s => [fmtTime(s.updated), fmtSize(s.size), s.model || '',
+const itemMeta = s => s.pending ? `${fmtTime(s.updated)} · 等待首条消息`
+  : [fmtTime(s.updated), fmtSize(s.size), s.model || '',
                        s.agents ? `⑂${s.agents}` : '',
                        s.hits ? `命中 ${s.hits}${s.hits_capped ? '+' : ''}` : '']
                       .filter(Boolean).join(' · ');
@@ -521,8 +575,9 @@ function renderSide() {
     for (const s of items) {
       const meta = itemMeta(s);
       const it = el('div', 'item' + (S.sel === s.uid ? ' sel' : '')
-                              + (S.live.has(s.uid) ? ' live' : '')
-                              + (S.liveTmux.has(s.uid) ? ' live-tmux' : ''),
+                              + (s.pending ? ' pending live live-tmux' : '')
+                              + (!s.pending && S.live.has(s.uid) ? ' live' : '')
+                              + (!s.pending && S.liveTmux.has(s.uid) ? ' live-tmux' : ''),
         `<span class="ico">${icon(s.source)}</span>
          <div class="body">
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
@@ -532,7 +587,8 @@ function renderSide() {
            ${s.snippet ? `<div class="snip">${hl(s.snippet)}</div>` : ''}
          </div>`);
       it.dataset.uid = s.uid;
-      it.onclick = () => openSession(s.uid);
+      if (s.pending) it.dataset.tmuxName = s.tmuxName;
+      it.onclick = () => s.pending ? openPendingSession(s) : openSession(s.uid);
       ul.appendChild(it);
     }
     g.appendChild(ul);
@@ -821,20 +877,13 @@ function head(m, total) {
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
           (typeof T !== 'undefined' && T.enabled)
             ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
-        <button class="iconbtn mobile-more" id="a-more" title="更多操作" aria-label="更多操作"
-          aria-expanded="false">${uiIcon('more')}</button>
-        <div class="mobile-action-menu">
-          <a class="iconbtn" id="a-export" href="${appUrl(`api/export/${encodeURIComponent(m.uid)}`)}" download
-             title="导出 Markdown" aria-label="导出 Markdown">${uiIcon('download')}</a>
-          <button class="iconbtn" id="a-fold" title="折叠工具输出" aria-label="折叠工具输出">${uiIcon('fold')}</button>
-          ${S.term ? `<span class="mnav"><b id="mcount">…</b>
-            <button class="iconbtn" id="m-prev" title="上一处" aria-label="上一处">↑</button>
-            <button class="iconbtn" id="m-next" title="下一处" aria-label="下一处">↓</button></span>` : ''}
-          ${m.agents ? `<button class="iconbtn${S.agents ? ' on' : ''}" id="a-agents"
-            title="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理" aria-label="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理"
-            aria-pressed="${S.agents}">${uiIcon('agents')}<span class="action-badge">${m.agents}</span></button>` : ''}
-          <button class="iconbtn danger" id="a-del" title="删除会话" aria-label="删除会话">${uiIcon('trash')}</button>
-        </div>
+        ${S.term ? `<span class="mnav"><b id="mcount">…</b>
+          <button class="iconbtn" id="m-prev" title="上一处" aria-label="上一处">↑</button>
+          <button class="iconbtn" id="m-next" title="下一处" aria-label="下一处">↓</button></span>` : ''}
+        ${m.agents ? `<button class="iconbtn${S.agents ? ' on' : ''}" id="a-agents"
+          title="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理" aria-label="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理"
+          aria-pressed="${S.agents}">${uiIcon('agents')}<span class="action-badge">${m.agents}</span></button>` : ''}
+        <button class="iconbtn danger" id="a-session-action"></button>
       </div>
     </div>
     <div class="dmeta">
@@ -849,23 +898,6 @@ function head(m, total) {
       <span class="meta-secondary"><code>${esc(m.cwd)}</code></span>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
-  const actions = h.querySelector('.dhead-actions');
-  const more = h.querySelector('#a-more');
-  const closeActions = () => {
-    actions.classList.remove('menu-open');
-    more.setAttribute('aria-expanded', 'false');
-  };
-  more.onclick = e => {
-    e.stopPropagation();
-    const open = actions.classList.toggle('menu-open');
-    more.setAttribute('aria-expanded', String(open));
-    if (open) setTimeout(() => document.addEventListener('click', e => {
-      if (!actions.contains(e.target)) closeActions();
-    }, { once: true }), 0);
-  };
-  h.querySelector('.mobile-action-menu').onclick = e => {
-    if (e.target.closest('a, button')) setTimeout(closeActions, 0);
-  };
   const ag = h.querySelector('#a-agents');
   if (ag) ag.onclick = () => openSession(m.uid, !S.agents);
   const tb = h.querySelector('#a-term');
@@ -880,17 +912,35 @@ function head(m, total) {
     };
     setTimeout(renderTakeoverBtn, 0);
   }
-  const fb = h.querySelector('#a-fold');
-  fb.onclick = () => {
-    const fold = fb.dataset.state !== 'folded';   // 按状态判断, 不能靠按钮文案
-    document.querySelectorAll('.msg.foldable').forEach(n => fold ? n._fold() : n._open());
-    fb.dataset.state = fold ? 'folded' : 'open';
-    const label = fold ? '展开工具输出' : '折叠工具输出';
-    fb.innerHTML = uiIcon(fold ? 'expand' : 'fold');
-    fb.title = fb.ariaLabel = label;
-  };
-  h.querySelector('#a-del').onclick = () => del(m);
+  renderSessionAction(m, h.querySelector('#a-session-action'));
   return h;
+}
+
+function renderSessionAction(m, button = $('#a-session-action')) {
+  if (!button || m.uid !== S.sel) return;
+  const running = S.live.has(m.uid);
+  const label = running ? '停止会话' : '删除会话';
+  button.innerHTML = uiIcon(running ? 'power' : 'trash');
+  button.title = button.ariaLabel = label;
+  button.onclick = () => running ? stopSession(m, button) : del(m);
+}
+
+async function stopSession(m, button) {
+  if (!confirm(`停止会话「${m.title}」?\n\n停止后才可以删除会话记录。`)) return;
+  button.disabled = true;
+  try {
+    const r = await fetch(appUrl('api/session/stop'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid: m.uid }),
+    });
+    const d = await r.json();
+    if (!r.ok) return alert('停止失败: ' + (d.error || r.status));
+    await refreshLive(true);
+    if (typeof loadTermList === 'function') await loadTermList();
+    paintLive();
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function del(m) {
@@ -1251,6 +1301,7 @@ MOBILE.addEventListener?.('change', e => {
   } else {
     document.body.classList.remove('mobile-detail');
   }
+  syncMobileViewport();
   setSideWidth(store.get('width', SIDE_DEFAULT));
 });
 

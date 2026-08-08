@@ -14,6 +14,10 @@ const T = {
   mode: store.get('termmode', 'normal'), // normal | collapsed | full
   localMouse: store.get('tmouse', false),   // true = 鼠标归浏览器, 可以框选复制
   scrollPos: 0,                             // tmux 里往上翻了多少行
+  sources: {},
+  home: '',
+  pending: [],
+  resolving: new Set(),
 };
 
 // 应用(claude/codex 的 TUI)申请接管鼠标的那些序列。选择模式下要拦掉,
@@ -46,14 +50,36 @@ const terminalFontReady = document.fonts
   : Promise.resolve();
 
 async function loadTermList() {
+  const fingerprint = () => [
+    ...(T.list || []).map(x => `${x.name}\t${x.cwd}`),
+    ...(T.pending || []).map(x => `pending\t${x.name}\t${x.cwd}`),
+  ].join('\n');
+  const before = fingerprint();
   try {
     const d = await (await fetch(appUrl('api/term/list'))).json();
     T.enabled = !!d.enabled;
     T.list = d.sessions || [];
+    T.sources = d.sources || {};
+    T.home = d.home || '';
+    T.pending = d.pending || [];
   } catch {
     T.enabled = false;
     T.list = [];
+    T.sources = {};
+    T.pending = [];
   }
+  $('#new-session')?.classList.toggle('hidden', !T.enabled);
+  const after = fingerprint();
+  if (after !== before && typeof renderSide === 'function') {
+    const side = $('#side'), top = side?.scrollTop || 0;
+    renderChips();
+    if (!S.results) showSessionCount(sidebarSessions().length);
+    renderSide();
+    if (side) side.scrollTop = top;
+    paintLive();
+  }
+  // 刷新页面后仍从持久化 meta 恢复关联轮询；Set 防止重复启动。
+  for (const pending of pendingTmuxSessions()) resolveNewSession(pending);
 }
 
 /** 某个会话是否已经被接管 (存在对应的 tmux 会话)。 */
@@ -104,6 +130,164 @@ async function post(url, body) {
   });
   return r.json();
 }
+
+// ---------------------------------------------------------------- 新建会话
+function commonSessionDirs() {
+  const dirs = new Map();
+  for (const s of S.sessions) {
+    const cwd = String(s.cwd || '');
+    if (!cwd.startsWith('/')) continue;
+    const row = dirs.get(cwd) || { cwd, count: 0, updated: '' };
+    row.count++;
+    if ((s.updated || '') > row.updated) row.updated = s.updated || '';
+    dirs.set(cwd, row);
+  }
+  for (const [i, cwd] of store.get('newDirs', []).entries()) {
+    if (!cwd?.startsWith('/')) continue;
+    const row = dirs.get(cwd) || { cwd, count: 0, updated: '' };
+    row.recent = 20 - i;
+    dirs.set(cwd, row);
+  }
+  if (T.home && !dirs.has(T.home)) dirs.set(T.home, { cwd: T.home, count: 0, updated: '' });
+  return [...dirs.values()].sort((a, b) =>
+    (b.recent || 0) - (a.recent || 0) || b.count - a.count
+    || b.updated.localeCompare(a.updated) || a.cwd.localeCompare(b.cwd)).slice(0, 18);
+}
+
+function openNewSessionDialog() {
+  const dialog = $('#new-session-dialog');
+  const list = $('#new-cwd-list');
+  const rows = commonSessionDirs();
+  list.innerHTML = '';
+  for (const d of rows) {
+    const o = document.createElement('option');
+    o.value = d.cwd;
+    o.textContent = d.count ? `${d.cwd}  ·  ${d.count} 个会话` : d.cwd;
+    list.appendChild(o);
+  }
+  for (const input of dialog.querySelectorAll('input[name="new-source"]')) {
+    input.disabled = !T.sources[input.value];
+  }
+  const checked = dialog.querySelector('input[name="new-source"]:checked');
+  if (!checked || checked.disabled) dialog.querySelector('input[name="new-source"]:not(:disabled)')?.click();
+  const selected = S.sessions.find(s => s.uid === S.sel)?.cwd;
+  const cwd = selected || store.get('newDirs', [])[0] || rows[0]?.cwd || T.home || '';
+  $('#new-cwd').value = cwd;
+  list.value = cwd;
+  $('#new-session-error').textContent = '';
+  $('#new-session-go').disabled = false;
+  dialog.showModal();
+  setTimeout(() => { $('#new-cwd').focus(); $('#new-cwd').select(); }, 0);
+}
+
+function showNewSessionStage(info) {
+  S.results = null;
+  S.filter = S.term = '';
+  $('#q').value = '';
+  S.sel = pendingUid(info.name);
+  store.set('sel', S.sel);
+  renderSide();
+  showSessionCount(sidebarSessions().length);
+  $('#composer').classList.add('hidden');
+  const src = SOURCES[info.source];
+  $('#detail').innerHTML = `<div class="dhead"><div class="dtitle">
+    <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
+    <h2>${icon(info.source)} 新建 ${esc(src.name)} 会话</h2></div>
+    <div class="dmeta"><span class="meta-source">${esc(src.name)}</span><span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>
+  </div><div class="empty new-session-wait">终端已启动，正在等待会话记录落盘…</div>`;
+  $('#detail .mobile-back').onclick = showMobileList;
+  showMobileDetail();
+  T.uid = null;
+  T.mode = 'full';
+}
+
+async function openPendingSession(info) {
+  const pending = { ...info, name: info.tmuxName || info.name };
+  showNewSessionStage(pending);
+  await openTermPane(pending.name);
+  resolveNewSession(pending);
+}
+
+async function resolveNewSession(info) {
+  const pendingId = pendingUid(info.name);
+  if (T.resolving.has(info.name)) return;
+  T.resolving.add(info.name);
+  try {
+    for (let i = 0; i < 160; i++) {         // TUI 等用户首次输入时可能较久，最多等两分钟
+      await new Promise(r => setTimeout(r, 750));
+      let d;
+      try {
+        d = await (await fetch(appUrl(`api/term/new-status?name=${encodeURIComponent(info.name)}`))).json();
+      } catch { continue; }
+      if (d.error) {
+        const wait = $('.new-session-wait');
+        if (wait && S.sel === pendingId) wait.textContent = `会话关联失败：${d.error}`;
+        return;
+      }
+      if (d.waiting) {
+        const wait = $('.new-session-wait');
+        if (wait && S.sel === pendingId && !d.running) wait.textContent = 'CLI 已退出，尚未生成会话记录';
+        continue;
+      }
+      const active = S.sel === pendingId;
+      await loadSessions(true);
+      await loadTermList();
+      if (!active) return;                  // 用户已看别处，只更新列表，不抢走右侧页面
+      T.uid = d.uid;
+      if (d.running) {
+        S.live.add(d.uid);
+        S.liveTmux.add(d.uid);
+      }
+      await openSession(d.uid);
+      if (d.running) await openTermPane(d.name);
+      else closeTermPane();
+      paintLive();
+      return;
+    }
+    const wait = $('.new-session-wait');
+    if (wait && S.sel === pendingId) wait.textContent = '会话仍在终端中运行；产生首条记录后会出现在列表里';
+  } finally {
+    T.resolving.delete(info.name);
+  }
+}
+
+async function createNewSession(e) {
+  e.preventDefault();
+  const source = $('#new-session-dialog input[name="new-source"]:checked')?.value;
+  const cwd = $('#new-cwd').value.trim();
+  const go = $('#new-session-go'), error = $('#new-session-error');
+  error.textContent = '';
+  if (!source) { error.textContent = '没有可用的会话类型'; return; }
+  if (!cwd) { error.textContent = '请选择启动目录'; return; }
+  go.disabled = true;
+  go.textContent = '创建中…';
+  try {
+    const d = await post('api/term/create', { source, cwd, cols: 120, rows: termRows() });
+    if (d.error) { error.textContent = d.error; return; }
+    const recent = [d.cwd, ...store.get('newDirs', []).filter(x => x !== d.cwd)].slice(0, 8);
+    store.set('newDirs', recent);
+    $('#new-session-dialog').close();
+    showNewSessionStage(d);
+    await loadTermList();
+    await openTermPane(d.name);
+    resolveNewSession(d);
+  } catch (err) {
+    error.textContent = err.message || '创建失败';
+  } finally {
+    go.disabled = false;
+    go.textContent = '创建并打开';
+  }
+}
+
+$('#new-session').onclick = openNewSessionDialog;
+$('#new-session-form').onsubmit = createNewSession;
+$('#new-session-dialog .modal-close').onclick = () => $('#new-session-dialog').close();
+$('#new-session-dialog .modal-cancel').onclick = () => $('#new-session-dialog').close();
+$('#new-cwd-list').onchange = e => { $('#new-cwd').value = e.target.value; };
+$('#new-cwd-list').ondblclick = () => $('#new-session-form').requestSubmit();
+$('#new-session-dialog').addEventListener('click', e => {
+  if (e.target === $('#new-session-dialog')) $('#new-session-dialog').close();
+});
 
 const termRows = () => Math.max(10, Math.floor((T.height - 34) / (termFontSize() * 1.31)));
 
@@ -227,7 +411,7 @@ function layoutTermPane() {
   pane.classList.toggle('term-collapsed', desktop && T.mode === 'collapsed');
   if (MOBILE.matches) {
     pane.style.removeProperty('height');
-    pane.style.setProperty('--mobile-terminal-top', `${$('.dhead')?.offsetHeight || 0}px`);
+    pane.style.removeProperty('--mobile-terminal-top');
   } else {
     pane.style.removeProperty('--mobile-terminal-top');
     if (T.mode === 'collapsed') pane.style.height = '0px';
@@ -460,6 +644,7 @@ document.addEventListener('pointercancel', finishTermDrag);
 
 $('#tmouse').onclick = () => setLocalMouse(!T.localMouse);
 $('#tscroll').onclick = () => leaveScroll();
+$('#tchat').onclick = () => closeTermPane();
 $('#tstop').onclick = () => stopTermSession();
 
 loadTermList();

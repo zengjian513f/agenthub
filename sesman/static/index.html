@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>sesman · 会话管理</title>
 <link rel="stylesheet" href="vendor/xterm.css">
 <link rel="stylesheet" href="vendor/katex/katex.min.css">
@@ -21,18 +21,9 @@
   <symbol id="i-grok" viewBox="0 0 16 16">
     <path fill="currentColor" d="M2 14L9.4 4.2 12.6 2 6.6 11.3 2 14zm7.5-.1l3.6-5.1V2.4L9.5 7.2v6.7z"/>
   </symbol>
-  <symbol id="i-download" viewBox="0 0 16 16">
-    <path d="M8 1.8v8.5m-3.2-3L8 10.6l3.2-3.3M2.5 13.7h11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-  </symbol>
   <symbol id="i-terminal" viewBox="0 0 16 16">
     <rect x="1.5" y="2" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/>
     <path d="M4 5l2.3 2L4 9m4 1h3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
-  </symbol>
-  <symbol id="i-fold" viewBox="0 0 16 16">
-    <path d="M2.5 2h11M8 2v4.5m0 0L5.5 4M8 6.5L10.5 4M2.5 14h11M8 14V9.5m0 0L5.5 12M8 9.5l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
-  </symbol>
-  <symbol id="i-expand" viewBox="0 0 16 16">
-    <path d="M2.5 7h11M8 7V2.5m0 0L5.5 5M8 2.5L10.5 5M2.5 9h11M8 9v4.5m0 0L5.5 11M8 13.5l2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
   </symbol>
   <symbol id="i-agents" viewBox="0 0 16 16">
     <circle cx="4" cy="4" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/>
@@ -43,10 +34,8 @@
   <symbol id="i-trash" viewBox="0 0 16 16">
     <path d="M2.5 4h11M6 4V2h4v2m2 0l-.6 9.5h-6.8L4 4m2.5 2.5v4.5m3-4.5v4.5" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
   </symbol>
-  <symbol id="i-more" viewBox="0 0 16 16">
-    <circle cx="3" cy="8" r="1.25" fill="currentColor"/>
-    <circle cx="8" cy="8" r="1.25" fill="currentColor"/>
-    <circle cx="13" cy="8" r="1.25" fill="currentColor"/>
+  <symbol id="i-power" viewBox="0 0 16 16">
+    <path d="M8 1.5v6M4.2 3.8a5.5 5.5 0 107.6 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
   </symbol>
   <symbol id="i-select" viewBox="0 0 16 16">
     <path d="M2.5 5V2.5H5m6 0h2.5V5m0 6v2.5H11m-6 0H2.5V11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
@@ -55,6 +44,15 @@
   <symbol id="i-stop" viewBox="0 0 16 16">
     <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/>
     <rect x="5.2" y="5.2" width="5.6" height="5.6" rx=".7" fill="currentColor"/>
+  </symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16">
+    <path d="M8 2.5v11M2.5 8h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-refresh" viewBox="0 0 16 16">
+    <path d="M13.2 5.8A5.6 5.6 0 103.4 11M13.2 2.8v3h-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="i-chat" viewBox="0 0 16 16">
+    <path d="M2 2.5h12v8.3H7l-3.7 2.7v-2.7H2z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
   </symbol>
 </svg>
 
@@ -66,7 +64,12 @@
       <button data-v="tree" class="on" title="项目树" aria-label="项目树">📁 <span class="mobile-label">项目树</span></button>
       <button data-v="date" title="时间轴" aria-label="时间轴">🕒 <span class="mobile-label">时间轴</span></button>
     </div>
-    <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">↻ <span class="mobile-label">刷新</span></button>
+    <button class="btn hidden" id="new-session" title="新建会话" aria-label="新建会话">
+      <svg class="ui-icon" aria-hidden="true"><use href="#i-plus"/></svg>
+    </button>
+    <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">
+      <svg class="ui-icon" aria-hidden="true"><use href="#i-refresh"/></svg>
+    </button>
   </header>
   <div id="prog"><div class="bar"></div><span class="txt"></span></div>
   <main>
@@ -100,6 +103,9 @@
       <div id="termpane" class="hidden">
         <div class="term-resizer" id="tgrip" title="拖动终端上边界调整高度"></div>
         <div class="thead">
+          <button class="iconbtn mobile-term-chat" id="tchat" title="切换到对话" aria-label="切换到对话">
+            <svg class="ui-icon" aria-hidden="true"><use href="#i-chat"/></svg>
+          </button>
           <span id="tstatus">未连接</span>
           <button class="chipbtn" id="tscroll"></button>
           <span class="spacer"></span>
@@ -109,19 +115,43 @@
           <button class="iconbtn danger" id="tstop" title="结束这个 tmux 会话" aria-label="结束会话">
             <svg class="ui-icon" aria-hidden="true"><use href="#i-stop"/></svg>
           </button>
-        </div>
-        <div class="term-keys" aria-label="终端方向与翻页键">
-          <button data-term-key="Up" title="方向键上" aria-label="方向键上">↑</button>
-          <button data-term-key="Down" title="方向键下" aria-label="方向键下">↓</button>
-          <button data-term-key="PPage" title="Page Up" aria-label="Page Up">Pg↑</button>
-          <button data-term-key="NPage" title="Page Down" aria-label="Page Down">Pg↓</button>
-          <button data-term-key="Escape" title="Escape" aria-label="Escape">Esc</button>
+          <div class="term-keys" aria-label="终端方向与翻页键">
+            <button data-term-key="Up" title="方向键上" aria-label="方向键上">↑</button>
+            <button data-term-key="Down" title="方向键下" aria-label="方向键下">↓</button>
+            <button data-term-key="PPage" title="Page Up" aria-label="Page Up">Pg↑</button>
+            <button data-term-key="NPage" title="Page Down" aria-label="Page Down">Pg↓</button>
+            <button data-term-key="Escape" title="Escape" aria-label="Escape">Esc</button>
+          </div>
         </div>
         <div id="xterm"></div>
       </div>
     </div>
   </main>
 </div>
+
+<dialog id="new-session-dialog" aria-labelledby="new-session-title">
+  <form id="new-session-form">
+    <div class="modal-head">
+      <div><h2 id="new-session-title">新建会话</h2><p>选择会话类型和启动目录</p></div>
+      <button type="button" class="modal-close" title="关闭" aria-label="关闭">×</button>
+    </div>
+    <fieldset class="new-source">
+      <legend>会话类型</legend>
+      <label><input type="radio" name="new-source" value="claude" checked><span><svg class="ico"><use href="#i-claude"/></svg>Claude</span></label>
+      <label><input type="radio" name="new-source" value="codex"><span><svg class="ico"><use href="#i-codex"/></svg>Codex</span></label>
+      <label><input type="radio" name="new-source" value="grok"><span><svg class="ico"><use href="#i-grok"/></svg>Grok</span></label>
+    </fieldset>
+    <label class="new-cwd-label" for="new-cwd">启动目录</label>
+    <input id="new-cwd" name="cwd" autocomplete="off" spellcheck="false" placeholder="/home/user/Projects/project">
+    <label class="new-common-label" for="new-cwd-list">常用目录</label>
+    <select id="new-cwd-list" size="6" aria-label="常用启动目录"></select>
+    <div id="new-session-error" role="alert"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn modal-cancel">取消</button>
+      <button type="submit" class="btn go" id="new-session-go">创建并打开</button>
+    </div>
+  </form>
+</dialog>
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="vendor/katex/katex.min.js"></script>

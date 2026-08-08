@@ -12,14 +12,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import index, live, media, term, wsock
+from . import index, live, media, pending as pending_store, term, wsock
 
 STATIC = Path(__file__).parent / "static"
 ALLOWED_IPS: set[str] = set()
 TERMINAL = False        # 远程终端 = 远程执行, 必须显式 --terminal 打开
 WATCH_POLL = 0.05       # 服务端盯文件的间隔; stat 一个文件是微秒级, 这里很便宜
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "sesman"
     protocol_version = "HTTP/1.1"
@@ -67,6 +65,8 @@ class Handler(BaseHTTPRequestHandler):
         if not TERMINAL:
             return self._json({"error": "终端未启用, 服务端需加 --terminal"}, 403)
         try:
+            if u.path == "/api/term/create":
+                return self._create_session(body)
             if u.path == "/api/term/new":
                 name = term.new_session(body.get("name") or "s", body["cmd"],
                                         body.get("cwd"), int(body.get("cols", 120)),
@@ -74,7 +74,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"name": name})
             if u.path == "/api/term/kill":
                 term.kill_session(body["name"])
+                pending_store.discard(body["name"])
                 return self._json({"ok": True})
+            if u.path == "/api/session/stop":
+                return self._stop_session(body)
             if u.path == "/api/term/takeover":
                 return self._takeover(body)
             if u.path == "/api/term/scroll":
@@ -130,6 +133,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "not found"}, 404)
         uid = unquote(u.path[len("/api/session/"):])
         try:
+            s = index.get(uid)
+            if not s:
+                raise KeyError(uid)
+            name = term.session_name_for(s["source"], s["sid"])
+            if live.is_live(s, force=True) or term.has_session(name):
+                return self._json({"error": "请先停止会话"}, 409)
             dest = index.delete(uid)
         except KeyError:
             return self._json({"error": "会话不存在"}, 404)
@@ -157,8 +166,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"uids": uids, "tmux_uids": tmux_uids})
 
         if path == "/api/term/list":
+            tmux_sessions = term.list_sessions() if TERMINAL else []
+            pending = pending_store.active({x["name"] for x in tmux_sessions}) if TERMINAL else []
+            public_pending = [{k: row.get(k) for k in
+                               ("name", "source", "sid", "cwd", "started", "cols", "rows")}
+                              for row in pending]
             return self._json({"enabled": TERMINAL and term.available(),
-                               "sessions": term.list_sessions() if TERMINAL else []})
+                               "sources": term.available_sources() if TERMINAL else {},
+                               "home": str(Path.home()),
+                               "sessions": tmux_sessions,
+                               "pending": public_pending})
+
+        if path == "/api/term/new-status":
+            return self._new_session_status(q)
 
         if path.startswith("/api/media/"):
             token = path[len("/api/media/"):]
@@ -203,12 +223,6 @@ class Handler(BaseHTTPRequestHandler):
                 raise KeyError(uid)
             return self._json(index.version(s))
 
-        if path.startswith("/api/export/"):
-            uid = unquote(path[len("/api/export/"):])
-            md = index.to_markdown(uid)
-            name = uid.replace(":", "-") + ".md"
-            return self._send(200, md.encode(), "text/markdown; charset=utf-8",
-                              {"Content-Disposition": f'attachment; filename="{name}"'})
         raise KeyError(path)
 
     def _search_stream(self, query: str, sources, **opts):
@@ -315,7 +329,115 @@ class Handler(BaseHTTPRequestHandler):
 
         cols, rows = int(body.get("cols", 120)), int(body.get("rows", 32))
         term.new_session(name, term.resume_command(s["source"], s["sid"]), s["cwd"], cols, rows)
+        time.sleep(0.1)
+        if not term.has_session(name):
+            return self._json({"error": f"{s['source']} 启动后立即退出，请检查 CLI 环境"}, 500)
         return self._json({"name": name, "action": "killed" if pids else "started"})
+
+    def _stop_session(self, body: dict):
+        """停止会话的运行实例，保留对话文件供后续查看或删除。"""
+        s = index.get(str(body.get("uid") or ""))
+        if not s:
+            return self._json({"error": "会话不存在"}, 404)
+
+        pids = live.pids_of(s, force=True)
+        name = term.session_name_for(s["source"], s["sid"])
+        panes = term.list_sessions()
+        pane = next((x for x in panes if x["name"] == name), None)
+        if not pane:
+            # 会话可能在网页里改过 tmux 名，用 pane 进程树找回 sesman 所属 tmux。
+            pane = next((x for x in panes if x["owned"] and any(
+                p > 0 and term.process_belongs_to(p, x["pid"]) for p in pids
+            )), None)
+
+        if pane:
+            term.kill_session(pane["name"])
+            pending_store.discard(pane["name"])
+            killed = [p for p in pids if p > 0]
+        else:
+            killed = term.kill_pids(pids)
+        live.snapshot(force=True)
+        return self._json({"ok": True, "stopped": bool(pane or killed),
+                           "tmux": bool(pane)})
+
+    def _create_session(self, body: dict):
+        """用固定 CLI 白名单新建会话；不接受浏览器传入的任意命令。"""
+        source = str(body.get("source") or "")
+        before = {str(s["sid"]) for s in index.load() if s["source"] == source}
+        cols, rows = int(body.get("cols", 120)), int(body.get("rows", 32))
+        info = term.new_cli_session(
+            source, str(body.get("cwd") or ""),
+            cols, rows,
+        )
+        record = {**info, "before": before, "started": time.time(),
+                  "cols": cols, "rows": rows}
+        try:
+            pending_store.put(record)
+        except Exception:
+            # 记录失败就撤销刚启动的 tmux，不能制造一个网页再也找不到的孤儿。
+            term.kill_session(info["name"])
+            raise
+        return self._json({k: info[k] for k in ("name", "source", "sid", "cwd", "token")})
+
+    def _new_session_status(self, q: dict):
+        """等待 CLI 落盘后，把临时 tmux 名称关联到真正的 sesman 会话。"""
+        if not TERMINAL:
+            return self._json({"error": "终端未启用"}, 403)
+        name = q.get("name", [""])[0]
+        pending = pending_store.get(name)
+        if pending and pending.get("resolved"):
+            return self._json(pending["resolved"])
+        if not pending:
+            return self._json({"error": "新会话记录不存在或已过期"}, 404)
+
+        # 签名包含路径、mtime 和大小；新文件/首条消息会自然触发重建。
+        # 不能在 750ms 状态轮询里强制全量解析所有会话。
+        sessions = index.load()
+        source, sid, cwd = pending["source"], pending["sid"], pending["cwd"]
+
+        def same_cwd(s):
+            try:
+                return str(Path(s["cwd"]).expanduser().resolve()) == cwd
+            except (OSError, TypeError):
+                return False
+
+        if sid:
+            candidates = [s for s in sessions if s["source"] == source and str(s["sid"]) == sid]
+        else:
+            before = set(pending.get("before") or [])
+            candidates = [s for s in sessions if s["source"] == source
+                          and str(s["sid"]) not in before and same_cwd(s)]
+
+        # Codex 不能预先指定 UUID。若同目录恰好同时新建多条，就用 tmux pane
+        # 的进程树与 Codex 持有的 rollout 文件 fd 做精确关联。
+        if source == "codex" and candidates:
+            pane = next((x for x in term.list_sessions() if x["name"] == name), None)
+            if pane:
+                live.snapshot(force=True)
+                linked = [s for s in candidates if any(
+                    term.process_belongs_to(pid, pane["pid"])
+                    for pid in live.pids_of(s)
+                )]
+                if linked:
+                    candidates = linked
+                else:
+                    candidates = []           # rollout 已出现但进程关系还没稳定，下轮再认
+        if not candidates:
+            exists = any(x["name"] == name for x in term.list_sessions())
+            return self._json({"waiting": True, "running": exists})
+
+        s = max(candidates, key=lambda x: x["created"])
+        canonical = term.session_name_for(s["source"], s["sid"])
+        names = {x["name"] for x in term.list_sessions()}
+        if name != canonical and name in names:
+            if canonical in names:
+                return self._json({"error": f"tmux 会话名冲突: {canonical}"}, 409)
+            canonical = term.rename_session(name, canonical)
+        running = name in names or canonical in names
+        result = {"waiting": False, "running": running,
+                  "name": canonical, "uid": s["uid"], "session": s}
+        pending_store.resolve(name, result)
+        return self._json(result)
 
     def _attach(self, q: dict):
         """WebSocket ↔ tmux attach 的字节转发。"""

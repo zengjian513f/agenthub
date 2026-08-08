@@ -265,20 +265,3 @@ def search(query: str, sources=None, limit: int = 60,
             progress(done, len(pool))
     hits.sort(key=lambda x: x["updated"], reverse=True)
     return {"results": hits, "truncated": truncated, "total_pool": len(pool)}
-
-
-def to_markdown(uid: str) -> str:
-    d = messages(uid)
-    s, msgs = d["meta"], d["messages"]
-    lines = [f"# {s['title']}", "",
-             f"- 来源: {s['source']}", f"- 会话 ID: {s['sid']}", f"- 目录: {s['cwd']}",
-             f"- 创建: {s['created']}", f"- 更新: {s['updated']}",
-             f"- 文件: {s['path']}", "", "---", ""]
-    for m in msgs:
-        head = m["role"] + (f" · {m['name']}" if m.get("name") else "")
-        lines.append(f"### {head}")
-        if m["role"] in ("tool", "tool_result"):
-            lines += ["```", m["text"][:20000], "```", ""]
-        else:
-            lines += [m["text"], ""]
-    return "\n".join(lines)
