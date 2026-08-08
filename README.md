@@ -171,6 +171,12 @@ Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex
 | 缓存命中再打开 | ~150ms |
 | 增量同步（无新内容） | 服务端 3ms |
 
+会话消息、列表和搜索等 JSON 响应超过 1 KiB 时，会根据客户端的
+`Accept-Encoding` 使用 gzip level 4，并返回 `Vary: Accept-Encoding`。浏览器自动解压，
+前端不需要额外处理。当前真实大会话抽样中，37.1 MiB 源文件解析成 4.5 MiB 首包，
+压缩后为 1.20 MiB（减少 73%，服务端约增加 75 ms CPU）；增量响应通常很小，不会压缩。
+反向代理配置也对 JSON、JS、CSS 和 SVG 提供相同级别的 gzip 兜底，WebSocket 与 SSE 不压缩。
+
 有个坑值得记：渲染必须**先在游离的 `DocumentFragment` 里建好整棵子树再一次性挂上**。若逐批插入已在文档中的容器，每批都会触发一次全量 layout，节点上万时是 O(n²) —— 同一个会话实测 243ms 变成 14.5s。批间让出主线程也要用 `setTimeout` 而非 `requestAnimationFrame`，后者会等一次绘制，又把 layout 成本引回来。
 
 ## 索引缓存与列表自动刷新

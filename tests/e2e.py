@@ -1,11 +1,13 @@
 """sesman 前端端到端测试: 真实浏览器点遍每个交互。"""
 import base64
+import gzip
 import json
 import os
 import re
 import shutil
 import subprocess
 import threading
+import urllib.parse
 import urllib.request
 import sys
 import time
@@ -385,6 +387,26 @@ def run(pw):
     meta_codes = p.locator(".dmeta code").all_inner_texts()
     check("目录在前且 UUID 内容在后",
           meta_codes[-2:] == ["/tmp/sesman-selftest", "00000000-dead-beef-0000-000000000001"], meta_codes)
+    message_url = BASE + "/api/messages/" + urllib.parse.quote(p.evaluate("S.sel"), safe="")
+    plain_res = urllib.request.urlopen(urllib.request.Request(
+        message_url, headers={"Accept-Encoding": "identity"}), timeout=30)
+    plain_body = plain_res.read()
+    gzip_res = urllib.request.urlopen(urllib.request.Request(
+        message_url, headers={"Accept-Encoding": "br, gzip"}), timeout=30)
+    gzip_body = gzip_res.read()
+    gzip_data = json.loads(gzip.decompress(gzip_body))
+    check("大会话 JSON 使用 gzip 降低传输流量",
+          gzip_res.headers.get("Content-Encoding") == "gzip"
+          and "Accept-Encoding" in gzip_res.headers.get("Vary", "")
+          and gzip_data["meta"]["uid"] == p.evaluate("S.sel")
+          and len(gzip_body) < len(plain_body) * .7,
+          f"{len(plain_body)} -> {len(gzip_body)}")
+    no_gzip_res = urllib.request.urlopen(urllib.request.Request(
+        message_url, headers={"Accept-Encoding": "*, gzip;q=0"}), timeout=30)
+    no_gzip_body = no_gzip_res.read()
+    check("客户端拒绝 gzip 时仍返回原始 JSON",
+          no_gzip_res.headers.get("Content-Encoding") is None
+          and json.loads(no_gzip_body)["meta"]["uid"] == p.evaluate("S.sel"))
     roles = p.locator("#msgs [data-role]").evaluate_all("ns => ns.map(n => n.dataset.role)")
     check("消息角色齐全", {"user", "assistant", "thinking", "tool", "tool_result", "context"} <= set(roles), roles)
     check("结构化询问显示为对话气泡", "question" in roles)

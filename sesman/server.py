@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import mimetypes
 import re
@@ -18,6 +19,33 @@ STATIC = Path(__file__).parent / "static"
 ALLOWED_IPS: set[str] = set()
 TERMINAL = False        # 远程终端 = 远程执行, 必须显式 --terminal 打开
 WATCH_POLL = 0.05       # 服务端盯文件的间隔; stat 一个文件是微秒级, 这里很便宜
+JSON_GZIP_MIN = 1024    # 小响应省不了多少，避免反而增加压缩 CPU 和头部体积
+JSON_GZIP_LEVEL = 4     # 实测 4.5 MiB → 1.20 MiB / 75 ms，继续加级收益很小
+
+
+def _accepts_gzip(value: str) -> bool:
+    """按 RFC 的 q 值判断客户端是否接受 gzip；显式 gzip;q=0 优先于通配符。"""
+    exact = wildcard = None
+    for raw in value.lower().split(","):
+        parts = [p.strip() for p in raw.split(";")]
+        coding = parts[0]
+        if not coding:
+            continue
+        quality = 1.0
+        for param in parts[1:]:
+            key, sep, val = param.partition("=")
+            if sep and key.strip() == "q":
+                try:
+                    quality = float(val.strip())
+                except ValueError:
+                    quality = 0.0
+        if coding == "gzip":
+            exact = quality > 0
+        elif coding == "*":
+            wildcard = quality > 0
+    return exact if exact is not None else bool(wildcard)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "sesman"
     protocol_version = "HTTP/1.1"
@@ -50,7 +78,15 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _json(self, obj, code: int = 200):
-        self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        headers = {"Vary": "Accept-Encoding"}
+        if len(body) >= JSON_GZIP_MIN and _accepts_gzip(
+                self.headers.get("Accept-Encoding", "")):
+            packed = gzip.compress(body, compresslevel=JSON_GZIP_LEVEL, mtime=0)
+            if len(packed) < len(body):
+                body = packed
+                headers["Content-Encoding"] = "gzip"
+        self._send(code, body, "application/json; charset=utf-8", headers)
 
     # ---- 路由 --------------------------------------------------------
     def do_POST(self):
