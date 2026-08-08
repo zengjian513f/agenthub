@@ -22,7 +22,7 @@ _state = {"sessions": [], "built_at": 0.0, "sig": None}
 
 
 def signature() -> str:
-    """当前磁盘状态的签名。全量 stat 约 3ms, 便宜到可以让前端轮询。"""
+    """当前磁盘状态的签名。全量 stat 为个位数毫秒, 可供前端低频轮询。"""
     return _signature()
 
 
@@ -31,7 +31,10 @@ def _signature() -> str:
     import hashlib
     h = hashlib.sha1()
     from .adapters import CLAUDE_ROOT, CODEX_ROOT, CODEX_INDEX, GROK_ROOT
-    roots = [(CLAUDE_ROOT, "*/*.jsonl"), (CODEX_ROOT, "**/*.jsonl"),
+    roots = [(CLAUDE_ROOT, "*/*.jsonl"),
+             (CLAUDE_ROOT, "*/*/subagents/*.jsonl"),
+             (CLAUDE_ROOT, "*/*/subagents/*.meta.json"),
+             (CODEX_ROOT, "**/*.jsonl"),
              (GROK_ROOT, "*/*/summary.json"), (GROK_ROOT, "*/*/chat_history.jsonl")]
     for root, pat in roots:
         if not root.is_dir():
@@ -135,18 +138,36 @@ def _anchor_hash(f: Path, pos: int) -> str:
         return ""
 
 
-def messages(uid: str, include_agents: bool = False,
+def session_view(s: dict, agent: str = "") -> dict:
+    """把子代理作为父会话的一个可切换视图，不升格为独立 session。"""
+    if not agent:
+        return s
+    if s.get("source") != "claude":
+        raise KeyError(agent)
+    item = next((x for x in s.get("agent_items", []) if x.get("id") == agent), None)
+    if not item:
+        raise KeyError(agent)
+    path = Path(s["path"]).parent / Path(s["path"]).stem / "subagents" / f"agent-{agent}.jsonl"
+    if not path.is_file():
+        raise KeyError(agent)
+    return {**s, "path": str(path), "sid": agent, "title": item["title"],
+            "size": item.get("size", path.stat().st_size),
+            "updated": item.get("updated", s["updated"]),
+            "agent_id": agent, "agent_type": item.get("type", "subagent"),
+            "parent_title": s["title"]}
+
+
+def messages(uid: str, agent: str = "",
              start: int = 0, head: str = "", anchor: str = "") -> dict:
     s = get(uid)
     if not s:
         raise KeyError(uid)
-    return messages_for(s, include_agents, start, head, anchor)
+    return messages_for(session_view(s, agent), start, head, anchor)
 
 
-def messages_for(s: dict, include_agents: bool = False,
-                 start: int = 0, head: str = "", anchor: str = "") -> dict:
+def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "") -> dict:
     """整份或增量读取。传的是会话元数据而不是 uid —— SSE 那边每 50ms 要调一次,
-    走 uid 的话每次都会连带重算索引签名(203 次 stat)甚至重建整个索引。
+    走 uid 的话每次都会连带重算索引签名(数百次 stat)甚至重建整个索引。
 
     能接着上次读的条件: 文件头没变、文件没缩短、而且**偏移点之前的内容也没变**。
     最后一条是必需的 —— 会话可以被回滚(双 Esc)截断后再写新内容, 那时文件头照旧、
@@ -162,15 +183,18 @@ def messages_for(s: dict, include_agents: bool = False,
     if reset:
         start = 0
     ad = ADAPTERS[s["source"]]
-    if include_agents and isinstance(ad, ClaudeAdapter):
-        msgs, end = ad.read(s["path"], include_agents=True)
-        reset, start = True, 0          # 合并子代理时按整份处理
+    if isinstance(ad, ClaudeAdapter) and s.get("agent_id"):
+        msgs, end = ad.read(s["path"], start=start, agent=s["agent_id"])
     else:
         msgs, end = ad.read(s["path"], start=start)
+    activity_events = [m for m in msgs if m.get("role") == "status"]
+    msgs = [m for m in msgs if m.get("role") != "status"]
     for msg in msgs:
         media.enrich_message(msg, s.get("cwd"))
     return {"meta": s, "version": ver, "reset": reset, "start": start, "end": end,
-            "anchor": _anchor_hash(data_file(s), end), "messages": msgs}
+            "anchor": _anchor_hash(data_file(s), end), "messages": msgs,
+            "activity_changed": bool(activity_events),
+            "activity": activity_events[-1] if activity_events else None}
 
 
 def delete(uid: str) -> str:
@@ -193,7 +217,7 @@ def delete(uid: str) -> str:
 _ANSI_T = re.compile(r"\x1b\[[0-9;]*m")
 HIT_CAP = 200   # 单会话命中计数上限, 超过只报 "200+"
 SEARCH_ROLES = frozenset({"user", "assistant", "user·subagent",
-                          "assistant·subagent", "thinking"})
+                          "assistant·subagent", "thinking", "question", "answer"})
 _search_text_cache = {}
 _search_text_lock = threading.Lock()
 

@@ -122,10 +122,64 @@ def _clip(s: str, n: int = 90) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
+_QUESTION_TOOLS = {"askuserquestion", "request_user_input"}
+
+
+def _is_question_tool(name: str | None) -> bool:
+    key = str(name or "").lower()
+    return key in _QUESTION_TOOLS or key.endswith(".request_user_input") \
+        or key.endswith("__request_user_input")
+
+
+def _json_value(v):
+    """工具参数有时是 dict，有时是 JSON 字符串。"""
+    if not isinstance(v, str):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return v
+
+
+def _question_message(name: str, value) -> dict | None:
+    """把 Claude/Codex 的询问工具统一成可直接排版的问题结构。"""
+    if not _is_question_tool(name):
+        return None
+    data = _json_value(value)
+    if not isinstance(data, dict):
+        return None
+    rows = data.get("questions") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    questions = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("question"):
+            continue
+        options = []
+        for opt in row.get("options") or []:
+            if isinstance(opt, str):
+                options.append({"label": opt, "description": ""})
+            elif isinstance(opt, dict) and opt.get("label"):
+                options.append({"label": str(opt["label"]),
+                                "description": str(opt.get("description") or "")})
+        questions.append({
+            "header": str(row.get("header") or ""),
+            "question": str(row["question"]),
+            "options": options,
+            "multiple": bool(row.get("multiSelect") or row.get("multiple")),
+        })
+    if not questions:
+        return None
+    return {"text": "\n\n".join(q["question"] for q in questions),
+            "questions": questions}
+
+
 # 各家 CLI 都会把项目说明 / 环境信息伪装成 user 消息注入, 这些不能当标题
 _INJECTED = re.compile(
     r"AGENTS\.md instructions|<INSTRUCTIONS>|<user_info>|<environment_context>|"
     r"<system-reminder>|<command-name>|Caveat: The messages below|"
+    r"<local-command-(?:caveat|stdout)>|"
+    r"This session is being continued from a previous conversation|"
     r"# Global User Guidance|<project_instructions>|<user_instructions>", re.I)
 
 
@@ -165,16 +219,22 @@ def _flatten_content(content) -> list[dict]:
         elif t == "thinking":
             parts.append({"kind": "thinking", "text": it.get("thinking", "")})
         elif t == "tool_use":
-            parts.append({
-                "kind": "tool", "name": it.get("name", "tool"),
-                "text": json.dumps(it.get("input", {}), ensure_ascii=False, indent=2),
-            })
+            name = it.get("name", "tool")
+            question = _question_message(name, it.get("input", {}))
+            if question:
+                parts.append({"kind": "question", "name": name,
+                              "call_id": it.get("id"), **question})
+            else:
+                parts.append({
+                    "kind": "tool", "name": name, "call_id": it.get("id"),
+                    "text": json.dumps(it.get("input", {}), ensure_ascii=False, indent=2),
+                })
         elif t == "tool_result":
             nested = _flatten_content(it.get("content"))
             images = [p["media"] for p in nested if p.get("media")]
             texts = [p["text"] for p in nested if p.get("kind") != "image" and p.get("text")]
             parts.append({"kind": "tool_result", "text": "\n".join(texts) or "[图片]",
-                          "media": images})
+                          "call_id": it.get("tool_use_id"), "media": images})
         elif t in ("image", "input_image") or "image_url" in it:
             image = media.from_block(it)
             parts.append({"kind": "image", "text": "[图片]", "media": image})
@@ -197,12 +257,17 @@ def _stringify(v) -> str:
     return str(v)
 
 
-def _msg(role, text="", ts=None, name=None, args=None, media_parts=None):
+def _msg(role, text="", ts=None, name=None, args=None, media_parts=None, **extra):
     out = {"role": role, "text": text, "ts": ts, "name": name, "args": args}
     images = [x for x in (media_parts or []) if x]
     if images:
         out["media"] = images
+    out.update(extra)
     return out
+
+
+def _status(state: str, ts=None, **extra):
+    return _msg("status", state, ts, state=state, **extra)
 
 
 def _user_role(role: str, text: str) -> str:
@@ -257,7 +322,11 @@ class ClaudeAdapter:
                 if txt.strip() and not _is_injected(txt):
                     first_user = txt
         custom_title = latest_ai_title = None
+        tail_cwds = {}
         for rec in _tail_lines(f):
+            if rec.get("cwd"):
+                value = str(rec["cwd"])
+                tail_cwds[value] = tail_cwds.get(value, 0) + 1
             if rec.get("type") == "custom-title" and rec.get("customTitle"):
                 custom_title = rec["customTitle"]
             elif rec.get("type") == "ai-title" and rec.get("aiTitle"):
@@ -265,27 +334,43 @@ class ClaudeAdapter:
         title = custom_title or latest_ai_title or generated_title
         if not title:
             title = _title_from_text(first_user) if first_user else f.stem[:8]
+        if not cwd and tail_cwds:
+            # 老会话的开头可能先塞入大段 hook/attachment，真正的 cwd 会落在
+            # HEAD_BYTES 或前 40 条之后。文件尾本来就会为 rename 读取，优先从
+            # 其中恢复出现次数最多的真实路径，避免把有歧义的 Claude slug 硬拆。
+            cwd = max(tail_cwds, key=tail_cwds.get)
         if not cwd:
             cwd = "/" + proj_name.lstrip("-").replace("-", "/")
-        agents = len(list((f.parent / f.stem / "subagents").glob("*.jsonl")))
+        agent_items = []
+        for af in sorted((f.parent / f.stem / "subagents").glob("agent-*.jsonl")):
+            agent_id = af.stem.removeprefix("agent-")
+            try:
+                info = json.loads(af.with_suffix(".meta.json").read_text(errors="replace"))
+            except (OSError, ValueError):
+                info = {}
+            try:
+                ast = af.stat()
+            except OSError:
+                continue
+            agent_items.append({
+                "id": agent_id,
+                "title": str(info.get("description") or f"子代理 {agent_id[:8]}"),
+                "type": str(info.get("agentType") or "subagent"),
+                "updated": _iso(ast.st_mtime), "size": ast.st_size,
+            })
         return {
             "uid": _uid("claude", str(f)), "source": "claude", "sid": sid or f.stem,
             "title": title, "cwd": cwd, "created": created or _iso(st.st_mtime),
             "updated": _iso(st.st_mtime), "size": st.st_size, "path": str(f),
-            "model": None, "branch": branch, "agents": agents,
+            "model": None, "branch": branch, "agents": len(agent_items),
+            "agent_items": agent_items,
         }
 
-    def read(self, path: str, include_agents: bool = False, start: int = 0):
-        msgs, end = self._read_one(path, start=start)
-        if include_agents:
-            sub = Path(path).parent / Path(path).stem / "subagents"
-            for af in sorted(sub.glob("*.jsonl")):
-                msgs.extend(self._read_one(str(af), agent=af.stem.replace("agent-", "")[:8])[0])
-            msgs.sort(key=lambda m: m["ts"] or "")
-        return msgs, end
+    def read(self, path: str, start: int = 0, agent: str | None = None):
+        return self._read_one(path, start=start, agent=agent[:8] if agent else None)
 
     def _read_one(self, path: str, agent: str | None = None, start: int = 0):
-        msgs, end = [], start
+        msgs, end, calls = [], start, {}
         for rec, off in _iter_records(path, start):
             end = off
             t = rec.get("type")
@@ -293,7 +378,13 @@ class ClaudeAdapter:
             tag = agent or (rec.get("agentId", "")[:8] if rec.get("isSidechain") else None)
             if t in ("user", "assistant"):
                 role = f"{t}·subagent" if tag else t
-                for p in _flatten_content((rec.get("message") or {}).get("content")):
+                parts = _flatten_content((rec.get("message") or {}).get("content"))
+                # Claude 没有 task_started；真实用户输入就是新回合的结构化起点。
+                text_parts = [p["text"] for p in parts if p["kind"] == "text"]
+                if t == "user" and not tag and any(
+                        x.strip() and not _is_injected(x) for x in text_parts):
+                    msgs.append(_status("working", ts))
+                for p in parts:
                     if not str(p.get("text", "")).strip() and not p.get("media"):
                         continue
                     if p["kind"] == "text":
@@ -304,12 +395,30 @@ class ClaudeAdapter:
                     elif p["kind"] == "thinking":
                         msgs.append(_msg("thinking", p["text"], ts, name=tag))
                     elif p["kind"] == "tool":
+                        calls[p.get("call_id")] = p["name"]
                         msgs.append(_msg("tool", p["text"], ts, name=p["name"]))
+                    elif p["kind"] == "question":
+                        calls[p.get("call_id")] = p["name"]
+                        msgs.append(_msg("question", p["text"], ts,
+                                         questions=p["questions"]))
+                        if not tag:
+                            msgs.append(_status("waiting", ts))
                     elif p["kind"] == "tool_result":
-                        msgs.append(_msg("tool_result", p["text"], ts,
+                        name = calls.get(p.get("call_id"))
+                        is_answer = _is_question_tool(name)
+                        msgs.append(_msg("answer" if is_answer else "tool_result",
+                                         p["text"], ts, name=name,
                                          media_parts=p.get("media")))
-            elif t == "system" and rec.get("content"):
-                msgs.append(_msg("system", _stringify(rec["content"]), ts))
+                        if is_answer and not tag:
+                            msgs.append(_status("working", ts))
+            elif t == "system":
+                if not tag and rec.get("subtype") == "turn_duration":
+                    msgs.append(_status("idle", ts, duration_ms=rec.get("durationMs")))
+                elif not tag and rec.get("subtype") == "compact_boundary":
+                    # /compact 没有 turn_duration；边界记录就是压缩完成点。
+                    msgs.append(_status("idle", ts))
+                elif rec.get("content"):
+                    msgs.append(_msg("system", _stringify(rec["content"]), ts))
         return msgs, end
 
 
@@ -386,6 +495,18 @@ class CodexAdapter:
             end = off
             ts = _norm_ts(rec.get("timestamp"))
             p = rec.get("payload") or {}
+            if rec.get("type") == "event_msg":
+                event = p.get("type")
+                if event == "task_started":
+                    msgs.append(_status("working", ts, turn_id=p.get("turn_id")))
+                elif event == "task_complete":
+                    state = "failed" if p.get("error") else "idle"
+                    msgs.append(_status(state, ts, turn_id=p.get("turn_id"),
+                                        duration_ms=p.get("duration_ms")))
+                elif event == "turn_aborted":
+                    msgs.append(_status("aborted", ts, turn_id=p.get("turn_id"),
+                                        reason=p.get("reason"), duration_ms=p.get("duration_ms")))
+                continue
             if rec.get("type") != "response_item":
                 continue
             k = p.get("type")
@@ -406,10 +527,20 @@ class CodexAdapter:
                 name = p.get("name") or k
                 body = p.get("arguments") or p.get("input") or p.get("action") or ""
                 calls[p.get("call_id")] = name
-                msgs.append(_msg("tool", _pretty_json(body), ts, name=name))
+                question = _question_message(name, body)
+                if question:
+                    msgs.append(_msg("question", question["text"], ts,
+                                     questions=question["questions"]))
+                    msgs.append(_status("waiting", ts, turn_id=p.get("turn_id")))
+                else:
+                    msgs.append(_msg("tool", _pretty_json(body), ts, name=name))
             elif k in ("function_call_output", "custom_tool_call_output", "local_shell_call_output"):
                 name = calls.get(p.get("call_id"))
-                msgs.append(_msg("tool_result", _stringify(p.get("output")), ts, name=name))
+                is_answer = _is_question_tool(name)
+                msgs.append(_msg("answer" if is_answer else "tool_result",
+                                 _stringify(p.get("output")), ts, name=name))
+                if is_answer:
+                    msgs.append(_status("working", ts))
             elif k in ("web_search_call", "tool_search_call"):
                 msgs.append(_msg("tool", _pretty_json(p.get("arguments") or {}), ts, name=k))
         return msgs, end
@@ -489,7 +620,13 @@ class GrokAdapter:
                     name = tc.get("name") or (tc.get("function") or {}).get("name") or "tool"
                     args = tc.get("arguments") or (tc.get("function") or {}).get("arguments") or ""
                     calls[tc.get("id")] = name
-                    msgs.append(_msg("tool", _pretty_json(args), name=name))
+                    question = _question_message(name, args)
+                    if question:
+                        msgs.append(_msg("question", question["text"],
+                                         questions=question["questions"]))
+                        msgs.append(_status("waiting"))
+                    else:
+                        msgs.append(_msg("tool", _pretty_json(args), name=name))
         return msgs, end
 
 

@@ -41,6 +41,7 @@
   --bubble-tool: var(--terminal-bg);
   --bubble-system: #eef1f5;
   --bubble-context: #eef1f5;
+  --bubble-question: #fff8dc;
   --shadow: 0 1px 2px rgba(16, 24, 40, .06);
   --side-width: 340px;
   --content-max: 1150px;
@@ -67,6 +68,7 @@
     --bubble-thinking: #302d45;
     --bubble-system: #292d35;
     --bubble-context: #292d35;
+    --bubble-question: #383323;
     --shadow: none;
   }
 }
@@ -389,12 +391,40 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   width: 100%; max-width: var(--content-max);
   border-bottom: 1px solid var(--border); padding: 11px 18px;
 }
-.dtitle { display: flex; align-items: flex-start; gap: 10px; }
+.dtitle { display: flex; align-items: flex-start; gap: 10px; position: relative; }
 .mobile-back { display: none; }
 .dtitle h2 {
   flex: 1; min-width: 0; margin: 2px 0 5px;
   font-size: 16px; font-weight: 600; overflow-wrap: anywhere;
 }
+.dtitle h2.has-session-views { display: flex; align-items: flex-start; gap: 5px; }
+.dtitle h2.has-session-views > .ico { flex: none; margin-top: 2px; }
+.session-view-switch {
+  display: flex; align-items: flex-start; gap: 5px; min-width: 0; max-width: 100%;
+  margin: -2px 0; padding: 2px 4px; border: 0; border-radius: 5px;
+  background: transparent; color: inherit; font: inherit; font-weight: inherit;
+  line-height: 1.35; text-align: left; cursor: pointer;
+}
+.session-view-switch:hover, .session-view-switch[aria-expanded="true"] { background: var(--hover); }
+.session-view-switch > span { min-width: 0; overflow-wrap: anywhere; }
+.session-view-switch > i { flex: none; color: var(--muted); font-style: normal; font-size: 13px; }
+.session-view-menu {
+  position: absolute; z-index: 12; top: calc(100% + 5px); left: 21px;
+  display: grid; gap: 3px; width: min(520px, calc(100vw - 40px));
+  max-height: min(480px, 70vh); overflow-y: auto; padding: 5px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+  box-shadow: 0 10px 28px rgba(16, 24, 40, .18);
+}
+.session-view-menu[hidden] { display: none; }
+.session-view-menu button {
+  display: grid; gap: 2px; width: 100%; padding: 7px 9px; border: 0;
+  border-radius: 5px; background: transparent; color: var(--text);
+  text-align: left; cursor: pointer;
+}
+.session-view-menu button:hover { background: var(--hover); }
+.session-view-menu button.on { background: var(--sel); }
+.session-view-menu small { color: var(--muted); font-size: 10.5px; font-weight: 500; }
+.session-view-menu b { overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.35; }
 .dhead-actions {
   flex: none; display: flex; align-items: center; justify-content: flex-end;
   flex-wrap: wrap; gap: 2px; max-width: 58%; position: relative;
@@ -411,12 +441,6 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .iconbtn.danger:hover { background: #e5484d; color: #fff; }
 .iconbtn[disabled] { opacity: .5; cursor: default; }
 .ui-icon { width: 16px; height: 16px; }
-.action-badge {
-  position: absolute; right: 0; top: -2px; min-width: 13px; height: 13px;
-  padding: 0 3px; border-radius: 999px; background: var(--panel-2); color: var(--muted);
-  box-shadow: 0 0 0 1px var(--border); font-size: 9px; line-height: 13px;
-}
-.iconbtn.on .action-badge { background: var(--accent); color: #fff; box-shadow: 0 0 0 1px #fff; }
 .dmeta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); font-size: 12px; }
 .dmeta code { font-size: 11.5px; background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 
@@ -463,6 +487,44 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .msg[data-role="system"] { --bubble: var(--bubble-system); }
 .msg[data-role="context"] { --bubble: var(--bubble-context); }
+.msg[data-role="question"] {
+  --bubble: var(--bubble-question); width: min(520px, 100%); border-color: #e5c96b;
+}
+.msg[data-role="answer"] {
+  --bubble: var(--bubble-user); margin-left: auto; margin-right: 0;
+}
+
+.question-body { min-width: 0; }
+.question-item + .question-item { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.question-header {
+  margin-bottom: 3px; color: #9a6700; font-size: 11px; font-weight: 700;
+  letter-spacing: .02em;
+}
+.question-text { font-weight: 600; line-height: 1.45; white-space: pre-wrap; }
+.question-multiple { margin-top: 3px; color: var(--muted); font-size: 11px; }
+.question-options { display: grid; gap: 5px; margin-top: 9px; }
+.question-option {
+  display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
+}
+.question-option > span {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 18px; height: 18px; border-radius: 50%; background: var(--panel-2);
+  color: var(--muted); font-size: 10px; font-weight: 700;
+}
+.question-option b { display: block; font-size: 12.5px; line-height: 1.35; }
+.question-option small { display: block; margin-top: 2px; color: var(--muted); line-height: 1.35; }
+
+.activity {
+  display: inline-flex; align-items: center; gap: 7px; width: fit-content;
+  margin: 2px 0 8px; padding: 5px 9px; border-radius: 999px;
+  background: var(--panel-2); color: var(--muted); font-size: 12px;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.activity i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.activity.waiting { color: #9a6700; background: var(--bubble-question); }
+.activity.waiting i { background: #d4a72c; }
+.activity.aborted i, .activity.failed i { background: #e5484d; }
 
 /* 单条工具输出只保留 .msg 这一层气泡；pre 只是排版容器，不再画灰色内框。 */
 .msg[data-role="tool"] > .mb,
@@ -693,6 +755,10 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   }
   .mobile-back:hover { background: var(--hover); }
   .dtitle h2 { margin: 3px 0 2px; font-size: 14.5px; line-height: 1.35; }
+  .session-view-menu {
+    position: fixed; top: max(45px, env(safe-area-inset-top)); right: 8px; left: 8px;
+    width: auto; max-height: min(480px, calc(100dvh - 54px));
+  }
   .dhead-actions { max-width: none; flex-wrap: nowrap; gap: 0; }
   .dhead-actions > .iconbtn { width: 32px; height: 32px; }
   .mobile-msg-count {

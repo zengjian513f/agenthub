@@ -163,7 +163,15 @@ class Handler(BaseHTTPRequestHandler):
             live_set = set(uids)
             tmux_uids = [s["uid"] for s in sessions
                          if s["uid"] in live_set and term.in_tmux(live.pids_of(s))]
-            return self._json({"uids": uids, "tmux_uids": tmux_uids})
+            started_at = {}
+            for s in sessions:
+                if s["uid"] not in live_set:
+                    continue
+                value = live.started_at(s)
+                if value is not None:
+                    started_at[s["uid"]] = value
+            return self._json({"uids": uids, "tmux_uids": tmux_uids,
+                               "started_at": started_at})
 
         if path == "/api/term/list":
             tmux_sessions = term.list_sessions() if TERMINAL else []
@@ -210,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
             uid = unquote(path[len("/api/messages/"):])
             return self._json(index.messages(
                 uid,
-                include_agents=q.get("agents", ["0"])[0] == "1",
+                agent=q.get("agent", [""])[0],
                 start=int(q.get("start", ["0"])[0]),
                 head=q.get("head", [""])[0],
                 anchor=q.get("anchor", [""])[0],
@@ -267,6 +275,10 @@ class Handler(BaseHTTPRequestHandler):
         s = index.get(uid)
         if not s:
             return self._send(404, b"no such session", "text/plain")
+        try:
+            s = index.session_view(s, q.get("agent", [""])[0])
+        except KeyError:
+            return self._send(404, b"no such agent", "text/plain")
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -287,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 用 messages_for 而不是 messages: 后者要过一遍索引,
                     # 而文件刚变过, 签名对不上就会重建整个索引(百毫秒级)
                     d = index.messages_for(s, start=start, head=head, anchor=anchor)
-                    if d["reset"] or d["messages"]:
+                    if d["reset"] or d["messages"] or d["activity_changed"]:
                         payload = json.dumps(d, ensure_ascii=False)
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()

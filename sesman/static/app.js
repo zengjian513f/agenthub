@@ -30,11 +30,12 @@ const S = {
   autoOpen: 0,        // 本次渲染已自动展开的命中消息数
   markCapped: false,  // 高亮是否因数量上限被截断
   results: null,      // 全文搜索结果, null 表示未处于搜索态
-  agents: false,      // 详情页是否合并子代理消息
+  agent: null,        // 当前查看的子代理 id；null = 主会话
   syncing: false,     // 增量同步进行中
   syncGap: 350,       // 当前会话的同步间隔, 随有无新内容自适应
   live: new Set(),    // 仍在运行的会话 uid
   liveTmux: new Set(),// 其中运行在 tmux 里的会话 uid
+  liveStarted: new Map(), // uid → 当前 CLI 主进程启动时间（Unix 秒）
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -137,7 +138,8 @@ const FAST_MAX = 3000;
 const TICK_MS = 200;
 const BACKUP_MS = 20000;    // SSE 正常时的兜底对账间隔
 const LIST_MS = 8000;       // 会话列表跟进磁盘变化的间隔
-const cache = new Map();          // uid → {meta, msgs, version, end, bytes}
+const cache = new Map();          // viewKey → {meta, msgs, version, end, bytes}
+const viewKey = (uid, agent = null) => agent ? `${uid}::${agent}` : uid;
 
 function cacheGet(uid) {
   const e = cache.get(uid);
@@ -165,7 +167,7 @@ async function fetchMessages(uid, opts = {}) {
     p.set('head', opts.head);
     p.set('anchor', opts.anchor || '');     // 没有锚点服务端会拒绝续读, 直接给整份
   }
-  if (opts.agents) p.set('agents', '1');
+  if (opts.agent) p.set('agent', opts.agent);
   const r = await fetch(appUrl(`api/messages/${encodeURIComponent(uid)}?${p}`), { signal: opts.signal });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const total = +r.headers.get('Content-Length') || 0;
@@ -205,13 +207,16 @@ function progressDone() {
 
 /** 把服务端给的一份 diff 应用到缓存和界面上。
  *  两种情况: 追加(接到末尾) 或 reset(整份重来) —— 和服务端的判定一一对应。 */
-async function applyDiff(uid, data, bytes = 0) {
-  const e = cache.get(uid);
+async function applyDiff(uid, data, bytes = 0, agent = null) {
+  const key = viewKey(uid, agent);
+  const e = cache.get(key);
   if (!e) return 0;
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
-    cachePut(uid, { meta: data.meta, msgs: data.messages, version: data.version,
-                    end: data.end, anchor: data.anchor, bytes });
-    if (S.sel === uid) await renderSession(data.meta, data.messages);
+    cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
+                    end: data.end, anchor: data.anchor, activity: data.activity, bytes });
+    if (S.sel === uid && S.agent === agent) {
+      await renderSession(data.meta, data.messages, data.activity);
+    }
     return data.messages.length;
   }
   if (data.start !== e.end) return 0;       // 不是接着当前位置的(重连/乱序), 丢掉
@@ -219,16 +224,30 @@ async function applyDiff(uid, data, bytes = 0) {
   e.end = data.end;
   e.anchor = data.anchor;
   e.bytes += bytes;
-  if (!data.messages.length) return 0;
+  if (data.activity_changed) e.activity = data.activity;
+  else if (e.activity?.state === 'waiting' && data.messages.some(
+      m => m.role === 'tool_result' || m.role === 'answer')) {
+    // 问题和回答可能分属两次增量读取，第二次已没有 call_id 映射。
+    const answerAt = data.messages.findIndex(m => m.role === 'tool_result');
+    data.messages = data.messages.map((m, i) => i === answerAt && m.role === 'tool_result'
+      ? { ...m, role: 'answer' } : m);
+    e.activity = { role: 'status', state: 'working', text: 'working', ts: new Date().toISOString() };
+  }
+  if (!data.messages.length) {
+    if (S.sel === uid && S.agent === agent) renderActivity(e.activity);
+    return 0;
+  }
   e.msgs = e.msgs.concat(data.messages);
-  if (S.sel !== uid) return data.messages.length;
+  if (S.sel !== uid || S.agent !== agent) return data.messages.length;
   const box = $('#msgs');
   if (!box) return data.messages.length;
+  $('#activity')?.remove();
   const mark = el('span');
   box.appendChild(mark);
   appendMessages(box, data.messages, null);
   for (let n = mark.nextSibling; n; n = n.nextSibling) markMatches(n);
   mark.remove();
+  renderActivity(e.activity);
   const c = $('#mcount-total');
   if (c) c.textContent = `${e.msgs.length} 条消息`;
   const mc = $('.mobile-msg-count');
@@ -242,14 +261,14 @@ async function applyDiff(uid, data, bytes = 0) {
 
 /** 兜底用的主动拉取。正常情况下更新由服务端 SSE 推过来, 这里只在
  *  连接还没建起来或断了的时候补一手。 */
-async function syncSession(uid) {
-  const e = cache.get(uid);
+async function syncSession(uid, agent = S.agent) {
+  const e = cache.get(viewKey(uid, agent));
   if (!e || S.syncing) return 0;
   S.syncing = true;
   try {
     const { data, bytes } = await fetchMessages(uid, {
-      start: e.end, head: e.version.head, anchor: e.anchor });
-    return await applyDiff(uid, data, bytes);
+      agent, start: e.end, head: e.version.head, anchor: e.anchor });
+    return await applyDiff(uid, data, bytes, agent);
   } catch {
     return 0;
   } finally {
@@ -261,18 +280,19 @@ async function syncSession(uid) {
 // 服务端盯着会话文件, 一变就把 diff 推过来, 不用客户端反复问。
 let _es = null, _esUid = null, _esRetry = null;
 
-function watchSession(uid) {
+function watchSession(uid, agent = S.agent) {
   closeWatch();
-  const e = cache.get(uid);
+  const e = cache.get(viewKey(uid, agent));
   if (!e || !window.EventSource) return;
   const p = new URLSearchParams({ uid, start: e.end, head: e.version.head, anchor: e.anchor || '' });
+  if (agent) p.set('agent', agent);
   const es = new EventSource(appUrl('api/watch?' + p));
   _es = es;
   _esUid = uid;
   es.onmessage = ev => {
     let data;
     try { data = JSON.parse(ev.data); } catch { return; }
-    applyDiff(uid, data);
+    applyDiff(uid, data, 0, agent);
   };
   es.onerror = () => {
     // EventSource 自带的重连会沿用旧 URL(旧偏移), 所以自己关掉重开, 带上新偏移
@@ -280,7 +300,9 @@ function watchSession(uid) {
     if (_es !== es) return;
     _es = null;
     clearTimeout(_esRetry);
-    _esRetry = setTimeout(() => { if (S.sel === uid) watchSession(uid); }, 1500);
+    _esRetry = setTimeout(() => {
+      if (S.sel === uid && S.agent === agent) watchSession(uid, agent);
+    }, 1500);
   };
 }
 
@@ -300,14 +322,15 @@ function newBadge(n) {
 
 /** 兜底轮询: SSE 连着的时候只是很慢地对一下账, 断了才回到自适应的快节奏。 */
 function tickSync() {
-  if (!S.sel || document.hidden || S.agents) return;
+  if (!S.sel || document.hidden) return;
   const pushing = _es && _esUid === S.sel && _es.readyState === 1;
   const gap = pushing ? BACKUP_MS : (S.live.has(S.sel) ? S.syncGap : SYNC_MS);
   if (Date.now() - (S.lastSync || 0) < gap) return;
   S.lastSync = Date.now();
   const uid = S.sel;
-  syncSession(uid).then(n => {
-    if (uid !== S.sel || pushing) return;
+  const agent = S.agent;
+  syncSession(uid, agent).then(n => {
+    if (uid !== S.sel || agent !== S.agent || pushing) return;
     S.syncGap = n ? FAST_MIN : Math.min(FAST_MAX, Math.round(S.syncGap * 1.5));
   });
 }
@@ -319,10 +342,16 @@ async function refreshLive(force = false) {
   const d = await (await fetch(appUrl('api/live' + (force ? '?force=1' : '')))).json();
   const next = new Set(d.uids);
   const nextTmux = new Set((d.tmux_uids || []).filter(u => next.has(u)));
-  const changed = (a, b) => a.size !== b.size || [...a].some(u => !b.has(u));
-  if (changed(next, S.live) || changed(nextTmux, S.liveTmux)) {
-    S.live = next;
-    S.liveTmux = nextTmux;
+  const nextStarted = new Map(Object.entries(d.started_at || {}).map(([u, t]) => [u, +t]));
+  const setChanged = (a, b) => a.size !== b.size || [...a].some(u => !b.has(u));
+  const mapChanged = (a, b) => a.size !== b.size
+    || [...a].some(([u, t]) => b.get(u) !== t);
+  const changed = setChanged(next, S.live) || setChanged(nextTmux, S.liveTmux)
+    || mapChanged(nextStarted, S.liveStarted);
+  S.live = next;
+  S.liveTmux = nextTmux;
+  S.liveStarted = nextStarted;
+  if (changed) {
     paintLive();
   }
 }
@@ -356,7 +385,8 @@ function paintLive() {
     const tmux = S.liveTmux.has(S.sel);
     h.classList.toggle('on', S.live.has(S.sel));
     h.classList.toggle('tmux', tmux);
-    h.textContent = tmux ? '● tmux 中' : '● 进行中';
+    h.textContent = '●';
+    h.title = h.ariaLabel = tmux ? '运行于 tmux' : '运行中';
   }
   const termButton = $('#a-term');
   if (termButton) {
@@ -364,7 +394,10 @@ function paintLive() {
     termButton.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
   }
   const selected = S.sessions.find(x => x.uid === S.sel);
-  if (selected) renderSessionAction(selected);
+  if (selected) {
+    renderSessionAction(selected);
+    renderActivity(cache.get(viewKey(selected.uid, S.agent))?.activity);
+  }
   const c = $('#livecount');
   if (c) {
     const tmux = S.liveTmux.size, direct = S.live.size - tmux;
@@ -381,7 +414,9 @@ setInterval(pollLive, LIVE_MS);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { closeWatch(); return; }
   pollLive();
-  if (S.sel && cache.get(S.sel)) { syncSession(S.sel).then(() => watchSession(S.sel)); }
+  if (S.sel && cache.get(viewKey(S.sel, S.agent))) {
+    syncSession(S.sel, S.agent).then(() => watchSession(S.sel, S.agent));
+  }
 });
 
 // ---------------------------------------------------------------- 数据加载
@@ -412,14 +447,34 @@ const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions];
 
 /** 列表元数据变更后同步缓存和当前详情标题，不重绘消息正文。 */
 function refreshSessionMeta() {
+  const headerKey = m => JSON.stringify([
+    m.title, m.parent_title, m.sid, m.agent_type,
+    (m.agent_items || []).map(a => [a.id, a.title, a.type]),
+  ]);
+  const before = cache.get(viewKey(S.sel, S.agent));
+  const beforeKey = before ? headerKey(before.meta) : '';
   for (const s of S.sessions) {
-    const e = cache.get(s.uid);
-    if (e) e.meta = { ...e.meta, ...s };
+    for (const e of cache.values()) {
+      if (e.meta.uid !== s.uid) continue;
+      const agent = e.meta.agent_id;
+      if (!agent) {
+        e.meta = { ...e.meta, ...s };
+        continue;
+      }
+      const item = (s.agent_items || []).find(a => a.id === agent);
+      if (!item) continue;
+      const childPath = e.meta.path;
+      e.meta = {
+        ...e.meta, ...s, path: childPath,
+        sid: agent, title: item.title, size: item.size, updated: item.updated,
+        agent_id: agent, agent_type: item.type, parent_title: s.title,
+      };
+    }
   }
-  const current = S.sessions.find(s => s.uid === S.sel);
-  const title = $('#detail .dhead h2');
-  if (current && title && title.textContent.trim() !== current.title) {
-    title.innerHTML = `${icon(current.source)} ${esc(current.title)}`;
+  const current = cache.get(viewKey(S.sel, S.agent));
+  const oldHead = $('#detail > .dhead');
+  if (current && oldHead && headerKey(current.meta) !== beforeKey) {
+    oldHead.replaceWith(head(current.meta, current.msgs.length));
   }
 }
 
@@ -435,7 +490,7 @@ async function loadSessions(force) {
   showSessionCount(sidebarSessions().length);
 }
 
-/** 列表自动跟进磁盘变化。签名没变时服务端只回一个 unchanged, 成本约 3ms。 */
+/** 列表自动跟进磁盘变化。签名没变时服务端只回一个 unchanged, 成本为个位数毫秒。 */
 async function pollSessions() {
   if (document.hidden || !S.sig) return;
   try {
@@ -674,24 +729,27 @@ function jumpMark(delta) {
 // ---------------------------------------------------------------- 详情
 let inflight = null;
 
-async function openSession(uid, agents) {
+async function openSession(uid, agent = null) {
+  const selectedAgent = agent || null;
   showMobileDetail();
   inflight?.abort();            // 连点列表时, 放弃上一个还没回来的请求
   const ac = inflight = new AbortController();
   closeWatch();
   if (typeof T !== 'undefined') {
-    if (T.uid && T.uid !== uid) closeTermPane();
+    if (T.uid && (T.uid !== uid || selectedAgent)) closeTermPane();
     $('#composer').classList.add('hidden');    // 先收起, 渲染完再按新会话的状态决定
   }
   S.sel = uid;
-  S.agents = agents ?? false;
+  S.agent = selectedAgent;
   store.set('sel', uid);
+  store.set('agent', S.agent ? { uid, id: S.agent } : null);
   renderSide();
 
-  const hit = S.agents ? null : cacheGet(uid);   // 合并子代理的结果不入缓存
+  const key = viewKey(uid, selectedAgent);
+  const hit = cacheGet(key);
   if (hit) {
-    await renderSession(hit.meta, hit.msgs);
-    syncSession(uid);                            // 缓存先上屏, 再后台补新消息
+    await renderSession(hit.meta, hit.msgs, hit.activity);
+    if (S.sel === uid && S.agent === selectedAgent) syncSession(uid, selectedAgent);
     return;
   }
 
@@ -700,7 +758,7 @@ async function openSession(uid, agents) {
   let res;
   try {
     res = await fetchMessages(uid, {
-      agents: S.agents, signal: ac.signal,
+      agent: selectedAgent, signal: ac.signal,
       onProgress: (a, b) => progress(a, b, '读取'),
     });
   } catch (e) {
@@ -709,13 +767,11 @@ async function openSession(uid, agents) {
     $('#detail').innerHTML = `<div class="empty">读取失败: ${esc(e.message)}</div>`;
     return;
   }
-  if (S.sel !== uid) return progressDone();      // 期间点了别的会话
+  if (S.sel !== uid || S.agent !== selectedAgent) return; // 期间切了别的视图
   const { data, bytes } = res;
-  if (!S.agents) {
-    cachePut(uid, { meta: data.meta, msgs: data.messages, version: data.version,
-                    end: data.end, anchor: data.anchor, bytes });
-  }
-  await renderSession(data.meta, data.messages);
+  cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
+                  end: data.end, anchor: data.anchor, activity: data.activity, bytes });
+  await renderSession(data.meta, data.messages, data.activity);
 }
 
 // ---- 保持贴底 ----
@@ -821,8 +877,13 @@ addEventListener('resize', () => {
 });
 
 /** 整份渲染。消息可能上万条, 分批交还主线程, 否则页面会卡住不动。 */
-async function renderSession(meta, msgs) {
+let renderSeq = 0;
+
+async function renderSession(meta, msgs, activity = null) {
+  const seq = ++renderSeq;
   const uid = meta.uid;
+  const agent = meta.agent_id || null;
+  if (S.sel !== uid || S.agent !== agent) return;
   const d = $('#detail');
   d.innerHTML = '';
   d.appendChild(head(meta, msgs.length));
@@ -841,10 +902,11 @@ async function renderSession(meta, msgs) {
     if (i + RENDER_BATCH < plan.length) {
       progress(i + RENDER_BATCH, plan.length, '渲染');
       await new Promise(r => setTimeout(r, 0));
-      if (S.sel !== uid) return progressDone();
+      if (seq !== renderSeq || S.sel !== uid || S.agent !== agent) return;
     }
   }
   box.appendChild(frag);
+  renderActivity(activity);
   stickBottom(box, true);                // 默认停在最新的一条
   watchBottom(box);
   progressDone();
@@ -861,45 +923,87 @@ async function renderSession(meta, msgs) {
     $('#m-next').onclick = () => jumpMark(1);
     if (hits) jumpMark(1);
   }
-  if (typeof renderComposer === 'function') renderComposer();
-  watchSession(meta.uid);          // 之后的更新由服务端推过来
+  if (typeof renderComposer === 'function') {
+    if (S.agent) $('#composer').classList.add('hidden');
+    else renderComposer();
+  }
+  if (seq === renderSeq && S.sel === uid && S.agent === agent) {
+    watchSession(meta.uid, agent); // 之后的更新由服务端推过来
+  }
 }
 
 function head(m, total) {
   const h = el('div', 'dhead');
   const tmuxLive = S.liveTmux.has(m.uid);
+  const agentItems = m.agent_items || [];
+  const hasAgents = agentItems.length > 0;
+  const mainTitle = m.parent_title || m.title;
+  const titleView = hasAgents ? `
+    <button class="session-view-switch" id="a-view-switch" type="button"
+      title="切换主会话/子代理" aria-label="切换主会话/子代理" aria-expanded="false">
+      <span>${esc(m.title)}</span><i>⌄</i>
+    </button>` : `<span>${esc(m.title)}</span>`;
+  const menuView = hasAgents ? `
+    <div class="session-view-menu" id="session-view-menu" hidden role="menu">
+      <button type="button" data-agent="" class="${m.agent_id ? '' : 'on'}" role="menuitem">
+        <small>主会话</small><b>${esc(mainTitle)}</b>
+      </button>
+      ${agentItems.map(a => `<button type="button" data-agent="${esc(a.id)}"
+        class="${m.agent_id === a.id ? 'on' : ''}" role="menuitem">
+        <small>子代理 · ${esc(a.type)}</small><b>${esc(a.title)}</b>
+      </button>`).join('')}
+    </div>` : '';
   h.innerHTML = `
     <div class="dtitle">
       <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
-      <h2>${icon(m.source)} ${esc(m.title)}</h2>
+      <h2 class="${hasAgents ? 'has-session-views' : ''}">${icon(m.source)}${titleView}</h2>
+      ${menuView}
       <div class="dhead-actions" aria-label="会话操作">
         <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
-          (typeof T !== 'undefined' && T.enabled)
+          (!m.agent_id && typeof T !== 'undefined' && T.enabled)
             ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
         ${S.term ? `<span class="mnav"><b id="mcount">…</b>
           <button class="iconbtn" id="m-prev" title="上一处" aria-label="上一处">↑</button>
           <button class="iconbtn" id="m-next" title="下一处" aria-label="下一处">↓</button></span>` : ''}
-        ${m.agents ? `<button class="iconbtn${S.agents ? ' on' : ''}" id="a-agents"
-          title="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理" aria-label="${S.agents ? '不合并' : '合并'} ${m.agents} 个子代理"
-          aria-pressed="${S.agents}">${uiIcon('agents')}<span class="action-badge">${m.agents}</span></button>` : ''}
-        <button class="iconbtn danger" id="a-session-action"></button>
+        ${m.agent_id ? '' : '<button class="iconbtn danger" id="a-session-action"></button>'}
       </div>
     </div>
     <div class="dmeta">
-      <span class="meta-source">${SOURCES[m.source].name}</span>
+      <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       <span id="mcount-total">${total} 条消息</span>
-      <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}">${tmuxLive ? '● tmux 中' : '● 进行中'}</span>
+      <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}"
+        title="${tmuxLive ? '运行于 tmux' : '运行中'}" aria-label="${tmuxLive ? '运行于 tmux' : '运行中'}">●</span>
       <span id="newmsg" class="newmsg"></span>
       <span class="meta-secondary">${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
       <span class="meta-secondary">${fmtSize(m.size)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
       <span class="meta-secondary"><code>${esc(m.cwd)}</code></span>
+      <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
-  const ag = h.querySelector('#a-agents');
-  if (ag) ag.onclick = () => openSession(m.uid, !S.agents);
+  const viewSwitch = h.querySelector('#a-view-switch');
+  const viewMenu = h.querySelector('#session-view-menu');
+  if (viewSwitch && viewMenu) {
+    const close = () => {
+      viewMenu.hidden = true;
+      viewSwitch.setAttribute('aria-expanded', 'false');
+    };
+    viewSwitch.onclick = e => {
+      e.stopPropagation();
+      viewMenu.hidden = !viewMenu.hidden;
+      viewSwitch.setAttribute('aria-expanded', String(!viewMenu.hidden));
+      if (!viewMenu.hidden) setTimeout(() => document.addEventListener('click', close, { once: true }), 0);
+    };
+    viewMenu.onclick = e => {
+      e.stopPropagation();
+      const b = e.target.closest('button[data-agent]');
+      if (!b) return;
+      close();
+      openSession(m.uid, b.dataset.agent || null);
+    };
+  }
   const tb = h.querySelector('#a-term');
   if (tb) {
     tb.onclick = () => {
@@ -965,10 +1069,11 @@ const ROLE_LABEL = {
   user: '👤 用户', assistant: '🤖 助手', 'user·subagent': '👤 子代理输入',
   'assistant·subagent': '🤖 子代理', thinking: '💭 思考', system: '⚙️ 系统',
   tool: '🔧 工具调用', tool_result: '📄 工具输出', context: '📎 注入上下文',
+  question: '❓ 询问', answer: '💬 回答',
 };
 // 连续 3 条以上的工具调用/输出合并成一个可折叠的组, 避免刷屏
 const TOOL_ROLES = new Set(['tool', 'tool_result']);
-const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent', 'thinking']);
+const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent', 'thinking', 'question', 'answer']);
 const GROUP_MIN = 3;
 
 /** 先算分组(纯计算, 很快), 再分批建 DOM —— 分批不会把一个组切成两半。 */
@@ -1109,6 +1214,7 @@ function renderFormulae(root) {
 }
 
 function msgNode(m) {
+  if (m.role === 'question') return questionNode(m);
   // 命中的消息展开且不截断, 保证高亮可见; 但设上限, 否则搜 "a" 会把整个会话全量展开
   const found = SEARCH_ROLES.has(m.role) && hasTerm(m.text);
   const hit = found && S.autoOpen < AUTO_OPEN_MAX;
@@ -1150,6 +1256,55 @@ function msgNode(m) {
     hit ? full() : clipped();
   }
   return n;
+}
+
+function questionNode(m) {
+  const n = el('div', 'msg question');
+  n.dataset.role = 'question';
+  const body = el('div', 'mb question-body');
+  const rows = Array.isArray(m.questions) && m.questions.length
+    ? m.questions : [{ question: m.text, options: [] }];
+  body.innerHTML = rows.map((q, i) => `
+    <section class="question-item">
+      ${q.header ? `<div class="question-header">${esc(q.header)}</div>` : ''}
+      <div class="question-text">${esc(q.question || m.text)}</div>
+      ${q.multiple ? '<div class="question-multiple">可多选</div>' : ''}
+      ${(q.options || []).length ? `<div class="question-options">${q.options.map((o, j) => `
+        <div class="question-option"><span>${j + 1}</span><div><b>${esc(o.label)}</b>
+          ${o.description ? `<small>${esc(o.description)}</small>` : ''}</div></div>`).join('')}</div>` : ''}
+    </section>`).join('');
+  n.appendChild(body);
+  return n;
+}
+
+function renderActivity(activity) {
+  const box = $('#msgs');
+  if (!box) return;
+  $('#activity')?.remove();
+  if (!activity || activity.state === 'idle') return;
+  if (activity.state === 'working') {
+    if (!S.live.has(S.sel)) return;
+    const processStart = S.liveStarted.get(S.sel);
+    const activityAt = Date.parse(activity.ts) / 1000;
+    // resume 出来的新 CLI 停在输入提示符时，旧 transcript 可能仍以一条未回答的
+    // user 消息结尾。那条 working 属于上一进程，不能带进当前进程。
+    if (Number.isFinite(processStart) && Number.isFinite(activityAt)
+        && activityAt < processStart - 2) return;
+  }
+  const labels = {
+    working: 'Working…', waiting: '等待回答',
+    aborted: '已中断', failed: '执行失败',
+  };
+  const label = labels[activity.state];
+  if (!label) return;
+  const n = el('div', `activity ${activity.state}`);
+  n.id = 'activity';
+  n.dataset.state = activity.state;
+  n.setAttribute('role', 'status');
+  n.setAttribute('aria-live', 'polite');
+  n.innerHTML = `<i></i><span>${label}</span>`;
+  if (activity.reason) n.title = activity.reason;
+  box.appendChild(n);
 }
 
 const CLIP = 4000;
@@ -1436,6 +1591,9 @@ renderView();
 pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
 loadSessions(false).then(() => {
   const last = store.get('sel', null);       // 恢复上次看的会话
+  const savedAgent = store.get('agent', null);
   const restoreDetail = !MOBILE.matches || store.get('mobilePage', 'list') === 'detail';
-  if (restoreDetail && last && S.sessions.some(s => s.uid === last)) openSession(last);
+  if (restoreDetail && last && S.sessions.some(s => s.uid === last)) {
+    openSession(last, savedAgent?.uid === last ? savedAgent.id : null);
+  }
 });

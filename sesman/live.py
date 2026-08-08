@@ -24,6 +24,8 @@ _KEYWORDS = ("claude", "codex", "grok")
 
 TTL = 3.0          # 扫描结果的缓存秒数, 前端可以放心高频轮询
 _cache = {"at": 0.0, "sids": set(), "paths": set()}
+_boot_time: float | None = None
+_clock_ticks = os.sysconf("SC_CLK_TCK")
 
 
 _CLI_NAMES = ("claude", "codex", "grok")
@@ -33,6 +35,22 @@ def _is_cli(cmd: str) -> bool:
     """是不是 CLI 主进程本身 (而不是它拉起来的 shell 之类)。接管时只杀这些。"""
     head = cmd.strip().split(" ", 1)[0].rsplit("/", 1)[-1]
     return head in _CLI_NAMES or head.startswith(("codex-", "claude-"))
+
+
+def _process_started_at(pid: int) -> float | None:
+    """从 /proc 读取进程启动时间（Unix 秒），避免把旧回合状态带入新进程。"""
+    global _boot_time
+    try:
+        if _boot_time is None:
+            with open("/proc/stat") as fh:
+                _boot_time = float(next(
+                    line.split()[1] for line in fh if line.startswith("btime ")))
+        st = open(f"/proc/{pid}/stat").read()
+        # 去掉可能含空格的 comm；余下从字段 3(state) 开始，starttime 是索引 19。
+        start_ticks = int(st[st.rindex(")") + 2:].split()[19])
+        return _boot_time + start_ticks / _clock_ticks
+    except (OSError, StopIteration, ValueError, IndexError):
+        return None
 
 
 def _cli_ancestor(pid: int) -> int | None:
@@ -147,6 +165,25 @@ def is_live(session: dict, force: bool = False) -> bool:
     sid = str(session.get("sid", "")).lower()
     return bool((sid and sid in sids) or session["path"] in paths
                 or f'{session["path"]}/chat_history.jsonl' in paths)
+
+
+def started_at(session: dict, force: bool = False) -> float | None:
+    """当前会话最早的 CLI 主进程启动时间；没有可确认主进程时返回 None。"""
+    starts = []
+    for pid in pids_of(session, force=force):
+        if pid <= 0:
+            continue
+        try:
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read() \
+                .replace(b"\0", b" ").decode("utf8", "replace")
+        except OSError:
+            continue
+        if not _is_cli(cmd):
+            continue
+        value = _process_started_at(pid)
+        if value is not None:
+            starts.append(value)
+    return min(starts) if starts else None
 
 
 def live_uids(sessions: list[dict], force: bool = False) -> list[str]:

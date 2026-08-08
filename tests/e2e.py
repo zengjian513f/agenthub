@@ -81,7 +81,23 @@ def make_fake_session():
             {"type": "tool_result", "content": "单行工具输出不折叠"}]},
          "uuid": "u4", "timestamp": "2026-08-06T12:00:08.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{
+            "type": "tool_use", "id": "ask-1", "name": "AskUserQuestion", "input": {"questions": [{
+                "header": "启动方式", "question": "要使用哪种启动方式？", "multiSelect": False,
+                "options": [
+                    {"label": "tmux", "description": "保留可重连的终端"},
+                    {"label": "普通进程", "description": "直接在当前终端运行"},
+                ]}]}}]}, "uuid": "ask-a", "timestamp": "2026-08-06T12:00:09.000Z",
+         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "user", "message": {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "ask-1",
+            "content": "User has answered your questions: 启动方式=tmux"}]},
+         "uuid": "ask-u", "timestamp": "2026-08-06T12:00:10.000Z",
+         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
     ]
+    # 模拟老 Claude 会话：大段启动附件会把首个 cwd 挤出前 40 条元数据记录。
+    # 详情仍应从文件尾恢复真实 cwd，不能把项目 slug 猜成 /tmp/sesman/selftest。
+    rows[1:1] = [{"type": "progress", "data": {"n": i}} for i in range(45)]
     # 确定性覆盖前端两层限流：前 40 条命中消息自动展开、前 3000 处命中高亮。
     # 不能拿用户真实会话的文件大小推断命中消息数；大文件也可能只有一条超长消息。
     rows.extend({
@@ -90,7 +106,40 @@ def make_fake_session():
         "uuid": f"cap-{i}", "timestamp": f"2026-08-06T12:01:{i:02d}.000Z",
         "cwd": "/tmp/sesman-selftest", "sessionId": sid,
     } for i in range(45))
+    rows.append({"type": "system", "subtype": "turn_duration", "durationMs": 1234,
+                 "timestamp": "2026-08-06T12:02:00.000Z", "cwd": "/tmp/sesman-selftest",
+                 "sessionId": sid})
+    rows.extend([
+        {"type": "user", "message": {"role": "user", "content": "/compact"},
+         "timestamp": "2026-08-06T12:03:00.000Z", "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "system", "subtype": "compact_boundary", "timestamp": "2026-08-06T12:03:02.000Z",
+         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "user", "message": {"role": "user", "content":
+         "This session is being continued from a previous conversation that ran out of context."},
+         "timestamp": "2026-08-06T12:03:02.100Z", "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "user", "message": {"role": "user", "content":
+         "<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>"},
+         "timestamp": "2026-08-06T12:03:02.200Z", "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+    ])
     f.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+    sub = FAKE_PROJ / sid / "subagents"
+    sub.mkdir(parents=True, exist_ok=True)
+    agents = [
+        ("selftest-one", "调查数据链路", "子代理一的独立结论"),
+        ("selftest-two", "检查回测参数", "子代理二的独立结论"),
+    ]
+    for i, (agent_id, title, answer) in enumerate(agents):
+        af = sub / f"agent-{agent_id}.jsonl"
+        arows = [
+            {"type": "user", "message": {"role": "user", "content": f"子代理任务 {i + 1}"},
+             "timestamp": f"2026-08-06T12:10:0{i}.000Z", "sessionId": sid},
+            {"type": "assistant", "message": {"role": "assistant", "content": answer},
+             "timestamp": f"2026-08-06T12:10:1{i}.000Z", "sessionId": sid},
+        ]
+        af.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in arows) + "\n")
+        af.with_suffix(".meta.json").write_text(json.dumps({
+            "agentType": "Explore", "description": title, "spawnDepth": 1,
+        }, ensure_ascii=False))
     return f
 
 
@@ -315,8 +364,42 @@ def run(pw):
     check("选中项高亮", p.locator(".item.sel").count() == 1)
     check("详情标题正确", "SESMAN自测会话请删除" in p.locator(".dhead h2").inner_text())
     check("详情元信息含 cwd", "/tmp/sesman-selftest" in p.locator(".dmeta").inner_text())
+    check("电脑版详情显示会话 UUID",
+          "00000000-dead-beef-0000-000000000001" in p.locator(".dmeta").inner_text())
+    meta_codes = p.locator(".dmeta code").all_inner_texts()
+    check("目录在前且 UUID 内容在后",
+          meta_codes[-2:] == ["/tmp/sesman-selftest", "00000000-dead-beef-0000-000000000001"], meta_codes)
     roles = p.locator("#msgs [data-role]").evaluate_all("ns => ns.map(n => n.dataset.role)")
     check("消息角色齐全", {"user", "assistant", "thinking", "tool", "tool_result", "context"} <= set(roles), roles)
+    check("结构化询问显示为对话气泡", "question" in roles)
+    question = p.locator('.msg[data-role="question"]')
+    check("询问气泡显示问题和选项",
+          "要使用哪种启动方式" in question.inner_text()
+          and "tmux" in question.inner_text() and "保留可重连的终端" in question.inner_text())
+    check("询问回答显示为用户气泡", "answer" in roles)
+    activity = p.evaluate("""() => {
+      const e = cache.get(S.sel), old = e.activity, wasLive = S.live.has(S.sel);
+      const hadStart = S.liveStarted.has(S.sel), oldStart = S.liveStarted.get(S.sel);
+      S.live.add(S.sel); S.liveStarted.set(S.sel, Date.now() / 1000 - 5);
+      e.activity = {state:'working', ts:new Date().toISOString()}; renderActivity(e.activity);
+      const working = document.querySelector('#activity')?.textContent;
+      e.activity = {state:'working', ts:'2000-01-01T00:00:00Z'}; renderActivity(e.activity);
+      const staleGone = !document.querySelector('#activity');
+      e.activity = {state:'waiting'}; renderActivity(e.activity);
+      const waiting = document.querySelector('#activity')?.textContent;
+      e.activity = {state:'idle'}; renderActivity(e.activity);
+      const idleGone = !document.querySelector('#activity');
+      e.activity = old; if (!wasLive) S.live.delete(S.sel);
+      if (hadStart) S.liveStarted.set(S.sel, oldStart); else S.liveStarted.delete(S.sel);
+      renderActivity(old);
+      return {working, staleGone, waiting, idleGone};
+    }""")
+    check("对话栏显示 Working 状态", "Working" in (activity["working"] or ""), activity)
+    check("新进程不继承旧回合的 Working", activity["staleGone"], activity)
+    check("对话栏显示等待回答状态", "等待回答" in (activity["waiting"] or ""), activity)
+    check("回合完成后移除临时状态", activity["idleGone"], activity)
+    check("compact 自动注入不会残留 Working",
+          p.evaluate("cache.get(S.sel)?.activity?.state") == "idle")
 
     # ---- 8. 默认折叠规则 ----
     def body_visible(role):
@@ -381,10 +464,11 @@ def run(pw):
       const box = document.querySelector('#msgs'), cs = getComputedStyle(box), br = box.getBoundingClientRect();
       const left = br.left + parseFloat(cs.paddingLeft), right = br.right - parseFloat(cs.paddingRight);
       const width = right - left;
-      const u = document.querySelector('#msgs > .msg[data-role="user"]:not(.folded)').getBoundingClientRect();
-      const a = document.querySelector('#msgs > .msg[data-role="assistant"]:not(.folded)').getBoundingClientRect();
+      const un = document.querySelector('#msgs > .msg[data-role="user"]:not(.folded)');
+      const an = document.querySelector('#msgs > .msg[data-role="assistant"]:not(.folded)');
+      const u = un.getBoundingClientRect(), a = an.getBoundingClientRect();
       return { userRight: right-u.right, otherLeft: a.left-left,
-               userMax: getComputedStyle(u).maxWidth, otherMax: getComputedStyle(a).maxWidth };
+               userMax: getComputedStyle(un).maxWidth, otherMax: getComputedStyle(an).maxWidth };
     }""")
     check("用户气泡靠右", bubble_geo["userRight"] <= 2, bubble_geo)
     check("其他气泡靠左", bubble_geo["otherLeft"] <= 2, bubble_geo)
@@ -480,22 +564,27 @@ def run(pw):
     check("展开后没有可见按钮", not target.query_selector(".more").is_visible())
     check("展开后内容完整", "点下方按钮展开全文" not in mb.inner_text())
 
-    # ---- 10. 子代理合并 (换一个有子代理的真实会话) ----
-    p.fill("#q", "")
-    p.wait_for_timeout(300)
-    idx = p.locator(".item").evaluate_all("ns => ns.findIndex(n => n.querySelector('.m').textContent.includes('⑂'))")
-    if idx >= 0:
-        p.locator(".item").nth(idx).click()
-        p.wait_for_selector("#a-agents", timeout=15000)
-        before = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
-        p.locator("#a-agents").click()
-        p.wait_for_timeout(3000)
-        p.wait_for_selector("#a-agents", timeout=30000)
-        after_n = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
-        check("合并子代理后消息变多", after_n > before, f"{before}->{after_n}")
-        check("合并按钮显示选中态", p.locator("#a-agents").get_attribute("aria-pressed") == "true")
-    else:
-        check("找到带子代理的会话", False, "无")
+    # ---- 10. 子代理是父会话内的互斥视图，不混入主时间线 ----
+    check("有子代理的会话标题可下拉切换", p.locator("#a-view-switch").count() == 1)
+    check("不再显示合并子代理按钮", p.locator("#a-agents").count() == 0)
+    p.locator("#a-view-switch").click()
+    check("下拉列出主会话和两个子代理",
+          p.locator("#session-view-menu button").count() == 3)
+    check("子代理任务描述作为标题",
+          "调查数据链路" in p.locator("#session-view-menu").inner_text())
+    p.locator('#session-view-menu button[data-agent="selftest-one"]').click()
+    p.wait_for_function("document.querySelector('.dhead h2')?.textContent.includes('调查数据链路')")
+    check("切换后只显示选中子代理",
+          "子代理一的独立结论" in p.locator("#msgs").inner_text()
+          and "自测：第一条用户消息" not in p.locator("#msgs").inner_text())
+    check("子代理不会出现在左侧独立会话列表",
+          p.locator(".item").filter(has_text="调查数据链路").count() == 0)
+    check("切换子代理不改变左侧父会话选中项", p.locator(".item.sel").count() == 1)
+    p.locator("#a-view-switch").click()
+    p.locator('#session-view-menu button[data-agent=""]').click()
+    p.wait_for_function("document.querySelector('.dhead h2')?.textContent.includes('SESMAN自测会话请删除')")
+    check("切回主会话后不残留子代理内容",
+          "子代理一的独立结论" not in p.locator("#msgs").inner_text())
 
     # ---- 14. 整份载入 + 进度条 + LRU 缓存 ----
     p.fill("#q", "")
@@ -670,6 +759,8 @@ def run(pw):
     api = json.loads(urllib.request.urlopen(BASE + "/api/live", timeout=60).read())
     check("活跃检测接口可用", isinstance(api.get("uids"), list)
           and isinstance(api.get("tmux_uids"), list)
+          and isinstance(api.get("started_at"), dict)
+          and set(api["started_at"]).issubset(api["uids"])
           and set(api["tmux_uids"]).issubset(api["uids"]), api)
     # 跑测试的这个进程本身就是活的 Claude 会话, 至少应检出一个
     check("检出正在运行的会话", len(api["uids"]) >= 1, api["uids"])

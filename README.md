@@ -18,7 +18,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 
 | 来源 | 路径 | 说明 |
 |---|---|---|
-| Claude | `~/.claude/projects/<编码cwd>/<uuid>.jsonl` | 标题取会话内的 `ai-title`；`<uuid>/subagents/*.jsonl` 为子代理会话，不单列，可在详情页合并 |
+| Claude | `~/.claude/projects/<编码cwd>/<uuid>.jsonl` | 标题取会话内的 `ai-title`；`<uuid>/subagents/*.jsonl` 为子代理会话，不单列，在详情标题下拉中单独切换 |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 元数据取首行 `session_meta`；标题优先用 `~/.codex/session_index.jsonl` 的 `thread_name` |
 | Grok | `~/.grok/sessions/<urlencoded-cwd>/<uuid>/` | 元数据取 `summary.json`，正文取 `chat_history.jsonl` |
 
@@ -48,8 +48,9 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 - **Markdown 渲染**：正文里的表格渲染成真表格（表头灰底、支持 `:---:` 对齐、宽表独立横向滚动不撑破布局），另外支持有序/无序列表、引用块、分隔线、多级标题、行内代码与粗斜体。代码块保持等宽原样。
 - **公式与图片**：KaTeX 渲染 `$...$`、`$$...$$`、`\(...\)`、`\[...\]`，代码块和行内代码不解析公式。支持 Claude/Codex/Grok 的结构化内嵌图片、Markdown 图片，以及正文中确实存在的本地图片路径；图片惰性加载、可点开原图。内嵌和本地图片通过有界内存注册表及不透明 `/api/media/` 地址提供，浏览器看不到本机路径；不存在的相对路径只显示文字占位，不会误发 HTTP 请求。为安全起见仅代理常见光栅格式，不代理 SVG。
 - **工具调用分组**：连续 3 条以上的工具调用/输出自动并成一组，组头显示「N 次工具调用」和工具名摘要（如 `Write ×3 · Bash ×2 · Edit ×3`），整组默认折叠。展开后工具内容使用与终端一致的 Cascadia Mono、纯黑底柔和灰字单层气泡，中文依次回退到 Noto/Sarasa CJK、微软雅黑或苹方，超长内容只提供「展开全文」。这样一屏能看到完整的对话脉络，而不是被几十条工具输出淹没。
+- **状态与询问**：直接解析 Codex `task_started/task_complete/turn_aborted` 和 Claude 回合事件，在消息流底部显示临时 `Working…`、「等待回答」、「已中断」或失败状态，完成后自动移除，不计入消息数或历史正文。`Working…` 还会与当前 CLI 进程的启动时间交叉校验，resume 后停在输入提示符的新进程不会继承旧回合状态。Claude `AskUserQuestion` 和 Codex `request_user_input` 按问题、选项和说明排成专用气泡，回答按用户消息显示；全程读取结构化 JSONL，不做 OCR。
 - **手机适配**：720px 以下改为“会话列表 → 会话详情”的单栏导航，不再硬挤左右栏，并记住当前在列表还是详情，刷新后原页恢复。详情使用紧凑返回键，消息数放在标题栏右侧，运行状态改为终端图标左上角的绿/蓝点；标题栏不设三点菜单，只保留直接操作图标，次要元信息默认省略。状态、来源、视图与刷新压在同一行，极窄屏只省略来源数量；输入框兼容安全区域，展开终端时直接覆盖消息区和输入框，并提供方向、翻页和 Esc 触控键。
-- **管理操作**：可合并子代理消息；运行中的会话显示停止按钮，停止后原位变为删除按钮。
+- **管理操作**：Claude 子代理可在会话标题处下拉切换，各自保留独立时间线；运行中的会话显示停止按钮，停止后原位变为删除按钮。
 
 ## 界面状态
 
@@ -172,7 +173,7 @@ Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex
 
 索引缓存在 `~/.cache/sesman/index.json`，用全部会话文件的 `(路径, mtime, 大小)` 摘要做失效判断：文件有变动就自动重建（全量约 0.1s，元数据只读每个文件的前 96KB）。顶栏 `↻ 刷新` 强制重建。
 
-列表每 8s 自动跟进磁盘变化：前端带上手里的签名请求 `/api/sessions?sig=<签名>`，一致时服务端只回 `{"unchanged": true}` —— 全量 stat 203 个文件约 3ms，响应 70 字节。新会话出现、rename（Claude 的最新 `custom-title`、Codex 的 `session_index.jsonl`、Grok 的 summary）、时间重排都会自动反映，**不打断当前的选中和滚动位置**，搜索态下也不会把结果冲掉。
+列表每 8s 自动跟进磁盘变化：前端带上手里的签名请求 `/api/sessions?sig=<签名>`，一致时服务端只回 `{"unchanged": true}` —— 全量 stat 会话及子代理文件为个位数毫秒，响应约 70 字节。新会话出现、rename（Claude 的最新 `custom-title`、Codex 的 `session_index.jsonl`、Grok 的 summary）、时间重排和子代理增删都会自动反映，**不打断当前的选中和滚动位置**，搜索态下也不会把结果冲掉。
 
 **拿到新列表也不等于要重画**。活跃会话每隔几秒就变一次大小和时间，每次都重建左栏 DOM 的话，看起来就是一直在闪。所以先比对结构（顺序、标题、目录，时间轴视图下还要比日期分组）：只有结构真变了才重建，否则只把那一行的文字改掉，DOM 节点原地不动。
 
@@ -180,12 +181,12 @@ Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex
 
 | 轮询 | 间隔 | 成本 |
 |---|---|---|
-| 会话列表签名 | 8s | ~3ms / 70 字节 |
+| 会话列表签名 | 8s | 个位数毫秒 / ~70 字节 |
 | 活跃会话（扫 `/proc`） | 3s | ~40ms，服务端缓存 3s |
 | 当前会话更新 | **服务端推送**，检测间隔 50ms | 只 stat 一个文件，微秒级 |
 | 推送断开时的兜底 | 自适应 350ms~3s | 无新内容时服务端 3ms |
 
-活跃标识按运行环境分色：绿色表示普通的非 tmux 进程，蓝色表示运行在 tmux 中、可直接接入的会话；详情状态和顶栏计数使用同一套颜色。
+活跃标识按运行环境分色：绿色表示普通的非 tmux 进程，蓝色表示运行在 tmux 中、可直接接入的会话；详情只显示纯色点，说明放在悬停提示中。
 
 这几个轮询都不写日志（`/api/live`、`sig=`、`start=` 一律静默），否则真正有用的日志会被淹没。
 
@@ -193,7 +194,7 @@ Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex
 
 ## 测试
 
-`tests/e2e.py` 用 Playwright 驱动真实 Chromium 点遍全部交互（218 项断言：列表渲染、来源筛选、两种视图、分组折叠、标题过滤、全文搜索、聊天气泡布局、单层工具输出、自带终端字体与配色、滚动条样式、输入区宽度、工具输出折叠、展开全文、公式与图片、导出、子代理合并、增量同步、刷新、快捷键、接管终端、删除入回收站，以及页面无 JS/HTTP 错误）。
+`tests/e2e.py` 用 Playwright 驱动真实 Chromium 点遍全部交互（列表渲染、来源筛选、两种视图、分组折叠、标题过滤、全文搜索、聊天气泡布局、单层工具输出、自带终端字体与配色、滚动条样式、输入区宽度、工具输出折叠、展开全文、公式与图片、子代理独立视图切换、增量同步、刷新、快捷键、接管终端、删除入回收站，以及页面无 JS/HTTP 错误）。
 
 删除相关的断言跑在一个临时造出来的自测会话上（`~/.claude/projects/-tmp-sesman-selftest/`），跑完自动清理，不碰真实会话。
 
@@ -218,8 +219,9 @@ sesman/
 ### HTTP 接口
 
 - `GET /api/sessions[?force=1&sig=]` — 全部会话元数据；签名未变时返回轻量结果
-- `GET /api/messages/<uid>?start=&head=&anchor=&agents=1` — 整份或增量消息（`agents=1` 合并 Claude 子代理）
-- `GET /api/watch?uid=&start=&head=&anchor=` — 当前会话的 SSE 增量推送
+- `GET /api/live[?force=1]` — 活跃会话、tmux 子集及当前 CLI 进程启动时间
+- `GET /api/messages/<uid>?start=&head=&anchor=&agent=<id>` — 整份或增量消息；`agent` 选择单个 Claude 子代理视图
+- `GET /api/watch?uid=&agent=&start=&head=&anchor=` — 当前主会话或所选子代理视图的 SSE 增量推送
 - `GET /api/media/<token>` — 会话中已登记图片的不透明只读地址
 - `GET /api/search?q=&source=claude,codex` — 正文全文搜索
 - `POST /api/term/create` / `GET /api/term/new-status?name=` — 创建并关联新 CLI 会话（需 `--terminal`）
