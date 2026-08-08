@@ -25,6 +25,22 @@ def check(name, cond, extra=""):
     print(f"{'✅' if cond else '❌'} {name}{'  ' + str(extra) if extra and not cond else ''}")
 
 
+def tmux_run(server, *args, **kwargs):
+    """显式选择 tmux socket，避免测试误操作用户默认 server 中的同名会话。"""
+    return subprocess.run(["tmux", "-L", server, *args], **kwargs)
+
+
+def term_rows():
+    return json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())["sessions"]
+
+
+def term_server(name):
+    row = next((x for x in term_rows() if x["name"] == name), None)
+    if not row:
+        raise RuntimeError(f"找不到终端会话 {name}")
+    return row.get("server", "default")
+
+
 def make_fake_session():
     """造一个一次性会话, 用来安全地测删除。"""
     FAKE_PROJ.mkdir(parents=True, exist_ok=True)
@@ -777,9 +793,31 @@ def run(pw):
         marked = p.locator(".item.live").count()
         shown = p.evaluate("[...S.live].filter(u => document.querySelector(`.item[data-uid=\"${u}\"]`)).length")
         check("列表里可见的活跃会话都标了", marked == shown, f"{marked} vs {shown}")
-    check("顶栏显示分类后的进行中计数",
-          "进行中" in (p.locator("#livecount").get_attribute("aria-label") or "") if api["uids"] else True,
-          p.locator("#livecount").get_attribute("aria-label"))
+    live_switch = p.locator("#livecount")
+    check("顶栏活动计数是一个开关",
+          live_switch.evaluate("n => n.tagName") == "BUTTON"
+          and live_switch.get_attribute("aria-pressed") == "false")
+    check("活动计数不再显示 tmux 文字",
+          "tmux" not in live_switch.inner_text().lower(), live_switch.inner_text())
+    before_live_filter = set(p.locator("#side .item").evaluate_all(
+        "nodes => nodes.map(n => n.dataset.uid)"))
+    live_switch.click()
+    p.wait_for_timeout(100)
+    expected_active = set(p.evaluate("""() => sidebarSessions()
+      .filter(s => !S.off.has(s.source) && (s.pending || S.live.has(s.uid)))
+      .map(s => s.uid)"""))
+    shown_active = set(p.locator("#side .item").evaluate_all(
+        "nodes => nodes.map(n => n.dataset.uid)"))
+    check("活动开关按下后只显示活动会话",
+          shown_active == expected_active
+          and live_switch.get_attribute("aria-pressed") == "true",
+          f"shown={shown_active}, expected={expected_active}")
+    live_switch.click()
+    p.wait_for_timeout(100)
+    check("再次点击活动开关恢复全部会话",
+          set(p.locator("#side .item").evaluate_all("nodes => nodes.map(n => n.dataset.uid)"))
+          == before_live_filter
+          and live_switch.get_attribute("aria-pressed") == "false")
     # 活跃标记不该重渲染列表 (会打断滚动/选中)
     p.locator(".item").first.click()
     p.wait_for_selector(".msg", timeout=30000)
@@ -980,6 +1018,21 @@ def run(pw):
         check("终端未启用时不显示接管入口", p.locator("#a-term").count() == 0)
         check("终端未启用时不显示新建入口", p.locator("#new-session").is_hidden())
     else:
+        # 新会话进入专用 server，但改造前默认 server 中的 sesman-* 仍须可见、可路由。
+        legacy_name = "sesman-e2e-legacycompat"
+        tmux_run("default", "kill-session", "-t", legacy_name, capture_output=True)
+        tmux_run("default", "new-session", "-d", "-s", legacy_name, "sleep 60", check=True)
+        legacy_row = next((x for x in term_rows() if x["name"] == legacy_name), None)
+        check("默认 server 的旧 sesman 会话仍可见",
+              legacy_row is not None and legacy_row.get("server") == "default", legacy_row)
+        urllib.request.urlopen(urllib.request.Request(
+            BASE + "/api/term/kill",
+            json.dumps({"name": legacy_name}).encode(),
+            {"Content-Type": "application/json"}), timeout=30).read()
+        check("旧会话操作会路由回默认 server",
+              tmux_run("default", "has-session", "-t", legacy_name,
+                       capture_output=True).returncode != 0)
+
         p.click("#new-session")
         p.wait_for_selector("#new-session-dialog[open]")
         check("新建弹窗有三种会话类型", p.locator('input[name="new-source"]').count() == 3)
@@ -1019,7 +1072,9 @@ def run(pw):
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=90000)
         p.wait_for_timeout(1500)
         tname = p.evaluate("T.name")
+        tserver = term_server(tname)
         check("一键接管起了 tmux 会话", tname.startswith("sesman-claude-"), tname)
+        check("新接管会话使用 sesman 专用 server", tserver == "sesman", tserver)
         check("接管未弹确认框(会话本来就没在跑)", not dialogs, dialogs[:1])
         check("终端出现在会话底部", p.locator("#termpane").is_visible())
         check("消息流还在上方", p.locator("#msgs .msg").count() > 0)
@@ -1057,8 +1112,64 @@ def run(pw):
         check("接管后消息流底部出现输入框", p.locator("#composer").is_visible())
         sent = []
         p.on("response", lambda r: sent.append(r.status) if "/api/term/send" in r.url else None)
-        pane_before = subprocess.run(["tmux", "capture-pane", "-p", "-t", tname],
-                                     capture_output=True, text=True).stdout
+        # 手机 Enter 只换行，发送必须点按钮；短 placeholder 不把单行输入框撑高。
+        viewport(390, 780)
+        p.evaluate("showMobileDetail()")
+        mobile_head = p.evaluate("""() => {
+          const h = document.querySelector('.dtitle h2');
+          const title = h.querySelector('.session-view-switch > span')
+            || [...h.children].find(n => n.tagName === 'SPAN');
+          const old = title.textContent;
+          title.textContent = '这是一条必须在手机标题栏中保持单行并用省略号截断的很长会话标题';
+          const hs = getComputedStyle(h), ts = getComputedStyle(title);
+          const hr = h.getBoundingClientRect(), ar = document.querySelector('.dhead-actions').getBoundingClientRect();
+          const result = {height: hr.height, lineHeight: parseFloat(hs.lineHeight),
+            whiteSpace: hs.whiteSpace, overflow: hs.overflow, textOverflow: ts.textOverflow,
+            noOverlap: hr.right <= ar.left + 1};
+          title.textContent = old;
+          newBadge(7);
+          return result;
+        }""")
+        check("手机详情标题保持单行省略",
+              mobile_head["whiteSpace"] == "nowrap"
+              and mobile_head["overflow"] == "hidden"
+              and mobile_head["textOverflow"] == "ellipsis"
+              and mobile_head["height"] <= mobile_head["lineHeight"] + 2
+              and mobile_head["noOverlap"], mobile_head)
+        mobile_badge = p.evaluate("""() => {
+          const count = document.querySelector('.mobile-msg-count');
+          const badge = document.querySelector('.mobile-newmsg');
+          const c = count.getBoundingClientRect(), b = badge.getBoundingClientRect();
+          const s = getComputedStyle(badge);
+          return {text: badge.textContent, visible: b.width > 0 && b.height > 0,
+            after: badge.previousElementSibling === count && b.left >= c.right,
+            width: b.width, height: b.height, radius: parseFloat(s.borderRadius)};
+        }""")
+        check("手机新消息以总数后的数字圆标显示",
+              mobile_badge["text"] == "7" and mobile_badge["visible"]
+              and mobile_badge["after"]
+              and abs(mobile_badge["width"] - mobile_badge["height"]) <= 1
+              and mobile_badge["radius"] >= mobile_badge["height"] / 2,
+              mobile_badge)
+        p.fill("#cinput", "手机第一行")
+        mobile_single_line_height = p.locator("#cinput").bounding_box()["height"]
+        sent_before_enter = len(sent)
+        p.press("#cinput", "Enter")
+        p.wait_for_timeout(100)
+        check("手机输入提示保持简短单行",
+              p.locator("#cinput").get_attribute("placeholder") == "输入内容"
+              and mobile_single_line_height <= 40, mobile_single_line_height)
+        check("手机 Enter 只换行不发送",
+              p.input_value("#cinput") == "手机第一行\n" and len(sent) == sent_before_enter,
+              repr(p.input_value("#cinput")))
+        p.fill("#cinput", "")
+        p.evaluate("document.querySelectorAll('.newmsg').forEach(n => n.classList.remove('on'))")
+        viewport(1280, 800)
+        p.wait_for_timeout(100)
+        check("桌面仍提示 Enter 与 Shift+Enter",
+              "Shift+Enter" in p.locator("#cinput").get_attribute("placeholder"))
+        pane_before = tmux_run(tserver, "capture-pane", "-p", "-t", tname,
+                               capture_output=True, text=True).stdout
         if "trust this folder" in pane_before:      # 新起的 TUI 可能停在信任确认页
             p.fill("#cinput", "1")
             p.press("#cinput", "Enter")
@@ -1075,8 +1186,8 @@ def run(pw):
         pane = ""
         deadline = time.time() + 20
         while time.time() < deadline:
-            pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", tname],
-                                  capture_output=True, text=True).stdout
+            pane = tmux_run(tserver, "capture-pane", "-p", "-t", tname,
+                            capture_output=True, text=True).stdout
             if any(k in pane for k in help_words):
                 break
             # 让 Playwright 同时派发 fetch response 事件；time.sleep 会阻塞它的事件泵。
@@ -1085,14 +1196,32 @@ def run(pw):
         check("CLI 确实响应了输入", any(k in pane for k in help_words), pane.strip()[-90:])
         check("发送后输入框清空", p.input_value("#cinput") == "")
 
-        # 终端要像普通终端: 滚轮翻历史、鼠标能框选。
-        # 用一个独立的 shell 会话来测 —— CLI 的 TUI 是 alternate screen,
-        # tmux 根本不给它存历史, 那条路径走的是"滚轮转方向键"。
-        subprocess.run(["tmux", "kill-session", "-t", "sesman-wheeltest"], capture_output=True)
+        # 专用 server 只做托管：无状态栏/前缀/鼠标接管，滚动留给 xterm。
+        for server in ("sesman", "default"):
+            tmux_run(server, "kill-session", "-t", "sesman-wheeltest", capture_output=True)
         wname = json.loads(urllib.request.urlopen(urllib.request.Request(
             BASE + "/api/term/new",
             json.dumps({"name": "wheeltest", "cmd": "bash --noprofile --norc", "cwd": "/tmp"}).encode(),
             {"Content-Type": "application/json"}), timeout=30).read())["name"]
+        wserver = term_server(wname)
+        check("测试终端位于专用 server", wserver == "sesman", wserver)
+        transparent = {
+            "status": tmux_run(wserver, "show-options", "-gv", "status",
+                               capture_output=True, text=True).stdout.strip(),
+            "mouse": tmux_run(wserver, "show-options", "-gv", "mouse",
+                              capture_output=True, text=True).stdout.strip(),
+            "prefix": tmux_run(wserver, "show-options", "-gv", "prefix",
+                               capture_output=True, text=True).stdout.strip(),
+            "escape": tmux_run(wserver, "show-options", "-sv", "escape-time",
+                               capture_output=True, text=True).stdout.strip(),
+            "focus": tmux_run(wserver, "show-options", "-sv", "focus-events",
+                              capture_output=True, text=True).stdout.strip(),
+            "extended": tmux_run(wserver, "show-options", "-sv", "extended-keys",
+                                 capture_output=True, text=True).stdout.strip(),
+        }
+        check("专用 tmux 已关闭 UI 与输入截获",
+              transparent == {"status": "off", "mouse": "off", "prefix": "None",
+                              "escape": "10", "focus": "on", "extended": "on"}, transparent)
         urllib.request.urlopen(urllib.request.Request(
             BASE + "/api/term/send",
             json.dumps({"name": wname, "text": "for i in $(seq 1 200); do echo 历史行$i; done"}).encode(),
@@ -1101,46 +1230,100 @@ def run(pw):
         p.evaluate("n => openTermPane(n)", wname)
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
         p.wait_for_timeout(1200)
-        in_mode = lambda: subprocess.run(
-            ["tmux", "display", "-p", "-t", wname, "#{pane_in_mode}"],
+        in_mode = lambda: tmux_run(
+            wserver, "display", "-p", "-t", wname, "#{pane_in_mode}",
             capture_output=True, text=True).stdout.strip()
+        check("网页终端使用 xterm 正常缓冲区",
+              p.evaluate("T.term.buffer.active === T.term.buffer.normal"))
+        check("连接时已把 tmux 历史送入 xterm scrollback",
+              p.evaluate("T.term.buffer.normal.baseY") > 100,
+              p.evaluate("T.term.buffer.normal.baseY"))
+        scroll_urls = []
+        def _scroll_req(req):
+            if "/api/term/scroll" in req.url:
+                scroll_urls.append(req.url)
+        p.on("request", _scroll_req)
         box = p.locator("#xterm").bounding_box()
         p.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        for _ in range(5):
-            p.mouse.wheel(0, -300)
-        p.wait_for_function("T.scrollPos > 0", timeout=15000)
-        check("滚轮能翻 tmux 历史", p.evaluate("T.scrollPos") > 0, p.evaluate("T.scrollPos"))
-        check("显示已上翻多少行", "上翻" in p.locator("#tscroll").inner_text(),
-              p.locator("#tscroll").inner_text())
-        check("此时 tmux 进入 copy-mode", in_mode() == "1", in_mode())
+        for _ in range(4):
+            p.mouse.wheel(0, -1200)
+        p.wait_for_function("T.term.buffer.active.viewportY < T.term.buffer.active.baseY", timeout=15000)
+        check("滚轮由 xterm 本地滚动",
+              p.evaluate("T.term.buffer.active.viewportY < T.term.buffer.active.baseY"))
+        check("滚动不请求服务端也不进入 copy-mode",
+              not scroll_urls and in_mode() == "0", {"requests": scroll_urls, "mode": in_mode()})
+        p.evaluate("T.term.scrollToTop()")
         seen = p.evaluate("""() => { const b = T.term.buffer.active; let s = '';
-          for (let i = 0; i < T.term.rows; i++) s += (b.getLine(i)?.translateToString(true) || '');
+          for (let i = b.viewportY; i < b.viewportY + T.term.rows; i++)
+            s += (b.getLine(i)?.translateToString(true) || '');
           return s; }""")
         check("确实看到了更早的输出", "历史行1" in seen and "历史行200" not in seen)
-        p.click("#tscroll")
-        p.wait_for_function("T.scrollPos === 0", timeout=15000)
-        check("点提示条回到最新画面", in_mode() == "0", in_mode())
-        p.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)  # 鼠标挪回终端里
-        for _ in range(4):
-            p.mouse.wheel(0, -300)
-        p.wait_for_function("T.scrollPos > 0", timeout=15000)
-        p.evaluate("T.term.focus()")        # 刚点过按钮, 焦点得先还给终端
+        p.evaluate("T.term.scrollLines(-20); T.term.focus()")
         p.keyboard.type("x")
-        p.wait_for_function("T.scrollPos === 0", timeout=15000)
+        p.wait_for_function("T.term.buffer.active.viewportY === T.term.buffer.active.baseY", timeout=15000)
         ok = received = False
         tail = ""
-        for _ in range(20):                 # tmux 退出 copy-mode 和处理按键都有延迟
+        for _ in range(20):
             p.wait_for_timeout(250)
             ok = in_mode() == "0"
-            pane = subprocess.run(["tmux", "capture-pane", "-p", "-t", wname],
-                                  capture_output=True, text=True).stdout
+            pane = tmux_run(wserver, "capture-pane", "-p", "-t", wname,
+                            capture_output=True, text=True).stdout
             tail = pane.rstrip().splitlines()[-1] if pane.rstrip() else ""
             received = tail.rstrip().endswith("x")
             if ok and received:
                 break
-        check("一打字就自动回到实时画面", ok, in_mode())
-        check("退出滚动时首个字符未被吞", received, tail)
+        check("一打字由 xterm 自动回到底部", ok, in_mode())
+        check("本地滚动后的首个字符未被吞", received, tail)
+        p.remove_listener("request", _scroll_req)
         p.keyboard.press("Backspace")
+
+        before_detach = tmux_run(wserver, "capture-pane", "-p", "-t", wname,
+                                 capture_output=True, text=True).stdout.rstrip().splitlines()[-1]
+        p.evaluate("closeTermPane()")
+        p.wait_for_timeout(300)
+        after_detach = tmux_run(wserver, "capture-pane", "-p", "-t", wname,
+                                capture_output=True, text=True).stdout.rstrip().splitlines()[-1]
+        check("无前缀断开不会结束会话或注入 Ctrl-B d",
+              tmux_run(wserver, "has-session", "-t", wname,
+                       capture_output=True).returncode == 0
+              and after_detach == before_detach,
+              f"{before_detach!r} -> {after_detach!r}")
+        p.evaluate("n => openTermPane(n)", wname)
+        p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
+        p.wait_for_timeout(300)
+
+        # 手机终端没有实体修饰键：Ctrl 点一次只修饰下一键，随后自动解除。
+        p.keyboard.type("sleep 30")
+        p.keyboard.press("Enter")
+        p.wait_for_timeout(300)
+        pane_command = lambda: tmux_run(
+            wserver, "display", "-p", "-t", wname, "#{pane_current_command}",
+            capture_output=True, text=True).stdout.strip()
+        check("Ctrl 测试命令已经运行", pane_command() == "sleep", pane_command())
+        viewport(390, 780)
+        p.wait_for_timeout(200)
+        key_labels = p.locator(".term-keys button").all_inner_texts()
+        key_tops = [round(p.locator(".term-keys button").nth(i).bounding_box()["y"])
+                    for i in range(p.locator(".term-keys button").count())]
+        check("手机终端补齐 Ctrl、Tab、左右、上下、翻页和 Esc",
+              all(k in key_labels for k in ("Ctrl", "Tab", "←", "→", "↑", "↓", "Pg↑", "Pg↓", "Esc")),
+              key_labels)
+        check("手机终端快捷键保持单排", max(key_tops) - min(key_tops) <= 1, key_tops)
+        p.click('[data-term-modifier="ctrl"]')
+        check("Ctrl 点亮为下一键待用",
+              p.locator('[data-term-modifier="ctrl"]').get_attribute("aria-pressed") == "true")
+        p.keyboard.type("c")
+        p.wait_for_timeout(100)
+        check("输入 c 后 Ctrl 自动解除",
+              p.locator('[data-term-modifier="ctrl"]').get_attribute("aria-pressed") == "false")
+        for _ in range(20):
+            if pane_command() != "sleep":
+                break
+            p.wait_for_timeout(100)
+        check("Ctrl 后输入 c 实际发送 Ctrl+C", pane_command() != "sleep", pane_command())
+        viewport(1280, 800)
+        p.wait_for_timeout(200)
+        p.evaluate("fitTerm()")
 
         was = p.evaluate("T.localMouse")
         p.click("#tmouse")
@@ -1156,7 +1339,7 @@ def run(pw):
         if p.evaluate("T.localMouse") != was:
             p.click("#tmouse")
             p.wait_for_timeout(300)
-        # 全屏应用那条路径: 滚轮转成方向键, 不进 copy-mode
+        # 全屏应用仍由 tmux 模拟 alternate screen，但外层 xterm 保持正常缓冲区。
         urllib.request.urlopen(urllib.request.Request(
             BASE + "/api/term/send",
             json.dumps({"name": wname, "text": "less /etc/services"}).encode(),
@@ -1164,8 +1347,8 @@ def run(pw):
         alt = "0"
         for _ in range(20):                     # less 起来要一会儿
             time.sleep(0.3)
-            alt = subprocess.run(["tmux", "display", "-p", "-t", wname, "#{alternate_on}"],
-                                 capture_output=True, text=True).stdout.strip()
+            alt = tmux_run(wserver, "display", "-p", "-t", wname, "#{alternate_on}",
+                           capture_output=True, text=True).stdout.strip()
             if alt == "1":
                 break
         if alt == "1":
@@ -1174,10 +1357,10 @@ def run(pw):
             for _ in range(3):
                 p.mouse.wheel(0, -300)
             p.wait_for_timeout(1000)
-            check("全屏应用下不进 copy-mode(滚轮转方向键)", in_mode() == "0", in_mode())
+            check("全屏应用下仍不进入 copy-mode", in_mode() == "0", in_mode())
         else:
             print("⏭  跳过全屏应用那条(less 没起来, 环境问题)")
-        subprocess.run(["tmux", "kill-session", "-t", wname], capture_output=True)
+        tmux_run(wserver, "kill-session", "-t", wname, capture_output=True)
         p.evaluate("closeTermPane()")
         p.wait_for_timeout(300)
         p.evaluate("n => openTermPane(n)", tname)
@@ -1186,7 +1369,7 @@ def run(pw):
         p.wait_for_timeout(300)
 
         # 从外部结束这个 tmux 会话, 前端应在下一轮轮询里自己发现并收起
-        subprocess.run(["tmux", "kill-session", "-t", tname], capture_output=True)
+        tmux_run(tserver, "kill-session", "-t", tname, capture_output=True)
         p.evaluate("pollLive()")
         p.wait_for_timeout(1200)
         gone = json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())
@@ -1260,8 +1443,13 @@ def run(pw):
     p.locator(".item").first.click()
     p.wait_for_selector("#a-session-action[title='删除会话']", timeout=10000)
     p.once("dialog", lambda d: d.accept())
-    p.locator("#a-session-action").click()
-    p.wait_for_timeout(1200)
+    # 删除前会强制扫描进程；机器繁忙时可能超过固定 sleep。等真实响应结束，
+    # 否则 finally 的 cleanup 会先删掉测试文件，让尚在处理的请求误报 404。
+    with p.expect_response(
+            lambda r: "/api/session/" in r.url and r.request.method == "DELETE",
+            timeout=30000):
+        p.locator("#a-session-action").click()
+    p.wait_for_timeout(200)
     check("删除后提示回收站", "回收站" in p.locator("#detail").inner_text())
     p.fill("#q", "SESMAN自测")
     p.wait_for_timeout(300)

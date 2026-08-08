@@ -52,7 +52,7 @@
 
 <div id="app">
   <header>
-    <div class="brand"><span class="brand-name">sesman</span><small id="stat">加载中…</small><span id="livecount" class="livecount"></span></div>
+    <div class="brand"><span class="brand-name">sesman</span><small id="stat">加载中…</small><button type="button" id="livecount" class="livecount" aria-pressed="false"></button></div>
     <div class="chips" id="chips"></div>
     <div class="seg" id="view">
       <button data-v="tree" class="on" title="项目树" aria-label="项目树">📁 <span class="mobile-label">项目树</span></button>
@@ -88,7 +88,7 @@
     <div id="right">
       <div id="detail"><div class="empty">从左侧选择一个会话</div></div>
       <div id="composer" class="hidden">
-        <textarea id="cinput" rows="1" placeholder="输入内容，Enter 发送给会话，Shift+Enter 换行"></textarea>
+        <textarea id="cinput" rows="1" enterkeyhint="enter" placeholder="输入内容"></textarea>
         <div class="cbtns">
           <button class="btn" id="cesc" title="发送 Esc（中断）">Esc</button>
           <button class="btn go" id="csend">发送</button>
@@ -109,12 +109,16 @@
           <button class="iconbtn danger" id="tstop" title="结束这个 tmux 会话" aria-label="结束会话">
             <svg class="ui-icon" aria-hidden="true"><use href="#i-stop"/></svg>
           </button>
-          <div class="term-keys" aria-label="终端方向与翻页键">
+          <div class="term-keys" aria-label="终端快捷键">
+            <button data-term-modifier="ctrl" title="Ctrl（下一键生效）" aria-label="Ctrl，下一键生效" aria-pressed="false">Ctrl</button>
+            <button data-term-key="Escape" title="Escape" aria-label="Escape">Esc</button>
+            <button data-term-key="Tab" title="Tab" aria-label="Tab">Tab</button>
+            <button data-term-key="Left" title="方向键左" aria-label="方向键左">←</button>
             <button data-term-key="Up" title="方向键上" aria-label="方向键上">↑</button>
             <button data-term-key="Down" title="方向键下" aria-label="方向键下">↓</button>
+            <button data-term-key="Right" title="方向键右" aria-label="方向键右">→</button>
             <button data-term-key="PPage" title="Page Up" aria-label="Page Up">Pg↑</button>
             <button data-term-key="NPage" title="Page Down" aria-label="Page Down">Pg↓</button>
-            <button data-term-key="Escape" title="Escape" aria-label="Escape">Esc</button>
           </div>
         </div>
         <div id="xterm"></div>

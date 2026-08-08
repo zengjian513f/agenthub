@@ -49,7 +49,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 - **公式与图片**：KaTeX 渲染 `$...$`、`$$...$$`、`\(...\)`、`\[...\]`，代码块和行内代码不解析公式。支持 Claude/Codex/Grok 的结构化内嵌图片、Markdown 图片，以及正文中确实存在的本地图片路径；图片惰性加载、可点开原图。内嵌和本地图片通过有界内存注册表及不透明 `/api/media/` 地址提供，浏览器看不到本机路径；不存在的相对路径只显示文字占位，不会误发 HTTP 请求。为安全起见仅代理常见光栅格式，不代理 SVG。
 - **工具调用分组**：连续 3 条以上的工具调用/输出自动并成一组，组头显示「N 次工具调用」和工具名摘要（如 `Write ×3 · Bash ×2 · Edit ×3`），整组默认折叠。展开后工具内容使用与终端一致的 Cascadia Mono、纯黑底柔和灰字单层气泡，中文依次回退到 Noto/Sarasa CJK、微软雅黑或苹方，超长内容只提供「展开全文」。这样一屏能看到完整的对话脉络，而不是被几十条工具输出淹没。
 - **状态与询问**：直接解析 Codex `task_started/task_complete/turn_aborted` 和 Claude 回合事件，在消息流底部显示临时 `Working…`、「等待回答」、「已中断」或失败状态，完成后自动移除，不计入消息数或历史正文。`Working…` 还会与当前 CLI 进程的启动时间交叉校验，resume 后停在输入提示符的新进程不会继承旧回合状态。Claude `AskUserQuestion` 和 Codex `request_user_input` 按问题、选项和说明排成专用气泡，回答按用户消息显示；全程读取结构化 JSONL，不做 OCR。
-- **手机适配**：720px 以下改为“会话列表 → 会话详情”的单栏导航，不再硬挤左右栏，并记住当前在列表还是详情，刷新后原页恢复。详情使用紧凑返回键，消息数放在标题栏右侧，运行状态改为终端图标左上角的绿/蓝点；标题栏不设三点菜单，只保留直接操作图标，次要元信息默认省略。状态、来源、视图与刷新压在同一行，极窄屏只省略来源数量；输入框兼容安全区域，展开终端时直接覆盖消息区和输入框，并提供方向、翻页和 Esc 触控键。
+- **手机适配**：720px 以下改为“会话列表 → 会话详情”的单栏导航，不再硬挤左右栏，并记住当前在列表还是详情，刷新后原页恢复。详情使用紧凑返回键，消息数放在标题栏右侧，运行状态改为终端图标左上角的绿/蓝点；标题栏不设三点菜单，只保留直接操作图标，次要元信息默认省略。状态、来源、视图与刷新压在同一行，极窄屏只省略来源数量；输入框使用短提示词，手机 Enter 只换行、点击发送按钮才提交，并兼容安全区域；展开终端时直接覆盖消息区和输入框，提供 Ctrl（下一键生效）、Tab、方向、翻页和 Esc 触控键。
 - **管理操作**：Claude 子代理可在会话标题处下拉切换，各自保留独立时间线；运行中的会话显示停止按钮，停止后原位变为删除按钮。
 
 ## 界面状态
@@ -83,7 +83,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 
 启用后，任何会话的详情页都会出现终端图标。点一下，服务端在后台把这个会话用 tmux 起起来（`claude --resume` / `codex resume` / `grok --resume`，自动沿用它原来的工作目录），**消息流底部立刻出现一个输入框** —— 打字回车就发给会话，回复通过增量同步自动出现在上面的历史里。
 
-顶栏的「＋ 新建」可以直接创建 Claude / Codex / Grok 会话。弹窗允许手输绝对路径，也会按近期使用、已有会话数量和最后活跃时间列出常用 cwd；选择后在该目录启动独立 tmux，并立即打开网页终端。后端只接受三种固定 CLI 和确实存在的目录，不接受浏览器传任意 shell 命令。CLI 生成会话文件后，临时终端会自动关联到新会话并切换为正常的对话＋终端视图。
+顶栏的「＋ 新建」可以直接创建 Claude / Codex / Grok 会话。弹窗允许手输绝对路径，也会按近期使用、已有会话数量和最后活跃时间列出常用 cwd；选择后在该目录启动独立终端，并立即打开网页。后端只接受三种固定 CLI 和确实存在的目录，不接受浏览器传任意 shell 命令。CLI 生成会话文件后，临时终端会自动关联到新会话并切换为正常的对话＋终端视图。
 
 标题栏的终端图标统一负责全部终端操作：没接管时是「接管会话」，接管后在「展开终端」和「收起终端」之间切换。输入框只保留 `Esc` 中断和发送；日常对话用输入框就够，需要方向键选菜单、回答批准提示或看 TUI 全屏界面时，再从标题栏展开终端。
 
@@ -103,7 +103,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 ./sesman-run codex
 ```
 
-本地终端和网页可以**同时连着同一个会话**（tmux 支持多客户端）。
+本地终端和网页可以**同时连着同一个会话**。专用 server 中的会话可用 `tmux -L sesman attach -t <name>` 本地接入；普通 `tmux` 命令仍连接用户原来的默认 server。
 
 ### 为什么绕 tmux
 
@@ -111,13 +111,17 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 
 好处是**会话独立于 sesman 存活**：关掉浏览器、重启 sesman、甚至 sesman 崩了，会话照常跑。
 
-实现上不是 `send-keys` + `capture-pane` 轮询，而是服务端起一个 pty 跑 `tmux attach`，WebSocket 双向转发原始字节 —— 所以方向键、`Ctrl-C`、批准提示 `y/n`、Claude 的全屏 TUI 菜单都原样可用。WebSocket 是按 RFC 6455 手写的最小实现（`wsock.py`，约 100 行），后端仍然零第三方依赖；xterm.js 作为静态资源 vendor 在 `static/vendor/`。
+新会话运行在 `tmux -L sesman` 专用 server 中，并加载 [`sesman/tmux.conf`](sesman/tmux.conf)：关闭状态栏、前缀键、tmux 鼠标、自动改名和通知，缩短 Esc 延迟，同时开启 focus events、扩展键和真彩色。默认 tmux server 完全不改；升级前已经存在的 `sesman-*` 会话仍会被发现并路由回原 server，直到自然结束。
+
+systemd 部署使用独立的 [`deploy/sesman-tmux.service`](deploy/sesman-tmux.service) 以前台模式持有这个 server。它和网页服务处于不同 cgroup，因此重启或升级 sesman 不会结束 CLI；systemd 也能监测并重启异常退出的后端，而不必采用 `KillMode=process` 留下失联的网页 attach 子进程。
+
+服务端起一个 PTY 跑 `tmux attach`，WebSocket 双向转发原始字节。专用 server 不让 attach 切换浏览器 xterm 的 alternate screen；连接时只做一次 `capture-pane` 历史回放，之后滚轮完全使用 xterm 本地 scrollback，不再触发 tmux copy-mode 或把滚轮改成方向键。方向键、`Ctrl-C`、批准提示和 CLI 全屏 TUI 仍按真实终端字节传递。WebSocket 是按 RFC 6455 手写的最小实现（`wsock.py`，约 100 行），后端仍然零第三方依赖。
 
 要杀掉哪个进程也不是猜的：裸 `claude` 启动的会话命令行里没有 session id，只有子 shell 的环境变量能认出来，所以要顺着 `/proc` 的进程树往上找到真正的 CLI 主进程。会话 id 只允许 UUID 字符，避免拼命令时被注入。
 
 ## 活跃会话检测
 
-正在运行的会话在列表里标一个跳动的绿点、标题加粗，顶栏显示「N 个进行中」，详情页头部显示「● 进行中」。每 3s 探测一次（页面不可见时不探测），**只改小圆点不重渲染列表**，否则会打断滚动和选中。
+正在运行的会话在列表里标一个状态点、标题加粗，顶栏用绿/蓝两种圆点分别显示活动数量，不再附加文字标签。整个计数胶囊也是筛选开关：点击后左栏只显示活动会话，再点恢复，并可与来源、标题和全文搜索叠加。每 3s 探测一次（页面不可见时不探测）；未开启活动筛选时只改小圆点、不重渲染列表，避免打断滚动和选中。
 
 三家留下的痕迹完全不同，所以三种信号都收（全部只读 `/proc` 与状态文件，不触碰任何 CLI 进程）：
 
@@ -233,19 +237,14 @@ sesman/
 
 ## 开机自启（可选）
 
-```ini
-# ~/.config/systemd/user/sesman.service
-[Unit]
-Description=sesman 会话管理服务
-[Service]
-ExecStart=/home/user/Projects/sesman/run.sh
-Restart=on-failure
-[Install]
-WantedBy=default.target
-```
+仓库提供两个用户服务：[`deploy/sesman.service`](deploy/sesman.service) 运行网页，
+[`deploy/sesman-tmux.service`](deploy/sesman-tmux.service) 独立持有终端后端。网页服务通过
+`Wants`/`After` 依赖后端，但停止或重启网页不会连带停止后端。若项目路径不同，安装前需同步修改两个文件中的绝对路径。
 
 ```bash
-systemctl --user daemon-reload && systemctl --user enable --now sesman
+cp deploy/sesman.service deploy/sesman-tmux.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now sesman-tmux.service sesman.service
 ```
 
 ### hub-host 反向代理

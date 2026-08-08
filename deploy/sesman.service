@@ -1,7 +1,7 @@
 [Unit]
 Description=Sesman session manager
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target sesman-tmux.service
+After=network-online.target sesman-tmux.service
 
 [Service]
 Type=simple

@@ -14,6 +14,7 @@ const T = {
   mode: store.get('termmode', 'normal'), // normal | collapsed | full
   localMouse: store.get('tmouse', false),   // true = 鼠标归浏览器, 可以框选复制
   scrollPos: 0,                             // tmux 里往上翻了多少行
+  ctrlArmed: false,                         // 手机 Ctrl：只修饰下一次输入
   sources: {},
   home: '',
   pending: [],
@@ -192,7 +193,7 @@ function showNewSessionStage(info) {
   const src = SOURCES[info.source];
   $('#detail').innerHTML = `<div class="dhead"><div class="dtitle">
     <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
-    <h2>${icon(info.source)} 新建 ${esc(src.name)} 会话</h2></div>
+    <h2>${icon(info.source)}<span>新建 ${esc(src.name)} 会话</span></h2></div>
     <div class="dmeta"><span class="meta-source">${esc(src.name)}</span><span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>
   </div><div class="empty new-session-wait">终端已启动，正在等待会话记录落盘…</div>`;
   $('#detail .mobile-back').onclick = showMobileList;
@@ -316,12 +317,14 @@ function ensureTerm() {
   if (T.term) return T.term;
   T.term = new Terminal({
     fontFamily: termFont(),
-    fontSize: termFontSize(), cursorBlink: true, scrollback: 8000, theme: termTheme(),
+    fontSize: termFontSize(), cursorBlink: true, scrollback: 10000,
+    scrollOnUserInput: true, theme: termTheme(),
   });
   T.fit = new FitAddon.FitAddon();
   T.term.loadAddon(T.fit);
   T.term.open($('#xterm'));
   T.term.onData(d => {
+    d = applyTermCtrl(d);
     if (T.ws?.readyState !== 1) return;
     if (T.scrollPos || _wheelRequests.size || _resumeInput) {
       // 等所有已经发出的滚轮请求落地，再由一个服务端请求原子执行
@@ -341,9 +344,11 @@ function ensureTerm() {
     }
     T.ws.send(new TextEncoder().encode(d));
   });
-  // 滚轮翻 tmux 的历史, 而不是发给应用 —— 这样才像普通终端
+  // 专用 server 不让 tmux 接管滚动：外层不进 alternate screen，直接使用
+  // xterm 的正常 scrollback。改造前遗留在默认 server 的会话仍走旧兼容路径。
   T.term.attachCustomWheelEventHandler(e => {
     if (!T.name) return true;
+    if (T.list?.find(x => x.name === T.name)?.server === 'sesman') return true;
     wheelBy(e.deltaY);
     return false;
   });
@@ -524,6 +529,7 @@ function setLocalMouse(on) {
 function detachTerm() {
   if (T.ws) { try { T.ws.close(); } catch {} T.ws = null; }
   T.name = null;
+  setTermCtrl(false);
   setTermStatus('未连接', false);
 }
 
@@ -554,12 +560,20 @@ function renderComposer() {
   const name = T.enabled ? takenOver(S.sel) : null;
   const box = $('#composer');
   box.classList.toggle('hidden', !name);
-  if (name) autoGrow($('#cinput'));
+  if (name) syncComposerMode();
 }
 
 function autoGrow(ta) {
   ta.style.height = 'auto';
   ta.style.height = Math.min(180, Math.max(34, ta.scrollHeight)) + 'px';
+}
+
+function syncComposerMode() {
+  const ta = $('#cinput');
+  ta.placeholder = MOBILE.matches
+    ? '输入内容'
+    : '输入内容，Enter 发送，Shift+Enter 换行';
+  autoGrow(ta);
 }
 
 async function sendToSession(text, keys) {
@@ -576,7 +590,8 @@ async function sendToSession(text, keys) {
 
 $('#cinput').addEventListener('input', e => autoGrow(e.target));
 $('#cinput').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  // 手机软键盘没有方便的 Shift+Enter：Enter 始终换行，只允许按钮发送。
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !MOBILE.matches) {
     e.preventDefault();
     const ta = e.target;
     const text = ta.value;
@@ -586,6 +601,8 @@ $('#cinput').addEventListener('keydown', e => {
     sendToSession(text);
   }
 });
+MOBILE.addEventListener('change', syncComposerMode);
+syncComposerMode();
 $('#csend').onclick = () => {
   const ta = $('#cinput');
   if (!ta.value.trim()) return;
@@ -595,9 +612,43 @@ $('#csend').onclick = () => {
   sendToSession(text);
 };
 $('#cesc').onclick = () => sendToSession(null, ['Escape']);
+
+function setTermCtrl(on) {
+  T.ctrlArmed = !!on;
+  const b = $('[data-term-modifier="ctrl"]');
+  if (b) {
+    b.classList.toggle('on', T.ctrlArmed);
+    b.setAttribute('aria-pressed', String(T.ctrlArmed));
+  }
+}
+
+/** 把 Ctrl 后的单个 ASCII 键转换为终端控制字节。多字符粘贴和中文不改写。 */
+function applyTermCtrl(data) {
+  if (!T.ctrlArmed) return data;
+  // focus-events、鼠标和粘贴都会产生多字节数据，它们不是用户要修饰的“下一键”。
+  if (data.length !== 1) return data;
+  setTermCtrl(false);
+  const code = data.charCodeAt(0);
+  if ((code >= 64 && code <= 95) || (code >= 97 && code <= 122)) {
+    return String.fromCharCode(code & 31);
+  }
+  const aliases = { ' ': 0, '2': 0, '3': 27, '4': 28, '5': 29, '6': 30, '7': 31, '8': 127, '?': 127 };
+  return Object.hasOwn(aliases, data) ? String.fromCharCode(aliases[data]) : data;
+}
+
 $('.term-keys').onclick = e => {
+  const modifier = e.target.closest('[data-term-modifier]');
+  if (modifier) {
+    setTermCtrl(!T.ctrlArmed);
+    T.term?.focus();
+    return;
+  }
   const b = e.target.closest('[data-term-key]');
-  if (b) sendToSession(null, [b.dataset.termKey]);
+  if (!b) return;
+  const key = T.ctrlArmed ? `C-${b.dataset.termKey}` : b.dataset.termKey;
+  setTermCtrl(false);
+  sendToSession(null, [key]);
+  T.term?.focus();
 };
 
 // ---- 高度拖动 ----

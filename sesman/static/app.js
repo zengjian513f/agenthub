@@ -36,6 +36,7 @@ const S = {
   live: new Set(),    // 仍在运行的会话 uid
   liveTmux: new Set(),// 其中运行在 tmux 里的会话 uid
   liveStarted: new Map(), // uid → 当前 CLI 主进程启动时间（Unix 秒）
+  activeOnly: store.get('activeOnly', false), // 左栏只显示仍在运行的会话
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -312,12 +313,14 @@ function closeWatch() {
 }
 
 function newBadge(n) {
-  const b = $('#newmsg');
-  if (!b) return;
-  b.textContent = `+${n} 条新消息`;
-  b.classList.add('on');
-  clearTimeout(b._t);
-  b._t = setTimeout(() => b.classList.remove('on'), 4000);
+  for (const b of document.querySelectorAll('.newmsg')) {
+    const mobile = b.classList.contains('mobile-newmsg');
+    b.textContent = mobile ? String(n) : `+${n} 条新消息`;
+    b.setAttribute('aria-label', `${n} 条新消息`);
+    b.classList.add('on');
+    clearTimeout(b._t);
+    b._t = setTimeout(() => b.classList.remove('on'), 4000);
+  }
 }
 
 /** 兜底轮询: SSE 连着的时候只是很慢地对一下账, 断了才回到自适应的快节奏。 */
@@ -400,15 +403,39 @@ function paintLive() {
   }
   const c = $('#livecount');
   if (c) {
-    const tmux = S.liveTmux.size, direct = S.live.size - tmux;
-    c.innerHTML = S.live.size
+    const pending = pendingTmuxSessions().length;
+    const tmux = S.liveTmux.size + pending, direct = Math.max(0, S.live.size - S.liveTmux.size);
+    const total = direct + tmux;
+    c.innerHTML = total
       ? `${direct ? `<span class="live-direct">● ${direct}</span>` : ''}`
-        + `${tmux ? `<span class="live-tmux-count">● ${tmux}<span class="live-kind"> tmux</span></span>` : ''}` : '';
-    c.ariaLabel = `${S.live.size} 个进行中：${direct} 个非 tmux，${tmux} 个 tmux`;
-    c.title = '绿色：非 tmux · 蓝色：tmux';
-    c.classList.toggle('on', S.live.size > 0);
+        + `${tmux ? `<span class="live-tmux-count">● ${tmux}</span>` : ''}`
+      : '<span class="live-direct">● 0</span>';
+    c.setAttribute('aria-label', `${total} 个活动会话；${S.activeOnly ? '正在只显示活动会话' : '点击只显示活动会话'}`);
+    c.setAttribute('aria-pressed', String(S.activeOnly));
+    c.title = S.activeOnly ? '显示全部会话' : '只显示活动会话';
+    c.classList.toggle('visible', total > 0 || S.activeOnly);
+    c.classList.toggle('active-only', S.activeOnly);
   }
+  syncActiveOnlyList();
 }
+
+/** 活动筛选开启时，进程启停会改变列表成员；集合没变就不动 DOM。 */
+function syncActiveOnlyList() {
+  if (!S.activeOnly) return;
+  const wanted = new Set(visible().map(s => s.uid));
+  const shown = new Set([...document.querySelectorAll('#side .item')].map(n => n.dataset.uid));
+  if (wanted.size === shown.size && [...wanted].every(uid => shown.has(uid))) return;
+  const side = $('#side'), top = side?.scrollTop || 0;
+  renderSide();
+  if (side) side.scrollTop = top;
+}
+
+$('#livecount').onclick = () => {
+  S.activeOnly = !S.activeOnly;
+  store.set('activeOnly', S.activeOnly);
+  renderSide();
+  paintLive();
+};
 
 setInterval(pollLive, LIVE_MS);
 document.addEventListener('visibilitychange', () => {
@@ -521,7 +548,8 @@ setInterval(pollSessions, LIST_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSessions(); });
 
 function visible() {
-  const pool = (S.results || sidebarSessions()).filter(s => !S.off.has(s.source));
+  let pool = (S.results || sidebarSessions()).filter(s => !S.off.has(s.source));
+  if (S.activeOnly) pool = pool.filter(s => s.pending || S.live.has(s.uid));
   if (!S.term || S.results) return pool;          // 搜索态下服务端已经筛过
   return pool.filter(s => hasTerm(s.title) || hasTerm(s.cwd));
 }
@@ -610,7 +638,10 @@ function renderSide() {
   side.innerHTML = '';
   const list = visible();
   if (!list.length) {
-    side.appendChild(el('div', 'empty', S.results ? '没有匹配的会话' : '没有会话'));
+    const text = S.activeOnly
+      ? (S.results ? '没有活动的匹配会话' : '没有活动会话')
+      : (S.results ? '没有匹配的会话' : '没有会话');
+    side.appendChild(el('div', 'empty', text));
     return;
   }
   for (const [key, items] of groupBy(list)) {
@@ -959,7 +990,10 @@ function head(m, total) {
       <h2 class="${hasAgents ? 'has-session-views' : ''}">${icon(m.source)}${titleView}</h2>
       ${menuView}
       <div class="dhead-actions" aria-label="会话操作">
-        <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
+        <span class="mobile-msg-summary">
+          <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
+          <span class="newmsg mobile-newmsg" aria-live="polite"></span>
+        </span>
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
           (!m.agent_id && typeof T !== 'undefined' && T.enabled)
             ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
@@ -974,7 +1008,7 @@ function head(m, total) {
       <span id="mcount-total">${total} 条消息</span>
       <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}"
         title="${tmuxLive ? '运行于 tmux' : '运行中'}" aria-label="${tmuxLive ? '运行于 tmux' : '运行中'}">●</span>
-      <span id="newmsg" class="newmsg"></span>
+      <span id="newmsg" class="newmsg" aria-live="polite"></span>
       <span class="meta-secondary">${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
       <span class="meta-secondary">${fmtSize(m.size)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}

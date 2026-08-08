@@ -1,0 +1,14 @@
+[Unit]
+Description=Sesman isolated tmux server
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tmux -D -L sesman -f /home/user/Projects/sesman/sesman/tmux.conf
+ExecReload=/usr/bin/tmux -N -L sesman source-file /home/user/Projects/sesman/sesman/tmux.conf
+Restart=always
+RestartSec=1
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target
