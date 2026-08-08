@@ -357,12 +357,26 @@ function showSessionCount(n) {
   $('#stat').innerHTML = `${n}<span class="stat-unit"> 个会话</span>`;
 }
 
+/** 列表元数据变更后同步缓存和当前详情标题，不重绘消息正文。 */
+function refreshSessionMeta() {
+  for (const s of S.sessions) {
+    const e = cache.get(s.uid);
+    if (e) e.meta = { ...e.meta, ...s };
+  }
+  const current = S.sessions.find(s => s.uid === S.sel);
+  const title = $('#detail .dhead h2');
+  if (current && title && title.textContent.trim() !== current.title) {
+    title.innerHTML = `${icon(current.source)} ${esc(current.title)}`;
+  }
+}
+
 async function loadSessions(force) {
   $('#stat').textContent = force ? ' 重新扫描…' : ' 加载中…';
   const r = await fetch(appUrl('api/sessions' + (force ? '?force=1' : '')));
   const d = await r.json();
   S.sig = d.sig;
   S.sessions = d.sessions;
+  refreshSessionMeta();
   renderChips();
   renderSide();
   showSessionCount(d.sessions.length);
@@ -376,8 +390,15 @@ async function pollSessions() {
     if (d.unchanged || !d.sessions) return;
     S.sig = d.sig;
     S.sessions = d.sessions;
+    refreshSessionMeta();
     renderChips();
-    if (S.results) return;              // 搜索态下, 列表和顶栏文案都不能动
+    if (S.results) {
+      // 搜索结果集合保持不变，只合入 rename 等最新元数据。
+      const fresh = new Map(S.sessions.map(s => [s.uid, s]));
+      S.results = S.results.map(r => fresh.has(r.uid) ? { ...r, ...fresh.get(r.uid) } : r);
+      if (!patchSide(visible())) renderSide();
+      return;
+    }
     showSessionCount(d.sessions.length);
     if (patchSide(visible())) return;   // 能就地更新就不重建, 否则会一直闪
     const side = $('#side');
@@ -463,6 +484,11 @@ function patchSide(list) {
       const m = n.querySelector('.m');
       const t = itemMeta(s);
       if (m && m.textContent !== t) m.textContent = t;
+      const title = n.querySelector('.t');
+      if (title && title.textContent !== s.title) {
+        title.title = s.title;
+        title.innerHTML = hl(s.title);
+      }
     }
     const c = g.querySelector('.gcount');
     if (c && c.textContent !== String(items.length)) c.textContent = items.length;
@@ -544,8 +570,12 @@ function markMatches(root) {
   if (!re) return 0;
   // 只高亮正文: 折叠预览是正文副本, 高亮在那里会造成重复计数。
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode: n => n.parentElement.closest('.fold-preview, .katex')
-      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+    acceptNode: n => {
+      const msg = n.parentElement.closest('.msg');
+      return n.parentElement.closest('.fold-preview, .katex')
+        || !msg || !SEARCH_ROLES.has(msg.dataset.role)
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+    },
   });
   const targets = [];
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
@@ -888,6 +918,7 @@ const ROLE_LABEL = {
 };
 // 连续 3 条以上的工具调用/输出合并成一个可折叠的组, 避免刷屏
 const TOOL_ROLES = new Set(['tool', 'tool_result']);
+const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent', 'thinking']);
 const GROUP_MIN = 3;
 
 /** 先算分组(纯计算, 很快), 再分批建 DOM —— 分批不会把一个组切成两半。 */
@@ -963,8 +994,8 @@ function toolEntry(m) {
 }
 
 function groupNode(items) {
-  // 组里有命中就默认展开, 否则高亮藏在折叠层里看不见
-  const n = el('div', 'msg grp' + (items.some(m => hasTerm(m.text)) ? '' : ' folded'));
+  // 工具协议不属于对话正文搜索范围，工具组始终按默认规则折叠。
+  const n = el('div', 'msg grp folded');
   n.dataset.role = 'toolgroup';
   const calls = items.filter(m => m.role === 'tool');
   const tally = {};
@@ -1029,7 +1060,7 @@ function renderFormulae(root) {
 
 function msgNode(m) {
   // 命中的消息展开且不截断, 保证高亮可见; 但设上限, 否则搜 "a" 会把整个会话全量展开
-  const found = hasTerm(m.text);
+  const found = SEARCH_ROLES.has(m.role) && hasTerm(m.text);
   const hit = found && S.autoOpen < AUTO_OPEN_MAX;
   if (hit) S.autoOpen++;
   const raw = TOOL_ROLES.has(m.role);
@@ -1188,11 +1219,11 @@ const SIDE_DEFAULT = 340;
 
 function setSideWidth(px, save) {
   if (MOBILE.matches) {
-    $('#side').style.removeProperty('width');
+    $('#left').style.removeProperty('width');
     return;
   }
   const w = Math.round(Math.max(200, Math.min(px, window.innerWidth - 320)));
-  $('#side').style.width = w + 'px';
+  $('#left').style.width = w + 'px';
   document.documentElement.style.setProperty('--side-width', w + 'px');
   if (save) store.set('width', w);
 }
@@ -1208,11 +1239,11 @@ document.addEventListener('mouseup', () => {
   if (!dragging) return;
   dragging = false;
   document.body.classList.remove('dragging');
-  setSideWidth(parseInt($('#side').style.width, 10), true);
+  setSideWidth(parseInt($('#left').style.width, 10), true);
 });
 $('#drag').addEventListener('dblclick', () => setSideWidth(SIDE_DEFAULT, true));
 window.addEventListener('resize', () => setSideWidth(
-  parseInt($('#side').style.width, 10) || store.get('width', SIDE_DEFAULT)));
+  parseInt($('#left').style.width, 10) || store.get('width', SIDE_DEFAULT)));
 MOBILE.addEventListener?.('change', e => {
   if (e.matches) {
     document.body.classList.toggle('mobile-detail',
@@ -1234,11 +1265,57 @@ $('#q').onkeydown = async e => {
   runSearch();
 };
 
-let searchSeq = 0;
+let searchSeq = 0, searchRun = 0, searchAbort = null;
+
+function searchProgress(done, total) {
+  const box = $('#search-progress');
+  const known = total > 0;
+  box.classList.add('on');
+  box.classList.toggle('idle', !known);
+  box.querySelector('b').textContent = known ? `${done} / ${total}` : '扫描中…';
+  box.querySelector('i').style.width = known ? `${Math.min(100, done / total * 100)}%` : '12%';
+}
+
+function searchProgressDone() {
+  const box = $('#search-progress');
+  box.classList.remove('on', 'idle');
+  box.querySelector('i').style.width = '0%';
+}
+
+async function fetchSearch(params, signal) {
+  params.set('progress', '1');
+  const r = await fetch(appUrl('api/search?' + params), { signal });
+  if (!r.ok || !r.headers.get('Content-Type')?.includes('application/x-ndjson')) {
+    return { ok: r.ok, data: await r.json() };
+  }
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = '', result = null, error = null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    buf += dec.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buf.split('\n');
+    buf = done ? '' : lines.pop();
+    for (const line of lines) {
+      if (!line) continue;
+      const event = JSON.parse(line);
+      if (event.type === 'progress') searchProgress(event.done, event.total);
+      else if (event.type === 'result') result = event.data;
+      else if (event.type === 'error') error = event.error;
+    }
+    if (done) break;
+  }
+  return error ? { ok: false, data: { error } }
+    : result ? { ok: true, data: result }
+      : { ok: false, data: { error: '搜索响应不完整' } };
+}
 
 async function runSearch() {
   const q = $('#q').value.trim();
   S.term = q;
+  const run = ++searchRun;
+  searchAbort?.abort();
+  searchAbort = null;
+  searchProgressDone();
   if (!q) { S.results = null; renderSide(); return; }
   if (S.opts.regex && !reTerm(false)) {   // 本地先验一次, 省掉一次全盘扫描
     S.results = [];
@@ -1248,12 +1325,22 @@ async function runSearch() {
     $('#stat').dataset.seq = ++searchSeq;
     return;
   }
-  $('#stat').textContent = ' 全文搜索中…';
   const p = new URLSearchParams({ q });
   for (const k of ['case', 'word', 'regex']) if (S.opts[k]) p.set(k, '1');
-  const r = await fetch(appUrl('api/search?' + p));
-  const d = await r.json();
-  if (!r.ok) {                       // 兜底: 前端漏判的非法模式
+  const ac = searchAbort = new AbortController();
+  searchProgress(0, 0);
+  let response;
+  try {
+    response = await fetchSearch(p, ac.signal);
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    response = { ok: false, data: { error: e.message || '搜索失败' } };
+  }
+  if (run !== searchRun) return;
+  searchAbort = null;
+  searchProgressDone();
+  const { ok, data: d } = response;
+  if (!ok) {                       // 兜底: 前端漏判的非法模式或网络失败
     S.results = [];
     $('#stat').textContent = ' ' + (d.error || '搜索失败');
     $('#stat').classList.add('err');
@@ -1265,7 +1352,7 @@ async function runSearch() {
       : ` 全文命中 ${d.results.length} 个会话`;
   }
   renderSide();
-  if (r.ok && S.sel) openSession(S.sel, S.agents);   // 已打开的会话重渲染以带上高亮
+  // 全文搜索只筛左侧列表；右侧会话的内容、滚动位置和展开状态保持原样。
   $('#stat').dataset.seq = ++searchSeq;              // 供测试判定"这一轮搜索已结束"
 }
 
@@ -1281,8 +1368,8 @@ $('#opts').onclick = e => {
 
 function renderOpts() {
   for (const b of $('#opts').children) b.classList.toggle('on', !!S.opts[b.dataset.o]);
-  $('#q').placeholder = S.opts.regex ? '正则搜索…  按 Enter 全文搜索会话内容'
-                                     : '搜索标题…  按 Enter 全文搜索会话内容';
+  $('#q').placeholder = S.opts.regex ? '正则搜索…  Enter 搜索对话正文'
+                                     : '搜索标题…  Enter 搜索对话正文';
 }
 
 $('#reload').onclick = () => { S.results = null; loadSessions(true); };

@@ -30,7 +30,7 @@ def _signature() -> str:
     """所有会话文件的 (path, mtime, size) 摘要, 用来判断缓存是否过期。"""
     import hashlib
     h = hashlib.sha1()
-    from .adapters import CLAUDE_ROOT, CODEX_ROOT, GROK_ROOT
+    from .adapters import CLAUDE_ROOT, CODEX_ROOT, CODEX_INDEX, GROK_ROOT
     roots = [(CLAUDE_ROOT, "*/*.jsonl"), (CODEX_ROOT, "**/*.jsonl"),
              (GROK_ROOT, "*/*/summary.json"), (GROK_ROOT, "*/*/chat_history.jsonl")]
     for root, pat in roots:
@@ -42,6 +42,11 @@ def _signature() -> str:
             except OSError:
                 continue
             h.update(f"{f}|{int(st.st_mtime)}|{st.st_size}\n".encode())
+    try:
+        st = CODEX_INDEX.stat()
+        h.update(f"{CODEX_INDEX}|{st.st_mtime_ns}|{st.st_size}\n".encode())
+    except OSError:
+        pass
     return h.hexdigest()
 
 
@@ -185,60 +190,79 @@ def delete(uid: str) -> str:
     return str(dest)
 
 
-_ANSI = re.compile(rb"\x1b\[[0-9;]*m")
 _ANSI_T = re.compile(r"\x1b\[[0-9;]*m")
 HIT_CAP = 200   # 单会话命中计数上限, 超过只报 "200+"
+SEARCH_ROLES = frozenset({"user", "assistant", "user·subagent",
+                          "assistant·subagent", "thinking"})
+_search_text_cache = {}
+_search_text_lock = threading.Lock()
 
 
 def build_pattern(query: str, word=False, case=False, regex=False) -> re.Pattern:
-    """全词匹配用环视而非 \\b —— \\b 在字节模式下对中文永不成立。
-
-    正则模式编译成 str 正则: 字节模式下 `.` 和量词按字节计, 一个汉字占 3 字节,
-    `.{0,4}` 连两个汉字都跨不过去, 用户写的正则会完全不按预期工作。
-    非正则模式仍走字节, 省掉整盘 decode。
-    """
+    """在解析后的 Unicode 对话正文上构造匹配模式。"""
     src = query if regex else re.escape(query)
     if word:
         src = r"(?<!\w)(?:" + src + r")(?!\w)"
     flags = 0 if case else re.I
-    return re.compile(src, flags) if regex else re.compile(src.encode(), flags)
+    return re.compile(src, flags)
+
+
+def _search_text(s: dict) -> str:
+    """返回与会话页语义一致的对话正文，并按文件版本缓存在内存中。
+
+    原始 JSONL 还含工具协议、系统注入、compact 摘要和 JSON 包装，直接扫文件会
+    产生大量用户在对话正文里看不到的假命中。
+    """
+    f = data_file(s)
+    try:
+        st = f.stat()
+        key = (str(f), st.st_size, st.st_mtime_ns)
+    except OSError:
+        return ""
+    with _search_text_lock:
+        cached = _search_text_cache.get(s["uid"])
+        if cached and cached[0] == key:
+            return cached[1]
+    try:
+        msgs, _ = ADAPTERS[s["source"]].read(s["path"])
+    except Exception:
+        return ""
+    text = "\n".join(m.get("text", "") for m in msgs
+                     if m.get("role") in SEARCH_ROLES and m.get("text"))
+    with _search_text_lock:
+        _search_text_cache[s["uid"]] = (key, text)
+    return text
 
 
 def search(query: str, sources=None, limit: int = 60,
-           word=False, case=False, regex=False) -> dict:
-    """按内容全文匹配, 返回带命中片段的会话列表。"""
+           word=False, case=False, regex=False, progress=None) -> dict:
+    """按解析后的用户/助手/思考正文匹配，返回带命中片段的会话列表。"""
     if not query.strip():
         return {"results": [], "truncated": False, "total_pool": 0}
     pat = build_pattern(query, word, case, regex)
     hits, truncated = [], False
     pool = [s for s in load() if not sources or s["source"] in sources]
-    for s in pool:
+    if progress:
+        progress(0, len(pool))
+    for done, s in enumerate(pool, 1):
         if len(hits) >= limit:
             truncated = True     # 还有没扫的会话, 结果不完整
             break
-        files = [Path(s["path"])] if s["source"] != "grok" else [Path(s["path"]) / "chat_history.jsonl"]
         snippet, count, capped = None, 0, False
-        for f in files:
-            try:
-                with open(f, "rb") as fh:
-                    blob = fh.read()
-            except OSError:
-                continue
-            hay = blob.decode("utf-8", "replace") if regex else blob
-            for m in pat.finditer(hay):
-                count += 1
-                if snippet is None:
-                    # 命中词靠前, 否则片段在窄侧栏里会被右侧省略号吃掉
-                    lo, hi = max(0, m.start() - 40), m.end() + 150
-                    chunk = hay[lo:hi]
-                    raw = (_ANSI.sub(b"", chunk).decode("utf-8", "replace")
-                           if isinstance(chunk, bytes) else _ANSI_T.sub("", chunk))
-                    snippet = " ".join(raw.split())
-                if count >= HIT_CAP:
-                    capped = True
-                    break
+        hay = _search_text(s)
+        for m in pat.finditer(hay):
+            count += 1
+            if snippet is None:
+                # 命中词靠前, 否则片段在窄侧栏里会被右侧省略号吃掉
+                lo, hi = max(0, m.start() - 40), m.end() + 150
+                snippet = " ".join(_ANSI_T.sub("", hay[lo:hi]).split())
+            if count >= HIT_CAP:
+                capped = True
+                break
         if count:
             hits.append({**s, "hits": count, "hits_capped": capped, "snippet": snippet})
+        if progress:
+            progress(done, len(pool))
     hits.sort(key=lambda x: x["updated"], reverse=True)
     return {"results": hits, "truncated": truncated, "total_pool": len(pool)}
 

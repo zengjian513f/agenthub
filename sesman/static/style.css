@@ -154,6 +154,7 @@ header {
 .btn.go { color: #22c55e; border-color: currentColor; }
 .btn.go:hover { background: #22c55e; color: #fff; }
 .btn[disabled] { opacity: .5; cursor: default; }
+header #reload { margin-left: auto; }
 
 /* ---------- 布局 ---------- */
 /* 载入进度条 */
@@ -211,9 +212,42 @@ header {
 
 main { display: flex; flex: 1; min-height: 0; }
 
-#side {
-  width: 340px; flex: none; overflow-y: auto;
+#left {
+  width: 340px; flex: none; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; position: relative;
   background: var(--panel); border-right: 1px solid var(--border);
+}
+.side-search {
+  flex: none; position: relative; z-index: 4; padding: 8px;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+}
+.side-search .qbox { width: 100%; max-width: none; flex: none; }
+
+#search-progress {
+  display: none; position: absolute; z-index: 9; top: calc(100% + 6px); left: 10px; right: 10px;
+  width: auto; padding: 9px 11px;
+  border: 1px solid var(--border); border-radius: 9px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent); box-shadow: 0 8px 24px rgba(16, 24, 40, .14);
+  backdrop-filter: blur(8px); pointer-events: none;
+}
+#search-progress.on { display: block; }
+.search-progress-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 12px; }
+.search-progress-head span { color: var(--text); font-weight: 600; }
+.search-progress-head b {
+  flex: 1; color: var(--muted); font-weight: 500; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.search-progress-track { height: 3px; overflow: hidden; border-radius: 999px; background: var(--border); }
+.search-progress-track i {
+  display: block; width: 12%; height: 100%; border-radius: inherit; background: var(--accent);
+  transition: width .1s linear;
+}
+#search-progress.idle .search-progress-track i { animation: search-sweep 1.1s ease-in-out infinite; }
+@keyframes search-sweep { 0% { margin-left: 0; } 50% { margin-left: 88%; } 100% { margin-left: 0; } }
+
+#side {
+  width: 100%; flex: 1; min-height: 0; overflow-y: auto;
+  background: var(--panel);
 }
 
 #drag {
@@ -563,14 +597,13 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   .seg { grid-column: 3; grid-row: 1; }
   .seg button { min-width: 30px; padding: 4px 6px; }
   #reload { min-width: 30px; padding: 4px 7px; font-size: 16px; }
-  .qbox { grid-column: 1 / -1; grid-row: 2; width: 100%; max-width: none; }
-
   body.mobile-detail header { display: none; }
   main { width: 100%; min-width: 0; }
-  #side { width: 100% !important; border-right: 0; }
+  #left { width: 100% !important; border-right: 0; }
+  #side { width: 100%; }
   #drag { display: none; }
   #right { display: none; width: 100%; min-width: 0; position: relative; }
-  body.mobile-detail #side { display: none; }
+  body.mobile-detail #left { display: none; }
   body.mobile-detail #right { display: flex; }
 
   .dhead { z-index: 5; max-width: none; padding: 6px 8px; }

@@ -55,8 +55,9 @@ def make_fake_session():
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PNG_B64}},
         ]}, "uuid": "u1-img", "timestamp": "2026-08-06T12:00:00.500Z",
          "cwd": "/tmp/sesman-selftest", "sessionId": sid},
-        # 大小写 / 全词 选项的样本: SesmanCase 各一次, hi 与 hi2 各出现
-        {"type": "user", "message": {"role": "user", "content": "SesmanCase 与 sesmancase 各一次"},
+        # 大小写 / 全词选项使用对话正文样本；工具协议不属于全文搜索范围。
+        {"type": "user", "message": {"role": "user", "content":
+         "SesmanCase 与 sesmancase 各一次；wordprobe 与 wordprobe2 各一次"},
          "uuid": "u1b", "timestamp": "2026-08-06T12:00:01.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
         {"type": "assistant", "message": {"role": "assistant", "content": [
@@ -220,9 +221,12 @@ def run(pw):
     check("大小写敏感只匹配一次", cs == 1, cs)
     check("选项按钮显示为激活", "on" in (p.locator('#opts button[data-o="case"]').get_attribute("class") or ""))
 
-    sub = search_hits("hi")
-    whole = search_hits("hi", ["word"])
+    sub = search_hits("wordprobe")
+    whole = search_hits("wordprobe", ["word"])
     check("全词匹配少于子串匹配", 0 < whole < sub, f"whole={whole} sub={sub}")
+
+    check("工具输出不进入对话正文搜索", search_hits("单行工具输出不折叠") == 0)
+    check("注入上下文不进入对话正文搜索", search_hits("<INSTRUCTIONS>注入的") == 0)
 
     rx = search_hits("自测.{0,4}内容", ["regex"])
     check("正则匹配生效", rx >= 1, rx)

@@ -22,6 +22,7 @@ CODEX_INDEX = HOME / ".codex" / "session_index.jsonl"
 GROK_ROOT = HOME / ".grok" / "sessions"
 
 HEAD_BYTES = 96 * 1024  # 元数据只读文件头, 大文件不全量加载
+TAIL_BYTES = 512 * 1024  # rename/custom-title 通常追加在文件尾
 
 
 def _uid(source: str, path: str) -> str:
@@ -57,6 +58,31 @@ def _head_lines(path: Path, limit: int = 40):
     except OSError:
         return out
     for raw in blob.split(b"\n")[:limit]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw))
+        except Exception:
+            continue
+    return out
+
+
+def _tail_lines(path: Path):
+    """解析文件尾部的完整 JSONL 记录，用于读取后追加的 rename 元数据。"""
+    try:
+        size = path.stat().st_size
+        start = max(0, size - TAIL_BYTES)
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return []
+    lines = blob.split(b"\n")
+    if start:
+        lines = lines[1:]  # 尾读通常从一条大记录中间开始，丢掉残行
+    out = []
+    for raw in lines:
         raw = raw.strip()
         if not raw:
             continue
@@ -211,12 +237,12 @@ class ClaudeAdapter:
         return out
 
     def _meta(self, f: Path, st, proj_name: str):
-        title = cwd = branch = created = sid = None
+        generated_title = cwd = branch = created = sid = None
         first_user = None
         for rec in _head_lines(f):
             t = rec.get("type")
-            if t == "ai-title" and not title:
-                title = rec.get("aiTitle")
+            if t == "ai-title" and not generated_title:
+                generated_title = rec.get("aiTitle")
             if not cwd and rec.get("cwd"):
                 cwd = rec["cwd"]
             if not branch and rec.get("gitBranch"):
@@ -230,6 +256,13 @@ class ClaudeAdapter:
                 txt = "\n".join(p["text"] for p in parts if p["kind"] == "text")
                 if txt.strip() and not _is_injected(txt):
                     first_user = txt
+        custom_title = latest_ai_title = None
+        for rec in _tail_lines(f):
+            if rec.get("type") == "custom-title" and rec.get("customTitle"):
+                custom_title = rec["customTitle"]
+            elif rec.get("type") == "ai-title" and rec.get("aiTitle"):
+                latest_ai_title = rec["aiTitle"]
+        title = custom_title or latest_ai_title or generated_title
         if not title:
             title = _title_from_text(first_user) if first_user else f.stem[:8]
         if not cwd:
@@ -289,10 +322,17 @@ class CodexAdapter:
 
     def __init__(self):
         self._names = None
+        self._names_key = None
 
     def _thread_names(self):
-        if self._names is None:
+        try:
+            st = CODEX_INDEX.stat()
+            key = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            key = None
+        if self._names is None or key != self._names_key:
             self._names = {}
+            self._names_key = key
             if CODEX_INDEX.exists():
                 with open(CODEX_INDEX, "r", errors="replace") as fh:
                     for line in fh:

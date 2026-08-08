@@ -66,19 +66,27 @@
       <button data-v="tree" class="on" title="项目树" aria-label="项目树">📁 <span class="mobile-label">项目树</span></button>
       <button data-v="date" title="时间轴" aria-label="时间轴">🕒 <span class="mobile-label">时间轴</span></button>
     </div>
-    <div class="qbox">
-        <input id="q" placeholder="搜索标题…  按 Enter 全文搜索会话内容">
-      <div class="opts" id="opts">
-        <button data-o="case" title="大小写敏感">Aa</button>
-        <button data-o="word" title="全词匹配">ab|</button>
-        <button data-o="regex" title="正则表达式">.*</button>
-      </div>
-    </div>
     <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">↻ <span class="mobile-label">刷新</span></button>
   </header>
   <div id="prog"><div class="bar"></div><span class="txt"></span></div>
   <main>
-    <div id="side"><div class="spin">正在扫描会话…</div></div>
+    <div id="left">
+      <div class="side-search">
+        <div class="qbox">
+          <input id="q" placeholder="搜索标题…  Enter 搜索对话正文">
+          <div class="opts" id="opts">
+            <button data-o="case" title="大小写敏感">Aa</button>
+            <button data-o="word" title="全词匹配">ab|</button>
+            <button data-o="regex" title="正则表达式">.*</button>
+          </div>
+        </div>
+        <div id="search-progress" role="status" aria-live="polite">
+          <div class="search-progress-head"><span>全文搜索</span><b>准备中…</b></div>
+          <div class="search-progress-track"><i></i></div>
+        </div>
+      </div>
+      <div id="side"><div class="spin">正在扫描会话…</div></div>
+    </div>
     <div id="drag" title="拖动调整宽度，双击复位"></div>
     <div id="right">
       <div id="detail"><div class="empty">从左侧选择一个会话</div></div>

@@ -177,6 +177,9 @@ class Handler(BaseHTTPRequestHandler):
             query = q.get("q", [""])[0]
             srcs = [s for s in q.get("source", [""])[0].split(",") if s] or None
             on = lambda k: q.get(k, ["0"])[0] == "1"
+            if on("progress"):
+                return self._search_stream(query, srcs, word=on("word"),
+                                           case=on("case"), regex=on("regex"))
             try:
                 return self._json(index.search(
                     query, srcs, word=on("word"), case=on("case"), regex=on("regex")))
@@ -207,6 +210,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, md.encode(), "text/markdown; charset=utf-8",
                               {"Content-Disposition": f'attachment; filename="{name}"'})
         raise KeyError(path)
+
+    def _search_stream(self, query: str, sources, **opts):
+        """以 NDJSON 推送扫描进度，最后一行给出完整搜索结果。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def emit(obj):
+            line = json.dumps(obj, ensure_ascii=False).encode() + b"\n"
+            self.wfile.write(line)
+            self.wfile.flush()
+
+        try:
+            result = index.search(
+                query, sources, **opts,
+                progress=lambda done, total: emit(
+                    {"type": "progress", "done": done, "total": total}),
+            )
+            emit({"type": "result", "data": result})
+        except re.error as e:
+            emit({"type": "error", "error": f"正则无效: {e}"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            try:
+                emit({"type": "error", "error": f"{type(e).__name__}: {e}"})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def _watch(self, q: dict):
         """SSE: 服务端盯着会话文件, 一有变化立刻把 diff 推过去。
