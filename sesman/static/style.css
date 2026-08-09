@@ -461,11 +461,12 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .dtitle { display: flex; align-items: flex-start; gap: 10px; position: relative; }
 .mobile-back { display: none; }
 .dtitle h2 {
+  display: flex; align-items: flex-start; gap: 7px;
   flex: 1; min-width: 0; margin: 2px 0 5px;
   font-size: 16px; font-weight: 600; overflow-wrap: anywhere;
 }
-.dtitle h2.has-session-views { display: flex; align-items: flex-start; gap: 5px; }
-.dtitle h2.has-session-views > .ico { flex: none; margin-top: 2px; }
+.dtitle h2 > .ico { flex: none; margin-top: 2px; }
+.dtitle h2 > span { min-width: 0; }
 .session-view-switch {
   display: flex; align-items: flex-start; gap: 5px; min-width: 0; max-width: 100%;
   margin: -2px 0; padding: 2px 4px; border: 0; border-radius: 5px;
@@ -1133,7 +1134,7 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   }
   .mobile-back:hover { background: var(--hover); }
   .dtitle h2, .dtitle h2.has-session-views {
-    display: flex; align-items: center; gap: 4px; overflow: hidden;
+    display: flex; align-items: center; gap: 6px; overflow: hidden;
     margin: 3px 0 2px; font-size: 14.5px; line-height: 1.35;
     overflow-wrap: normal; text-overflow: ellipsis; white-space: nowrap;
   }

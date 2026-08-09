@@ -571,6 +571,12 @@ def run(pw):
     p.wait_for_selector(".msg", timeout=10000)
     check("选中项高亮", p.locator(".item.sel").count() == 1)
     check("详情标题正确", "SESMAN自测会话请删除" in p.locator(".dhead h2").inner_text())
+    title_spacing = p.locator(".dhead h2").evaluate("""n => {
+      const icon = n.querySelector(':scope > .ico').getBoundingClientRect();
+      const title = n.querySelector(':scope > :nth-child(2)').getBoundingClientRect();
+      return title.left - icon.right;
+    }""")
+    check("会话来源图标与标题留有清晰间距", title_spacing >= 6, title_spacing)
     check("详情元信息含 cwd", "/tmp/sesman-selftest" in p.locator(".dmeta").inner_text())
     check("电脑版详情显示会话 UUID",
           "00000000-dead-beef-0000-000000000001" in p.locator(".dmeta").inner_text())
