@@ -196,6 +196,18 @@ function queuedMessages(uid) {
   return Array.isArray(items) ? items : [];
 }
 
+function queuedAfterTimestamp(uid) {
+  const entry = cache.get(viewKey(uid));
+  let latest = Date.parse(entry?.activity?.ts || '');
+  for (let i = (entry?.msgs?.length || 0) - 1; i >= 0; i--) {
+    const at = Date.parse(entry.msgs[i]?.ts || '');
+    if (!Number.isFinite(at)) continue;
+    latest = Number.isFinite(latest) ? Math.max(latest, at) : at;
+    break;
+  }
+  return Number.isFinite(latest) ? new Date(latest).toISOString() : null;
+}
+
 /** Codex 在忙时只把新输入留在 TUI 内存里，轮到它之前 rollout 没有任何记录。
  *  先持久化并回显；原生 user/command 记录出现后再按正文和时间精确消重。 */
 function queuePendingUserMessage(uid, text, media = []) {
@@ -203,7 +215,7 @@ function queuePendingUserMessage(uid, text, media = []) {
   if (!uid || !text.trim()) return null;
   const item = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-    text, created: Date.now(),
+    text, created: Date.now(), afterTs: queuedAfterTimestamp(uid),
     // 附件消息在 CLI 真正写入 rollout 前也要能显示图片。这里只保存服务端
     // 签发的短媒体 token，不把 File/blob URL 或本地绝对路径塞进 localStorage。
     media: Array.isArray(media) ? media.filter(x => x?.src).map(x => ({ ...x })) : [],
@@ -237,7 +249,12 @@ function reconcileQueuedMessages(uid, messages) {
     const at = items.findIndex(item => {
       if (item.text !== String(message.text || '')) return false;
       const recorded = Date.parse(message.ts || '');
-      return !Number.isFinite(recorded) || recorded >= (+item.created || 0) - 5000;
+      const boundary = Date.parse(item.afterTs || '');
+      // 不比较浏览器 Date.now() 和 CLI 时间：手机/电脑时钟偏差、CLI 排队延迟
+      // 都可能超过数秒。发送时的最后原生消息才是可靠的因果边界。
+      // 旧版遗留项没有 afterTs，首次完整对账时按同文迁移清理。
+      return !Number.isFinite(recorded) || !Number.isFinite(boundary)
+        || recorded >= boundary - 1000;
     });
     if (at >= 0) { items.splice(at, 1); changed = true; }
   }

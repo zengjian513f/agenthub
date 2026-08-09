@@ -1945,6 +1945,8 @@ def run(pw):
               bool(queued_id) and queued.count() == 1
               and "等待前一轮完成的指令" in queued.inner_text()
               and "排队中" in queued.inner_text())
+        check("排队副本记录原生会话边界而不依赖浏览器时钟",
+              bool(p.evaluate("u => queuedMessages(u)[0]?.afterTs", target)))
         check("排队中的附件消息立即显示图片",
               queued.locator(".media-gallery img").count() == 1
               and queued.locator(".media-gallery img").get_attribute("src").endswith(
@@ -1964,6 +1966,16 @@ def run(pw):
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
         }""", target)
         check("原生用户消息出现后移除乐观排队副本", queued.count() == 0)
+        p.evaluate("""u => {
+          S.queued.set(u, [{id:'legacy-clock-skew', text:'旧版残留',
+            created:Date.now() + 3600000, media:[]}]);
+          saveQueuedMessages();
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+          reconcileQueuedMessages(u, [{role:'user', text:'旧版残留',
+            ts:new Date(Date.now() - 3600000).toISOString()}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("旧版排队副本不再因浏览器时钟偏差而残留", queued.count() == 0)
         sent = []
         p.on("response", lambda r: sent.append(r.status) if "/api/term/send" in r.url else None)
         # 手机 Enter 只换行，发送必须点按钮；短 placeholder 不把单行输入框撑高。
