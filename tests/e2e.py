@@ -67,6 +67,8 @@ def make_fake_session():
         "行内公式 $E=mc^2$，块公式：\n\n$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$\n\n"
         "```text\n$code_not_math$\n```\n\n"
         "```python\ndef greet(name):\n    return f\"hello {name}\"\n```\n\n"
+        "```\n{\n  \"name\": \"sesman\",\n  \"enabled\": true\n}\n```\n\n"
+        "句中提到 ` ```python ` 不是围栏，后文不能被吞掉。\n\n"
         f"![本地测试图]({FAKE_IMG})\n\n"
         "附件1: ./sesman_attachments/4/image.png\n\n"
         "不存在的相对图片 ![缺失图](path-or-url)"
@@ -907,9 +909,17 @@ def run(pw):
     python_code = p.locator('code[data-code-lang="python"]')
     check("带语言标签的代码块使用本地语法高亮",
           python_code.locator(".hljs-keyword").count() >= 2
-          and python_code.locator(".hljs-title").count() >= 1)
+          and python_code.locator(".hljs-title").count() >= 1
+          and python_code.evaluate("c => c.parentElement.dataset.codeLanguage") == "python")
+    auto_json = p.locator('code[data-code-lang=""][data-detected="json"]')
+    check("无标签常见代码会自动识别并显示语言",
+          auto_json.count() == 1 and auto_json.locator(".hljs-attr").count() >= 2
+          and auto_json.evaluate("c => c.parentElement.dataset.codeLanguage") == "json")
     check("纯文本代码块不误做语言检测",
           p.locator('code[data-code-lang="text"].hljs').count() == 0)
+    check("句中三反引号不会把后文误切成代码块",
+          "句中提到 ```python 不是围栏，后文不能被吞掉" in p.locator(".msgs").inner_text()
+          and p.locator('code.code-block').filter(has_text="后文不能被吞掉").count() == 0)
     check("语法高亮依赖从 sesman 本地加载",
           p.locator('script[src$="syntax.js"]').count() == 1
           and p.locator('script[src^="http"]:not([src^="' + BASE + '"])').count() == 0)

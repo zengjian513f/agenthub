@@ -774,11 +774,17 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .diff-unavailable, .diff-empty { padding: 18px 12px; color: var(--muted); font-size: 12px; }
 
 .mb pre {
-  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  position: relative; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
   padding: 9px 11px; overflow-x: auto; margin: 8px 0;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 .mb pre > code.code-block { color: inherit; font: inherit; white-space: pre; }
+.mb pre[data-code-language]::before {
+  content: attr(data-code-language); position: sticky; float: right; right: 0; top: 0;
+  margin: -5px -7px 3px 10px; padding: 1px 5px; border-radius: 4px;
+  background: var(--panel); color: var(--muted); font: 9px/1.45 var(--terminal-font);
+  text-transform: uppercase; letter-spacing: .04em; opacity: .78; pointer-events: none;
+}
 .hljs-comment, .hljs-quote { color: var(--syntax-comment); font-style: italic; }
 .hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section { color: var(--syntax-keyword); }
 .hljs-string, .hljs-regexp, .hljs-addition { color: var(--syntax-string); }

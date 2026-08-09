@@ -2165,6 +2165,9 @@ function paintSyntax(root = document) {
     code.classList.add('hljs');
     if (result.language) code.classList.add(`language-${result.language}`);
     if (result.detected) code.dataset.detected = result.language;
+    if (result.language && code.parentElement?.tagName === 'PRE') {
+      code.parentElement.dataset.codeLanguage = result.language;
+    }
   }
 }
 
@@ -2172,15 +2175,43 @@ addEventListener('sesman-highlight-ready', () => paintSyntax(document));
 
 // 轻量 markdown: 代码块 / 表格 / 列表 / 引用 / 标题 / 行内标记
 function md(text, full, media = []) {
-  return (full ? text : clipText(text)).split(/```/)
-    .map((b, i) => {
-      if (i % 2 === 0) return blocks(b, media);
-      const head = b.match(/^([\w+-]*)[^\S\n]*\n/);
-      const language = head?.[1] || '';
-      const source = head ? b.slice(head[0].length) : b;
-      return `<pre><code class="code-block" data-code-lang="${esc(language)}">${esc(source)}</code></pre>`;
-    })
-    .join('') || '<p></p>';
+  const source = full ? text : clipText(text);
+  const lines = source.split('\n');
+  const output = [], prose = [];
+  const flush = () => {
+    if (!prose.length) return;
+    output.push(blocks(prose.join('\n'), media));
+    prose.length = 0;
+  };
+  for (let i = 0; i < lines.length;) {
+    // 只有独立行上的 Markdown 围栏才是代码块。旧的 split(/```/)
+    // 会把句子里提到的 ```python 也当成开头，后半条消息全吞进 pre。
+    const open = lines[i].match(/^\s{0,3}(`{3,}|~{3,})[^\S\n]*(.*)$/);
+    if (!open || (open[1][0] === '`' && open[2].includes('`'))) {
+      prose.push(lines[i++]);
+      continue;
+    }
+    const marker = open[1][0], width = open[1].length;
+    let close = i + 1;
+    for (; close < lines.length; close++) {
+      const found = lines[close].match(/^\s{0,3}(`+|~+)\s*$/);
+      if (found && found[1][0] === marker && found[1].length >= width) break;
+    }
+    // 未闭合围栏只在“展开全文”预览恰好截断时按代码处理；
+    // 原文本本身未闭合时保留原样，不再把整条消息误判为代码。
+    if (close === lines.length && (full || text.length <= CLIP)) {
+      prose.push(lines[i++]);
+      continue;
+    }
+    flush();
+    const info = open[2].trim();
+    const language = info.match(/^[\w+.-]+/)?.[0] || '';
+    const code = lines.slice(i + 1, close).join('\n');
+    output.push(`<pre><code class="code-block" data-code-lang="${esc(language)}">${esc(code)}</code></pre>`);
+    i = close < lines.length ? close + 1 : close;
+  }
+  flush();
+  return output.join('') || '<p></p>';
 }
 
 const RE_LIST = /^\s*([-*+]|\d+[.)])\s+/;
@@ -2250,8 +2281,18 @@ function blocks(src, media = []) {
 }
 
 const RE_MD_IMAGE = /!\[([^\]]*)\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/g;
+const RE_CODE_SPAN = /(^|[^`])(`+)(?!`)([^\n]*?)(?<!`)\2(?!`)/g;
 
 function inline(s, media = []) {
+  const codeSpans = [];
+  s = s.replace(RE_CODE_SPAN, (_, prefix, _ticks, raw) => {
+    // Markdown 代码跨度允许内容中出现更长的反引号串，例如用单反引号
+    // 包住 ```python。先占位再处理图片/粗体，避免代码内容被二次解析。
+    const content = raw.startsWith(' ') && raw.endsWith(' ') && /\S/.test(raw)
+      ? raw.slice(1, -1) : raw;
+    codeSpans.push(`<code>${esc(content)}</code>`);
+    return `${prefix}\u0000CODE${codeSpans.length - 1}\u0000`;
+  });
   const images = [];
   s = s.replace(RE_MD_IMAGE, (_, alt, raw) => {
     const ref = raw.replace(/^<|>$/g, '');
@@ -2263,9 +2304,9 @@ function inline(s, media = []) {
     return `\u0000IMG${images.length - 1}\u0000`;
   });
   return esc(s)
-    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>')
+    .replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeSpans[+i] || '')
     .replace(/\u0000IMG(\d+)\u0000/g, (_, i) => images[+i] || '');
 }
 

@@ -22,6 +22,30 @@ const aliases = {
 const plain = new Set(['text', 'txt', 'plain', 'plaintext', 'none']);
 const autoLanguages = ['python', 'javascript', 'typescript', 'bash', 'json', 'css', 'xml', 'sql', 'yaml'];
 
+function inferLanguage(source) {
+  const text = source.trim();
+  if (!text) return '';
+  if (/^(?:diff --git\b|@@\s+-\d|---\s+\S+\n\+\+\+\s+\S+)/m.test(text)) return 'diff';
+  if (/^[{[]/.test(text)) {
+    try { JSON.parse(text); return 'json'; } catch { /* 继续识别其他语言 */ }
+  }
+  if (/^\s*(?:async\s+)?(?:def|class|for|while|if|elif|with|try|except)\b.*:\s*$/m.test(text)
+      || /^\s*(?:from\s+\S+\s+import|import\s+[\w.]+)\b/m.test(text)) return 'python';
+  if (/^\s*(?:interface|type|enum|namespace)\s+\w+/m.test(text)
+      || /:\s*(?:string|number|boolean|unknown|never)(?:\W|$)/.test(text)) return 'typescript';
+  if (/^\s*(?:const|let|var|function|export|import\s+.+\s+from)\b/m.test(text)
+      || /=>|\b(?:document|window)\./.test(text)) return 'javascript';
+  if (/^\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|WITH)\b/im.test(text)
+      && /\b(?:FROM|INTO|TABLE|SET|JOIN|AS)\b/i.test(text)) return 'sql';
+  if (/^\s*(?:#!.*\b(?:ba|z|k)?sh\b|(?:[$#]\s*)?(?:sudo\s+)?(?:git|cd|ls|rg|grep|find|curl|wget|npm|pnpm|yarn|python\d*|node|docker|systemctl)\b)/m.test(text)
+      || /^\s*(?:if|then|fi|for|do|done)\b/m.test(text)) return 'bash';
+  if (/^\s*(?:<\?xml\b|<!DOCTYPE\b|<[A-Za-z][\w:-]*(?:\s|>|\/))/i.test(text)) return 'xml';
+  if (/^[^{}\n]+\{\s*$/.test(text.split('\n')[0])
+      && /^\s*[\w-]+\s*:\s*[^/].*;?\s*$/m.test(text)) return 'css';
+  if ((text.match(/^\s*[\w.-]+\s*:\s*\S.*$/gm) || []).length >= 2) return 'yaml';
+  return '';
+}
+
 window.sesmanHighlight = (source, rawLanguage = '') => {
   const label = String(rawLanguage || '').trim().toLowerCase();
   if (plain.has(label)) return null;
@@ -32,13 +56,20 @@ window.sesmanHighlight = (source, rawLanguage = '') => {
       return {html: hljs.highlight(source, {language, ignoreIllegals: true}).value,
               language, detected: false};
     }
-    // 无标签时只处理适中长度且明显像代码的块；相关性不够或候选太接近就
-    // 保持纯文本，避免把日志、自然语言和命令输出染成随机颜色。
-    if (source.length < 20 || source.length > 20000
-        || !/[{}()[\];=<>]|\b(?:def|class|function|const|let|var|SELECT|FROM|import)\b/.test(source)) return null;
+    // 先用可解释的强特征判断常见语言。highlightAuto 的 JS/TS、JSON/JS
+    // 经常同分，旧的“领先 1.5”条件使它们实际永远不会高亮。
+    if (source.length < 12 || source.length > 20000) return null;
+    const inferred = inferLanguage(source);
+    if (inferred) {
+      return {html: hljs.highlight(source, {language: inferred, ignoreIllegals: true}).value,
+              language: inferred, detected: true};
+    }
+    if (!/[{}()[\];=<>]|\b(?:def|class|function|const|let|var|SELECT|FROM|import)\b/.test(source)) return null;
     const result = hljs.highlightAuto(source, autoLanguages);
     const runnerUp = result.secondBest?.relevance || 0;
-    if (result.relevance < 4 || result.relevance - runnerUp < 1.5) return null;
+    const related = new Set([result.language, result.secondBest?.language]);
+    const sameFamily = related.has('javascript') && related.has('typescript');
+    if (result.relevance < 2 || (!sameFamily && result.relevance - runnerUp < .75)) return null;
     return {html: result.value, language: result.language || '', detected: true};
   } catch {
     return null;
