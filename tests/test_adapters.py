@@ -304,6 +304,27 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertEqual(result["call_id"], "t1")
         self.assertTrue(result["error"])
 
+    def test_claude_interrupt_ends_working_without_fake_user_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            rows = [
+                {"type": "user", "timestamp": "2026-08-09T10:00:00Z",
+                 "message": {"content": "开始任务"}},
+                {"type": "assistant", "timestamp": "2026-08-09T10:00:01Z",
+                 "message": {"content": "正在处理"}},
+                {"type": "user", "timestamp": "2026-08-09T10:00:02Z",
+                 "interruptedMessageId": "msg_123",
+                 "message": {"content": [{"type": "text",
+                              "text": "[Request interrupted by user]"}]}},
+            ]
+            f.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+            msgs, _ = adapters.ClaudeAdapter().read(str(f))
+
+        statuses = [m["state"] for m in msgs if m["role"] == "status"]
+        self.assertEqual(statuses, ["working", "aborted"])
+        self.assertNotIn("[Request interrupted by user]",
+                         [m["text"] for m in msgs])
+
 
 if __name__ == "__main__":
     unittest.main()

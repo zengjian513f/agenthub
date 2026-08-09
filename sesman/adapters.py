@@ -402,10 +402,17 @@ _INJECTED = re.compile(
     r"<local-command-(?:caveat|stdout)>|"
     r"This session is being continued from a previous conversation|"
     r"# Global User Guidance|<project_instructions>|<user_instructions>", re.I)
+_CLAUDE_INTERRUPT = re.compile(
+    r"\[Request interrupted by user(?: for tool use)?\]", re.I)
 
 
 def _is_injected(text: str) -> bool:
     return bool(_INJECTED.search(text[:2000]))
+
+
+def _is_claude_interrupt(text: str) -> bool:
+    """Claude 把 Esc 中断记成 user 消息，但它不是一个新回合。"""
+    return bool(_CLAUDE_INTERRUPT.fullmatch(text.strip()))
 
 
 def _title_from_text(text: str) -> str:
@@ -657,6 +664,11 @@ class ClaudeAdapter:
                 parts = _flatten_content((rec.get("message") or {}).get("content"))
                 # Claude 没有 task_started；真实用户输入就是新回合的结构化起点。
                 text_parts = [p["text"] for p in parts if p["kind"] == "text"]
+                if t == "user" and not tag and (
+                        rec.get("interruptedMessageId")
+                        or any(_is_claude_interrupt(x) for x in text_parts)):
+                    msgs.append(_status("aborted", ts))
+                    continue
                 if t == "user" and not tag and any(
                         x.strip() and not _is_injected(x) for x in text_parts):
                     msgs.append(_status("working", ts))
