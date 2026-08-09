@@ -1613,13 +1613,17 @@ function addClippedPre(entry, cls, text) {
     const rest = info.omittedLines > 0
       ? `另有 ${info.omittedLines.toLocaleString()} 行`
       : `另有 ${info.omittedChars.toLocaleString()} 字符`;
-    const more = el('button', 'more', `展开全文（${rest}）`);
+    const expandLabel = `展开全文（${rest}）`;
+    const more = el('button', 'more', expandLabel);
+    let expanded = false;
     more.onclick = () => {
-      pre.textContent = text;
+      expanded = !expanded;
+      pre.textContent = expanded ? text : info.text;
       paintToolOutputDiff(pre);
-      more.remove();
-      if (!wrap) actions.remove();
+      more.textContent = expanded ? '收起' : expandLabel;
+      more.setAttribute('aria-expanded', String(expanded));
     };
+    more.setAttribute('aria-expanded', 'false');
     actions.appendChild(more);
   }
   if (actions.childElementCount) entry.appendChild(actions);
@@ -1922,7 +1926,7 @@ function msgNode(m) {
   const fold = () => { n.classList.add('folded'); body.classList.remove('clip'); setAction(); };
   const full = () => {
     n.classList.remove('folded'); body.classList.remove('clip'); paint(true);
-    setAction(foldable ? '收起' : '', foldable ? fold : null);
+    setAction(foldable || long ? '收起' : '', foldable ? fold : (long ? clipped : null));
   };
   const clipped = () => {
     n.classList.remove('folded'); body.classList.add('clip'); paint(false);

@@ -945,6 +945,14 @@ def run(pw):
         check("长工具输出用省略行数而非总字符数",
               "另有 5 行" in failed_entry.locator("button.more").inner_text(),
               failed_entry.locator("button.more").inner_text())
+        failed_entry.locator("button.more").click()
+        check("工具输出展开后可以收起",
+              failed_entry.locator("button.more").inner_text() == "收起"
+              and failed_entry.locator("button.more").get_attribute("aria-expanded") == "true")
+        failed_entry.locator("button.more").click()
+        check("工具输出收起后恢复原预览",
+              "另有 5 行" in failed_entry.locator("button.more").inner_text()
+              and failed_entry.locator("button.more").get_attribute("aria-expanded") == "false")
         grp.locator("> .disclosure").click()
         p.wait_for_timeout(150)
         check("组可再折叠", not grp.locator("> .tool-entry").first.is_visible())
@@ -984,7 +992,7 @@ def run(pw):
     # ---- 9. 展开全文 ----
     more = p.locator(".msg .more:visible").filter(has_text="展开全文").first
     check("长消息出现展开全文按钮", more.count() > 0 and "展开全文" in more.inner_text())
-    # 对话长文只有这一个展开入口，展开后按钮消失。
+    # 对话长文只有这一个展开入口，展开后同一按钮变为收起。
     target = more.evaluate_handle("n => n.closest('.msg')").as_element()
     mb = target.query_selector(".mb")
     h_before = mb.bounding_box()["height"]
@@ -994,8 +1002,15 @@ def run(pw):
     p.wait_for_timeout(400)
     h_after = mb.bounding_box()["height"]
     check("展开全文后高度变大", h_after > h_before + 100, f"{h_before}->{h_after}")
-    check("展开后没有可见按钮", not target.query_selector(".more").is_visible())
+    check("展开后同一按钮变为收起",
+          target.query_selector(".more").is_visible()
+          and target.query_selector(".more").inner_text() == "收起")
     check("展开后内容完整", "点下方按钮展开全文" not in mb.inner_text())
+    target.query_selector(".more").click()
+    p.wait_for_timeout(200)
+    check("长对话可以收回预览",
+          mb.bounding_box()["height"] < h_after
+          and "展开全文" in target.query_selector(".more").inner_text())
 
     # ---- 10. 子代理是父会话内的互斥视图，不混入主时间线 ----
     check("有子代理的会话标题可下拉切换", p.locator("#a-view-switch").count() == 1)
