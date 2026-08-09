@@ -918,8 +918,11 @@ function attachTerm(name) {
     if (T.name === name) {
       T.ws = null;
     }
-    pollLive(true);                      // tmux 内程序退出时立即清理绿点和输入区
-    scheduleTermReconnect(view);
+    // 先刷新 tmux 列表再决定是否重连。若进程刚退出，旧 T.list 仍会短暂把它
+    // 判为存活；先排一个重连定时器会向已消失的会话握手，产生 404/close race。
+    Promise.resolve(pollLive(true)).finally(() => {
+      if (T.views.get(name) === view && !view.ws) scheduleTermReconnect(view);
+    });
   };
   ws.onerror = () => {};
 }
@@ -1181,6 +1184,12 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
     if (queuedId) discardQueuedUserMessage(uid, queuedId);
     alert('发送失败: ' + d.error);
     return false;
+  }
+  // Esc 会让 CLI 丢弃当前 TUI 内存中的排队输入；那些输入未必曾写入
+  // transcript，因此不能等待后续“同文消息”来消重。
+  if (sesmanCli(uid)?.clearsQueuedMessages(keys)
+      && typeof discardAllQueuedUserMessages === 'function') {
+    discardAllQueuedUserMessages(uid);
   }
   S.live.add(uid);            // 发完立刻按最快节奏拉新消息
   S.liveTmux.add(uid);
@@ -1465,9 +1474,10 @@ $('#csend').onclick = () => {
 let composerEscAt = -Infinity;
 async function sendComposerEscape(now = performance.now()) {
   const uid = S.sel;
-  const source = sidebarSessions().find(s => s.uid === uid)?.source;
-  const rewind = source === 'claude' && now - composerEscAt <= 650;
-  composerEscAt = rewind || source !== 'claude' ? -Infinity : now;
+  const escape = sesmanCli(uid)?.repeatedEscape(now, composerEscAt)
+    || { rewind: false, nextAt: -Infinity };
+  const rewind = escape.rewind;
+  composerEscAt = escape.nextAt;
   const name = takenOver(uid);
   const sent = await sendToSession(null, ['Escape'], uid);
   if (!rewind || !sent || !name || S.sel !== uid) return sent;

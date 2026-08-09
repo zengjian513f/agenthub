@@ -246,12 +246,38 @@ def run(pw):
     check("顶栏统计显示数量", re.search(r"\d+", p.locator("#stat").inner_text()), p.locator("#stat").inner_text())
     check("三个来源 chip 都在", p.locator(".chip").count() == 3)
     check("图标 SVG 渲染", p.locator(".item .ico svg").count() > 0)
+    cli_layers = p.evaluate("""() => ({
+      classes:[SESMAN_CLIS.claude instanceof ClaudeCli,
+        SESMAN_CLIS.codex instanceof CodexCli, SESMAN_CLIS.grok instanceof GrokCli,
+        Object.values(SESMAN_CLIS).every(x => x instanceof SesmanCli)],
+      claudeRemove:SESMAN_CLIS.claude.queueResolution({role:'queue_operation',
+        operation:'remove', text:'q'}),
+      codexRemove:SESMAN_CLIS.codex.queueResolution({role:'queue_operation',
+        operation:'remove', text:'q'}),
+      migrations:[SESMAN_CLIS.claude.migrateQueuedMessages([1], 1, 2),
+        SESMAN_CLIS.codex.migrateQueuedMessages([1], 1, 2),
+        SESMAN_CLIS.grok.migrateQueuedMessages([1], 1, 2)],
+      escape:[SESMAN_CLIS.claude.clearsQueuedMessages(['Escape']),
+        SESMAN_CLIS.codex.clearsQueuedMessages(['Escape']),
+        SESMAN_CLIS.grok.clearsQueuedMessages(['Escape'])],
+      rewind:[SESMAN_CLIS.claude.repeatedEscape(1200, 1000).rewind,
+        SESMAN_CLIS.codex.repeatedEscape(1200, 1000).rewind,
+        SESMAN_CLIS.grok.repeatedEscape(1200, 1000).rewind]
+    })""")
+    check("三种 CLI 继承公共基类并拥有独立队列策略",
+          all(cli_layers["classes"])
+          and cli_layers["claudeRemove"] == "q" and cli_layers["codexRemove"] is None
+          and cli_layers["migrations"] == [[1], [], [1]]
+          and cli_layers["escape"] == [True, True, False]
+          and cli_layers["rewind"] == [True, False, False], cli_layers)
     script_order = p.locator("script[src]").evaluate_all(
         "nodes => nodes.map(n => n.getAttribute('src'))")
     check("会话列表脚本不再被大型终端和公式库阻塞",
-          script_order.index("app.js") < script_order.index("vendor/xterm.js")
+          script_order.index("cli.js") < script_order.index("app.js")
+          < script_order.index("vendor/xterm.js")
           and all(p.locator(f'script[src="{src}"]').get_attribute("defer") is not None
-                  for src in ("app.js", "vendor/xterm.js", "vendor/katex/katex.min.js")),
+                  for src in ("cli.js", "app.js", "vendor/xterm.js",
+                              "vendor/katex/katex.min.js")),
           script_order)
     check("首次会话列表已替换静态扫描占位", p.locator("#side > .spin").count() == 0)
     action_styles = p.evaluate("""() => ['new-session', 'reload', 'settings'].map(id => {
@@ -1976,6 +2002,15 @@ def run(pw):
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
         }""", target)
         check("旧版排队副本不再因浏览器时钟偏差而残留", queued.count() == 0)
+        p.evaluate("u => queuePendingUserMessage(u, '按 Esc 后应从页面撤掉的排队消息')", target)
+        check("Esc 测试前确实有乐观排队副本", queued.count() == 1)
+        p.evaluate("""async u => {
+          const realPost = post;
+          post = async () => ({ok:true});
+          try { await sendToSession(null, ['Escape'], u); }
+          finally { post = realPost; }
+        }""", target)
+        check("从 TUI 取消但未落盘的消息会在 Esc 后撤掉", queued.count() == 0)
         sent = []
         p.on("response", lambda r: sent.append(r.status) if "/api/term/send" in r.url else None)
         # 手机 Enter 只换行，发送必须点按钮；短 placeholder 不把单行输入框撑高。

@@ -1,10 +1,9 @@
 'use strict';
 
-const SOURCES = {
-  claude: { name: 'Claude', icon: 'i-claude', color: 'var(--claude)' },
-  codex:  { name: 'Codex',  icon: 'i-codex',  color: 'var(--codex)'  },
-  grok:   { name: 'Grok',   icon: 'i-grok',   color: 'var(--grok)'   },
-};
+const SOURCES = Object.freeze(Object.fromEntries(
+  Object.values(SESMAN_CLIS).map(cli => [cli.source, {
+    name: cli.name, icon: cli.icon, color: cli.color,
+  }])));
 
 // 所有界面状态都落 localStorage, 刷新后原样恢复
 const store = {
@@ -16,6 +15,25 @@ const store = {
   },
   set: (k, v) => localStorage.setItem('sesman.' + k, JSON.stringify(v)),
 };
+
+// 存储结构的版本只由公共层调度；每种 CLI 自己决定怎样迁移旧队列。
+const QUEUED_MESSAGES_VERSION = 2;
+function loadQueuedMessages() {
+  const saved = store.get('queuedMessages', []);
+  const valid = Array.isArray(saved) ? saved : [];
+  const fromVersion = +store.get('queuedMessagesVersion', 1) || 1;
+  if (fromVersion !== QUEUED_MESSAGES_VERSION) {
+    const migrated = valid.flatMap(([uid, items]) => {
+      const kept = sesmanCli(uid)?.migrateQueuedMessages(
+        items, fromVersion, QUEUED_MESSAGES_VERSION) || [];
+      return kept.length ? [[uid, kept]] : [];
+    });
+    store.set('queuedMessages', migrated);
+    store.set('queuedMessagesVersion', QUEUED_MESSAGES_VERSION);
+    return migrated;
+  }
+  return valid;
+}
 
 const FONT_CHOICES = {
   cascadia: '"Sesman CJK Sans", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
@@ -66,10 +84,7 @@ const S = {
   activeOnly: store.get('activeOnly', false), // 左栏只显示仍在运行的会话
   unread: new Map(store.get('unread', [])),   // uid → {count, tmux}; 只计代理产生的新内容
   cursors: new Map(), // 主会话/子代理 EOF 游标；用于后台会话的精确未读增量
-  queued: new Map((() => {                    // uid → 尚未写入原生会话记录的已发送消息
-    const saved = store.get('queuedMessages', []);
-    return Array.isArray(saved) ? saved : [];
-  })()),
+  queued: new Map(loadQueuedMessages()),       // uid → 尚未写入原生会话记录的已发送消息
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -237,17 +252,26 @@ function discardQueuedUserMessage(uid, id) {
     cache.get(viewKey(uid))?.activity, uid);
 }
 
+function discardAllQueuedUserMessages(uid) {
+  if (!queuedMessages(uid).length) return false;
+  S.queued.delete(uid);
+  saveQueuedMessages();
+  if (S.sel === uid && !S.agent) renderConversationTail(
+    cache.get(viewKey(uid))?.activity, uid);
+  return true;
+}
+
 function reconcileQueuedMessages(uid, messages) {
   const items = queuedMessages(uid).slice();
   if (!items.length) return false;
+  const cli = sesmanCli(uid);
+  if (!cli) return false;
   let changed = false;
   for (const message of messages || []) {
-    const recordedUser = ['user', 'command'].includes(message.role);
-    const removedFromClaudeQueue = message.role === 'queue_operation'
-      && message.operation === 'remove';
-    if (!recordedUser && !removedFromClaudeQueue) continue;
+    const resolvedText = cli.queueResolution(message);
+    if (resolvedText === null) continue;
     const at = items.findIndex(item => {
-      if (item.text !== String(message.text || '')) return false;
+      if (item.text !== resolvedText) return false;
       const recorded = Date.parse(message.ts || '');
       const boundary = Date.parse(item.afterTs || '');
       // 不比较浏览器 Date.now() 和 CLI 时间：手机/电脑时钟偏差、CLI 排队延迟
