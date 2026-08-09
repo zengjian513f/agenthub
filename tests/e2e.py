@@ -95,13 +95,14 @@ def make_fake_session():
             {"type": "thinking", "thinking": "自测思考内容"},
             {"type": "text", "text": long_text},
             {"type": "tool_use", "id": "bash-1", "name": "Bash", "input": {"command": "echo hi"}},
-            {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/tmp/a"}},
+            {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/tmp/a.py"}},
             {"type": "tool_use", "id": "bash-2", "name": "Bash", "input": {"command": "echo hi2"}}]},
          "uuid": "a1", "timestamp": "2026-08-06T12:00:05.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "bash-1", "content": "hi"},
-            {"type": "tool_result", "tool_use_id": "read-1", "content": "文件内容"},
+            {"type": "tool_result", "tool_use_id": "read-1",
+             "content": "def loaded_value():\n    return 42"},
             {"type": "tool_result", "tool_use_id": "bash-2", "is_error": True,
              "content": "Error: Exit code 2\n" + "\n".join(f"log {i}" for i in range(12))}]},
          "uuid": "u2", "timestamp": "2026-08-06T12:00:06.000Z", "cwd": "/tmp/sesman-selftest",
@@ -923,6 +924,45 @@ def run(pw):
     check("语法高亮依赖从 sesman 本地加载",
           p.locator('script[src$="syntax.js"]').count() == 1
           and p.locator('script[src^="http"]:not([src^="' + BASE + '"])').count() == 0)
+    p.evaluate("""() => {
+      const mixed = document.createElement('div');
+      mixed.id = 'mixed-tool-syntax-probe';
+      mixed.className = 'tool-entry';
+      addClippedPre(mixed, 'tool-out',
+        '$ git status\\n\\ndef tool_value():\\n    return 42\\n\\nconst answer = 7;\\nconsole.log(answer);');
+      document.querySelector('#msgs').appendChild(mixed);
+      const diff = document.createElement('div');
+      diff.id = 'tool-diff-syntax-probe';
+      diff.className = 'tool-entry';
+      addClippedPre(diff, 'tool-out',
+        'diff --git a/demo.py b/demo.py\\n--- a/demo.py\\n+++ b/demo.py\\n@@ -1,2 +1,2 @@\\n-def value():\\n-    return 1\\n+def value():\\n+    return 2');
+      document.querySelector('#msgs').appendChild(diff);
+    }""")
+    p.wait_for_function("""() =>
+      document.querySelector('#mixed-tool-syntax-probe .syntax-segment[data-syntax-language=python] .hljs-keyword')
+      && document.querySelector('#mixed-tool-syntax-probe .syntax-segment[data-syntax-language=javascript] .hljs-keyword')
+      && document.querySelector('#tool-diff-syntax-probe .tool-diff-line.add .hljs-keyword')""",
+                        timeout=15000)
+    mixed_probe = p.locator("#mixed-tool-syntax-probe")
+    check("同一工具输出可分段识别 shell、Python 和 JavaScript",
+          mixed_probe.locator('[data-syntax-language="bash"]').count() == 1
+          and mixed_probe.locator('[data-syntax-language="python"] .hljs-keyword').count() >= 2
+          and mixed_probe.locator('[data-syntax-language="javascript"] .hljs-keyword').count() >= 1,
+          mixed_probe.locator('[data-syntax-language]').evaluate_all(
+              "ns => ns.map(n => n.dataset.syntaxLanguage)"))
+    tool_diff_probe = p.locator("#tool-diff-syntax-probe")
+    tool_diff_colors = tool_diff_probe.locator(".tool-diff-line.add").first.evaluate("""n => ({
+      background: getComputedStyle(n).backgroundColor,
+      keyword: getComputedStyle(n.querySelector('.hljs-keyword')).color,
+      base: getComputedStyle(n).color
+    })""")
+    check("工具输出里的 diff 同时保留增删底色和源码语法色",
+          tool_diff_probe.locator(".tool-diff-line.del .hljs-keyword").count() >= 1
+          and tool_diff_probe.locator(".tool-diff-line.add .hljs-keyword").count() >= 1
+          and tool_diff_colors["background"] != "rgba(0, 0, 0, 0)"
+          and tool_diff_colors["keyword"] != tool_diff_colors["base"], tool_diff_colors)
+    p.locator("#mixed-tool-syntax-probe, #tool-diff-syntax-probe").evaluate_all(
+        "ns => ns.forEach(n => n.remove())")
     imgs = p.locator(".mb img")
     check("Markdown、附件清单与结构化图片都渲染", imgs.count() >= 3, imgs.count())
     check("附件清单中的裸路径图片已渲染",
@@ -948,7 +988,7 @@ def run(pw):
         outline = grp.locator("> .fold-preview .group-outline > span").all_inner_texts()
         check("组预览按原顺序逐行列出调用",
               len(outline) >= 3 and outline[0].startswith("1. $ echo hi")
-              and outline[1].startswith("2. 读 /tmp/a")
+              and outline[1].startswith("2. 读 /tmp/a.py")
               and outline[2].startswith("3. $ echo hi2"), outline)
         check("组默认折叠", not grp.locator("> .tool-entry").first.is_visible())
         grp.hover()
@@ -971,6 +1011,14 @@ def run(pw):
         check("展开后预览不再占垂直空间", not grp.locator("> .fold-preview").is_visible())
         check("工具组不再包 grp-body", grp.locator("> .grp-body").count() == 0)
         check("工具组内不再嵌套 msg 气泡", grp.locator("> .msg").count() == 0)
+        read_entry = grp.locator("> .tool-entry").filter(has_text="读 /tmp/a.py")
+        p.wait_for_function("""() => [...document.querySelectorAll('.tool-entry')].some(n =>
+          n.textContent.includes('读 /tmp/a.py') && n.querySelector('.tool-out .hljs-keyword'))""",
+                            timeout=15000)
+        check("Read 工具输出按文件扩展名识别 Python",
+              read_entry.locator(".tool-out.hljs").count() == 1
+              and read_entry.locator(".tool-out .hljs-keyword").count() >= 2
+              and read_entry.locator(".tool-out").get_attribute("data-code-language") == "python")
         first_entry = grp.locator("> .tool-entry").first
         first_entry.locator("> .tool-head").click()
         args_geometry = first_entry.evaluate("""n => {
@@ -1031,11 +1079,19 @@ def run(pw):
     check("内联统一 diff 区分新增和删除",
           "return 1" in change.locator(".diff-line.del").inner_text()
           and "return 2" in change.locator(".diff-line.add").inner_text())
+    p.wait_for_function("document.querySelector('.file-change-card .diff-line.add .hljs-keyword')",
+                        timeout=15000)
+    check("内联 diff 按文件扩展名叠加源码语法高亮",
+          change.locator(".diff-line.del .hljs-keyword").count() >= 1
+          and change.locator(".diff-line.add .hljs-keyword").count() >= 1)
     change.locator('[data-diff-view="split"]').click()
     split = change.locator(".diff-split > section")
     check("diff 可以切换为修改前后并排", split.count() == 2
           and "return 1" in split.nth(0).inner_text()
           and "return 2" in split.nth(1).inner_text())
+    check("并排 diff 切换后仍保留语法高亮",
+          split.nth(0).locator(".hljs-keyword").count() >= 1
+          and split.nth(1).locator(".hljs-keyword").count() >= 1)
     check("片段不会伪装成完整文件", "片段" in change.locator(".file-change-head").inner_text())
     check("当前卡片记录并排状态", change.get_attribute("data-diff-view") == "split")
     change.locator('[data-diff-view="unified"]').click()

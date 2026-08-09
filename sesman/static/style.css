@@ -779,7 +779,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 .mb pre > code.code-block { color: inherit; font: inherit; white-space: pre; }
-.mb pre[data-code-language]::before {
+:where(.mb pre, .tool-entry > pre)[data-code-language]::before {
   content: attr(data-code-language); position: sticky; float: right; right: 0; top: 0;
   margin: -5px -7px 3px 10px; padding: 1px 5px; border-radius: 4px;
   background: var(--panel); color: var(--muted); font: 9px/1.45 var(--terminal-font);
@@ -861,7 +861,15 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-diff-line {
   display: block; min-height: 1.5em; padding-inline: 10px; white-space: pre;
 }
+.tool-diff-line.code {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr); padding-inline: 0;
+}
+.tool-diff-line.code > i {
+  color: var(--muted); opacity: .7; text-align: center; font-style: normal; user-select: none;
+}
+.tool-diff-line.code > code { min-width: 0; padding-right: 10px; color: inherit; font: inherit; white-space: pre; }
 .tool-entry > pre.wrap > .tool-diff-line { white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-entry > pre.wrap > .tool-diff-line.code > code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .tool-diff-line.meta { color: var(--muted); }
 .tool-diff-line.hunk { background: var(--panel-2); color: var(--accent); }
 .tool-diff-line.add { background: var(--diff-add-bg); color: var(--diff-add-fg); }

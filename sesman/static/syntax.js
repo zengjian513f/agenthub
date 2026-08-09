@@ -21,6 +21,49 @@ const aliases = {
 };
 const plain = new Set(['text', 'txt', 'plain', 'plaintext', 'none']);
 const autoLanguages = ['python', 'javascript', 'typescript', 'bash', 'json', 'css', 'xml', 'sql', 'yaml'];
+const extensionLanguages = new Map(Object.entries({
+  py: 'python', pyw: 'python', js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
+  ts: 'typescript', tsx: 'typescript', sh: 'bash', bash: 'bash', zsh: 'bash', json: 'json', jsonc: 'json',
+  css: 'css', html: 'xml', htm: 'xml', xml: 'xml', svg: 'xml', md: 'markdown', markdown: 'markdown',
+  sql: 'sql', yaml: 'yaml', yml: 'yaml', diff: 'diff', patch: 'diff', txt: 'text', log: 'text',
+}));
+
+function languageForPath(rawPath = '') {
+  const path = String(rawPath || '').split(/[?#]/, 1)[0].replace(/\\/g, '/');
+  const name = path.slice(path.lastIndexOf('/') + 1).toLowerCase();
+  if (/^(?:dockerfile|containerfile)(?:\.|$)/.test(name)) return 'bash';
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? (extensionLanguages.get(name.slice(dot + 1)) || '') : '';
+}
+
+function detectionSource(source) {
+  let text = String(source || '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  // Codex 工具回执常在真正内容前包一层 Script completed / Output
+  // 信封；Read 输出又可能带行号和箭头。检测时去掉它们，显示仍保留原文。
+  const envelope = text.match(/(?:^|\n)(?:Output|stdout|content):\s*\n([\s\S]*)$/i);
+  if (envelope) text = envelope[1];
+  return text.replace(/^\s*(?:\d+\s*[\u2192│|]\s?|\d+:\s+)/gm, '');
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>]/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[char]));
+}
+
+function lineStartLanguage(line) {
+  const text = line.trimStart();
+  if (/^(?:\$|❯)\s+\S/.test(text)
+      || /^(?:#!.*\b(?:ba|z|k)?sh\b|(?:sudo\s+)?(?:git|cd|ls|rg|grep|find|curl|wget|npm|pnpm|yarn|python\d*|node|docker|systemctl)\b)/.test(text)) {
+    return 'bash';
+  }
+  if (/^(?:interface|type|enum|namespace)\s+\w+/.test(text)) return 'typescript';
+  if (/^(?:const|let|var|function|export\s+|import\s+.+\s+from\b)/.test(text)) return 'javascript';
+  if (/^(?:@\w|(?:async\s+)?(?:def|class)\s+\w|from\s+\S+\s+import\b|import\s+[\w.]+(?:\s+as\s+\w+)?\s*(?:#.*)?$)/.test(text)) {
+    return 'python';
+  }
+  if (/^(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|WITH)\b/i.test(text)) return 'sql';
+  if (/^(?:<\?xml\b|<!DOCTYPE\b|<[A-Za-z][\w:-]*(?:\s|>|\/))/.test(text)) return 'xml';
+  return '';
+}
 
 function inferLanguage(source) {
   const text = source.trim();
@@ -46,8 +89,8 @@ function inferLanguage(source) {
   return '';
 }
 
-window.sesmanHighlight = (source, rawLanguage = '') => {
-  const label = String(rawLanguage || '').trim().toLowerCase();
+function highlight(source, rawLanguage = '', rawPath = '') {
+  const label = String(rawLanguage || languageForPath(rawPath) || '').trim().toLowerCase();
   if (plain.has(label)) return null;
   const language = aliases[label] || label;
   try {
@@ -58,22 +101,89 @@ window.sesmanHighlight = (source, rawLanguage = '') => {
     }
     // 先用可解释的强特征判断常见语言。highlightAuto 的 JS/TS、JSON/JS
     // 经常同分，旧的“领先 1.5”条件使它们实际永远不会高亮。
-    if (source.length < 12 || source.length > 20000) return null;
-    const inferred = inferLanguage(source);
+    if (source.length < 12 || source.length > 20000 || /\x1b\[/.test(source)) return null;
+    const sample = detectionSource(source);
+    const inferred = inferLanguage(sample);
     if (inferred) {
       return {html: hljs.highlight(source, {language: inferred, ignoreIllegals: true}).value,
               language: inferred, detected: true};
     }
-    if (!/[{}()[\];=<>]|\b(?:def|class|function|const|let|var|SELECT|FROM|import)\b/.test(source)) return null;
-    const result = hljs.highlightAuto(source, autoLanguages);
+    if (!/[{}()[\];=<>]|\b(?:def|class|function|const|let|var|SELECT|FROM|import)\b/.test(sample)) return null;
+    const result = hljs.highlightAuto(sample, autoLanguages);
     const runnerUp = result.secondBest?.relevance || 0;
     const related = new Set([result.language, result.secondBest?.language]);
     const sameFamily = related.has('javascript') && related.has('typescript');
     if (result.relevance < 2 || (!sameFamily && result.relevance - runnerUp < .75)) return null;
-    return {html: result.value, language: result.language || '', detected: true};
+    const detected = result.language || '';
+    return {html: hljs.highlight(source, {language: detected, ignoreIllegals: true}).value,
+            language: detected, detected: true};
   } catch {
     return null;
   }
-};
+}
+
+/**
+ * 工具输出不是一个源文件：一块终端文本里可能先有 shell 命令，随后又
+ * 打印 Python/JS。按空行和强语言起始行分岛，无法确认的普通日志原样保留。
+ */
+function highlightSegments(source, rawPath = '') {
+  const text = String(source || '');
+  if (!text || /\x1b\[/.test(text)) return null;
+  const pathLanguage = languageForPath(rawPath);
+  if (pathLanguage) return plain.has(pathLanguage) ? null : highlight(text, pathLanguage);
+
+  const lines = text.match(/[^\n]*(?:\n|$)/g)?.filter(Boolean) || [];
+  const chunks = [];
+  let current = null;
+  const flush = () => {
+    if (current?.text) chunks.push(current);
+    current = null;
+  };
+  const append = (kind, language, line) => {
+    if (!current || current.kind !== kind || current.language !== language) {
+      flush();
+      current = {kind, language, text: ''};
+    }
+    current.text += line;
+  };
+
+  for (const line of lines) {
+    const bare = line.replace(/\n$/, '');
+    if (!bare.trim()) {
+      append('plain', '', line);
+      flush();
+      continue;
+    }
+    const language = lineStartLanguage(bare);
+    if (language) {
+      append('code', language, line);
+    } else if (current?.kind === 'code') {
+      // 缩进正文、续行以及代码块里的普通表达式跟随已经确认的语言。
+      current.text += line;
+    } else {
+      append('plain', '', line);
+    }
+  }
+  flush();
+
+  let painted = 0;
+  const languages = new Set();
+  const html = chunks.map(chunk => {
+    const result = chunk.kind === 'code'
+      ? highlight(chunk.text, chunk.language)
+      : highlight(chunk.text);
+    if (!result?.html) return escapeHtml(chunk.text);
+    painted += 1;
+    languages.add(result.language);
+    return `<span class="syntax-segment hljs language-${result.language}" data-syntax-language="${result.language}">${result.html}</span>`;
+  }).join('');
+  if (!painted) return null;
+  const language = languages.size === 1 ? [...languages][0] : '';
+  return {html, language, languages: [...languages], detected: true, segmented: true};
+}
+
+window.sesmanLanguageForPath = languageForPath;
+window.sesmanHighlight = highlight;
+window.sesmanHighlightSegments = highlightSegments;
 
 dispatchEvent(new Event('sesman-highlight-ready'));

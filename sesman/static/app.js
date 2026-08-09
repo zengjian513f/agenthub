@@ -1671,11 +1671,44 @@ function outPreviewInfo(t) {
 
 function outPreview(t) { return outPreviewInfo(t).text; }
 
-function addClippedPre(entry, cls, text) {
-  const pre = el('pre', cls);
-  const info = outPreviewInfo(text);
-  pre.textContent = info.text;
+function toolOutputPath(m) {
+  const name = String(m?.name || '').toLowerCase();
+  if (!/(?:^|[_:./-])(?:read|read_file|notebookread|open)$/.test(name)) return '';
+  const raw = String(m?.text || '');
+  try {
+    const value = JSON.parse(raw);
+    for (const key of ['file_path', 'path', 'filename']) {
+      if (typeof value?.[key] === 'string') return value[key];
+    }
+  } catch { /* 某些适配器传的是 Python repr 或纯命令，继续用文本提取 */ }
+  const field = raw.match(/["'](?:file_path|path|filename)["']\s*[:=]\s*["']([^"']+)["']/);
+  if (field) return field[1];
+  const summary = String(m?.summary || '');
+  const match = summary.match(/(?:^|\s)([.~\w/-]+\.[A-Za-z0-9]+)(?=\s|$|[,:;)]|$)/);
+  return match?.[1] || '';
+}
+
+function clearSyntaxPaint(node) {
+  delete node.dataset.syntaxDone;
+  delete node.dataset.detected;
+  delete node.dataset.codeLanguage;
+  delete node.dataset.syntaxLanguages;
+  node.classList.remove('hljs');
+  for (const cls of [...node.classList]) if (cls.startsWith('language-')) node.classList.remove(cls);
+}
+
+function setToolOutput(pre, text) {
+  clearSyntaxPaint(pre);
+  pre.textContent = text;
   paintToolOutputDiff(pre);
+  paintSyntax(pre);
+}
+
+function addClippedPre(entry, cls, text, codePath = '') {
+  const pre = el('pre', cls);
+  if (codePath) pre.dataset.codePath = codePath;
+  const info = outPreviewInfo(text);
+  setToolOutput(pre, info.text);
   entry.appendChild(pre);
   const actions = el('div', 'tool-out-actions');
   let wrap = null;
@@ -1700,8 +1733,7 @@ function addClippedPre(entry, cls, text) {
     let expanded = false;
     more.onclick = () => {
       expanded = !expanded;
-      pre.textContent = expanded ? text : info.text;
-      paintToolOutputDiff(pre);
+      setToolOutput(pre, expanded ? text : info.text);
       more.textContent = expanded ? '收起' : expandLabel;
       more.setAttribute('aria-expanded', String(expanded));
     };
@@ -1718,7 +1750,7 @@ function toolEntry(m) {
   if (m.role !== 'tool') {
     // 落单的工具输出(没配到调用): 保持独立块
     addClippedPre(entry, 'tool-out' + (m.error ? ' err' : ''),
-                  m.name ? `${m.name}\n${m.text}` : m.text);
+                  m.name ? `${m.name}\n${m.text}` : m.text, toolOutputPath(m));
     if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
     return entry;
   }
@@ -1762,7 +1794,9 @@ function toolEntry(m) {
     status.push(stats.lines > 1 ? `${stats.lines.toLocaleString()} 行`
       : `${stats.chars.toLocaleString()} 字符`);
     entry.appendChild(el('div', 'tool-status' + (r.error ? ' err' : ''), status.join(' · ')));
-    if (String(r.text || '').trim()) addClippedPre(entry, 'tool-out' + (r.error ? ' err' : ''), r.text);
+    if (String(r.text || '').trim()) {
+      addClippedPre(entry, 'tool-out' + (r.error ? ' err' : ''), r.text, toolOutputPath(m));
+    }
     if (r.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(r.media));
   }
   return entry;
@@ -1780,6 +1814,22 @@ function diffKind(line) {
   return 'ctx';
 }
 
+function diffCodePath(lines) {
+  for (const prefix of ['+++ ', '--- ']) {
+    const header = lines.find(line => line.startsWith(prefix));
+    if (!header) continue;
+    const path = header.slice(prefix.length).split('\t', 1)[0].trim().replace(/^(?:a|b)\//, '');
+    if (path && path !== '/dev/null') return path;
+  }
+  return '';
+}
+
+function diffCodeParts(line, kind) {
+  if (kind === 'add' || kind === 'del') return {marker: line[0], source: line.slice(1)};
+  if (kind === 'ctx') return {marker: line.startsWith(' ') ? ' ' : '', source: line.startsWith(' ') ? line.slice(1) : line};
+  return null;
+}
+
 /** 给普通工具输出里夹带的 unified/git diff 上色；前置命令状态仍按原样显示。 */
 function paintToolOutputDiff(pre) {
   if (!(pre instanceof HTMLElement) || pre.querySelector(':scope > .tool-diff-line')) return;
@@ -1788,18 +1838,35 @@ function paintToolOutputDiff(pre) {
   const unified = first >= 0 ? first : lines.findIndex((line, i) =>
     line.startsWith('--- ') && lines.slice(i + 1, i + 4).some(x => x.startsWith('+++ ')));
   if (unified < 0) return;
+  const path = diffCodePath(lines.slice(unified));
   const fragment = document.createDocumentFragment();
   lines.forEach((line, i) => {
     const row = el('span', 'tool-diff-line');
-    if (i >= unified) row.classList.add(diffKind(line));
-    row.textContent = line || ' ';
+    const kind = i >= unified ? diffKind(line) : '';
+    if (kind) row.classList.add(kind);
+    const parts = path && diffCodeParts(line, kind);
+    if (parts) {
+      row.classList.add('code');
+      row.appendChild(el('i', '', parts.marker));
+      const code = el('code', '', parts.source || ' ');
+      code.dataset.codePath = path;
+      row.appendChild(code);
+    } else {
+      row.textContent = line || ' ';
+    }
     fragment.appendChild(row);
   });
   pre.replaceChildren(fragment);
 }
 
-function diffRows(lines) {
-  return lines.map(line => `<div class="diff-line ${diffKind(line)}"><i>${esc(line[0] || ' ')}</i><code>${esc(line)}</code></div>`).join('');
+function diffRows(lines, path) {
+  return lines.map(line => {
+    const kind = diffKind(line);
+    const parts = diffCodeParts(line, kind);
+    const attr = parts && path ? ` data-code-path="${esc(path)}"` : '';
+    return `<div class="diff-line ${kind}"><i>${esc(parts?.marker ?? line[0] ?? ' ')}</i>`
+      + `<code${attr}>${esc(parts?.source ?? line)}</code></div>`;
+  }).join('');
 }
 
 function diffSides(change) {
@@ -1822,22 +1889,26 @@ function diffSides(change) {
   return { before, after };
 }
 
-function sideRows(rows, unavailable) {
+function sideRows(rows, unavailable, path) {
   if (unavailable) return '<div class="diff-unavailable">原内容没有记录，无法可靠还原</div>';
-  return rows.map(row => `<div class="diff-line ${row.kind}"><code>${esc(row.text)}</code></div>`).join('')
+  return rows.map(row => {
+    const attr = row.kind === 'meta' ? '' : ` data-code-path="${esc(path)}"`;
+    return `<div class="diff-line ${row.kind}"><code${attr}>${esc(row.text)}</code></div>`;
+  }).join('')
     || '<div class="diff-empty">（空文件）</div>';
 }
 
 function fileDiffMarkup(change, view) {
+  const path = change.new_path || change.path || '';
   if (view === 'unified') {
-    return `<div class="diff-unified">${diffRows(String(change.patch || '').split('\n'))}</div>`;
+    return `<div class="diff-unified">${diffRows(String(change.patch || '').split('\n'), path)}</div>`;
   }
   const sides = diffSides(change);
   return `<div class="diff-split">
     <section><b>修改前${change.before_complete ? '（完整）' : '（片段）'}</b>
-      <div>${sideRows(sides.before, !change.before_available)}</div></section>
+      <div>${sideRows(sides.before, !change.before_available, change.path || path)}</div></section>
     <section><b>修改后${change.after_complete ? '（完整）' : '（片段）'}</b>
-      <div>${sideRows(sides.after, !change.after_available)}</div></section>
+      <div>${sideRows(sides.after, !change.after_available, path)}</div></section>
   </div>`;
 }
 
@@ -1848,7 +1919,9 @@ function paintInlineFileDiff(card, change, view) {
     button.classList.toggle('on', on);
     button.setAttribute('aria-pressed', String(on));
   }
-  card.querySelector('.file-change-body').innerHTML = fileDiffMarkup(change, view);
+  const body = card.querySelector('.file-change-body');
+  body.innerHTML = fileDiffMarkup(change, view);
+  paintSyntax(body);
 }
 
 function fileChangeNode(m) {
@@ -2154,19 +2227,35 @@ function ensureSyntax() {
 }
 
 function paintSyntax(root = document) {
-  const nodes = [...root.querySelectorAll('code.code-block:not([data-syntax-done])')];
+  const select = selector => [
+    ...(root.matches?.(selector) ? [root] : []),
+    ...root.querySelectorAll(selector),
+  ];
+  const blocks = select('code.code-block:not([data-syntax-done])');
+  const tools = select('pre.tool-out:not([data-syntax-done])').filter(
+    pre => !pre.querySelector(':scope > .tool-diff-line'));
+  const diffLines = select(
+    '.diff-line > code[data-code-path]:not([data-syntax-done]), '
+    + '.tool-diff-line > code[data-code-path]:not([data-syntax-done])');
+  const nodes = [...new Set([...blocks, ...tools, ...diffLines])];
   if (!nodes.length) return;
   if (!window.sesmanHighlight) { ensureSyntax(); return; }
   for (const code of nodes) {
     code.dataset.syntaxDone = '1';
-    const result = window.sesmanHighlight(code.textContent, code.dataset.codeLang || '');
+    const result = code.matches('pre.tool-out') && window.sesmanHighlightSegments
+      ? window.sesmanHighlightSegments(code.textContent, code.dataset.codePath || '')
+      : window.sesmanHighlight(code.textContent, code.dataset.codeLang || '', code.dataset.codePath || '');
     if (!result?.html) continue;
     code.innerHTML = result.html;
     code.classList.add('hljs');
     if (result.language) code.classList.add(`language-${result.language}`);
+    if (result.languages?.length) code.dataset.syntaxLanguages = result.languages.join(',');
     if (result.detected) code.dataset.detected = result.language;
-    if (result.language && code.parentElement?.tagName === 'PRE') {
-      code.parentElement.dataset.codeLanguage = result.language;
+    const host = code.tagName === 'PRE' ? code
+      : (code.classList.contains('code-block') && code.parentElement?.tagName === 'PRE'
+          ? code.parentElement : null);
+    if (result.language && host) {
+      host.dataset.codeLanguage = result.language;
     }
   }
 }
