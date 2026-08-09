@@ -22,6 +22,7 @@ FAKE_PROJ = Path.home() / ".claude" / "projects" / "-tmp-sesman-selftest"
 FAKE_IMG = Path("/tmp/sesman-selftest-image.png")
 FAKE_CWD = Path("/tmp/sesman-selftest")
 PENDING_TERM = "sesman-claude-e2epending"
+PENDING_EXIT_TERM = "sesman-claude-e2eexit"
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 PASS, FAIL = [], []
 
@@ -194,7 +195,9 @@ def make_window_session():
 
 def cleanup():
     tmux_run("sesman", "kill-session", "-t", PENDING_TERM, capture_output=True)
+    tmux_run("sesman", "kill-session", "-t", PENDING_EXIT_TERM, capture_output=True)
     pending_store.discard(PENDING_TERM)
+    pending_store.discard(PENDING_EXIT_TERM)
     shutil.rmtree(FAKE_PROJ, ignore_errors=True)
     shutil.rmtree(FAKE_CWD, ignore_errors=True)
     FAKE_IMG.unlink(missing_ok=True)
@@ -1507,6 +1510,39 @@ def run(pw):
         p.wait_for_function("!MOBILE.matches")
         p.wait_for_timeout(200)
 
+        # 首条消息前直接退出 CLI：临时项、选中详情、终端对象和输入框必须一起
+        # 消失，不能留下一个不在左栏、也无法再连接的“新建会话”孤儿页。
+        p.evaluate("T.mode = 'normal'")
+        tmux_run("sesman", "new-session", "-d", "-s", PENDING_EXIT_TERM,
+                 "-x", "100", "-y", "30", "-c", str(FAKE_CWD),
+                 "bash --noprofile --norc", check=True)
+        pending_store.put({
+            "name": PENDING_EXIT_TERM, "source": "claude",
+            "sid": "00000000-dead-beef-0000-000000000003", "cwd": str(FAKE_CWD),
+            "token": "e2e-exit", "before": [], "started": time.time(),
+            "cols": 100, "rows": 30,
+        })
+        p.evaluate("async () => { await loadTermList(); }")
+        p.evaluate("""n => openPendingSession(
+          pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n))""", PENDING_EXIT_TERM)
+        p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
+        tmux_run("sesman", "kill-session", "-t", PENDING_EXIT_TERM, check=True)
+        p.wait_for_function("n => S.sel !== pendingUid(n)", arg=PENDING_EXIT_TERM, timeout=30000)
+        abandoned = p.evaluate("""n => ({
+          selected:S.sel, stored:store.get('sel'), pending:T.pending.some(x => x.name === n),
+          view:T.views.has(n), open:T.openViews.has(n), composer:!$('#composer').classList.contains('hidden'),
+          terminal:!$('#termpane').classList.contains('hidden'), mode:T.mode, detail:$('#detail').innerText,
+          listed:!!document.querySelector(`.item[data-uid="${CSS.escape(pendingUid(n))}"]`)
+        })""", PENDING_EXIT_TERM)
+        check("首条消息前自然退出会完整移除临时会话",
+              abandoned == {"selected": None, "stored": None, "pending": False,
+                            "view": False, "open": False, "composer": False,
+                            "terminal": False, "mode": "normal",
+                            "detail": "从左侧选择一个会话", "listed": False},
+              abandoned)
+        check("自然退出同时删除服务端临时记录",
+              pending_store.get(PENDING_EXIT_TERM) is None)
+
         dialogs = []
         def _dlg(d):                 # 用完必须摘掉, 否则后面删除会话的确认框也会被它吃掉
             dialogs.append(d.message)
@@ -1688,6 +1724,17 @@ def run(pw):
               max(x["top"] for x in composer_alignment) - min(x["top"] for x in composer_alignment) < 1
               and max(x["bottom"] for x in composer_alignment) - min(x["bottom"] for x in composer_alignment) < 1,
               composer_alignment)
+        composer_single_line = p.evaluate("""() => {
+          const ta = document.querySelector('#cinput'), esc = document.querySelector('#cesc');
+          const send = document.querySelector('#csend'), es = getComputedStyle(esc), ss = getComputedStyle(send);
+          return {overflow:getComputedStyle(ta).overflowY,
+            esc:{height:esc.getBoundingClientRect().height, lineHeight:es.lineHeight, padding:es.paddingBlock},
+            send:{height:send.getBoundingClientRect().height, lineHeight:ss.lineHeight, padding:ss.paddingBlock}};
+        }""")
+        check("单行输入框不显示垂直滚动条",
+              composer_single_line["overflow"] == "hidden", composer_single_line)
+        check("Esc 和发送按钮使用完全相同的垂直尺寸",
+              composer_single_line["esc"] == composer_single_line["send"], composer_single_line)
         p.click("#cadd")
         check("加号菜单提供图片视频音频文件和引用",
               p.locator("#attach-menu button").evaluate_all(

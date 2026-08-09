@@ -871,7 +871,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 #composer.dragover { box-shadow: inset 0 0 0 2px var(--accent); }
 #cinput {
-  flex: 1; min-width: 0; resize: none; overflow-y: auto;
+  flex: 1; min-width: 0; resize: none; overflow-y: hidden;
   min-height: var(--composer-control-height);
   padding: 7px 11px; border: 1px solid var(--border); border-radius: 9px;
   background: var(--panel-2); color: var(--text); outline: none;
@@ -881,7 +881,8 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .cbtns { display: flex; gap: 6px; flex: none; height: var(--composer-control-height); }
 .cbtns .btn {
   display: inline-flex; align-items: center; justify-content: center;
-  height: var(--composer-control-height);
+  height: var(--composer-control-height); min-height: var(--composer-control-height);
+  padding-block: 0; line-height: 1;
 }
 
 #termpane {

@@ -601,7 +601,7 @@ class Handler(BaseHTTPRequestHandler):
         if pending and pending.get("resolved"):
             return self._json(pending["resolved"])
         if not pending:
-            return self._json({"error": "新会话记录不存在或已过期"}, 404)
+            return self._json({"error": "新会话记录不存在或已过期", "gone": True}, 404)
 
         # 签名包含路径、mtime 和大小；新文件/首条消息会自然触发重建。
         # 不能在 750ms 状态轮询里强制全量解析所有会话。
@@ -637,6 +637,12 @@ class Handler(BaseHTTPRequestHandler):
                     candidates = []           # rollout 已出现但进程关系还没稳定，下轮再认
         if not candidates:
             exists = any(x["name"] == name for x in term.list_sessions())
+            if not exists:
+                # CLI 在首条消息前退出：不会再产生可关联记录，不能让前端永远
+                # 停在一个已经从列表消失的临时详情页。waiting=True 兼容尚未
+                # 刷新的旧前端；新前端识别 exited 后完整清理本地视图。
+                pending_store.discard(name)
+                return self._json({"waiting": True, "running": False, "exited": True})
             return self._json({"waiting": True, "running": exists})
 
         s = max(candidates, key=lambda x: x["created"])

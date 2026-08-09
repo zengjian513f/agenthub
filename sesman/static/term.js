@@ -19,6 +19,7 @@ const T = {
   sources: {},
   home: '',
   pending: [],
+  pendingModes: new Map(), // 临时会话名 → 打开前的终端布局；退出未落盘时恢复
   resolving: new Set(),
   resolveControllers: new Map(),
   openViews: new Map(store.get('termviews', [])), // tmux 名 → {mode, height}
@@ -305,6 +306,7 @@ function openNewSessionDialog() {
 }
 
 function showNewSessionStage(info) {
+  if (!T.pendingModes.has(info.name)) T.pendingModes.set(info.name, T.mode);
   // create 返回后 term/list 可能还没拉完；先把服务端刚确认的新 tmux 放进本地
   // pending，详情页的终端切换、输入框和附件可以立即使用。
   if (!T.pending.some(x => x.name === info.name)) T.pending.push({ ...info, started: Date.now() / 1000 });
@@ -350,6 +352,8 @@ async function stopPendingSession(info, button) {
     if (d.error) return alert('停止失败: ' + d.error);
     const uid = pendingUid(info.name);
     if (S.sel === uid) {
+      const previousMode = T.pendingModes.get(info.name);
+      if (['normal', 'collapsed', 'full'].includes(previousMode)) T.mode = previousMode;
       closeTermPane();
       S.sel = null;
       store.set('sel', null);
@@ -357,6 +361,7 @@ async function stopPendingSession(info, button) {
       $('#detail').innerHTML = '<div class="empty">会话已停止</div>';
       showMobileList();
     }
+    T.pendingModes.delete(info.name);
     await loadTermList();
     renderSide();
     showSessionCount(sidebarSessions().length);
@@ -370,6 +375,36 @@ async function openPendingSession(info) {
   showNewSessionStage(pending);
   await openTermPane(pending.name);
   resolveNewSession(pending);
+}
+
+function discardAbandonedNewSession(info) {
+  const uid = pendingUid(info.name);
+  T.pending = (T.pending || []).filter(x => x.name !== info.name);
+  T.openViews.delete(info.name);
+  store.set('termviews', [...T.openViews]);
+  disposeTermView(info.name);
+
+  const draft = composerDrafts.get(uid);
+  for (const attachment of draft?.attachments || []) {
+    if (attachment.preview) URL.revokeObjectURL(attachment.preview);
+  }
+  composerDrafts.delete(uid);
+  if (composerUid === uid) composerUid = null;
+
+  if (S.sel === uid) {
+    const previousMode = T.pendingModes.get(info.name);
+    if (['normal', 'collapsed', 'full'].includes(previousMode)) T.mode = previousMode;
+    S.sel = null;
+    T.uid = null;
+    store.set('sel', null);
+    $('#composer').classList.add('hidden');
+    $('#detail').innerHTML = '<div class="empty">从左侧选择一个会话</div>';
+    showMobileList();
+  }
+  T.pendingModes.delete(info.name);
+  renderSide();
+  showSessionCount(sidebarSessions().length);
+  paintLive();
 }
 
 async function resolveNewSession(info) {
@@ -389,6 +424,12 @@ async function resolveNewSession(info) {
       } catch {
         if (controller.signal.aborted) return;
         continue;
+      }
+      // 另一浏览器可能已经先清理了同一临时记录；gone 与本页观察到
+      // exited 的收尾动作完全相同，不能退化成一个关联失败的孤儿页。
+      if (d.exited || d.gone) {
+        discardAbandonedNewSession(info);
+        return;
       }
       if (d.error) {
         const wait = $('.new-session-wait');
@@ -413,6 +454,7 @@ async function resolveNewSession(info) {
       await openSession(d.uid);
       if (d.running) await openTermPane(d.name);
       else closeTermPane();
+      T.pendingModes.delete(info.name);
       paintLive();
       return;
     }
@@ -1109,7 +1151,9 @@ function renderComposer() {
 
 function autoGrow(ta) {
   ta.style.height = 'auto';
-  ta.style.height = Math.min(180, Math.max(36, ta.scrollHeight)) + 'px';
+  const wanted = ta.scrollHeight;
+  ta.style.height = Math.min(180, Math.max(36, wanted)) + 'px';
+  ta.style.overflowY = wanted > 180 ? 'auto' : 'hidden';
 }
 
 function syncComposerMode() {
