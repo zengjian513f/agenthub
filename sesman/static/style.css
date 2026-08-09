@@ -670,6 +670,8 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--terminal-fg); font: 400 var(--tool-font-size)/1.35 var(--terminal-font);
 }
+.group-outline > span > .group-index { color: var(--muted); font-style: normal; }
+.group-outline > span > code { color: inherit; font: inherit; }
 .group-outline > .group-rest { color: var(--muted); font-size: 11px; }
 .tool-entry {
   margin-bottom: 6px; padding: 0; border: 0; background: transparent;

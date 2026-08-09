@@ -1761,6 +1761,9 @@ function toolEntry(m) {
   head.setAttribute('aria-expanded', 'false');
   head.innerHTML = `<code>${esc(m.summary || m.name || 'tool')}</code>`
     + (m.name && m.summary ? `<span class="tool-meta">${esc(m.name)}</span>` : '');
+  const headCode = head.querySelector(':scope > code');
+  if (/^\s*(?:\$|❯)\s+/.test(m.summary || '')) headCode.classList.add('tool-command');
+  paintSyntax(head);
   entry.appendChild(head);
   const args = el('pre', 'tool-args');
   args.hidden = !!m.summary;   // 识别不了的工具直接铺参数, 不藏
@@ -1969,10 +1972,19 @@ function groupNode(items) {
   peek.classList.add('group-peek');
   const count = el('span', 'group-count', `🔧 ×${visible.length}${hasErr ? ' ⚠' : ''}`);
   const outline = el('span', 'group-outline');
-  heads.forEach((head, i) => outline.appendChild(el('span', '', `${i + 1}. ${head}`)));
+  heads.forEach((head, i) => {
+    const row = el('span');
+    row.appendChild(el('i', 'group-index', `${i + 1}.`));
+    row.append(' ');
+    const code = el('code', /^\s*(?:\$|❯)\s+/.test(head) ? 'tool-command' : '');
+    code.textContent = head;
+    row.appendChild(code);
+    outline.appendChild(row);
+  });
   if (visible.length > heads.length) outline.appendChild(el('span', 'group-rest',
     `… 另有 ${visible.length - heads.length} 项`));
   peek.replaceChildren(count, outline);
+  paintSyntax(outline);
   items.forEach(m => n.appendChild(toolEntry(m))); // 直接铺在组内，不再套 grp-body + 内层 msg
   const setAction = addAction(n);
   const fold = () => { n.classList.add('folded'); setAction(); };
@@ -2232,19 +2244,22 @@ function paintSyntax(root = document) {
     ...root.querySelectorAll(selector),
   ];
   const blocks = select('code.code-block:not([data-syntax-done])');
+  const summaries = select('code.tool-command:not([data-syntax-done])');
   const tools = select('pre.tool-out:not([data-syntax-done])').filter(
     pre => !pre.querySelector(':scope > .tool-diff-line'));
   const diffLines = select(
     '.diff-line > code[data-code-path]:not([data-syntax-done]), '
     + '.tool-diff-line > code[data-code-path]:not([data-syntax-done])');
-  const nodes = [...new Set([...blocks, ...tools, ...diffLines])];
+  const nodes = [...new Set([...blocks, ...summaries, ...tools, ...diffLines])];
   if (!nodes.length) return;
   if (!window.sesmanHighlight) { ensureSyntax(); return; }
   for (const code of nodes) {
     code.dataset.syntaxDone = '1';
-    const result = code.matches('pre.tool-out') && window.sesmanHighlightSegments
-      ? window.sesmanHighlightSegments(code.textContent, code.dataset.codePath || '')
-      : window.sesmanHighlight(code.textContent, code.dataset.codeLang || '', code.dataset.codePath || '');
+    const result = code.matches('code.tool-command') && window.sesmanHighlightShellCommand
+      ? window.sesmanHighlightShellCommand(code.textContent)
+      : (code.matches('pre.tool-out') && window.sesmanHighlightSegments
+          ? window.sesmanHighlightSegments(code.textContent, code.dataset.codePath || '')
+          : window.sesmanHighlight(code.textContent, code.dataset.codeLang || '', code.dataset.codePath || ''));
     if (!result?.html) continue;
     code.innerHTML = result.html;
     code.classList.add('hljs');

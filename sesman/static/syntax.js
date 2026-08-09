@@ -49,6 +49,38 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>]/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[char]));
 }
 
+function shellCommandHighlight(source) {
+  const tokens = String(source || '').match(/\s+|&&|\|\||>>?|<<?|[|;()]|"(?:\\.|[^"\\])*"|'[^']*'|[^\s|;&()<>]+/g) || [];
+  let expectCommand = true;
+  let first = true;
+  const mark = (name, value) => `<span class="hljs-${name}">${escapeHtml(value)}</span>`;
+  const html = tokens.map(token => {
+    if (/^\s+$/.test(token)) return escapeHtml(token);
+    if (first && /^(?:\$|#|❯)$/.test(token)) {
+      first = false;
+      return mark('meta', token);
+    }
+    first = false;
+    if (/^(?:&&|\|\||>>?|<<?|[|;()])$/.test(token)) {
+      expectCommand = !/^[()]$/.test(token);
+      return mark('keyword', token);
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) && expectCommand) return mark('variable', token);
+    if (expectCommand && !token.startsWith('-')) {
+      expectCommand = false;
+      return mark('title', token);
+    }
+    if (/^-{1,2}[A-Za-z0-9]/.test(token)) return mark('attr', token);
+    if (/^(?:"[\s\S]*"|'[\s\S]*')$/.test(token)) return mark('string', token);
+    if (/\$[{A-Za-z_]/.test(token)) return mark('variable', token);
+    if (/(?:^|\/)\.?[\w@+-]+\.[A-Za-z0-9]+$/.test(token) || token.includes('/')) {
+      return mark('string', token);
+    }
+    return escapeHtml(token);
+  }).join('');
+  return {html, language: 'bash', detected: false};
+}
+
 function lineStartLanguage(line) {
   const text = line.trimStart();
   if (/^(?:\$|❯)\s+\S/.test(text)
@@ -185,5 +217,6 @@ function highlightSegments(source, rawPath = '') {
 window.sesmanLanguageForPath = languageForPath;
 window.sesmanHighlight = highlight;
 window.sesmanHighlightSegments = highlightSegments;
+window.sesmanHighlightShellCommand = shellCommandHighlight;
 
 dispatchEvent(new Event('sesman-highlight-ready'));

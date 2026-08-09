@@ -94,7 +94,8 @@ def make_fake_session():
         {"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "thinking", "thinking": "自测思考内容"},
             {"type": "text", "text": long_text},
-            {"type": "tool_use", "id": "bash-1", "name": "Bash", "input": {"command": "echo hi"}},
+            {"type": "tool_use", "id": "bash-1", "name": "Bash",
+             "input": {"command": "echo hi && node --check app.js"}},
             {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/tmp/a.py"}},
             {"type": "tool_use", "id": "bash-2", "name": "Bash", "input": {"command": "echo hi2"}}]},
          "uuid": "a1", "timestamp": "2026-08-06T12:00:05.000Z", "cwd": "/tmp/sesman-selftest",
@@ -990,6 +991,13 @@ def run(pw):
               len(outline) >= 3 and outline[0].startswith("1. $ echo hi")
               and outline[1].startswith("2. 读 /tmp/a.py")
               and outline[2].startswith("3. $ echo hi2"), outline)
+        first_command = grp.locator("> .fold-preview .group-outline .tool-command").first
+        p.wait_for_function("document.querySelector('.group-outline .tool-command.hljs .hljs-title')",
+                            timeout=15000)
+        check("折叠工具组里的命令摘要使用 Shell 语义高亮",
+              first_command.locator(".hljs-title").count() >= 2
+              and first_command.locator(".hljs-keyword").count() >= 1
+              and first_command.locator(".hljs-attr").count() >= 1)
         check("组默认折叠", not grp.locator("> .tool-entry").first.is_visible())
         grp.hover()
         folded_hover = grp.evaluate("""n => {
