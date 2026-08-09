@@ -210,6 +210,22 @@
     <div class="modal-actions"><button type="submit" class="btn go">完成</button></div>
   </form>
 </dialog>
+<dialog id="file-diff-dialog" class="app-dialog diff-dialog" aria-labelledby="file-diff-title">
+  <div class="diff-shell">
+    <div class="modal-head diff-head">
+      <div>
+        <h2 id="file-diff-title">文件修改</h2>
+        <p id="file-diff-note"></p>
+      </div>
+      <button type="button" class="modal-close" title="关闭" aria-label="关闭">×</button>
+    </div>
+    <div class="diff-toolbar" role="group" aria-label="Diff 显示方式">
+      <button type="button" class="on" data-diff-view="unified">统一</button>
+      <button type="button" data-diff-view="split">并排</button>
+    </div>
+    <div id="file-diff-body"></div>
+  </div>
+</dialog>
 <!-- 列表是首屏核心，必须先执行；终端和公式库较大，延后加载且不能阻塞扫描。 -->
 <script defer src="app.js"></script>
 <script defer src="vendor/xterm.js"></script>

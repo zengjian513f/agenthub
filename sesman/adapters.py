@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import re
@@ -174,6 +175,118 @@ def _question_message(name: str, value) -> dict | None:
             "questions": questions}
 
 
+def _quoted_apply_patch(text: str) -> str | None:
+    """从 Codex 的 exec 包装代码里取出传给 apply_patch 的字符串。"""
+    if not isinstance(text, str):
+        return None
+    if text.lstrip().startswith("*** Begin Patch"):
+        return text[text.index("*** Begin Patch"):]
+    # functions.exec 把自由格式补丁写成 JS 字符串；逐个解码字符串字面量比
+    # 猜测变量名可靠，也不会把后面的 JS 包装代码混进补丁。
+    for match in re.finditer(r'"(?:\\.|[^"\\])*"', text, re.S):
+        try:
+            value = json.loads(match.group())
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, str) and value.lstrip().startswith("*** Begin Patch"):
+            return value[value.index("*** Begin Patch"):]
+    return None
+
+
+def _apply_patch_changes(patch: str) -> list[dict]:
+    """把 apply_patch 协议拆成可独立打开的文件 diff。"""
+    rows = patch.splitlines()
+    changes, current = [], None
+    header = re.compile(r"^\*\*\* (Add|Update|Delete) File: (.+)$")
+
+    def finish():
+        nonlocal current
+        if not current:
+            return
+        body = current.pop("_body")
+        current["patch"] = "\n".join(body)
+        current["added"] = sum(1 for line in body
+                               if line.startswith("+") and not line.startswith("+++"))
+        current["removed"] = sum(1 for line in body
+                                 if line.startswith("-") and not line.startswith("---"))
+        changes.append(current)
+        current = None
+
+    for line in rows:
+        match = header.match(line)
+        if match:
+            finish()
+            action, path = match.groups()
+            current = {
+                "path": path.strip(), "operation": action.lower(), "_body": [],
+                # Update 只保存 hunk；Add/Delete 的已知一侧则是完整文件。
+                "before_complete": action == "Delete",
+                "after_complete": action == "Add",
+                "before_available": action != "Add",
+                "after_available": action != "Delete",
+            }
+            continue
+        if not current or line in ("*** Begin Patch", "*** End Patch"):
+            continue
+        if line.startswith("*** Move to: "):
+            current["new_path"] = line.removeprefix("*** Move to: ").strip()
+            continue
+        current["_body"].append(line)
+    finish()
+    return changes
+
+
+def _edit_change(path: str, old, new, operation: str = "edit") -> dict:
+    old, new = str(old or ""), str(new or "")
+    rows = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(), fromfile=path, tofile=path,
+        lineterm="", n=3,
+    ))
+    return {
+        "path": path or "(未知文件)", "operation": operation,
+        "patch": "\n".join(rows),
+        "added": sum(1 for line in rows if line.startswith("+") and not line.startswith("+++")),
+        "removed": sum(1 for line in rows if line.startswith("-") and not line.startswith("---")),
+        "before_available": True, "after_available": True,
+        "before_complete": False, "after_complete": False,
+    }
+
+
+def _tool_file_changes(name: str, value) -> list[dict]:
+    """识别各 CLI 的结构化文件修改；无法证明的 shell 修改不做推断。"""
+    data = _json_value(value)
+    key = str(name or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1]
+    patch = None
+    if isinstance(data, dict):
+        for field in ("patch", "input"):
+            patch = _quoted_apply_patch(data.get(field))
+            if patch:
+                break
+    elif isinstance(data, str):
+        patch = _quoted_apply_patch(data)
+    if patch:
+        return _apply_patch_changes(patch)
+
+    if not isinstance(data, dict):
+        return []
+    path = str(data.get("file_path") or data.get("path") or "")
+    if key in ("edit", "str_replace") and path and "old_string" in data and "new_string" in data:
+        return [_edit_change(path, data["old_string"], data["new_string"])]
+    if key in ("multiedit", "multi_edit") and path:
+        return [_edit_change(path, row.get("old_string"), row.get("new_string"))
+                for row in data.get("edits") or [] if isinstance(row, dict)]
+    if key in ("write", "write_file") and path and "content" in data:
+        content = str(data.get("content") or "")
+        return [{
+            "path": path, "operation": "write",
+            "patch": "\n".join("+" + line for line in content.splitlines()),
+            "added": len(content.splitlines()), "removed": 0,
+            "before_available": False, "after_available": True,
+            "before_complete": False, "after_complete": True,
+        }]
+    return []
+
+
 # 各家 CLI 都会把项目说明 / 环境信息伪装成 user 消息注入, 这些不能当标题
 _INJECTED = re.compile(
     r"AGENTS\.md instructions|<INSTRUCTIONS>|<user_info>|<environment_context>|"
@@ -220,14 +333,16 @@ def _flatten_content(content) -> list[dict]:
             parts.append({"kind": "thinking", "text": it.get("thinking", "")})
         elif t == "tool_use":
             name = it.get("name", "tool")
-            question = _question_message(name, it.get("input", {}))
+            tool_input = it.get("input", {})
+            question = _question_message(name, tool_input)
             if question:
                 parts.append({"kind": "question", "name": name,
                               "call_id": it.get("id"), **question})
             else:
                 parts.append({
                     "kind": "tool", "name": name, "call_id": it.get("id"),
-                    "text": json.dumps(it.get("input", {}), ensure_ascii=False, indent=2),
+                    "text": json.dumps(tool_input, ensure_ascii=False, indent=2),
+                    "changes": _tool_file_changes(name, tool_input),
                 })
         elif t == "tool_result":
             nested = _flatten_content(it.get("content"))
@@ -396,7 +511,8 @@ class ClaudeAdapter:
                         msgs.append(_msg("thinking", p["text"], ts, name=tag))
                     elif p["kind"] == "tool":
                         calls[p.get("call_id")] = p["name"]
-                        msgs.append(_msg("tool", p["text"], ts, name=p["name"]))
+                        msgs.append(_msg("tool", p["text"], ts, name=p["name"],
+                                         changes=p.get("changes") or None))
                     elif p["kind"] == "question":
                         calls[p.get("call_id")] = p["name"]
                         msgs.append(_msg("question", p["text"], ts,
@@ -643,7 +759,8 @@ class CodexAdapter:
                                      questions=question["questions"]))
                     msgs.append(_status("waiting", ts, turn_id=p.get("turn_id")))
                 else:
-                    msgs.append(_msg("tool", _pretty_json(body), ts, name=name))
+                    msgs.append(_msg("tool", _pretty_json(body), ts, name=name,
+                                     changes=_tool_file_changes(name, body) or None))
             elif k in ("function_call_output", "custom_tool_call_output", "local_shell_call_output"):
                 name = calls.get(p.get("call_id"))
                 is_answer = _is_question_tool(name)
@@ -764,7 +881,8 @@ class GrokAdapter:
                                          questions=question["questions"]))
                         msgs.append(_status("waiting"))
                     else:
-                        msgs.append(_msg("tool", _pretty_json(args), name=name))
+                        msgs.append(_msg("tool", _pretty_json(args), name=name,
+                                         changes=_tool_file_changes(name, args) or None))
         return msgs, end
 
 

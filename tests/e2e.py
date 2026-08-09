@@ -105,6 +105,17 @@ def make_fake_session():
          "uuid": "u4", "timestamp": "2026-08-06T12:00:08.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
         {"type": "assistant", "message": {"role": "assistant", "content": [{
+            "type": "tool_use", "id": "edit-1", "name": "Edit", "input": {
+                "file_path": "/tmp/sesman-selftest/demo.py",
+                "old_string": "def value():\n    return 1",
+                "new_string": "def value():\n    return 2",
+            }}]}, "uuid": "edit-a", "timestamp": "2026-08-06T12:00:08.200Z",
+         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "user", "message": {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "edit-1", "content": "文件修改成功"}]},
+         "uuid": "edit-u", "timestamp": "2026-08-06T12:00:08.300Z",
+         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{
             "type": "tool_use", "id": "ask-1", "name": "AskUserQuestion", "input": {"questions": [{
                 "header": "启动方式", "question": "要使用哪种启动方式？", "multiSelect": False,
                 "options": [
@@ -754,6 +765,30 @@ def run(pw):
         grp.locator("> .disclosure").click()
         p.wait_for_timeout(150)
         check("组可再折叠", not grp.locator("> .tool-entry").first.is_visible())
+
+    # ---- 8c. 文件修改卡片与 diff 视图 ----
+    change = p.locator(".file-change-card").first
+    check("文件修改不埋在折叠工具组里", change.is_visible())
+    check("修改卡显示路径和增删统计",
+          "demo.py" in change.inner_text() and "+1" in change.inner_text() and "−1" in change.inner_text(),
+          change.inner_text())
+    check("时间线直接显示修改 snippet",
+          "return 1" in change.inner_text() and "return 2" in change.inner_text())
+    change.click()
+    p.wait_for_selector("#file-diff-dialog[open]")
+    check("点击修改卡打开 diff 视图",
+          "demo.py" in p.locator("#file-diff-title").inner_text())
+    check("统一 diff 区分新增和删除",
+          "return 1" in p.locator("#file-diff-body .diff-line.del").inner_text()
+          and "return 2" in p.locator("#file-diff-body .diff-line.add").inner_text())
+    p.click('[data-diff-view="split"]')
+    split = p.locator("#file-diff-body .diff-split > section")
+    check("diff 可以切换为修改前后并排", split.count() == 2
+          and "return 1" in split.nth(0).inner_text()
+          and "return 2" in split.nth(1).inner_text())
+    check("片段不会伪装成完整文件", "片段" in p.locator("#file-diff-note").inner_text())
+    p.click("#file-diff-dialog .modal-close")
+    check("diff 视图可以关闭", not p.locator("#file-diff-dialog").is_visible())
 
     # ---- 9. 展开全文 ----
     more = p.locator(".msg .more:visible").filter(has_text="展开全文").first

@@ -1257,7 +1257,9 @@ function planMessages(msgs) {
     run = [];
   };
   for (const m of msgs) {
-    if (TOOL_ROLES.has(m.role)) { run.push(m); continue; }
+    // 文件修改本身是用户关心的工作记录，始终作为可见卡片留在时间线；
+    // 普通工具协议继续按原规则合并折叠。
+    if (TOOL_ROLES.has(m.role) && !m.changes?.length) { run.push(m); continue; }
     flush();
     plan.push({ m });
   }
@@ -1317,6 +1319,103 @@ function toolEntry(m) {
     entry.appendChild(more);
   }
   return entry;
+}
+
+const CHANGE_LABEL = {
+  add: '新建', update: '修改', delete: '删除', edit: '修改', write: '写入',
+};
+
+function diffKind(line) {
+  if (/^(---|\+\+\+|@@|\*\*\*)/.test(line)) return 'meta';
+  if (line.startsWith('+')) return 'add';
+  if (line.startsWith('-')) return 'del';
+  return 'ctx';
+}
+
+function diffRows(lines) {
+  return lines.map(line => `<div class="diff-line ${diffKind(line)}"><i>${esc(line[0] || ' ')}</i><code>${esc(line)}</code></div>`).join('');
+}
+
+function diffSides(change) {
+  const before = [], after = [];
+  for (const line of String(change.patch || '').split('\n')) {
+    if (/^(---|\+\+\+|\*\*\*)/.test(line)) continue;
+    if (line.startsWith('@@')) {
+      before.push({ text: line, kind: 'meta' });
+      after.push({ text: line, kind: 'meta' });
+    } else if (line.startsWith('+')) {
+      after.push({ text: line.slice(1), kind: 'add' });
+    } else if (line.startsWith('-')) {
+      before.push({ text: line.slice(1), kind: 'del' });
+    } else {
+      const text = line.startsWith(' ') ? line.slice(1) : line;
+      before.push({ text, kind: 'ctx' });
+      after.push({ text, kind: 'ctx' });
+    }
+  }
+  return { before, after };
+}
+
+function sideRows(rows, unavailable) {
+  if (unavailable) return '<div class="diff-unavailable">原内容没有记录，无法可靠还原</div>';
+  return rows.map(row => `<div class="diff-line ${row.kind}"><code>${esc(row.text)}</code></div>`).join('')
+    || '<div class="diff-empty">（空文件）</div>';
+}
+
+let activeFileChange = null;
+let activeDiffView = 'unified';
+
+function paintFileDiff() {
+  const change = activeFileChange;
+  if (!change) return;
+  const body = $('#file-diff-body');
+  for (const button of document.querySelectorAll('[data-diff-view]')) {
+    button.classList.toggle('on', button.dataset.diffView === activeDiffView);
+  }
+  if (activeDiffView === 'unified') {
+    body.innerHTML = `<div class="diff-unified">${diffRows(String(change.patch || '').split('\n'))}</div>`;
+    return;
+  }
+  const sides = diffSides(change);
+  body.innerHTML = `<div class="diff-split">
+    <section><b>修改前${change.before_complete ? '（完整）' : '（片段）'}</b>
+      <div>${sideRows(sides.before, !change.before_available)}</div></section>
+    <section><b>修改后${change.after_complete ? '（完整）' : '（片段）'}</b>
+      <div>${sideRows(sides.after, !change.after_available)}</div></section>
+  </div>`;
+}
+
+function openFileDiff(change) {
+  activeFileChange = change;
+  activeDiffView = 'unified';
+  $('#file-diff-title').textContent = change.new_path
+    ? `${change.path} → ${change.new_path}` : change.path;
+  const scope = change.before_complete || change.after_complete ? '包含可确定的完整文件内容' : '会话只记录了修改片段';
+  $('#file-diff-note').textContent = `${CHANGE_LABEL[change.operation] || '修改'} · ${scope}`;
+  paintFileDiff();
+  $('#file-diff-dialog').showModal();
+}
+
+function fileChangeNode(m) {
+  const n = el('div', 'msg file-change-msg');
+  n.dataset.role = 'tool';
+  if (m.counted === false) n.dataset.counted = 'false';
+  const body = el('div', 'file-change-list');
+  for (const change of m.changes) {
+    const button = el('button', 'file-change-card');
+    button.type = 'button';
+    const path = change.new_path ? `${change.path} → ${change.new_path}` : change.path;
+    const preview = String(change.patch || '').split('\n')
+      .filter(line => !/^(---|\+\+\+|\*\*\*)/.test(line)).slice(0, 7);
+    button.innerHTML = `<span class="file-change-head"><b>${esc(path)}</b>
+      <span><em>${esc(CHANGE_LABEL[change.operation] || '修改')}</em>
+      <i class="add">+${change.added || 0}</i><i class="del">−${change.removed || 0}</i></span></span>
+      <span class="file-change-preview">${diffRows(preview)}</span>`;
+    button.onclick = () => openFileDiff(change);
+    body.appendChild(button);
+  }
+  n.appendChild(body);
+  return n;
 }
 
 function groupNode(items) {
@@ -1392,6 +1491,7 @@ function refreshFormulae() {
 }
 
 function msgNode(m) {
+  if (m.changes?.length) return fileChangeNode(m);
   if (m.role === 'question') return questionNode(m);
   // 命中的消息展开且不截断, 保证高亮可见; 但设上限, 否则搜 "a" 会把整个会话全量展开
   const found = SEARCH_ROLES.has(m.role) && hasTerm(m.text);
@@ -1790,6 +1890,16 @@ $('#settings').onclick = openSettings;
 $('#settings-dialog').addEventListener('click', e => {
   if (e.target === $('#settings-dialog')) $('#settings-dialog').close();
 });
+$('#file-diff-dialog .modal-close').onclick = () => $('#file-diff-dialog').close();
+$('#file-diff-dialog').addEventListener('click', e => {
+  if (e.target === $('#file-diff-dialog')) $('#file-diff-dialog').close();
+});
+$('#file-diff-dialog .diff-toolbar').onclick = e => {
+  const button = e.target.closest('[data-diff-view]');
+  if (!button) return;
+  activeDiffView = button.dataset.diffView;
+  paintFileDiff();
+};
 $('#setting-font').onchange = e => applyFont(e.target.value, true);
 $('#setting-theme').onchange = e => applyTheme(e.target.value, true);
 $('#setting-cache').onchange = e => {

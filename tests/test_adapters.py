@@ -121,5 +121,49 @@ class CodexEventTests(unittest.TestCase):
                 self.assertEqual([m["text"] for m in incremental], ["仅增量"])
 
 
+class FileChangeTests(unittest.TestCase):
+    def test_apply_patch_wrapper_recovers_per_file_diffs(self):
+        patch_text = """*** Begin Patch
+*** Update File: src/a.py
+@@
+ keep
+-old
++new
+*** Add File: src/b.py
++one
++two
+*** Delete File: src/c.py
+-gone
+*** End Patch"""
+        wrapped = "const patch = " + json.dumps(patch_text) + ";\ntext(await tools.apply_patch(patch));"
+        changes = adapters._tool_file_changes("exec", wrapped)
+
+        self.assertEqual([x["path"] for x in changes],
+                         ["src/a.py", "src/b.py", "src/c.py"])
+        self.assertEqual((changes[0]["added"], changes[0]["removed"]), (1, 1))
+        self.assertFalse(changes[0]["before_complete"])
+        self.assertFalse(changes[0]["after_complete"])
+        self.assertFalse(changes[1]["before_available"])
+        self.assertTrue(changes[1]["after_complete"])
+        self.assertTrue(changes[2]["before_complete"])
+        self.assertFalse(changes[2]["after_available"])
+
+    def test_claude_edit_and_write_expose_only_known_sides(self):
+        edit = adapters._tool_file_changes("Edit", {
+            "file_path": "demo.py", "old_string": "return 1", "new_string": "return 2",
+        })[0]
+        self.assertIn("-return 1", edit["patch"])
+        self.assertIn("+return 2", edit["patch"])
+        self.assertTrue(edit["before_available"])
+        self.assertTrue(edit["after_available"])
+
+        write = adapters._tool_file_changes("Write", {
+            "file_path": "new.py", "content": "one\ntwo\n",
+        })[0]
+        self.assertFalse(write["before_available"])
+        self.assertTrue(write["after_complete"])
+        self.assertEqual((write["added"], write["removed"]), (2, 0))
+
+
 if __name__ == "__main__":
     unittest.main()
