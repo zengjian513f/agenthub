@@ -229,6 +229,7 @@ sesman/
   index.py      索引缓存、增量读取、全文搜索与删除
   media.py      内嵌/本地图片的校验、限额注册与安全读取
   pending.py    新会话首次落盘前的持久化元数据
+  send_queue.py Codex 网页输入的服务端持久队列与原生记录确认
   session_meta.py  星标等 sesman 自有会话元数据
   server.py     ThreadingHTTPServer 路由与 IP 白名单
   static/       前端 (原生 JS, 无构建步骤；vendor/ 含 KaTeX 与 xterm.js)
@@ -245,6 +246,8 @@ sesman/
 - `POST /api/term/create` / `GET /api/term/new-status?name=` — 创建并关联新 CLI 会话（需 `--terminal`）
 - `POST /api/session/attachment?uid=&name=&id=` — 上传附件到会话 cwd 的受控批次子目录；首个文件省略 `id`，后续文件复用响应中的 `attachment_id`
 - `POST /api/session/star` — 设置会话星标（JSON：`{"uid":"…","starred":true}`）
+- `POST /api/session/send` — 把已有 Codex 会话的网页输入加入服务端持久队列
+- `POST /api/session/outbox/retry` / `POST /api/session/outbox/discard` — 重试或移除未确认的 Codex 输入
 - `POST /api/session/stop` — 从内层 CLI 开始停止运行实例，保留对话记录
 - `DELETE /api/session/<uid>` — 移入回收站
 
@@ -253,6 +256,13 @@ sesman/
 消失；记录保存类型、启动目录、会话 ID、tmux 名和终端尺寸。临时会话也有空对话页、
 输入框和附件入口，手机端可以切换终端/对话，并用关机按钮按 tmux 名直接停止。正式会话
 关联后自动退出临时列表，尚未发送的正文、引用和附件草稿会迁移到正式 uid，不会消失。
+
+Codex 忙时不会把尚未轮到的输入写进 rollout，tmux 接受粘贴也不能证明 Codex
+已经接收。因此已有 Codex 会话的网页输入先持久化到权限为 `0600` 的
+`~/.local/share/sesman/send-queue.json`；观察到原生回合结束且终端画面稳定后才交付，
+服务端会独立续读 rollout，浏览器锁屏或断开也不影响队列推进；最终以其中出现对应的
+`user` 记录确认。超时未确认的消息会保留在时间线，供用户
+重试或移除。Claude 继续使用其原生 `queue-operation enqueue/remove` 对账，不经过这条队列。
 
 ## 开机自启（可选）
 

@@ -17,7 +17,7 @@ const store = {
 };
 
 // 存储结构的版本只由公共层调度；每种 CLI 自己决定怎样迁移旧队列。
-const QUEUED_MESSAGES_VERSION = 3;
+const QUEUED_MESSAGES_VERSION = 4;
 function loadQueuedMessages() {
   const saved = store.get('queuedMessages', []);
   const valid = Array.isArray(saved) ? saved : [];
@@ -204,7 +204,11 @@ function saveQueuedMessages() {
     if (!Array.isArray(items) || !items.length) S.queued.delete(uid);
   }
   // 极长 prompt 可能超过浏览器的 localStorage 配额；不能让持久化失败反过来阻止发送。
-  try { store.set('queuedMessages', [...S.queued]); } catch { /* 本页内存回显仍然有效 */ }
+  const localOnly = [...S.queued].flatMap(([uid, items]) => {
+    const kept = items.filter(item => !item?.server);
+    return kept.length ? [[uid, kept]] : [];
+  });
+  try { store.set('queuedMessages', localOnly); } catch { /* 本页内存回显仍然有效 */ }
 }
 
 function queuedMessages(uid) {
@@ -263,6 +267,31 @@ function discardAllQueuedUserMessages(uid) {
   if (S.sel === uid && !S.agent) renderConversationTail(
     cache.get(viewKey(uid))?.activity, uid);
   return true;
+}
+
+function syncServerOutbox(uid, items) {
+  if (sesmanCli(uid)?.source !== 'codex' || !Array.isArray(items)) return false;
+  const next = items.map(item => ({ ...item, server: true }));
+  const before = JSON.stringify(queuedMessages(uid));
+  if (next.length) S.queued.set(uid, next); else S.queued.delete(uid);
+  const changed = before !== JSON.stringify(next);
+  if (changed && S.sel === uid && !S.agent) {
+    renderConversationTail(cache.get(viewKey(uid))?.activity, uid);
+  }
+  return changed;
+}
+
+async function retryServerQueuedMessage(uid, id) {
+  const activity = cache.get(viewKey(uid))?.activity || null;
+  const d = await post('api/session/outbox/retry', { uid, id, activity });
+  if (d.error) return alert('重试失败: ' + d.error);
+  syncServerOutbox(uid, d.outbox || []);
+}
+
+async function discardServerQueuedMessage(uid, id) {
+  const d = await post('api/session/outbox/discard', { uid, id });
+  if (d.error) return alert('移除失败: ' + d.error);
+  syncServerOutbox(uid, d.outbox || []);
 }
 
 function reconcileQueuedMessages(uid, messages) {
@@ -426,6 +455,8 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   const key = viewKey(uid, agent);
   const e = cache.get(key);
   if (!e) return 0;
+  if (!agent && Array.isArray(data.outbox)) syncServerOutbox(uid, data.outbox);
+  if (data.outbox_only) return 0;
   if (!agent) reconcileQueuedMessages(uid, data.messages);
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
     cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
@@ -1279,6 +1310,7 @@ async function openSession(uid, agent = null) {
   }
   if (S.sel !== uid || S.agent !== selectedAgent) return; // 期间切了别的视图
   const { data, bytes } = res;
+  if (!selectedAgent && Array.isArray(data.outbox)) syncServerOutbox(uid, data.outbox);
   cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
                   end: data.end, anchor: data.anchor, activity: data.activity, bytes,
                   total: data.message_total, partial: data.partial || null });
@@ -2292,8 +2324,21 @@ function renderQueuedMessages(uid = S.sel) {
     const cli = sesmanCli(uid);
     const node = msgNode({role: 'user', text: item.text, media: item.media, counted: false});
     node.classList.add('client-pending');
+    node.classList.toggle('failed', item.state === 'failed');
     node.dataset.queuedId = item.id;
     node.appendChild(el('small', 'client-pending-state', cli?.queuedMessageLabel(item) || '排队中'));
+    if (item.state === 'failed' && item.server) {
+      const actions = el('span', 'client-pending-actions');
+      const retry = el('button', '', '重试');
+      retry.type = 'button';
+      retry.onclick = () => retryServerQueuedMessage(uid, item.id);
+      const discard = el('button', '', '移除');
+      discard.type = 'button';
+      discard.onclick = () => discardServerQueuedMessage(uid, item.id);
+      actions.append(retry, discard);
+      node.appendChild(actions);
+      if (item.error) node.title = item.error;
+    }
     box.appendChild(node);
   }
 }

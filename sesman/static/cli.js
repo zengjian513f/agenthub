@@ -109,9 +109,15 @@ class CodexCli extends SesmanCli {
   }
 
   migrateQueuedMessages(items, fromVersion, _toVersion) {
-    // 旧版没有记录 Esc 取消，Codex 又没有持久化的 queue remove 事件；
-    // 这些 UI 副本已无法判定真伪，只在 v1 -> v2 时清理一次。
-    return fromVersion < 2 ? [] : super.migrateQueuedMessages(items);
+    // v4 起 Codex 队列归服务端管理。浏览器旧副本没有交付凭据，全部丢弃；
+    // 真实待发送项会随 /api/messages 或 SSE 重新同步回来。
+    return fromVersion < 4 ? [] : super.migrateQueuedMessages(items);
+  }
+
+  queuedMessageLabel(item) {
+    if (item?.state === 'delivering') return '发送中';
+    if (item?.state === 'failed') return '发送未确认';
+    return '排队中';
   }
 
   clearsQueuedMessages(keys) {

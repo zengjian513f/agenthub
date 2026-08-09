@@ -270,8 +270,8 @@ def run(pw):
         SESMAN_CLIS.claude.createQueuedMessage({created:1000}), 9001, true),
       claudeMigration:SESMAN_CLIS.claude.migrateQueuedMessages(
         [{id:'old', created:1000}], 2, 3),
-      migrations:[SESMAN_CLIS.codex.migrateQueuedMessages([1], 2, 3),
-        SESMAN_CLIS.grok.migrateQueuedMessages([1], 2, 3)],
+      migrations:[SESMAN_CLIS.codex.migrateQueuedMessages([1], 3, 4),
+        SESMAN_CLIS.grok.migrateQueuedMessages([1], 3, 4)],
       escape:[SESMAN_CLIS.claude.clearsQueuedMessages(['Escape']),
         SESMAN_CLIS.codex.clearsQueuedMessages(['Escape']),
         SESMAN_CLIS.grok.clearsQueuedMessages(['Escape'])],
@@ -290,9 +290,44 @@ def run(pw):
           and cli_layers["claudeMigration"] == [{"id": "old", "created": 1000,
                                                   "state": "sending", "expiresAt": 9000,
                                                   "legacy": True}]
-          and cli_layers["migrations"] == [[1], [1]]
+          and cli_layers["migrations"] == [[], [1]]
           and cli_layers["escape"] == [True, True, False]
           and cli_layers["rewind"] == [True, False, False], cli_layers)
+    codex_delivery = p.evaluate("""async () => {
+      const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
+      if (!session) return {error:'no codex session'};
+      const uid = session.uid, key = viewKey(uid), name = `sesman-codex-${session.sid.slice(0, 8)}`;
+      const oldPost = post, oldList = T.list, oldEntry = cache.get(key);
+      const oldQueued = S.queued.get(uid);
+      let request = null;
+      T.list = [...(T.list || []), {uid, name}];
+      cache.set(key, {activity:{state:'working', ts:'2026-08-09T10:00:00Z'}, msgs:[],
+        end:123, version:{head:'head-token'}, anchor:'anchor-token'});
+      post = async (url, body) => {
+        request = {url, body};
+        return {ok:true, outbox:[{id:'server-1', uid, text:body.text,
+          created:1000, state:'queued', server:true}]};
+      };
+      try { await sendToSession('由服务端托管的 Codex 消息', null, uid); }
+      finally {
+        post = oldPost; T.list = oldList;
+        if (oldEntry) cache.set(key, oldEntry); else cache.delete(key);
+      }
+      const shown = queuedMessages(uid)[0];
+      const persisted = store.get('queuedMessages', []).flatMap(x => x[1] || [])
+        .some(x => x.text === '由服务端托管的 Codex 消息');
+      if (oldQueued) S.queued.set(uid, oldQueued); else S.queued.delete(uid);
+      return {url:request?.url, uid:request?.body?.uid,
+        activity:request?.body?.activity?.state, shown:shown?.state,
+        cursor:request?.body?.cursor, server:shown?.server, persisted};
+    }""")
+    check("Codex 网页消息先进入服务端队列且不再写浏览器乐观队列",
+          codex_delivery == {"url": "api/session/send", "uid": codex_delivery.get("uid"),
+                             "activity": "working", "shown": "queued",
+                             "cursor": {"start": 123, "head": "head-token",
+                                        "anchor": "anchor-token"},
+                             "server": True, "persisted": False}
+          and str(codex_delivery.get("uid", "")).startswith("codex:"), codex_delivery)
     script_order = p.locator("script[src]").evaluate_all(
         "nodes => nodes.map(n => n.getAttribute('src'))")
     check("会话列表脚本不再被大型终端和公式库阻塞",

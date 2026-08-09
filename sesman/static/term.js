@@ -1170,11 +1170,26 @@ function syncComposerMode() {
 async function sendToSession(text, keys, uid = S.sel, media = []) {
   const name = takenOver(uid);
   if (!name) return false;
-  const queuedId = text && typeof queuePendingUserMessage === 'function'
+  const cli = sesmanCli(uid);
+  const serverQueued = !!text && cli?.source === 'codex' && !uid.startsWith('tmux:');
+  const queuedId = text && !serverQueued && typeof queuePendingUserMessage === 'function'
     ? queuePendingUserMessage(uid, text, media) : null;
   let d;
   try {
-    d = await post('api/term/send', keys ? { name, keys } : { name, text });
+    if (serverQueued) {
+      const entry = cache.get(viewKey(uid));
+      const activity = entry?.activity || null;
+      const requestId = globalThis.crypto?.randomUUID?.()
+        || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      d = await post('api/session/send', {
+        uid, name, text, media, activity, request_id: requestId,
+        cursor: entry ? {
+          start: entry.end, head: entry.version?.head, anchor: entry.anchor,
+        } : null,
+      });
+    } else {
+      d = await post('api/term/send', keys ? { name, keys, uid } : { name, text });
+    }
   } catch (e) {
     if (queuedId) discardQueuedUserMessage(uid, queuedId);
     alert('发送失败: ' + (e.message || e));
@@ -1184,6 +1199,9 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
     if (queuedId) discardQueuedUserMessage(uid, queuedId);
     alert('发送失败: ' + d.error);
     return false;
+  }
+  if (serverQueued && typeof syncServerOutbox === 'function') {
+    syncServerOutbox(uid, d.outbox || []);
   }
   // Esc 会让 CLI 丢弃当前 TUI 内存中的排队输入；那些输入未必曾写入
   // transcript，因此不能等待后续“同文消息”来消重。

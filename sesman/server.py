@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import index, live, media, pending as pending_store, session_meta, term, wsock
+from . import (index, live, media, pending as pending_store, send_queue,
+               session_meta, term, wsock)
 
 STATIC = Path(__file__).parent / "static"
 ALLOWED_IPS: set[str] = set()
@@ -25,6 +26,74 @@ JSON_GZIP_LEVEL = 4     # 实测 4.5 MiB → 1.20 MiB / 75 ms，继续加级收�
 ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 ATTACHMENT_DIR = "sesman_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
+OUTBOX_WAKE = threading.Event()
+
+
+def _poll_outbox() -> None:
+    """即使浏览器断开，也独立从 Codex rollout 追踪完成与接收事件。"""
+    for item in send_queue.tracked():
+        uid = str(item.get("uid") or "")
+        s = index.get(uid)
+        if not s or s.get("source") != "codex":
+            continue
+        try:
+            start = int(item.get("watch_start") or 0)
+            head = str(item.get("watch_head") or "")
+            anchor = str(item.get("watch_anchor") or "")
+            if start and head and anchor:
+                result = index.messages_for(s, start=start, head=head, anchor=anchor)
+            else:
+                # 没有浏览器续读点时只在当前 EOF 建基线，不能为此整读几十 MB。
+                result = index.messages_for(s, append_only=True)
+            cursor = {
+                "start": result["end"],
+                "head": result["version"]["head"],
+                "anchor": result["anchor"],
+            }
+            send_queue.observe(uid, result["messages"], result.get("activity"),
+                               cursor=cursor)
+        except (OSError, ValueError, KeyError):
+            # 文件可能正处于切换/追加的瞬间；下一轮继续，不能把瞬态读失败
+            # 伪装成“发送失败”。
+            continue
+
+
+def _outbox_loop() -> None:
+    """只交付服务端已经判定可发送的 Codex 队首消息。"""
+    while True:
+        _poll_outbox()
+        send_queue.expire_deliveries()
+        ready = send_queue.ready()
+        if not ready:
+            OUTBOX_WAKE.wait(0.5)
+            OUTBOX_WAKE.clear()
+            continue
+        try:
+            panes = term.list_sessions()
+        except Exception:
+            OUTBOX_WAKE.wait(0.5)
+            OUTBOX_WAKE.clear()
+            continue
+        for item in ready:
+            s = index.get(str(item.get("uid") or ""))
+            pane = _pane_for_session(s, panes) if s and s.get("source") == "codex" else None
+            if not pane:
+                send_queue.mark_failed(item["id"], "Codex tmux 会话已断开")
+                continue
+            name = pane["name"]
+            try:
+                # task_complete 写盘到 TUI 真正回到输入框仍有一个很短的重绘窗口。
+                # 连续两帧终端文本一致才注入，避开本次事故中的 15ms 状态切换。
+                before = term.capture(name, 40)
+                time.sleep(0.08)
+                if before != term.capture(name, 40):
+                    send_queue.defer(item["id"])
+                    continue
+                send_queue.mark_delivering(item["id"])
+                term.leave_copy_mode(name)
+                term.submit_text(name, str(item.get("text") or ""))
+            except Exception as e:
+                send_queue.mark_failed(item["id"], str(e))
 
 
 def _sessions_signature() -> str:
@@ -143,6 +212,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._json({"error": "bad body"}, 400)
         try:
+            if u.path == "/api/session/send":
+                return self._queue_message(body)
+            if u.path == "/api/session/outbox/retry":
+                return self._retry_message(body)
+            if u.path == "/api/session/outbox/discard":
+                return self._discard_message(body)
             if u.path == "/api/term/create":
                 return self._create_session(body)
             if u.path == "/api/term/kill":
@@ -169,6 +244,8 @@ class Handler(BaseHTTPRequestHandler):
                 term.leave_copy_mode(name)       # 正在翻历史的话先回到实时画面
                 if body.get("keys"):                 # 特殊键: Enter / Escape / C-c …
                     term.send_keys(name, *body["keys"])
+                    if "Escape" in body["keys"] and body.get("uid"):
+                        send_queue.discard_uid(str(body["uid"]))
                 else:
                     text = body.get("text", "")
                     enter = body.get("enter", True)
@@ -358,6 +435,7 @@ class Handler(BaseHTTPRequestHandler):
             session_meta.discard(uid)
         except OSError:
             pass  # 会话已成功移入回收站，不能把元数据清理失败误报成删除失败
+        send_queue.discard_uid(uid)
         self._json({"ok": True, "trash": dest})
 
     def _api_get(self, path: str, q: dict):
@@ -416,6 +494,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/term/new-status":
             return self._new_session_status(q)
 
+        if path == "/api/session/outbox":
+            return self._json({"outbox": send_queue.list_for(q.get("uid", [""])[0])})
+
         if path.startswith("/api/media/"):
             token = path[len("/api/media/"):]
             got = media.get(token)
@@ -446,15 +527,20 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/messages/"):
             uid = unquote(path[len("/api/messages/"):])
+            agent = q.get("agent", [""])[0]
             result = index.messages(
                 uid,
-                agent=q.get("agent", [""])[0],
+                agent=agent,
                 start=int(q.get("start", ["0"])[0]),
                 head=q.get("head", [""])[0],
                 anchor=q.get("anchor", [""])[0],
                 append_only=q.get("append", ["0"])[0] == "1",
                 windowed=q.get("window", ["0"])[0] == "1",
             )
+            if not agent:
+                if send_queue.observe(uid, result["messages"], result.get("activity")):
+                    OUTBOX_WAKE.set()
+                result["outbox"] = send_queue.list_for(uid)
             result["meta"] = session_meta.enrich_one(result["meta"])
             return self._json(result)
 
@@ -518,20 +604,36 @@ class Handler(BaseHTTPRequestHandler):
         head = q.get("head", [""])[0]
         anchor = q.get("anchor", [""])[0]
         last = None
+        outbox_revision = -1
         beat = time.time()
         try:
             while True:
                 ver = index.version(s)
                 if ver != last:
                     last = ver
+                    previous_outbox_revision = outbox_revision
                     # 用 messages_for 而不是 messages: 后者要过一遍索引,
                     # 而文件刚变过, 签名对不上就会重建整个索引(百毫秒级)
                     d = index.messages_for(s, start=start, head=head, anchor=anchor)
-                    if d["reset"] or d["messages"] or d["activity_changed"]:
+                    if not s.get("agent_id"):
+                        if send_queue.observe(uid, d["messages"], d.get("activity")):
+                            OUTBOX_WAKE.set()
+                        d["outbox"] = send_queue.list_for(uid)
+                        outbox_revision = send_queue.revision()
+                    if (d["reset"] or d["messages"] or d["activity_changed"]
+                            or outbox_revision != previous_outbox_revision):
                         payload = json.dumps(d, ensure_ascii=False)
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
                     start, head, anchor = d["end"], d["version"]["head"], d["anchor"]
+                    beat = time.time()
+                elif not s.get("agent_id") and send_queue.revision() != outbox_revision:
+                    outbox_revision = send_queue.revision()
+                    payload = json.dumps({"outbox_only": True,
+                                          "outbox": send_queue.list_for(uid)},
+                                         ensure_ascii=False)
+                    self.wfile.write(f"data: {payload}\n\n".encode())
+                    self.wfile.flush()
                     beat = time.time()
                 elif time.time() - beat > 20:     # 心跳, 让中间的代理别掐连接
                     self.wfile.write(b": ping\n\n")
@@ -555,6 +657,39 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             return self._json({"error": str(e)}, 500)
         return self._json({"ok": True, "uid": uid, **meta})
+
+    def _queue_message(self, body: dict):
+        uid = str(body.get("uid") or "")
+        s = index.get(uid)
+        if not s or s.get("source") != "codex":
+            return self._json({"error": "服务端发送队列目前只用于已有 Codex 会话"}, 400)
+        panes = term.list_sessions()
+        pane = _pane_for_session(s, panes)
+        if not pane or pane["name"] != str(body.get("name") or ""):
+            return self._json({"error": "Codex tmux 会话未连接"}, 409)
+        item = send_queue.enqueue(
+            uid, pane["name"], str(body.get("text") or ""), body.get("media"),
+            body.get("activity"), str(body.get("request_id") or ""),
+            body.get("cursor"))
+        OUTBOX_WAKE.set()
+        return self._json({"ok": True, "item": item,
+                           "outbox": send_queue.list_for(uid)})
+
+    def _retry_message(self, body: dict):
+        uid = str(body.get("uid") or "")
+        item = send_queue.retry(str(body.get("id") or ""), body.get("activity"), uid)
+        if not item:
+            return self._json({"error": "待发送消息不存在"}, 404)
+        OUTBOX_WAKE.set()
+        return self._json({"ok": True, "outbox": send_queue.list_for(item["uid"])})
+
+    def _discard_message(self, body: dict):
+        item_id = str(body.get("id") or "")
+        uid = str(body.get("uid") or "")
+        if not send_queue.discard(item_id, uid):
+            return self._json({"error": "待发送消息不存在"}, 404)
+        return self._json({"ok": True, "uid": uid,
+                           "outbox": send_queue.list_for(uid)})
 
     def _takeover(self, body: dict):
         """接管一个会话: 在 tmux 里把它 resume 起来, 之后网页就能直接输入。
@@ -607,6 +742,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             killed = term.kill_pids(pids)
         live.snapshot(force=True)
+        send_queue.discard_uid(s["uid"])
         return self._json({"ok": True, "stopped": bool(pane or killed),
                            "tmux": bool(pane)})
 
@@ -774,6 +910,9 @@ def main():
     if TERMINAL and not term.available():
         print("[sesman] 警告: 找不到 tmux, 终端功能不可用")
         TERMINAL = False
+
+    if TERMINAL:
+        threading.Thread(target=_outbox_loop, daemon=True, name="sesman-outbox").start()
 
     ALLOWED_IPS.update({"127.0.0.1", "::1", "localhost"})
     ALLOWED_IPS.update(x.strip() for x in args.allow.split(",") if x.strip())
