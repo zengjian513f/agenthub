@@ -1950,6 +1950,15 @@ def run(pw):
               and queued.locator(".media-gallery img").get_attribute("src").endswith(
                   image_attachment_response["media"]["src"]))
         p.evaluate("""u => {
+          reconcileQueuedMessages(u, [{role:'queue_operation', operation:'remove',
+            text:'等待前一轮完成的指令', ts:new Date().toISOString()}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("Claude 从原生队列移除后撤掉乐观排队副本", queued.count() == 0)
+        p.evaluate("""({u, media}) => queuePendingUserMessage(
+          u, '等待前一轮完成的指令', [{...media, gallery:true}])""",
+                   {"u": target, "media": image_attachment_response["media"]})
+        p.evaluate("""u => {
           reconcileQueuedMessages(u, [{role:'user', text:'等待前一轮完成的指令',
             ts:new Date().toISOString()}]);
           renderConversationTail(cache.get(viewKey(u))?.activity, u);

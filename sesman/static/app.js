@@ -230,7 +230,10 @@ function reconcileQueuedMessages(uid, messages) {
   if (!items.length) return false;
   let changed = false;
   for (const message of messages || []) {
-    if (!['user', 'command'].includes(message.role)) continue;
+    const recordedUser = ['user', 'command'].includes(message.role);
+    const removedFromClaudeQueue = message.role === 'queue_operation'
+      && message.operation === 'remove';
+    if (!recordedUser && !removedFromClaudeQueue) continue;
     const at = items.findIndex(item => {
       if (item.text !== String(message.text || '')) return false;
       const recorded = Date.parse(message.ts || '');
