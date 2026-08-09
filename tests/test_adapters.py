@@ -23,7 +23,8 @@ class CodexEventTests(unittest.TestCase):
                 {"timestamp": "2026-08-09T10:00:01Z", "type": "response_item",
                  "payload": {"type": "message", "role": "user",
                              "content": [{"type": "input_text",
-                                          "text": marker + " 这个作为用户正文保留"}]}},
+                                          "text": marker + "\n" + marker
+                                                  + "\n这个作为用户正文保留"}]}},
             ]
             rollout.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
             messages, _ = adapters.CodexAdapter().read(str(rollout))
@@ -33,7 +34,7 @@ class CodexEventTests(unittest.TestCase):
         visible = [m for m in messages if m["role"] != "status"]
         self.assertEqual(len(visible), 1)
         self.assertEqual(visible[0]["role"], "user")
-        self.assertIn("这个作为用户正文保留", visible[0]["text"])
+        self.assertEqual(visible[0]["text"], "这个作为用户正文保留")
 
     def test_name_and_compaction_are_visible_but_not_counted_messages(self):
         with tempfile.TemporaryDirectory() as tmp:

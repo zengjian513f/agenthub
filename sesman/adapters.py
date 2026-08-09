@@ -415,6 +415,8 @@ _CLAUDE_INTERRUPT = re.compile(
     r"\[Request interrupted by user(?: for tool use)?\]", re.I)
 _CODEX_ABORT_MARKER = re.compile(
     r"\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
+_CODEX_ABORT_PREFIX = re.compile(
+    r"^\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
 
 
 def _is_injected(text: str) -> bool:
@@ -424,6 +426,13 @@ def _is_injected(text: str) -> bool:
 def _is_claude_interrupt(text: str) -> bool:
     """Claude 把 Esc 中断记成 user 消息，但它不是一个新回合。"""
     return bool(_CLAUDE_INTERRUPT.fullmatch(text.strip()))
+
+
+def _strip_codex_abort_prefix(text: str) -> str:
+    """Codex 会把一轮或多轮中断控制块拼到下一条真实 user 正文前。"""
+    while match := _CODEX_ABORT_PREFIX.match(text):
+        text = text[match.end():]
+    return text
 
 
 def _notification_tag(text: str, name: str) -> str:
@@ -1007,6 +1016,8 @@ class CodexAdapter:
                 # 后者已经提供结构化状态；把 XML 再画成系统气泡只会重复且吓人。
                 if native_role == "developer" and _CODEX_ABORT_MARKER.fullmatch(txt):
                     continue
+                if native_role == "user":
+                    txt = _strip_codex_abort_prefix(txt)
                 if txt.strip() or images:
                     shown = txt or "[图片]"
                     msgs.append(_msg(_user_role(role, shown), shown, ts, media_parts=images))
