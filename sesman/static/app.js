@@ -85,6 +85,7 @@ const S = {
   unread: new Map(store.get('unread', [])),   // uid → {count, tmux}; 只计代理产生的新内容
   cursors: new Map(), // 主会话/子代理 EOF 游标；用于后台会话的精确未读增量
   queued: new Map(loadQueuedMessages()),       // uid → 尚未写入原生会话记录的已发送消息
+  starBusy: new Set(), // 正在持久化星标的会话，避免多个网页请求在服务端乱序
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -834,7 +835,7 @@ function mergeSessionMetaEvent(entry, session) {
 /** 列表元数据变更后同步缓存和当前详情标题，不重绘消息正文。 */
 function refreshSessionMeta() {
   const headerKey = m => JSON.stringify([
-    m.title, m.parent_title, m.sid, m.agent_type,
+    m.title, m.parent_title, m.sid, m.agent_type, !!m.starred,
     (m.agent_items || []).map(a => [a.id, a.title, a.type]),
   ]);
   const before = cache.get(viewKey(S.sel, S.agent));
@@ -947,6 +948,80 @@ function visible() {
 }
 
 // ---------------------------------------------------------------- 左栏
+const sessionStarred = uid => !!S.sessions.find(s => s.uid === uid)?.starred;
+
+function starButtonMarkup(uid, starred, cls = '', id = '') {
+  const label = starred ? '取消星标' : '标为星标';
+  return `<button type="button"${id ? ` id="${id}"` : ''}
+    class="star-toggle ${cls}${starred ? ' on' : ''}" data-star-uid="${esc(uid)}"
+    title="${label}" aria-label="${label}" aria-pressed="${starred}"
+    ${S.starBusy.has(uid) ? 'disabled' : ''}>${uiIcon(starred ? 'star-filled' : 'star')}</button>`;
+}
+
+function paintStarButton(button, starred, busy = false) {
+  if (!button) return;
+  const label = starred ? '取消星标' : '标为星标';
+  button.classList.toggle('on', starred);
+  button.title = button.ariaLabel = label;
+  button.setAttribute('aria-pressed', String(starred));
+  button.disabled = busy;
+  button.innerHTML = uiIcon(starred ? 'star-filled' : 'star');
+}
+
+function applySessionStar(uid, starred, starredAt = null) {
+  for (const rows of [S.sessions, S.results || []]) {
+    const row = rows.find(s => s.uid === uid);
+    if (!row) continue;
+    row.starred = starred;
+    if (starredAt) row.starred_at = starredAt;
+    else delete row.starred_at;
+  }
+  for (const entry of cache.values()) {
+    if (entry.meta?.uid !== uid) continue;
+    entry.meta.starred = starred;
+    if (starredAt) entry.meta.starred_at = starredAt;
+    else delete entry.meta.starred_at;
+  }
+}
+
+function refreshStarPresentation(uid) {
+  const side = $('#side');
+  const top = side?.scrollTop || 0;
+  renderSide();
+  if (side) side.scrollTop = top;
+  if (S.sel === uid) paintStarButton($('#a-star'), sessionStarred(uid), S.starBusy.has(uid));
+}
+
+async function toggleSessionStar(uid) {
+  if (!uid || S.starBusy.has(uid)) return;
+  const before = sessionStarred(uid);
+  const wanted = !before;
+  S.starBusy.add(uid);
+  applySessionStar(uid, wanted);
+  refreshStarPresentation(uid);
+  try {
+    const response = await fetch(appUrl('api/session/star'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid, starred: wanted}),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    applySessionStar(uid, !!data.starred, data.starred_at || null);
+  } catch (error) {
+    applySessionStar(uid, before);
+    const stat = $('#stat');
+    if (stat) {
+      stat.textContent = ' 星标保存失败';
+      stat.classList.add('err');
+      setTimeout(() => { stat.classList.remove('err'); showSessionCount(sidebarSessions().length); }, 1800);
+    }
+    console.error('星标保存失败', error);
+  } finally {
+    S.starBusy.delete(uid);
+    refreshStarPresentation(uid);
+  }
+}
+
 function renderChips() {
   const box = $('#chips');
   box.innerHTML = '';
@@ -979,7 +1054,9 @@ function groupBy(list) {
     const tb = Math.max(...m.get(b).map(x => +new Date(x.updated)));
     return tb - ta;
   });
-  for (const k of keys) m.get(k).sort((a, b) => new Date(b.updated) - new Date(a.updated));
+  for (const k of keys) m.get(k).sort((a, b) =>
+    Number(!!b.starred) - Number(!!a.starred)
+    || new Date(b.updated) - new Date(a.updated));
   return keys.map(k => [k, m.get(k)]);
 }
 
@@ -1018,6 +1095,7 @@ function patchSide(list) {
         title.title = s.title;
         title.innerHTML = hl(s.title);
       }
+      paintStarButton(n.querySelector('.item-star'), !!s.starred, S.starBusy.has(s.uid));
     }
     const c = g.querySelector('.gcount');
     if (c && c.textContent !== String(items.length)) c.textContent = items.length;
@@ -1063,10 +1141,16 @@ function renderSide() {
            ${S.view === 'date'
              ? `<div class="cwd" title="${esc(s.cwd)}">${esc(shortCwd(s.cwd))}</div>` : ''}
            ${s.snippet ? `<div class="snip">${hl(s.snippet)}</div>` : ''}
-         </div>`);
+         </div>
+         ${s.pending ? '' : starButtonMarkup(s.uid, !!s.starred, 'item-star')}`);
       it.dataset.uid = s.uid;
       if (s.pending) it.dataset.tmuxName = s.tmuxName;
       it.onclick = () => s.pending ? openPendingSession(s) : openSession(s.uid);
+      const star = it.querySelector('.item-star');
+      if (star) star.onclick = event => {
+        event.stopPropagation();
+        toggleSessionStar(s.uid);
+      };
       paintItemStatus(it);
       ul.appendChild(it);
     }
@@ -1445,6 +1529,7 @@ function head(m, total) {
         <span class="mobile-msg-summary">
           <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
         </span>
+        ${starButtonMarkup(m.uid, !!m.starred, 'iconbtn', 'a-star')}
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
           (!m.agent_id && typeof T !== 'undefined' && T.enabled)
             ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
@@ -1467,6 +1552,7 @@ function head(m, total) {
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
+  h.querySelector('#a-star').onclick = () => toggleSessionStar(m.uid);
   const viewSwitch = h.querySelector('#a-view-switch');
   const viewMenu = h.querySelector('#session-view-menu');
   if (viewSwitch && viewMenu) {

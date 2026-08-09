@@ -27,6 +27,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 ## 界面
 
 - **左栏**：两种视图 —— 📁 项目树（按 cwd 分组）/ 🕒 时间轴（按日期倒排，每条单独一行显示所在目录）。分组可折叠，折叠状态存 localStorage。家目录缩写成 `~`，过长的路径中间省略（`/a/b/…/y/z`）——不能用 `direction: rtl` 截左边，bidi 会把开头的 `/` 挪到末尾。
+- **会话星标**：列表项与详情标题共用一个星标开关；星标会话在当前项目/日期分组内靠前。状态写入权限为 `0600` 的 `~/.local/share/sesman/session-meta.json`，不修改 Claude/Codex/Grok 原始记录，换浏览器或重启服务后仍保留，并会同步到其他打开的页面。
 - **来源筛选**：顶栏三个 chip，各带图标与数量，点击开关。
 - **搜索**：输入即按标题/路径过滤；按 `Enter` 对全部会话中解析后的用户、助手和思考正文做全文搜索，结果带命中次数和上下文片段。工具协议、系统注入、compact/记忆上下文和原始 JSON 包装不参与匹配，避免出现会话正文中看不到的大量假命中。快捷键 `/` 聚焦搜索框。
 - **搜索选项**（搜索框内三个开关，状态记在 localStorage）：`Aa` 大小写敏感、`ab|` 全词匹配、`.*` 正则表达式。前端过滤、后端搜索、正文高亮共用同一套匹配规则。
@@ -228,6 +229,7 @@ sesman/
   index.py      索引缓存、增量读取、全文搜索与删除
   media.py      内嵌/本地图片的校验、限额注册与安全读取
   pending.py    新会话首次落盘前的持久化元数据
+  session_meta.py  星标等 sesman 自有会话元数据
   server.py     ThreadingHTTPServer 路由与 IP 白名单
   static/       前端 (原生 JS, 无构建步骤；vendor/ 含 KaTeX 与 xterm.js)
 ```
@@ -242,6 +244,7 @@ sesman/
 - `GET /api/search?q=&source=claude,codex` — 正文全文搜索
 - `POST /api/term/create` / `GET /api/term/new-status?name=` — 创建并关联新 CLI 会话（需 `--terminal`）
 - `POST /api/session/attachment?uid=&name=&id=` — 上传附件到会话 cwd 的受控批次子目录；首个文件省略 `id`，后续文件复用响应中的 `attachment_id`
+- `POST /api/session/star` — 设置会话星标（JSON：`{"uid":"…","starred":true}`）
 - `POST /api/session/stop` — 从内层 CLI 开始停止运行实例，保留对话记录
 - `DELETE /api/session/<uid>` — 移入回收站
 

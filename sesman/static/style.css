@@ -43,6 +43,7 @@
   --scroll-thumb-hover: rgba(107, 114, 128, .68);
   --live-direct: #22c55e;
   --live-tmux: #0ea5e9;
+  --star: #a66b00;
   --bubble-user: #d9fdd3;
   --bubble-assistant: #ffffff;
   --bubble-thinking: #f1efff;
@@ -83,6 +84,7 @@
     --scroll-thumb-hover: rgba(223, 227, 234, .42);
     --live-direct: #4ade80;
     --live-tmux: #38bdf8;
+    --star: #f6c344;
     --bubble-user: #244c36;
     --bubble-assistant: #22262d;
     --bubble-thinking: #302d45;
@@ -421,6 +423,18 @@ body.dragging { cursor: col-resize; user-select: none; }
 .item.sel { background: var(--sel); border-left-color: var(--accent); }
 .item > .ico { flex: none; margin-top: 1px; }
 .item .body { min-width: 0; flex: 1; }
+.item-star {
+  flex: none; align-self: flex-start; width: 25px; height: 25px; margin: -2px -5px 0 0; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 6px; background: transparent; color: var(--muted);
+  opacity: .28; cursor: pointer;
+}
+.item:hover .item-star, .item-star:focus-visible, .item-star.on { opacity: 1; }
+.item-star:hover { background: var(--hover); color: var(--text); }
+.item-star.on, .item-star.on:hover { color: var(--star); }
+.item-star[disabled] { cursor: default; opacity: .45; }
+.item-star .ui-icon { width: 15px; height: 15px; }
+@media (hover: none) { .item-star { opacity: .58; } .item-star.on { opacity: 1; } }
 .item .t {
   font-size: 13px; line-height: 1.4; overflow: hidden; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
@@ -506,6 +520,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .iconbtn { position: relative; width: 28px; height: 28px; border-radius: 6px; padding: 0; }
 .iconbtn:hover { background: var(--hover); color: var(--text); }
 .iconbtn.on { background: var(--accent); color: #fff; }
+.iconbtn.star-toggle.on, .iconbtn.star-toggle.on:hover { background: transparent; color: var(--star); }
 .iconbtn.danger:hover { background: #e5484d; color: #fff; }
 .iconbtn[disabled] { opacity: .5; cursor: default; }
 .ui-icon { width: 16px; height: 16px; }

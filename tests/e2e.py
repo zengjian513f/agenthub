@@ -1,6 +1,7 @@
 """sesman 前端端到端测试: 真实浏览器点遍每个交互。"""
 import base64
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sesman import pending as pending_store, term
+from sesman import pending as pending_store, session_meta, term
 
 BASE = os.environ.get("SESMAN_BASE", "http://127.0.0.1:8710")
 FAKE_PROJ = Path.home() / ".claude" / "projects" / "-tmp-sesman-selftest"
@@ -217,6 +218,8 @@ def cleanup():
     tmux_run("sesman", "kill-session", "-t", PENDING_EXIT_TERM, capture_output=True)
     pending_store.discard(PENDING_TERM)
     pending_store.discard(PENDING_EXIT_TERM)
+    fake_path = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
+    session_meta.discard("claude:" + hashlib.sha1(str(fake_path).encode()).hexdigest()[:16])
     shutil.rmtree(FAKE_PROJ, ignore_errors=True)
     shutil.rmtree(FAKE_CWD, ignore_errors=True)
     FAKE_IMG.unlink(missing_ok=True)
@@ -577,6 +580,37 @@ def run(pw):
       return title.left - icon.right;
     }""")
     check("会话来源图标与标题留有清晰间距", title_spacing >= 6, title_spacing)
+    detail_star = p.locator("#a-star")
+    list_star = p.locator(f'.item[data-uid="{fake_uid}"] .item-star')
+    check("会话列表和详情标题都提供星标开关",
+          detail_star.count() == 1 and list_star.count() == 1
+          and detail_star.get_attribute("aria-pressed") == "false"
+          and list_star.get_attribute("aria-pressed") == "false")
+    with p.expect_response(lambda r: r.url.endswith("/api/session/star")
+                           and r.request.method == "POST") as star_info:
+        detail_star.click()
+    star_result = star_info.value.json()
+    p.wait_for_function("document.querySelector('#a-star')?.ariaPressed === 'true'")
+    starred_item = p.locator(f'.item[data-uid="{fake_uid}"]')
+    check("从详情加星后列表立即同步为实心星",
+          star_result.get("starred") is True
+          and starred_item.locator(".item-star.on").count() == 1
+          and detail_star.locator('use[href="#i-star-filled"]').count() == 1)
+    check("星标会话排在当前分组最前",
+          starred_item.locator("xpath=..").locator(":scope > .item").first.get_attribute("data-uid")
+          == fake_uid)
+    persisted_sessions = json.loads(urllib.request.urlopen(
+        BASE + "/api/sessions?force=1", timeout=60).read())["sessions"]
+    check("星标持久化在服务端而非当前浏览器",
+          next(s for s in persisted_sessions if s["uid"] == fake_uid).get("starred") is True)
+    selected_before_unstar = p.evaluate("S.sel")
+    with p.expect_response(lambda r: r.url.endswith("/api/session/star")
+                           and r.request.method == "POST"):
+        p.locator(f'.item[data-uid="{fake_uid}"] .item-star').click()
+    p.wait_for_function("document.querySelector('#a-star')?.ariaPressed === 'false'")
+    check("从列表取消星标会同步详情且不会打开别的会话",
+          p.evaluate("S.sel") == selected_before_unstar
+          and p.locator("#a-star.on").count() == 0)
     check("详情元信息含 cwd", "/tmp/sesman-selftest" in p.locator(".dmeta").inner_text())
     check("电脑版详情显示会话 UUID",
           "00000000-dead-beef-0000-000000000001" in p.locator(".dmeta").inner_text())

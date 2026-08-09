@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import index, live, media, pending as pending_store, term, wsock
+from . import index, live, media, pending as pending_store, session_meta, term, wsock
 
 STATIC = Path(__file__).parent / "static"
 ALLOWED_IPS: set[str] = set()
@@ -25,6 +25,11 @@ JSON_GZIP_LEVEL = 4     # 实测 4.5 MiB → 1.20 MiB / 75 ms，继续加级收�
 ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 ATTACHMENT_DIR = "sesman_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
+
+
+def _sessions_signature() -> str:
+    """原生会话与 sesman 自有元数据共同决定列表版本。"""
+    return f"{index.signature()}:{session_meta.signature()}"
 
 
 def _pane_for_session(session: dict, panes: list[dict],
@@ -114,6 +119,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
         u = urlparse(self.path)
+        if u.path == "/api/session/star":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._json({"error": "bad body"}, 400)
+            return self._star_session(body)
         if not TERMINAL:
             return self._json({"error": "终端未启用, 服务端需加 --terminal"}, 403)
         if u.path == "/api/session/attachment":
@@ -342,16 +354,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "会话不存在"}, 404)
         except OSError as e:
             return self._json({"error": str(e)}, 500)
+        try:
+            session_meta.discard(uid)
+        except OSError:
+            pass  # 会话已成功移入回收站，不能把元数据清理失败误报成删除失败
         self._json({"ok": True, "trash": dest})
 
     def _api_get(self, path: str, q: dict):
         if path == "/api/sessions":
             force = q.get("force", ["0"])[0] == "1"
             known = q.get("sig", [""])[0]
-            if known and not force and known == index.signature():
+            current_sig = _sessions_signature()
+            if known and not force and known == current_sig:
                 return self._json({"unchanged": True, "sig": known})
             sessions = index.load(force=force)
-            return self._json({"sessions": index.with_cursors(sessions), "sig": index._state["sig"],
+            rows = session_meta.enrich(index.with_cursors(sessions))
+            return self._json({"sessions": rows, "sig": _sessions_signature(),
                                "built_at": index._state["built_at"]})
 
         if path == "/api/live":
@@ -419,14 +437,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._search_stream(query, srcs, word=on("word"),
                                            case=on("case"), regex=on("regex"))
             try:
-                return self._json(index.search(
-                    query, srcs, word=on("word"), case=on("case"), regex=on("regex")))
+                result = index.search(
+                    query, srcs, word=on("word"), case=on("case"), regex=on("regex"))
+                result["results"] = session_meta.enrich(result["results"])
+                return self._json(result)
             except re.error as e:
                 return self._json({"error": f"正则无效: {e}"}, 400)
 
         if path.startswith("/api/messages/"):
             uid = unquote(path[len("/api/messages/"):])
-            return self._json(index.messages(
+            result = index.messages(
                 uid,
                 agent=q.get("agent", [""])[0],
                 start=int(q.get("start", ["0"])[0]),
@@ -434,7 +454,9 @@ class Handler(BaseHTTPRequestHandler):
                 anchor=q.get("anchor", [""])[0],
                 append_only=q.get("append", ["0"])[0] == "1",
                 windowed=q.get("window", ["0"])[0] == "1",
-            ))
+            )
+            result["meta"] = session_meta.enrich_one(result["meta"])
+            return self._json(result)
 
         raise KeyError(path)
 
@@ -459,6 +481,7 @@ class Handler(BaseHTTPRequestHandler):
                 progress=lambda done, total: emit(
                     {"type": "progress", "done": done, "total": total}),
             )
+            result["results"] = session_meta.enrich(result["results"])
             emit({"type": "result", "data": result})
         except re.error as e:
             emit({"type": "error", "error": f"正则无效: {e}"})
@@ -519,6 +542,19 @@ class Handler(BaseHTTPRequestHandler):
             pass                                  # 客户端走了
         finally:
             self.close_connection = True
+
+    def _star_session(self, body: dict):
+        uid = str(body.get("uid") or "")
+        starred = body.get("starred")
+        if not uid or not isinstance(starred, bool):
+            return self._json({"error": "需要 uid 和布尔值 starred"}, 400)
+        if not index.get(uid):
+            return self._json({"error": "会话不存在"}, 404)
+        try:
+            meta = session_meta.set_starred(uid, starred)
+        except OSError as e:
+            return self._json({"error": str(e)}, 500)
+        return self._json({"ok": True, "uid": uid, **meta})
 
     def _takeover(self, body: dict):
         """接管一个会话: 在 tmux 里把它 resume 起来, 之后网页就能直接输入。
