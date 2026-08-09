@@ -1109,7 +1109,7 @@ function renderComposer() {
 
 function autoGrow(ta) {
   ta.style.height = 'auto';
-  ta.style.height = Math.min(180, Math.max(34, ta.scrollHeight)) + 'px';
+  ta.style.height = Math.min(180, Math.max(36, ta.scrollHeight)) + 'px';
 }
 
 function syncComposerMode() {

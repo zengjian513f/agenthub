@@ -794,6 +794,18 @@ def run(pw):
         check("组预览显示语义摘要", "$ echo hi" in grp.locator("> .fold-preview .peek").inner_text(),
               grp.locator("> .fold-preview .peek").inner_text())
         check("组默认折叠", not grp.locator("> .tool-entry").first.is_visible())
+        grp.hover()
+        folded_hover = grp.evaluate("""n => {
+          const ns = getComputedStyle(n), ps = getComputedStyle(n.querySelector(':scope > .fold-preview'));
+          return { borders: [ns.borderTopColor, ns.borderRightColor, ns.borderBottomColor, ns.borderLeftColor],
+                   radius: ns.borderRadius, previewRadius: ps.borderRadius,
+                   previewBackground: ps.backgroundColor, previewFilter: ps.filter };
+        }""")
+        check("折叠气泡悬停使用完整圆角轮廓",
+              len(set(folded_hover["borders"])) == 1
+              and folded_hover["radius"] == folded_hover["previewRadius"]
+              and folded_hover["previewBackground"] == "rgba(0, 0, 0, 0)"
+              and folded_hover["previewFilter"] == "none", folded_hover)
         inner = grp.locator("> .tool-entry").count()
         check("组内至少 3 条", inner >= 3, inner)
         grp.locator("> .fold-preview").click()
@@ -1663,6 +1675,19 @@ def run(pw):
         p.wait_for_timeout(400)
         check("接管后消息流底部出现输入框", p.locator("#composer").is_visible())
         check("输入框左侧提供附件加号", p.locator("#cadd").is_visible())
+        composer_alignment = p.evaluate("""() => {
+          const ta = document.querySelector('#cinput');
+          ta.value = ''; autoGrow(ta);
+          const rects = ['#cadd', '#cinput', '#cesc', '#csend'].map(s => {
+            const r = document.querySelector(s).getBoundingClientRect();
+            return { top: r.top, bottom: r.bottom, height: r.height };
+          });
+          return rects;
+        }""")
+        check("单行输入栏各控件上下对齐",
+              max(x["top"] for x in composer_alignment) - min(x["top"] for x in composer_alignment) < 1
+              and max(x["bottom"] for x in composer_alignment) - min(x["bottom"] for x in composer_alignment) < 1,
+              composer_alignment)
         p.click("#cadd")
         check("加号菜单提供图片视频音频文件和引用",
               p.locator("#attach-menu button").evaluate_all(
