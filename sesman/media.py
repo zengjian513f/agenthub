@@ -153,8 +153,8 @@ _RAW_PATH = re.compile(
 _FENCE = re.compile(r"```.*?```", re.S)
 
 
-def discover(text: str, cwd: str | None) -> list[dict]:
-    """发现 Markdown 图片和正文中明确写出的本地图片路径。"""
+def discover(text: str, cwd: str | None, *, allow_raw_paths: bool = True) -> list[dict]:
+    """发现 Markdown 图片，以及对话正文中明确写出的本地图片路径。"""
     if not isinstance(text, str) or not text:
         return []
     scan = _FENCE.sub("", text)
@@ -168,20 +168,26 @@ def discover(text: str, cwd: str | None) -> list[dict]:
             got["ref"] = ref
             out.append(got)
             seen.add(got["src"])
-    for m in _RAW_PATH.finditer(scan):
-        if any(lo <= m.start() < hi for lo, hi in markdown_spans):
-            continue
-        ref = m.group(1).rstrip(".")
-        got = register_path(ref, cwd, Path(unquote(ref)).name)
-        if got and got["src"] not in seen:
-            got["gallery"] = True
-            out.append(got)
-            seen.add(got["src"])
+    if allow_raw_paths:
+        for m in _RAW_PATH.finditer(scan):
+            if any(lo <= m.start() < hi for lo, hi in markdown_spans):
+                continue
+            ref = m.group(1).rstrip(".")
+            got = register_path(ref, cwd, Path(unquote(ref)).name)
+            if got and got["src"] not in seen:
+                got["gallery"] = True
+                out.append(got)
+                seen.add(got["src"])
     return out
 
 
 def enrich_message(msg: dict, cwd: str | None) -> None:
-    found = discover(msg.get("text", ""), cwd)
+    role = str(msg.get("role") or "")
+    # shell/ls/find/grep 的输出只是数据，路径以 .png 结尾不代表“请展示图片”。
+    # 工具若真的返回图片，应走 adapter 已解析的结构化 media；显式 Markdown
+    # 图片仍可发现。只有用户/助手自然语言正文才兼容历史上的裸路径写法。
+    chat_text = role in {"user", "assistant", "command"} or role.endswith("·subagent")
+    found = discover(msg.get("text", ""), cwd, allow_raw_paths=chat_text)
     if not found:
         return
     media = msg.setdefault("media", [])
