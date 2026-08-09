@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 GROK_ACTIVE = Path.home() / ".grok" / "active_sessions.json"
@@ -23,7 +24,7 @@ _ENV_SID = ("CLAUDE_CODE_SESSION_ID=", "CODEX_COMPANION_SESSION_ID=", "GROK_SESS
 _KEYWORDS = ("claude", "codex", "grok")
 
 TTL = 3.0          # 扫描结果的缓存秒数, 前端可以放心高频轮询
-_cache = {"at": 0.0, "sids": set(), "paths": set()}
+_cache = {"at": 0.0, "sids": set(), "paths": set(), "bare_claude": {}}
 _boot_time: float | None = None
 _clock_ticks = os.sysconf("SC_CLK_TCK")
 
@@ -75,10 +76,11 @@ def _cli_ancestor(pid: int) -> int | None:
     return None
 
 
-def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[str, float]]]:
     """返回 (会话id → pid集合, 会话文件路径 → pid集合)。"""
     sids: dict[str, set[int]] = {}
     paths: dict[str, set[int]] = {}
+    bare_claude: dict[int, tuple[str, float]] = {}
 
     def note(d, k, pid):
         d.setdefault(k, set()).add(pid)
@@ -101,6 +103,19 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
         cmd_sids = {(m.group(1) or m.group(2)).lower() for m in _CMD_SID.finditer(cmd)}
         for sid in cmd_sids:
             note(sids, sid, pid)
+
+        # 控制台直接运行 `claude` 时，主进程既没有参数里的 session id，也不
+        # 常驻打开 jsonl；空闲时甚至没有带 CLAUDE_CODE_SESSION_ID 的工具子进程。
+        # 保留 cwd 与启动时间，稍后只和紧邻创建的 Claude 会话做严格配对。
+        head = cmd.strip().split(" ", 1)[0].rsplit("/", 1)[-1]
+        if main and head == "claude" and not cmd_sids:
+            try:
+                cwd = str(Path(os.readlink(f"/proc/{pid}/cwd")).resolve())
+                started = _process_started_at(pid)
+                if started is not None:
+                    bare_claude[pid] = (cwd, started)
+            except (OSError, RuntimeError):
+                pass
 
         try:
             for e in open(f"/proc/{pid}/environ", "rb").read().decode("utf8", "replace").split("\0"):
@@ -137,15 +152,32 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     except Exception:
         pass
 
-    return sids, paths
+    return sids, paths, bare_claude
 
 
 def snapshot(force: bool = False):
     now = time.time()
     if force or now - _cache["at"] > TTL:
-        sids, paths = _scan()
-        _cache.update(at=now, sids=sids, paths=paths)
+        sids, paths, bare_claude = _scan()
+        _cache.update(at=now, sids=sids, paths=paths, bare_claude=bare_claude)
     return _cache["sids"], _cache["paths"]
+
+
+def _bare_claude_pids(session: dict) -> set[int]:
+    """以 cwd + 启动时间识别没有显式 session id 的新建 Claude。
+
+    只接受会话在进程启动前 5 秒到启动后 30 秒内创建，既覆盖文件落盘抖动，
+    又不会把同目录的历史会话或稍后另开的会话误标为当前进程。
+    """
+    if session.get("source") != "claude" or not session.get("cwd"):
+        return set()
+    try:
+        cwd = str(Path(session["cwd"]).expanduser().resolve())
+        created = datetime.fromisoformat(str(session.get("created", "")).replace("Z", "+00:00")).timestamp()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return set()
+    return {pid for pid, (proc_cwd, started) in _cache.get("bare_claude", {}).items()
+            if proc_cwd == cwd and -5 <= created - started <= 30}
 
 
 def pids_of(session: dict, force: bool = False) -> list[int]:
@@ -157,6 +189,7 @@ def pids_of(session: dict, force: bool = False) -> list[int]:
         found |= sids.get(sid, set())
     for p in (session["path"], f'{session["path"]}/chat_history.jsonl'):
         found |= paths.get(p, set())
+    found |= _bare_claude_pids(session)
     return sorted(found)
 
 
@@ -164,7 +197,8 @@ def is_live(session: dict, force: bool = False) -> bool:
     sids, paths = snapshot(force)
     sid = str(session.get("sid", "")).lower()
     return bool((sid and sid in sids) or session["path"] in paths
-                or f'{session["path"]}/chat_history.jsonl' in paths)
+                or f'{session["path"]}/chat_history.jsonl' in paths
+                or _bare_claude_pids(session))
 
 
 def started_at(session: dict, force: bool = False) -> float | None:
