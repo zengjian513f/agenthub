@@ -92,15 +92,16 @@ def make_fake_session():
         {"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "thinking", "thinking": "自测思考内容"},
             {"type": "text", "text": long_text},
-            {"type": "tool_use", "name": "Bash", "input": {"command": "echo hi"}},
-            {"type": "tool_use", "name": "Read", "input": {"file_path": "/tmp/a"}},
-            {"type": "tool_use", "name": "Bash", "input": {"command": "echo hi2"}}]},
+            {"type": "tool_use", "id": "bash-1", "name": "Bash", "input": {"command": "echo hi"}},
+            {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/tmp/a"}},
+            {"type": "tool_use", "id": "bash-2", "name": "Bash", "input": {"command": "echo hi2"}}]},
          "uuid": "a1", "timestamp": "2026-08-06T12:00:05.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": [
-            {"type": "tool_result", "content": "hi"},
-            {"type": "tool_result", "content": "文件内容"},
-            {"type": "tool_result", "content": "hi2"}]},
+            {"type": "tool_result", "tool_use_id": "bash-1", "content": "hi"},
+            {"type": "tool_result", "tool_use_id": "read-1", "content": "文件内容"},
+            {"type": "tool_result", "tool_use_id": "bash-2", "is_error": True,
+             "content": "Error: Exit code 2\n" + "\n".join(f"log {i}" for i in range(12))}]},
          "uuid": "u2", "timestamp": "2026-08-06T12:00:06.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>注入的</INSTRUCTIONS>"},
@@ -134,6 +135,15 @@ def make_fake_session():
             "content": "User has answered your questions: 启动方式=tmux"}]},
          "uuid": "ask-u", "timestamp": "2026-08-06T12:00:10.000Z",
          "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "user", "message": {"role": "user", "content":
+         "<task-notification>\n<task-id>hidden-id</task-id>\n<status>completed</status>\n"
+         "<summary>Monitor event: \"自测训练\"</summary>\n"
+         "<result>监控详细结果\n第二行</result>\n</task-notification>"},
+         "uuid": "notice-u", "timestamp": "2026-08-06T12:00:11.000Z",
+         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+        {"type": "system", "subtype": "away_summary", "content": "自测任务已经收口",
+         "timestamp": "2026-08-06T12:00:12.000Z", "cwd": "/tmp/sesman-selftest",
+         "sessionId": sid},
     ]
     # 模拟老 Claude 会话：大段启动附件会把首个 cwd 挤出前 40 条元数据记录。
     # 详情仍应从文件尾恢复真实 cwd，不能把项目 slug 猜成 /tmp/sesman/selftest。
@@ -537,6 +547,17 @@ def run(pw):
           "要使用哪种启动方式" in question.inner_text()
           and "tmux" in question.inner_text() and "保留可重连的终端" in question.inner_text())
     check("询问回答显示为用户气泡", "answer" in roles)
+    task_event = p.locator('.timeline-event.task').filter(has_text="监控事件 · 自测训练")
+    check("Claude task notification 渲染成紧凑事件而非用户 XML",
+          task_event.count() == 1
+          and "<task-notification>" not in p.locator("#msgs").inner_text())
+    task_event.locator("summary").click()
+    check("任务事件保留可展开的结构化结果",
+          "监控详细结果" in task_event.locator(".event-detail-body").inner_text())
+    check("Claude recap 使用低强调回顾事件",
+          p.locator('.timeline-event.recap').filter(has_text="自测任务已经收口").count() == 1)
+    check("Claude 回合耗时显示在时间线",
+          p.locator('.timeline-event.duration').filter(has_text="耗时 1 秒").count() == 1)
     activity = p.evaluate("""() => {
       const e = cache.get(S.sel), old = e.activity, wasLive = S.live.has(S.sel);
       const hadStart = S.liveStarted.has(S.sel), oldStart = S.liveStarted.get(S.sel);
@@ -579,12 +600,16 @@ def run(pw):
     preview_limits = p.evaluate("""() => ({
       oneLine: outPreview('x'.repeat(10000)).length,
       eightLongLines: outPreview(Array(8).fill('中'.repeat(1000)).join('\\n')).length,
-      normal: outPreview('a\\nb')
+      normal: outPreview('a\\nb'),
+      omitted: outPreviewInfo(Array(13).fill('line').join('\\n')).omittedLines,
+      trailing: outPreviewInfo(Array(8).fill('line').join('\\n') + '\\n').omittedLines
     })""")
     check("工具预览限制巨型单行和超长行",
           preview_limits["oneLine"] <= 1602
           and preview_limits["eightLongLines"] <= 1602
-          and preview_limits["normal"] == "a\nb", preview_limits)
+          and preview_limits["normal"] == "a\nb"
+          and preview_limits["omitted"] == 5
+          and preview_limits["trailing"] == 0, preview_limits)
     tool_width = single_tool.evaluate("""n => ({
       tool: n.getBoundingClientRect().width,
       available: n.parentElement.clientWidth
@@ -756,8 +781,8 @@ def run(pw):
       return {ratio: r.width / box.width, radius: getComputedStyle(n).borderRadius,
               preview: !!n.querySelector(':scope > .fold-preview > .peek')};
     }""")
-    check("工具折叠态是纯正文预览短胶囊",
-          folded_geo["ratio"] <= .74 and folded_geo["radius"] == "999px"
+    check("工具组折叠态是紧凑的顺序提纲卡片",
+          folded_geo["ratio"] <= .80 and folded_geo["radius"] == "9px"
           and folded_geo["preview"], folded_geo)
 
     # ---- 8a. markdown 渲染 ----
@@ -814,6 +839,11 @@ def run(pw):
               grp.locator("> .fold-preview").inner_text())
         check("组预览显示语义摘要", "$ echo hi" in grp.locator("> .fold-preview .peek").inner_text(),
               grp.locator("> .fold-preview .peek").inner_text())
+        outline = grp.locator("> .fold-preview .group-outline > span").all_inner_texts()
+        check("组预览按原顺序逐行列出调用",
+              len(outline) >= 3 and outline[0].startswith("1. $ echo hi")
+              and outline[1].startswith("2. 读 /tmp/a")
+              and outline[2].startswith("3. $ echo hi2"), outline)
         check("组默认折叠", not grp.locator("> .tool-entry").first.is_visible())
         grp.hover()
         folded_hover = grp.evaluate("""n => {
@@ -835,6 +865,14 @@ def run(pw):
         check("展开后预览不再占垂直空间", not grp.locator("> .fold-preview").is_visible())
         check("工具组不再包 grp-body", grp.locator("> .grp-body").count() == 0)
         check("工具组内不再嵌套 msg 气泡", grp.locator("> .msg").count() == 0)
+        failed_entry = grp.locator("> .tool-entry").filter(has_text="$ echo hi2")
+        check("Claude 文本退出码进入工具状态行",
+              "exit 2" in failed_entry.locator(".tool-status").inner_text()
+              and "13 行" in failed_entry.locator(".tool-status").inner_text(),
+              failed_entry.locator(".tool-status").inner_text())
+        check("长工具输出用省略行数而非总字符数",
+              "另有 5 行" in failed_entry.locator("button.more").inner_text(),
+              failed_entry.locator("button.more").inner_text())
         grp.locator("> .disclosure").click()
         p.wait_for_timeout(150)
         check("组可再折叠", not grp.locator("> .tool-entry").first.is_visible())

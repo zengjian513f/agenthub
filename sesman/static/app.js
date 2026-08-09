@@ -1557,21 +1557,38 @@ function addAction(n) {
 // 输出预览: 前几行足够判断结果, 大段日志靠"展开全文"。
 const OUT_LINES = 8;
 const OUT_CHARS = 1600;
-function outPreview(t) {
-  const lines = t.split('\n');
-  let preview = lines.length > OUT_LINES ? lines.slice(0, OUT_LINES).join('\n') : t;
-  if (preview.length > OUT_CHARS) preview = preview.slice(0, OUT_CHARS);
-  return preview === t ? t : preview.replace(/\s+$/, '') + '\n…';
+function outputStats(t) {
+  const body = String(t || '').replace(/\n+$/, '');
+  return { lines: body ? body.split('\n').length : 0, chars: String(t || '').length };
 }
+
+function outPreviewInfo(t) {
+  const body = t.replace(/\n+$/, '');
+  const lines = body ? body.split('\n') : [];
+  let preview = lines.length > OUT_LINES ? lines.slice(0, OUT_LINES).join('\n') : t;
+  const lineCut = lines.length > OUT_LINES;
+  if (preview.length > OUT_CHARS) preview = preview.slice(0, OUT_CHARS);
+  const truncated = preview !== t;
+  return {
+    text: truncated ? preview.replace(/\s+$/, '') + '\n…' : t,
+    omittedLines: lineCut ? Math.max(0, outputStats(t).lines - OUT_LINES) : 0,
+    omittedChars: truncated ? Math.max(0, t.length - preview.length) : 0,
+  };
+}
+
+function outPreview(t) { return outPreviewInfo(t).text; }
 
 function addClippedPre(entry, cls, text) {
   const pre = el('pre', cls);
-  const short = outPreview(text);
-  pre.textContent = short;
+  const info = outPreviewInfo(text);
+  pre.textContent = info.text;
   paintToolOutputDiff(pre);
   entry.appendChild(pre);
-  if (short !== text) {
-    const more = el('button', 'more', `展开全文 (${text.length.toLocaleString()} 字符)`);
+  if (info.text !== text) {
+    const rest = info.omittedLines > 0
+      ? `另有 ${info.omittedLines.toLocaleString()} 行`
+      : `另有 ${info.omittedChars.toLocaleString()} 字符`;
+    const more = el('button', 'more', `展开全文（${rest}）`);
     more.onclick = () => {
       pre.textContent = text;
       paintToolOutputDiff(pre);
@@ -1612,7 +1629,9 @@ function toolEntry(m) {
     entry.dataset.result = '1';   // 吸收了一条 tool_result, 计数对账用
     const status = [r.error ? '✗ 出错' : '✓ 完成'];
     if (Number.isInteger(r.exit_code)) status.push(`exit ${r.exit_code}`);
-    status.push(`${(r.text || '').length.toLocaleString()} 字符`);
+    const stats = outputStats(r.text || '');
+    status.push(stats.lines > 1 ? `${stats.lines.toLocaleString()} 行`
+      : `${stats.chars.toLocaleString()} 字符`);
     entry.appendChild(el('div', 'tool-status' + (r.error ? ' err' : ''), status.join(' · ')));
     if (String(r.text || '').trim()) addClippedPre(entry, 'tool-out' + (r.error ? ' err' : ''), r.text);
     if (r.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(r.media));
@@ -1742,10 +1761,16 @@ function groupNode(items) {
   const visible = calls.length ? calls : items;
   const heads = visible.slice(0, 3).map(m => m.summary || m.name || 'tool');
   const hasErr = items.some(m => m.result?.error || (m.role === 'tool_result' && m.error));
-  const preview = addFoldPreview(n,
-    `🔧 ×${visible.length}${hasErr ? ' ⚠' : ''} · ${heads.join('  ·  ')}`
-      + (visible.length > 3 ? ' · …' : ''),
-    '工具调用组');
+  const preview = addFoldPreview(n, '', '工具调用组');
+  preview.classList.add('group-preview');
+  const peek = preview.querySelector('.peek');
+  peek.classList.add('group-peek');
+  const count = el('span', 'group-count', `🔧 ×${visible.length}${hasErr ? ' ⚠' : ''}`);
+  const outline = el('span', 'group-outline');
+  heads.forEach((head, i) => outline.appendChild(el('span', '', `${i + 1}. ${head}`)));
+  if (visible.length > heads.length) outline.appendChild(el('span', 'group-rest',
+    `… 另有 ${visible.length - heads.length} 项`));
+  peek.replaceChildren(count, outline);
   items.forEach(m => n.appendChild(toolEntry(m))); // 直接铺在组内，不再套 grp-body + 内层 msg
   const setAction = addAction(n);
   const fold = () => { n.classList.add('folded'); setAction(); };
@@ -1810,6 +1835,7 @@ function refreshFormulae() {
 }
 
 function msgNode(m) {
+  if (m.role === 'event') return eventNode(m);
   if (m.changes?.length) return fileChangeNode(m);
   if (m.role === 'question') return questionNode(m);
   if (TOOL_ROLES.has(m.role)) {
@@ -1860,6 +1886,45 @@ function msgNode(m) {
     if (hit) full();
   } else if (long) {
     hit ? full() : clipped();
+  }
+  return n;
+}
+
+function formatDuration(ms) {
+  let seconds = Math.max(0, Number(ms) || 0) / 1000;
+  if (seconds < 10) return `${seconds.toFixed(seconds < 1 ? 1 : 0)} 秒`;
+  seconds = Math.round(seconds);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return [hours ? `${hours} 小时` : '', minutes ? `${minutes} 分` : '',
+          rest || (!hours && !minutes) ? `${rest} 秒` : ''].filter(Boolean).join(' ');
+}
+
+function eventNode(m) {
+  const kind = m.event_kind || 'session';
+  const n = el('div', `timeline-event ${kind}${m.event_status ? ` ${m.event_status}` : ''}`);
+  n.dataset.role = 'event';
+  n.dataset.counted = 'false';
+  if (kind === 'duration') {
+    n.innerHTML = `<span>耗时 ${esc(formatDuration(m.duration_ms))}</span>`;
+    return n;
+  }
+  const label = kind === 'recap' ? '回顾' : (kind === 'task' ? '任务' : '会话');
+  n.innerHTML = `<b>${label}</b><span>${esc(m.text || '')}</span>`;
+  if (m.details) {
+    n.classList.add('has-details');
+    const disclosure = el('details', 'event-details');
+    const stats = outputStats(m.details);
+    disclosure.appendChild(el('summary', '', `查看结果 · ${stats.lines.toLocaleString()} 行`));
+    disclosure.ontoggle = () => {
+      if (!disclosure.open || disclosure.querySelector('.event-detail-body')) return;
+      const body = el('div', 'event-detail-body');
+      body.innerHTML = md(m.details, true);
+      renderFormulae(body); paintSyntax(body);
+      disclosure.appendChild(body);
+    };
+    n.appendChild(disclosure);
   }
   return n;
 }

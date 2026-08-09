@@ -620,6 +620,28 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .activity.waiting i { background: #d4a72c; }
 .activity.aborted i, .activity.failed i { background: #e5484d; }
 
+.timeline-event {
+  display: flex; align-items: baseline; gap: 7px; width: min(100%, max-content);
+  min-width: 0; margin: 1px 0 7px; padding: 3px 8px;
+  border-left: 2px solid var(--border); color: var(--muted);
+  font-size: 11.5px; line-height: 1.45;
+}
+.timeline-event > b { flex: none; color: var(--text); font-size: 11px; }
+.timeline-event > span { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.timeline-event.duration { margin-top: -4px; padding-block: 0; border-left-color: transparent; font-size: 10.5px; opacity: .8; }
+.timeline-event.task.completed { border-left-color: var(--live-direct); }
+.timeline-event.task.failed, .timeline-event.task.killed { border-left-color: #e5534b; }
+.event-details { flex: 0 0 100%; margin-top: 3px; }
+.timeline-event.has-details { flex-wrap: wrap; }
+.event-details > summary { width: fit-content; cursor: pointer; color: var(--accent); font-size: 11px; }
+.event-detail-body {
+  margin-top: 5px; padding: 7px 9px; max-height: 420px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
+  color: var(--text); font-size: 12px;
+}
+.event-detail-body > :first-child { margin-top: 0; }
+.event-detail-body > :last-child { margin-bottom: 0; }
+
 /* 单条工具输出只保留 .msg 这一层气泡；pre 只是排版容器，不再画灰色内框。 */
 .msg[data-role="tool"] > .mb,
 .msg[data-role="tool_result"] > .mb { padding: 0; }
@@ -636,6 +658,19 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   box-shadow: none; overflow: visible;
 }
 .msg.grp.folded > .tool-entry { display: none; }
+.msg.grp.folded { max-width: min(78%, 720px); border-radius: 9px; }
+.msg.grp.folded > .group-preview { align-items: flex-start; padding-block: 7px; }
+.msg .fold-preview .group-peek {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 9px;
+  max-width: min(68vw, 660px); white-space: normal; opacity: 1;
+}
+.group-count { padding-top: 1px; color: var(--muted); white-space: nowrap; font-size: 11px; }
+.group-outline { display: grid; gap: 1px; min-width: 0; }
+.group-outline > span {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--terminal-fg); font: 400 var(--tool-font-size)/1.35 var(--terminal-font);
+}
+.group-outline > .group-rest { color: var(--muted); font-size: 11px; }
 .tool-entry {
   margin-bottom: 6px; padding: 0; border: 0; background: transparent;
 }

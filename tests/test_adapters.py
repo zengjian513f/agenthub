@@ -297,7 +297,8 @@ class ToolSummaryTests(unittest.TestCase):
                                           "input": {"command": "bash -c 'false'"}}]}},
                 {"type": "user", "timestamp": "2026-08-09T10:00:01Z",
                  "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
-                                          "is_error": True, "content": "boom"}]}},
+                                          "is_error": True,
+                                          "content": "Error: Exit code 7\nboom"}]}},
             ]
             f.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
             msgs, _ = adapters.ClaudeAdapter().read(str(f))
@@ -307,6 +308,7 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertEqual(tool["call_id"], "t1")
         self.assertEqual(result["call_id"], "t1")
         self.assertTrue(result["error"])
+        self.assertEqual(result["exit_code"], 7)
 
     def test_claude_interrupt_ends_working_without_fake_user_message(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,6 +330,38 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertEqual(statuses, ["working", "aborted"])
         self.assertNotIn("[Request interrupted by user]",
                          [m["text"] for m in msgs])
+
+    def test_claude_notifications_recaps_and_duration_are_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            notification = """<task-notification>
+<task-id>secret-id</task-id>
+<status>completed</status>
+<summary>Monitor \"训练任务\" stream ended</summary>
+<result>第一行\n&lt;第二行&gt;</result>
+</task-notification>"""
+            rows = [
+                {"type": "user", "timestamp": "2026-08-09T10:00:00Z",
+                 "message": {"content": notification}},
+                {"type": "system", "subtype": "away_summary",
+                 "timestamp": "2026-08-09T10:00:01Z", "content": "任务已经收口"},
+                {"type": "system", "subtype": "turn_duration",
+                 "timestamp": "2026-08-09T10:00:02Z", "durationMs": 125000},
+            ]
+            f.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n")
+            msgs, _ = adapters.ClaudeAdapter().read(str(f))
+
+        events = [m for m in msgs if m["role"] == "event"]
+        self.assertEqual([m["event_kind"] for m in events],
+                         ["task", "recap", "duration"])
+        self.assertEqual(events[0]["text"], "监控结束 · 训练任务")
+        self.assertEqual(events[0]["details"], "第一行\n<第二行>")
+        self.assertEqual(events[0]["event_status"], "completed")
+        self.assertFalse(events[0]["counted"])
+        self.assertEqual(events[1]["text"], "任务已经收口")
+        self.assertEqual(events[2]["duration_ms"], 125000)
+        self.assertFalse(any(m["role"] == "user" for m in msgs))
+        self.assertEqual([m["state"] for m in msgs if m["role"] == "status"], ["idle"])
 
 
 if __name__ == "__main__":

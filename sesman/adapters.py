@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import html
 import json
 import re
 from datetime import datetime, timezone
@@ -271,15 +272,22 @@ def _tool_summary(name: str, value) -> str | None:
     return None
 
 
-_EXIT_CODE = re.compile(r'"exit_code"\s*:\s*(-?\d+)|\bexit(?:ed)?(?: with)?(?: code| status)? (-?\d+)')
+_EXIT_CODE = re.compile(
+    r'"exit_code"\s*:\s*(-?\d+)|\bexit(?:ed)?(?: with)?(?: code| status)? (-?\d+)',
+    re.I)
+
+
+def _output_exit_code(text: str) -> int | None:
+    """从工具输出头部提取退出码；Claude 常只把它写进可见文本。"""
+    m = _EXIT_CODE.search(str(text or "")[:400])
+    return int(m.group(1) or m.group(2)) if m else None
 
 
 def _output_error(text: str) -> bool | None:
     """从输出文本头部嗅探退出码; 嗅不到返回 None(未知), 不误报。"""
-    m = _EXIT_CODE.search(str(text or "")[:400])
-    if not m:
+    code = _output_exit_code(text)
+    if code is None:
         return None
-    code = int(m.group(1) or m.group(2))
     return code != 0
 
 
@@ -400,6 +408,7 @@ _INJECTED = re.compile(
     r"AGENTS\.md instructions|<INSTRUCTIONS>|<user_info>|<environment_context>|"
     r"<system-reminder>|<command-name>|Caveat: The messages below|"
     r"<local-command-(?:caveat|stdout)>|"
+    r"<task-notification>|"
     r"This session is being continued from a previous conversation|"
     r"# Global User Guidance|<project_instructions>|<user_instructions>", re.I)
 _CLAUDE_INTERRUPT = re.compile(
@@ -413,6 +422,44 @@ def _is_injected(text: str) -> bool:
 def _is_claude_interrupt(text: str) -> bool:
     """Claude 把 Esc 中断记成 user 消息，但它不是一个新回合。"""
     return bool(_CLAUDE_INTERRUPT.fullmatch(text.strip()))
+
+
+def _notification_tag(text: str, name: str) -> str:
+    match = re.search(fr"<{re.escape(name)}>(.*?)</{re.escape(name)}>", text,
+                      re.I | re.S)
+    return html.unescape(match.group(1).strip()) if match else ""
+
+
+def _task_notification_summary(summary: str, status: str) -> str:
+    """把 Claude 的内部英文通知压成一条可扫读的中文事件。"""
+    patterns = (
+        (r'^Monitor event:\s*"(.*)"$', "监控事件 · {}"),
+        (r'^Monitor\s+"(.*)"\s+stream ended$', "监控结束 · {}"),
+        (r'^Agent\s+"(.*)"\s+finished$', "子代理完成 · {}"),
+        (r'^Agent\s+"(.*)"\s+was stopped by user$', "子代理已停止 · {}"),
+        (r'^Agent\s+"(.*?)"\s+failed(?::\s*(.*))?$', "子代理失败 · {}{}"),
+    )
+    for pattern, template in patterns:
+        match = re.match(pattern, summary, re.I | re.S)
+        if not match:
+            continue
+        if len(match.groups()) == 1:
+            return template.format(match.group(1))
+        reason = f" · {match.group(2)}" if match.group(2) else ""
+        return template.format(match.group(1), reason)
+    if summary:
+        return summary
+    return {"completed": "后台任务完成", "failed": "后台任务失败",
+            "killed": "后台任务已停止"}.get(status, "后台任务通知")
+
+
+def _claude_task_notification(text: str) -> dict | None:
+    if not re.match(r"^\s*<task-notification>(?:\s|$)", str(text or ""), re.I):
+        return None
+    status = _notification_tag(text, "status").lower()
+    summary = _task_notification_summary(_notification_tag(text, "summary"), status)
+    return _msg("event", summary, event_kind="task", event_status=status,
+                details=_notification_tag(text, "result") or None, counted=False)
 
 
 def _title_from_text(text: str) -> str:
@@ -666,19 +713,26 @@ class ClaudeAdapter:
                 parts = _flatten_content((rec.get("message") or {}).get("content"))
                 # Claude 没有 task_started；真实用户输入就是新回合的结构化起点。
                 text_parts = [p["text"] for p in parts if p["kind"] == "text"]
+                notifications = [_claude_task_notification(x) for x in text_parts]
                 if t == "user" and not tag and (
                         rec.get("interruptedMessageId")
                         or any(_is_claude_interrupt(x) for x in text_parts)):
                     msgs.append(_status("aborted", ts))
                     continue
                 if t == "user" and not tag and any(
-                        x.strip() and not _is_injected(x) for x in text_parts):
+                        x.strip() and notice is None and not _is_injected(x)
+                        for x, notice in zip(text_parts, notifications)):
                     msgs.append(_status("working", ts))
                 for p in parts:
                     if not str(p.get("text", "")).strip() and not p.get("media"):
                         continue
                     if p["kind"] == "text":
-                        msgs.append(_msg(_user_role(role, p["text"]), p["text"], ts, name=tag))
+                        notice = _claude_task_notification(p["text"])
+                        if notice and not tag:
+                            notice["ts"] = ts
+                            msgs.append(notice)
+                        else:
+                            msgs.append(_msg(_user_role(role, p["text"]), p["text"], ts, name=tag))
                     elif p["kind"] == "image":
                         msgs.append(_msg(role, p["text"], ts, name=tag,
                                          media_parts=[p.get("media")]))
@@ -699,16 +753,26 @@ class ClaudeAdapter:
                     elif p["kind"] == "tool_result":
                         name = calls.get(p.get("call_id"))
                         is_answer = _is_question_tool(name)
+                        exit_code = _output_exit_code(p["text"])
+                        output_meta = {"exit_code": exit_code} if exit_code is not None else {}
                         msgs.append(_msg("answer" if is_answer else "tool_result",
                                          p["text"], ts, name=name,
                                          call_id=p.get("call_id"),
-                                         error=bool(p.get("error")),
-                                         media_parts=p.get("media")))
+                                         error=bool(p.get("error")) or
+                                               (exit_code is not None and exit_code != 0),
+                                         media_parts=p.get("media"), **output_meta))
                         if is_answer and not tag:
                             msgs.append(_status("working", ts))
             elif t == "system":
                 if not tag and rec.get("subtype") == "turn_duration":
-                    msgs.append(_status("idle", ts, duration_ms=rec.get("durationMs")))
+                    duration = rec.get("durationMs")
+                    msgs.append(_status("idle", ts, duration_ms=duration))
+                    if isinstance(duration, (int, float)) and duration >= 0:
+                        msgs.append(_msg("event", "", ts, counted=False,
+                                         event_kind="duration", duration_ms=duration))
+                elif not tag and rec.get("subtype") == "away_summary" and rec.get("content"):
+                    msgs.append(_msg("event", _stringify(rec["content"]), ts,
+                                     counted=False, event_kind="recap"))
                 elif not tag and rec.get("subtype") == "compact_boundary":
                     # /compact 没有 turn_duration；边界记录就是压缩完成点。
                     msgs.append(_status("idle", ts))
