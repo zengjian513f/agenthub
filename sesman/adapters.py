@@ -483,14 +483,15 @@ def _stringify(v) -> str:
 
 
 def _tool_output(name: str | None, value) -> tuple[str, dict]:
-    """展开 functions.exec 中被 text(result) 再包一层的命令结果。
+    """展开 exec 及其续取工具中被 text(result) 再包一层的命令结果。
 
     Codex 会把这种结果记成 ``Script completed / Output:`` 加一段 JSON；
     JSON 的 ``output`` 才是用户真正想看的 stdout。只识别带执行时长及
     进程状态字段的明确 exec_command 信封，普通工具返回的 JSON 保持原样。
     """
     text = _stringify(value)
-    if str(name or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1] != "exec":
+    key = str(name or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1]
+    if key not in {"exec", "exec_command", "wait", "write_stdin"}:
         return text, {}
 
     candidates = []

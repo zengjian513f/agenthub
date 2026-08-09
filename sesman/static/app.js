@@ -1556,10 +1556,12 @@ function addAction(n) {
 
 // 输出预览: 前几行足够判断结果, 大段日志靠"展开全文"。
 const OUT_LINES = 8;
+const OUT_CHARS = 1600;
 function outPreview(t) {
   const lines = t.split('\n');
-  if (lines.length > OUT_LINES) return lines.slice(0, OUT_LINES).join('\n') + '\n…';
-  return t.length > CLIP ? clipText(t) : t;
+  let preview = lines.length > OUT_LINES ? lines.slice(0, OUT_LINES).join('\n') : t;
+  if (preview.length > OUT_CHARS) preview = preview.slice(0, OUT_CHARS);
+  return preview === t ? t : preview.replace(/\s+$/, '') + '\n…';
 }
 
 function addClippedPre(entry, cls, text) {

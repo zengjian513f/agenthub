@@ -270,6 +270,16 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertEqual(adapters._tool_output("exec", combined),
                          ("still running\n", {"duration_s": 10.0}))
 
+        waited = json.dumps({
+            "session_id": 42, "chunk_id": "ghi789",
+            "wall_time_seconds": 30.0, "original_token_count": 2000,
+            "output": "line 1\nline 2\n",
+        })
+        self.assertEqual(adapters._tool_output("wait", waited),
+                         ("line 1\nline 2\n", {"duration_s": 30.0}))
+        self.assertEqual(adapters._tool_output("write_stdin", waited),
+                         ("line 1\nline 2\n", {"duration_s": 30.0}))
+
         # 业务工具恰好返回 output 字段时，不能仅凭字段名误拆信封。
         plain = '{"output":"business value"}'
         self.assertEqual(adapters._tool_output("exec", plain), (plain, {}))

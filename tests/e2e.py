@@ -568,6 +568,23 @@ def run(pw):
     single_tool = p.locator('.msg[data-role="tool_result"]').filter(has_text="单行工具输出不折叠")
     check("单行工具输出也不折叠",
           single_tool.locator(".tool-out").is_visible() and single_tool.locator(".fold-preview").count() == 0)
+    preview_limits = p.evaluate("""() => ({
+      oneLine: outPreview('x'.repeat(10000)).length,
+      eightLongLines: outPreview(Array(8).fill('中'.repeat(1000)).join('\\n')).length,
+      normal: outPreview('a\\nb')
+    })""")
+    check("工具预览限制巨型单行和超长行",
+          preview_limits["oneLine"] <= 1602
+          and preview_limits["eightLongLines"] <= 1602
+          and preview_limits["normal"] == "a\nb", preview_limits)
+    tool_width = single_tool.evaluate("""n => ({
+      tool: n.getBoundingClientRect().width,
+      available: n.parentElement.clientWidth
+        - parseFloat(getComputedStyle(n.parentElement).paddingLeft)
+        - parseFloat(getComputedStyle(n.parentElement).paddingRight)
+    })""")
+    check("工具卡片使用对话栏完整可用宽度",
+          abs(tool_width["tool"] - tool_width["available"]) < 2, tool_width)
     single_tool_skin = single_tool.evaluate("""n => {
       const entry = n.querySelector(':scope > .tool-entry');
       const pre = entry.querySelector(':scope > pre.tool-out');
@@ -792,6 +809,16 @@ def run(pw):
     # ---- 8c. 文件修改卡片内联 diff 与独立视图切换 ----
     change = p.locator(".file-change-card").first
     check("文件修改不埋在折叠工具组里", change.is_visible())
+    diff_width = change.evaluate("""n => {
+      const msg = n.closest('.file-change-msg');
+      const parent = msg.parentElement, ps = getComputedStyle(parent);
+      return {
+        diff: msg.getBoundingClientRect().width,
+        available: parent.clientWidth - parseFloat(ps.paddingLeft) - parseFloat(ps.paddingRight)
+      };
+    }""")
+    check("diff 卡片使用对话栏完整可用宽度",
+          abs(diff_width["diff"] - diff_width["available"]) < 2, diff_width)
     check("修改卡显示路径和增删统计",
           "demo.py" in change.inner_text() and "+1" in change.inner_text() and "−1" in change.inner_text(),
           change.inner_text())
