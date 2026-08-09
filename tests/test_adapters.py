@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import adapters
+from sesman import adapters, index as session_index
 
 
 class CodexEventTests(unittest.TestCase):
@@ -119,6 +119,33 @@ class CodexEventTests(unittest.TestCase):
                         "content": [{"type": "output_text", "text": "仅增量"}]}))
                 incremental, _ = adapter.read(session["path"], start=end)
                 self.assertEqual([m["text"] for m in incremental], ["仅增量"])
+
+
+class IncrementalCursorTests(unittest.TestCase):
+    def test_small_claude_session_append_keeps_valid_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.jsonl"
+            sid = "00000000-0000-0000-0000-000000000099"
+            first = {"type": "user", "message": {"role": "user", "content": "hello"},
+                     "timestamp": "2026-08-09T10:00:00Z", "cwd": tmp, "sessionId": sid}
+            path.write_text(json.dumps(first) + "\n")
+            session = {"uid": "claude:test", "source": "claude", "sid": sid,
+                       "path": str(path), "cwd": tmp}
+            cursor = session_index.cursor(session)
+            self.assertLess(cursor["end"], 4096)
+
+            reply = {"type": "assistant",
+                     "message": {"role": "assistant", "content": "new reply"},
+                     "timestamp": "2026-08-09T10:00:01Z", "cwd": tmp, "sessionId": sid}
+            with path.open("a") as fh:
+                fh.write(json.dumps(reply) + "\n")
+            result = session_index.messages_for(
+                session, start=cursor["end"], head=cursor["head"],
+                anchor=cursor["anchor"], append_only=True)
+
+            self.assertFalse(result["reset"])
+            self.assertEqual([(m["role"], m["text"]) for m in result["messages"]],
+                             [("assistant", "new reply")])
 
 
 class FileChangeTests(unittest.TestCase):

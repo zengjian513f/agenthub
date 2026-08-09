@@ -1159,6 +1159,29 @@ def run(pw):
           p.evaluate("document.querySelector('#side').scrollTop"))
     check("详情区没被打断", p.locator("#msgs .msg").count() > 0)
 
+    # 未选中的 Claude 会话也要从列表游标续读新增区间；不能只有当前详情页
+    # 的 SSE 才会累加角标，更不能为此重新下载整份历史。
+    extra_uid = p.evaluate(
+        "() => S.sessions.find(s => s.title.includes('SESMAN新会话ZZ')).uid")
+    with open(extra, "a") as fh:
+        fh.write(json.dumps({
+            "type": "assistant", "message": {"role": "assistant", "content": "后台回复未读BBQ"},
+            "uuid": "n2", "timestamp": "2026-08-07T09:00:01.000Z",
+            "cwd": "/tmp/sesman-selftest", "sessionId": extra.stem,
+        }, ensure_ascii=False) + "\n")
+    p.evaluate("pollSessions()")
+    p.wait_for_timeout(3000)
+    extra_badge = p.locator(f'.item[data-uid="{extra_uid}"] .item-status')
+    unread_debug = p.evaluate("""uid => ({
+      badge: document.querySelector(`.item[data-uid="${uid}"] .item-status`)?.textContent,
+      unread: S.unread.get(uid), cursor: S.cursors.get(uid),
+      sessionCursor: S.sessions.find(s => s.uid === uid)?.cursor,
+      syncing: [...sidebarSyncing], selected: S.sel,
+    })""", extra_uid)
+    check("未选中的 Claude 新回复显示在左栏",
+          "counted" in (extra_badge.get_attribute("class") or "")
+          and extra_badge.inner_text() == "1", unread_debug)
+
     # 活跃会话每隔几秒就变一次, 列表要是每次都重建就会一直闪。
     # 结构没变时只改文字, DOM 节点必须原地不动。
     live_file = FAKE_PROJ / "00000000-dead-beef-0000-000000000003.jsonl"

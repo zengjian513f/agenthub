@@ -330,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
             if known and not force and known == index.signature():
                 return self._json({"unchanged": True, "sig": known})
             sessions = index.load(force=force)
-            return self._json({"sessions": sessions, "sig": index._state["sig"],
+            return self._json({"sessions": index.with_cursors(sessions), "sig": index._state["sig"],
                                "built_at": index._state["built_at"]})
 
         if path == "/api/live":
@@ -411,6 +411,7 @@ class Handler(BaseHTTPRequestHandler):
                 start=int(q.get("start", ["0"])[0]),
                 head=q.get("head", [""])[0],
                 anchor=q.get("anchor", [""])[0],
+                append_only=q.get("append", ["0"])[0] == "1",
             ))
 
         raise KeyError(path)

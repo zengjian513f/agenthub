@@ -65,6 +65,7 @@ const S = {
   liveStarted: new Map(), // uid → 当前 CLI 主进程启动时间（Unix 秒）
   activeOnly: store.get('activeOnly', false), // 左栏只显示仍在运行的会话
   unread: new Map(store.get('unread', [])),   // uid → {count, tmux}; 只计代理产生的新内容
+  cursors: new Map(), // 主会话/子代理 EOF 游标；用于后台会话的精确未读增量
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -222,6 +223,7 @@ async function fetchMessages(uid, opts = {}) {
     p.set('anchor', opts.anchor || '');     // 没有锚点服务端会拒绝续读, 直接给整份
   }
   if (opts.agent) p.set('agent', opts.agent);
+  if (opts.appendOnly) p.set('append', '1');
   const r = await fetch(appUrl(`api/messages/${encodeURIComponent(uid)}?${p}`), { signal: opts.signal });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const total = +r.headers.get('Content-Length') || 0;
@@ -268,6 +270,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
     cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
                     end: data.end, anchor: data.anchor, activity: data.activity, bytes });
+    S.cursors.set(key, { end: data.end, head: data.version.head, anchor: data.anchor });
     if (S.sel === uid && S.agent === agent) {
       await renderSession(data.meta, data.messages, data.activity);
     }
@@ -277,6 +280,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   e.version = data.version;
   e.end = data.end;
   e.anchor = data.anchor;
+  S.cursors.set(key, { end: data.end, head: data.version.head, anchor: data.anchor });
   e.bytes += bytes;
   if (data.activity_changed) e.activity = data.activity;
   else if (e.activity?.state === 'waiting' && data.messages.some(
@@ -564,6 +568,93 @@ function pendingTmuxSessions() {
 
 const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions];
 
+function cursorViews(sessions) {
+  const rows = [];
+  for (const session of sessions) {
+    if (session.cursor) rows.push({uid: session.uid, agent: null, cursor: session.cursor});
+    for (const item of session.agent_items || []) {
+      if (item.cursor) rows.push({uid: session.uid, agent: item.id, cursor: item.cursor});
+    }
+  }
+  return rows;
+}
+
+function cleanCursor(value) {
+  return value && Number.isFinite(+value.end) && value.head
+    ? {end: +value.end, head: String(value.head), anchor: String(value.anchor || '')}
+    : null;
+}
+
+function seedSidebarCursors(sessions) {
+  for (const row of cursorViews(sessions)) {
+    const cursor = cleanCursor(row.cursor);
+    if (cursor) S.cursors.set(viewKey(row.uid, row.agent), cursor);
+  }
+}
+
+const sidebarSyncing = new Set();
+
+async function syncSidebarView(row, base, latest, attempt = 0) {
+  const key = viewKey(row.uid, row.agent);
+  if (sidebarSyncing.has(key)) return;
+  sidebarSyncing.add(key);
+  try {
+    const {data, bytes} = await fetchMessages(row.uid, {
+      agent: row.agent, start: base.end, head: base.head, anchor: base.anchor,
+      appendOnly: true,
+    });
+    if (data.reset) {
+      cache.delete(key);                    // 历史被回滚/改写，旧缓存已不可信
+      S.cursors.set(key, cleanCursor({end: data.end, head: data.version.head,
+                                     anchor: data.anchor}) || latest);
+      return;
+    }
+    const entry = cache.get(key);
+    if (entry && entry.end === data.start) {
+      await applyDiff(row.uid, data, bytes, row.agent);
+    } else {
+      const incoming = incomingCount(data.messages);
+      if (incoming) addUnread(row.uid, incoming);
+      S.cursors.set(key, cleanCursor({end: data.end, head: data.version.head,
+                                     anchor: data.anchor}) || latest);
+    }
+  } catch {
+    // 列表签名可能不会再变化；短暂断网后主动补两次，仍不影响其他会话。
+    if (attempt < 2) setTimeout(() => syncSidebarView(row, base, latest, attempt + 1), 1500);
+  }
+  finally { sidebarSyncing.delete(key); }
+}
+
+/** 列表发现其他会话文件增长时，只读取追加区间并累加左栏未读数。 */
+function syncSidebarUpdates(sessions) {
+  for (const row of cursorViews(sessions)) {
+    const key = viewKey(row.uid, row.agent);
+    const latest = cleanCursor(row.cursor);
+    if (!latest) continue;
+    const entry = cache.get(key);
+    const base = entry
+      ? cleanCursor({end: entry.end, head: entry.version?.head, anchor: entry.anchor})
+      : cleanCursor(S.cursors.get(key));
+    if (!base) { S.cursors.set(key, latest); continue; }
+    if (base.end === latest.end && base.head === latest.head && base.anchor === latest.anchor) {
+      S.cursors.set(key, latest);
+      continue;
+    }
+    const detailVisible = S.sel === row.uid && S.agent === row.agent
+      && (!MOBILE.matches || document.body.classList.contains('mobile-detail'));
+    if (detailVisible) {                     // 当前正在看的新增内容直接视为已读
+      S.cursors.set(key, latest);
+      continue;
+    }
+    if (latest.end < base.end) {
+      cache.delete(key);                      // 明确回滚，不尝试整份后台下载
+      S.cursors.set(key, latest);
+      continue;
+    }
+    void syncSidebarView(row, base, latest);
+  }
+}
+
 function mergeSessionMetaEvent(entry, session) {
   if (entry.meta.agent_id || !session.renamed_at || !session.renamed_to) return false;
   const eventId = `rename:${session.sid}:${session.renamed_at}`;
@@ -643,12 +734,14 @@ async function loadSessions(force) {
   }
   if (run !== sessionLoadRun) return false;
   $('#stat').classList.remove('err');
+  const seedCursors = S.cursors.size === 0;
   S.sig = d.sig;
   S.sessions = d.sessions;
   refreshSessionMeta();
   renderChips();
   renderSide();
   showSessionCount(sidebarSessions().length);
+  seedCursors ? seedSidebarCursors(d.sessions) : syncSidebarUpdates(d.sessions);
   return true;
 }
 
@@ -662,6 +755,7 @@ async function pollSessions() {
     S.sessions = d.sessions;
     refreshSessionMeta();
     renderChips();
+    syncSidebarUpdates(d.sessions);
     if (S.results) {
       // 搜索结果集合保持不变，只合入 rename 等最新元数据。
       const fresh = new Map(S.sessions.map(s => [s.uid, s]));
@@ -939,6 +1033,7 @@ async function openSession(uid, agent = null) {
   const { data, bytes } = res;
   cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
                   end: data.end, anchor: data.anchor, activity: data.activity, bytes });
+  S.cursors.set(key, {end: data.end, head: data.version.head, anchor: data.anchor});
   await renderSession(data.meta, data.messages, data.activity);
 }
 

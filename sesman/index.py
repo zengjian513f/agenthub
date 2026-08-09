@@ -105,22 +105,28 @@ def data_file(s: dict) -> Path:
     return p / "chat_history.jsonl" if s["source"] == "grok" else p
 
 
+def _head_hash(f: Path, limit: int = 4096) -> str:
+    import hashlib
+    try:
+        with open(f, "rb") as fh:
+            return hashlib.sha1(fh.read(max(0, limit))).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
 def version(s: dict) -> dict:
     """用 (大小, mtime, 文件头哈希) 标识一个版本。
 
-    会话是 append-only 的, 所以 "头部不变 + 变大" 就能安全地从旧偏移续读;
-    头哈希变了或文件缩小, 说明被重写/回退过, 必须整份重来。
+    会话通常是 append-only 的；续读时用旧 EOF 所对应的固定长度前缀和尾部
+    锚点确认旧内容没变。任一校验失败都说明可能被重写/回退，必须整份重来。
     """
-    import hashlib
     f = data_file(s)
     try:
         st = f.stat()
-        with open(f, "rb") as fh:
-            head = fh.read(4096)
     except OSError:
         return {"size": 0, "mtime": 0, "head": ""}
     return {"size": st.st_size, "mtime": int(st.st_mtime * 1000),
-            "head": hashlib.sha1(head).hexdigest()[:16]}
+            "head": _head_hash(f)}
 
 
 ANCHOR = 512      # 续读前校验偏移点之前这么多字节的内容
@@ -138,6 +144,36 @@ def _anchor_hash(f: Path, pos: int) -> str:
             return hashlib.sha1(fh.read(pos - lo)).hexdigest()[:16]
     except OSError:
         return ""
+
+
+def cursor(s: dict) -> dict:
+    """供浏览器低成本跟踪后台会话追加内容的安全续读游标。"""
+    ver = version(s)
+    return {"end": ver["size"], "head": ver["head"],
+            "anchor": _anchor_hash(data_file(s), ver["size"])}
+
+
+def with_cursors(sessions: list[dict]) -> list[dict]:
+    """给列表元数据附加主会话及 Claude 子代理的 EOF 游标。
+
+    这里只读取每个文件头 4 KiB 和尾部 512 B；浏览器随后只拉变化文件的
+    新增区间，不需要为了左栏未读数下载整份历史。
+    """
+    out = []
+    for session in sessions:
+        row = {**session, "cursor": cursor(session)}
+        items = []
+        for item in session.get("agent_items") or []:
+            copy = dict(item)
+            try:
+                copy["cursor"] = cursor(session_view(session, str(item.get("id") or "")))
+            except KeyError:
+                pass
+            items.append(copy)
+        if items:
+            row["agent_items"] = items
+        out.append(row)
+    return out
 
 
 def session_view(s: dict, agent: str = "") -> dict:
@@ -160,14 +196,16 @@ def session_view(s: dict, agent: str = "") -> dict:
 
 
 def messages(uid: str, agent: str = "",
-             start: int = 0, head: str = "", anchor: str = "") -> dict:
+             start: int = 0, head: str = "", anchor: str = "",
+             append_only: bool = False) -> dict:
     s = get(uid)
     if not s:
         raise KeyError(uid)
-    return messages_for(session_view(s, agent), start, head, anchor)
+    return messages_for(session_view(s, agent), start, head, anchor, append_only)
 
 
-def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "") -> dict:
+def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
+                 append_only: bool = False) -> dict:
     """整份或增量读取。传的是会话元数据而不是 uid —— SSE 那边每 50ms 要调一次,
     走 uid 的话每次都会连带重算索引签名(数百次 stat)甚至重建整个索引。
 
@@ -176,12 +214,22 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "") -> d
     长度也可能重新超过旧偏移, 只看头和长度会从旧偏移读到一段完全不同的内容。
     """
     ver = version(s)
-    ok = bool(start and head and head == ver["head"] and start <= ver["size"])
+    # 小于 4 KiB 的新会话追加后，当前 head 会自然变长、哈希也会变化；应当
+    # 用旧 EOF 所确定的同长度前缀校验，而不是把正常追加误判成历史改写。
+    ok = bool(start and head and start <= ver["size"]
+              and head == _head_hash(data_file(s), min(4096, start)))
     if ok and anchor:
         ok = anchor == _anchor_hash(data_file(s), start)
     elif ok and not anchor:
         ok = False                       # 没带锚点就不给续读, 宁可重来
     reset = not ok
+    if reset and append_only:
+        # 后台未读探测绝不能因回滚/重写退化成几十 MB 的整份下载；让调用方
+        # 丢弃旧缓存并以当前 EOF 重新建立基线即可。
+        end = ver["size"]
+        return {"meta": s, "version": ver, "reset": True, "start": end, "end": end,
+                "anchor": _anchor_hash(data_file(s), end), "messages": [],
+                "activity_changed": False, "activity": None}
     if reset:
         start = 0
     ad = ADAPTERS[s["source"]]
