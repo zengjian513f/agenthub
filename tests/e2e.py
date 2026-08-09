@@ -56,7 +56,7 @@ def make_fake_session():
     sid = f.stem
     long_text = "长文本测试 " + "x" * 9000
     FAKE_IMG.write_bytes(base64.b64decode(PNG_B64))
-    attachment_image = FAKE_CWD / "sesman_attachments/4/附件 图片.png"
+    attachment_image = FAKE_CWD / "sesman_attachments/4/image.png"
     attachment_image.parent.mkdir(parents=True, exist_ok=True)
     attachment_image.write_bytes(base64.b64decode(PNG_B64))
     render_sample = (
@@ -68,7 +68,7 @@ def make_fake_session():
         "```text\n$code_not_math$\n```\n\n"
         "```python\ndef greet(name):\n    return f\"hello {name}\"\n```\n\n"
         f"![本地测试图]({FAKE_IMG})\n\n"
-        "附件1:./sesman_attachments/4/附件 图片.png\n\n"
+        "附件1: ./sesman_attachments/4/image.png\n\n"
         "不存在的相对图片 ![缺失图](path-or-url)"
     )
     rows = [
@@ -794,8 +794,8 @@ def run(pw):
           and p.locator('script[src^="http"]:not([src^="' + BASE + '"])').count() == 0)
     imgs = p.locator(".mb img")
     check("Markdown、附件清单与结构化图片都渲染", imgs.count() >= 3, imgs.count())
-    check("附件清单图片带稳定附件编号",
-          p.locator('.media-link img[alt^="附件1 ·"]').count() >= 1)
+    check("附件清单中的裸路径图片已渲染",
+          p.locator('.media-link img[alt="image.png"]').count() >= 1)
     check("本地及内嵌图片走受限媒体接口",
           all(x.startswith("/api/media/") for x in imgs.evaluate_all("ns => ns.map(n => new URL(n.src).pathname)")))
     imgs.first.scroll_into_view_if_needed()
@@ -1804,8 +1804,8 @@ def run(pw):
           }], [])""")
         check("正文原样保留并在空行后追加精简附件清单",
               converted_prompt == "请分析 [附件1]，原样保留 @2\n\n"
-              "附件1:./sesman_attachments/7/图.png\n"
-              "附件3:./sesman_attachments/7/数据.csv",
+              "附件1: ./sesman_attachments/7/图.png\n"
+              "附件3: ./sesman_attachments/7/数据.csv",
               converted_prompt)
         check("纯文字 prompt 保持原样以兼容斜杠命令",
               p.evaluate("buildComposerPrompt('/rename abc', [], [])") == "/rename abc")

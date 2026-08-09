@@ -1342,7 +1342,7 @@ function buildComposerPrompt(text, attachments = [], quotes = []) {
   const blocks = [];
   if (attachments.length) {
     blocks.push(attachments.map((a, i) =>
-      `附件${Number.isInteger(a.number) ? a.number : i + 1}:${attachmentPath(a)}`).join('\n'));
+      `附件${Number.isInteger(a.number) ? a.number : i + 1}: ${attachmentPath(a)}`).join('\n'));
   }
   if (quoted.length) blocks.push(quoted.map((q, i) => `引用${i + 1}:\n${q}`).join('\n'));
   let prompt = body;
