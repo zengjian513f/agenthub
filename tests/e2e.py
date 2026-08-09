@@ -270,20 +270,26 @@ def run(pw):
     fake_uid = p.evaluate("() => S.sessions.find(s => s.title === 'SESMAN自测会话请删除').uid")
     attachment_payload = b"sesman attachment raw bytes\x00\x01"
     attachment_responses = p.evaluate("""async ({uid, bytes}) => {
-      async function upload(payload) {
+      async function upload(payload, id = null) {
         const url = new URL(appUrl('api/session/attachment'));
         url.searchParams.set('uid', uid); url.searchParams.set('name', '测试 attachment.txt');
+        if (id) url.searchParams.set('id', id);
         const file = new File([new Uint8Array(payload)], '测试 attachment.txt', {type:'text/plain'});
         const response = await fetch(url, {method:'POST', headers:{'Content-Type':file.type}, body:file});
         return response.json();
       }
-      return [await upload(bytes), await upload(bytes), await upload([...bytes, 2])];
+      const first = await upload(bytes);
+      return [first, await upload(bytes, first.attachment_id),
+        await upload([...bytes, 2], first.attachment_id)];
     }""", {"uid": fake_uid, "bytes": list(attachment_payload)})
     attachment_response, same_response, different_response = attachment_responses
     attachment_path = Path(attachment_response["path"])
-    check("附件以原文件名保存到当前目录的受控子目录",
-          attachment_path == FAKE_CWD / ".sesman_attachments" / "测试 attachment.txt"
-          and attachment_response["relative_path"] == ".sesman_attachments/测试 attachment.txt",
+    attachment_id = attachment_response["attachment_id"]
+    check("附件以原文件名保存到递增编号的受控子目录",
+          attachment_id.isdigit()
+          and attachment_path == FAKE_CWD / "sesman_attachments" / attachment_id / "测试 attachment.txt"
+          and attachment_response["relative_path"]
+          == f"sesman_attachments/{attachment_id}/测试 attachment.txt",
           attachment_response)
     check("附件按原始二进制流完整落盘",
           attachment_path.read_bytes() == attachment_payload
@@ -292,8 +298,8 @@ def run(pw):
           same_response["path"] == attachment_response["path"]
           and same_response["reused"] is True, same_response)
     different_path = Path(different_response["path"])
-    check("同名但内容不同的附件添加 Windows 式编号",
-          different_path.name == "测试 attachment (1).txt"
+    check("同名但内容不同的附件添加双下划线编号",
+          different_path.name == "测试 attachment__1.txt"
           and different_path.read_bytes() == attachment_payload + b"\x02"
           and different_response["reused"] is False, different_response)
     p.set_viewport_size({"width": 1280, "height": 720})
@@ -783,29 +789,27 @@ def run(pw):
         p.wait_for_timeout(150)
         check("组可再折叠", not grp.locator("> .tool-entry").first.is_visible())
 
-    # ---- 8c. 文件修改卡片与 diff 视图 ----
+    # ---- 8c. 文件修改卡片内联 diff 与独立视图切换 ----
     change = p.locator(".file-change-card").first
     check("文件修改不埋在折叠工具组里", change.is_visible())
     check("修改卡显示路径和增删统计",
           "demo.py" in change.inner_text() and "+1" in change.inner_text() and "−1" in change.inner_text(),
           change.inner_text())
-    check("时间线直接显示修改 snippet",
+    check("时间线直接显示完整修改 diff",
           "return 1" in change.inner_text() and "return 2" in change.inner_text())
-    change.click()
-    p.wait_for_selector("#file-diff-dialog[open]")
-    check("点击修改卡打开 diff 视图",
-          "demo.py" in p.locator("#file-diff-title").inner_text())
-    check("统一 diff 区分新增和删除",
-          "return 1" in p.locator("#file-diff-body .diff-line.del").inner_text()
-          and "return 2" in p.locator("#file-diff-body .diff-line.add").inner_text())
-    p.click('[data-diff-view="split"]')
-    split = p.locator("#file-diff-body .diff-split > section")
+    check("diff 不再使用点击弹窗", p.locator("#file-diff-dialog").count() == 0)
+    check("内联统一 diff 区分新增和删除",
+          "return 1" in change.locator(".diff-line.del").inner_text()
+          and "return 2" in change.locator(".diff-line.add").inner_text())
+    change.locator('[data-diff-view="split"]').click()
+    split = change.locator(".diff-split > section")
     check("diff 可以切换为修改前后并排", split.count() == 2
           and "return 1" in split.nth(0).inner_text()
           and "return 2" in split.nth(1).inner_text())
-    check("片段不会伪装成完整文件", "片段" in p.locator("#file-diff-note").inner_text())
-    p.click("#file-diff-dialog .modal-close")
-    check("diff 视图可以关闭", not p.locator("#file-diff-dialog").is_visible())
+    check("片段不会伪装成完整文件", "片段" in change.locator(".file-change-head").inner_text())
+    check("当前卡片记录并排状态", change.get_attribute("data-diff-view") == "split")
+    change.locator('[data-diff-view="unified"]').click()
+    check("diff 可以切回统一视图", change.locator(".diff-unified").is_visible())
 
     # ---- 9. 展开全文 ----
     more = p.locator(".msg .more:visible").filter(has_text="展开全文").first
@@ -1363,8 +1367,8 @@ def run(pw):
     p.keyboard.press("Escape")
     p.locator("body").click(position={"x": 5, "y": 400})
     p.keyboard.press("/")
-    check("斜杠聚焦搜索框", p.evaluate("document.activeElement.id") == "q")
-    check("斜杠未写入搜索框", p.input_value("#q") == "", repr(p.input_value("#q")))
+    check("斜杠不再劫持焦点到搜索框", p.evaluate("document.activeElement.id") != "q")
+    check("斜杠不会写入搜索框", p.input_value("#q") == "", repr(p.input_value("#q")))
 
     # ---- 15a. 接管会话 (服务端需 --terminal) ----
     tl = json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())
@@ -1430,7 +1434,8 @@ def run(pw):
         }""", PENDING_TERM)
         check("临时会话第一条消息前即可上传附件",
               pending_upload["status"] == 200
-              and pending_upload["data"]["relative_path"] == ".sesman_attachments/pending.png",
+              and re.fullmatch(r"sesman_attachments/\d+/pending\.png",
+                               pending_upload["data"]["relative_path"]),
               pending_upload)
         migrated_draft = p.evaluate("""() => {
           const from = 'tmux:e2e-draft', to = 'claude:e2e-draft';
@@ -1502,6 +1507,24 @@ def run(pw):
         check("接管未弹确认框(会话本来就没在跑)", not dialogs, dialogs[:1])
         check("终端出现在会话底部", p.locator("#termpane").is_visible())
         check("消息流还在上方", p.locator("#msgs .msg").count() > 0)
+        ctrl_lock = p.evaluate("""() => {
+          T.term.textarea.dispatchEvent(new KeyboardEvent('keydown', {
+            key:'Control', code:'ControlRight', location:2, ctrlKey:true, bubbles:true
+          }));
+          const result = {armed:T.ctrlArmed, pane:$('#termpane').classList.contains('ctrl-locked'),
+            indicator:$('#term-ctrl-lock').getClientRects().length > 0,
+            ctrlT:applyTermCtrl('t').charCodeAt(0)};
+          T.term.textarea.dispatchEvent(new KeyboardEvent('keyup', {
+            key:'Control', code:'ControlRight', location:2, bubbles:true
+          }));
+          result.released = !T.ctrlArmed && !$('#termpane').classList.contains('ctrl-locked');
+          return result;
+        }""")
+        check("桌面右 Ctrl 锁定下一键并在发送 Ctrl+T 后解除",
+              ctrl_lock == {"armed": True, "pane": True, "indicator": True,
+                            "ctrlT": 20, "released": True},
+              ctrl_lock)
+        check("终端不再提供全屏模式", p.locator("#term-exclusive").count() == 0)
         check("按钮变成收起终端", p.locator("#a-term").get_attribute("title") == "收起终端",
               p.locator("#a-term").get_attribute("title"))
         check("终端不再增加已接管状态栏",
@@ -1658,20 +1681,32 @@ def run(pw):
               and p.locator("#cinput").input_value() == "[附件1]", remaining_refs)
         converted_prompt = p.evaluate("""() => buildComposerPrompt(
           '请分析 [附件1]，原样保留 @2', [{
-            number:1, relative_path:'.sesman_attachments/图.png'
+            number:1, relative_path:'sesman_attachments/7/图.png'
           }, {
-            number:3, relative_path:'.sesman_attachments/数据.csv'
+            number:3, relative_path:'sesman_attachments/7/数据.csv'
           }], [])""")
         check("正文原样保留并在空行后追加精简附件清单",
               converted_prompt == "请分析 [附件1]，原样保留 @2\n\n"
-              "附件1:./.sesman_attachments/图.png\n"
-              "附件3:./.sesman_attachments/数据.csv",
+              "附件1:./sesman_attachments/7/图.png\n"
+              "附件3:./sesman_attachments/7/数据.csv",
               converted_prompt)
         check("纯文字 prompt 保持原样以兼容斜杠命令",
               p.evaluate("buildComposerPrompt('/rename abc', [], [])") == "/rename abc")
         p.locator("#compose-items .draft-remove").evaluate_all("nodes => nodes.forEach(n => n.click())")
         p.fill("#cinput", "")
         check("附件与引用可以在发送前移除", p.locator("#compose-items .draft-card").count() == 0)
+        queued_id = p.evaluate("u => queuePendingUserMessage(u, '等待前一轮完成的指令')", target)
+        queued = p.locator('.msg.client-pending[data-role="user"]')
+        check("尚未写入 Codex rollout 的输入立即显示为排队中",
+              bool(queued_id) and queued.count() == 1
+              and "等待前一轮完成的指令" in queued.inner_text()
+              and "排队中" in queued.inner_text())
+        p.evaluate("""u => {
+          reconcileQueuedMessages(u, [{role:'user', text:'等待前一轮完成的指令',
+            ts:new Date().toISOString()}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("原生用户消息出现后移除乐观排队副本", queued.count() == 0)
         sent = []
         p.on("response", lambda r: sent.append(r.status) if "/api/term/send" in r.url else None)
         # 手机 Enter 只换行，发送必须点按钮；短 placeholder 不把单行输入框撑高。

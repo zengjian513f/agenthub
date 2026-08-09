@@ -66,6 +66,10 @@ const S = {
   activeOnly: store.get('activeOnly', false), // 左栏只显示仍在运行的会话
   unread: new Map(store.get('unread', [])),   // uid → {count, tmux}; 只计代理产生的新内容
   cursors: new Map(), // 主会话/子代理 EOF 游标；用于后台会话的精确未读增量
+  queued: new Map((() => {                    // uid → 尚未写入原生会话记录的已发送消息
+    const saved = store.get('queuedMessages', []);
+    return Array.isArray(saved) ? saved : [];
+  })()),
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -179,6 +183,73 @@ const messageCount = msgs => msgs.filter(m => m.counted !== false).length;
 const entryTotal = entry => Number.isFinite(+entry?.total)
   ? +entry.total : messageCount(entry?.msgs || []);
 
+function saveQueuedMessages() {
+  for (const [uid, items] of S.queued) {
+    if (!Array.isArray(items) || !items.length) S.queued.delete(uid);
+  }
+  // 极长 prompt 可能超过浏览器的 localStorage 配额；不能让持久化失败反过来阻止发送。
+  try { store.set('queuedMessages', [...S.queued]); } catch { /* 本页内存回显仍然有效 */ }
+}
+
+function queuedMessages(uid) {
+  const items = S.queued.get(uid);
+  return Array.isArray(items) ? items : [];
+}
+
+/** Codex 在忙时只把新输入留在 TUI 内存里，轮到它之前 rollout 没有任何记录。
+ *  先持久化并回显；原生 user/command 记录出现后再按正文和时间精确消重。 */
+function queuePendingUserMessage(uid, text) {
+  text = String(text || '');
+  if (!uid || !text.trim()) return null;
+  const item = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    text, created: Date.now(),
+  };
+  const items = queuedMessages(uid).slice();
+  items.push(item);
+  S.queued.set(uid, items);
+  saveQueuedMessages();
+  if (S.sel === uid && !S.agent) renderConversationTail(
+    cache.get(viewKey(uid))?.activity, uid);
+  return item.id;
+}
+
+function discardQueuedUserMessage(uid, id) {
+  const items = queuedMessages(uid).filter(item => item.id !== id);
+  if (items.length) S.queued.set(uid, items); else S.queued.delete(uid);
+  saveQueuedMessages();
+  if (S.sel === uid && !S.agent) renderConversationTail(
+    cache.get(viewKey(uid))?.activity, uid);
+}
+
+function reconcileQueuedMessages(uid, messages) {
+  const items = queuedMessages(uid).slice();
+  if (!items.length) return false;
+  let changed = false;
+  for (const message of messages || []) {
+    if (!['user', 'command'].includes(message.role)) continue;
+    const at = items.findIndex(item => {
+      if (item.text !== String(message.text || '')) return false;
+      const recorded = Date.parse(message.ts || '');
+      return !Number.isFinite(recorded) || recorded >= (+item.created || 0) - 5000;
+    });
+    if (at >= 0) { items.splice(at, 1); changed = true; }
+  }
+  if (!changed) return false;
+  if (items.length) S.queued.set(uid, items); else S.queued.delete(uid);
+  saveQueuedMessages();
+  return true;
+}
+
+function migrateQueuedMessages(fromUid, toUid) {
+  if (!fromUid || !toUid || fromUid === toUid) return;
+  const moved = queuedMessages(fromUid);
+  if (!moved.length) return;
+  S.queued.set(toUid, [...queuedMessages(toUid), ...moved]);
+  S.queued.delete(fromUid);
+  saveQueuedMessages();
+}
+
 function cacheGet(uid) {
   const e = cache.get(uid);
   if (e) { cache.delete(uid); cache.set(uid, e); }   // 命中即移到队尾
@@ -270,6 +341,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   const key = viewKey(uid, agent);
   const e = cache.get(key);
   if (!e) return 0;
+  if (!agent) reconcileQueuedMessages(uid, data.messages);
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
     cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
                     end: data.end, anchor: data.anchor, activity: data.activity, bytes,
@@ -296,7 +368,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     e.activity = { role: 'status', state: 'working', text: 'working', ts: new Date().toISOString() };
   }
   if (!data.messages.length) {
-    if (S.sel === uid && S.agent === agent) renderActivity(e.activity);
+    if (S.sel === uid && S.agent === agent) renderConversationTail(e.activity, uid);
     return 0;
   }
   e.total = entryTotal(e) + messageCount(data.messages);
@@ -309,12 +381,13 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   const box = $('#msgs');
   if (!box) return data.messages.length;
   $('#activity')?.remove();
+  box.querySelectorAll('.client-pending').forEach(node => node.remove());
   const mark = el('span');
   box.appendChild(mark);
   appendMessages(box, data.messages, null);
   for (let n = mark.nextSibling; n; n = n.nextSibling) markMatches(n);
   mark.remove();
-  renderActivity(e.activity);
+  renderConversationTail(e.activity, uid);
   const c = $('#mcount-total');
   const total = entryTotal(e);
   if (c) c.textContent = `${total} 条消息`;
@@ -500,7 +573,7 @@ function paintLive() {
   const selected = S.sessions.find(x => x.uid === S.sel);
   if (selected) {
     renderSessionAction(selected);
-    renderActivity(cache.get(viewKey(selected.uid, S.agent))?.activity);
+    renderConversationTail(cache.get(viewKey(selected.uid, S.agent))?.activity, selected.uid);
   }
   const c = $('#livecount');
   if (c) {
@@ -1203,6 +1276,7 @@ async function renderSession(meta, msgs, activity = null) {
   const d = $('#detail');
   d.innerHTML = '';
   const entry = cache.get(viewKey(uid, agent));
+  if (!agent) reconcileQueuedMessages(uid, msgs);
   d.appendChild(head(meta, entryTotal(entry || {msgs})));
   const box = el('div', 'msgs');
   box.id = 'msgs';
@@ -1229,7 +1303,7 @@ async function renderSession(meta, msgs, activity = null) {
     }
   }
   box.appendChild(frag);
-  renderActivity(activity);
+  renderConversationTail(activity, uid);
   stickBottom(box, true);                // 默认停在最新的一条
   watchBottom(box);
   progressDone();
@@ -1604,22 +1678,12 @@ function sideRows(rows, unavailable) {
     || '<div class="diff-empty">（空文件）</div>';
 }
 
-let activeFileChange = null;
-let activeDiffView = 'unified';
-
-function paintFileDiff() {
-  const change = activeFileChange;
-  if (!change) return;
-  const body = $('#file-diff-body');
-  for (const button of document.querySelectorAll('[data-diff-view]')) {
-    button.classList.toggle('on', button.dataset.diffView === activeDiffView);
-  }
-  if (activeDiffView === 'unified') {
-    body.innerHTML = `<div class="diff-unified">${diffRows(String(change.patch || '').split('\n'))}</div>`;
-    return;
+function fileDiffMarkup(change, view) {
+  if (view === 'unified') {
+    return `<div class="diff-unified">${diffRows(String(change.patch || '').split('\n'))}</div>`;
   }
   const sides = diffSides(change);
-  body.innerHTML = `<div class="diff-split">
+  return `<div class="diff-split">
     <section><b>修改前${change.before_complete ? '（完整）' : '（片段）'}</b>
       <div>${sideRows(sides.before, !change.before_available)}</div></section>
     <section><b>修改后${change.after_complete ? '（完整）' : '（片段）'}</b>
@@ -1627,15 +1691,14 @@ function paintFileDiff() {
   </div>`;
 }
 
-function openFileDiff(change) {
-  activeFileChange = change;
-  activeDiffView = 'unified';
-  $('#file-diff-title').textContent = change.new_path
-    ? `${change.path} → ${change.new_path}` : change.path;
-  const scope = change.before_complete || change.after_complete ? '包含可确定的完整文件内容' : '会话只记录了修改片段';
-  $('#file-diff-note').textContent = `${CHANGE_LABEL[change.operation] || '修改'} · ${scope}`;
-  paintFileDiff();
-  $('#file-diff-dialog').showModal();
+function paintInlineFileDiff(card, change, view) {
+  card.dataset.diffView = view;
+  for (const button of card.querySelectorAll('[data-diff-view]')) {
+    const on = button.dataset.diffView === view;
+    button.classList.toggle('on', on);
+    button.setAttribute('aria-pressed', String(on));
+  }
+  card.querySelector('.file-change-body').innerHTML = fileDiffMarkup(change, view);
 }
 
 function fileChangeNode(m) {
@@ -1645,17 +1708,24 @@ function fileChangeNode(m) {
   if (m.counted === false) n.dataset.counted = 'false';
   const body = el('div', 'file-change-list');
   for (const change of m.changes) {
-    const button = el('button', 'file-change-card');
-    button.type = 'button';
+    const card = el('section', 'file-change-card');
     const path = change.new_path ? `${change.path} → ${change.new_path}` : change.path;
-    const preview = String(change.patch || '').split('\n')
-      .filter(line => !/^(---|\+\+\+|\*\*\*)/.test(line)).slice(0, 7);
-    button.innerHTML = `<span class="file-change-head"><b>${esc(path)}</b>
-      <span><em>${esc(CHANGE_LABEL[change.operation] || '修改')}</em>
-      <i class="add">+${change.added || 0}</i><i class="del">−${change.removed || 0}</i></span></span>
-      <span class="file-change-preview">${diffRows(preview)}</span>`;
-    button.onclick = () => openFileDiff(change);
-    body.appendChild(button);
+    const complete = change.before_complete || change.after_complete;
+    const scope = complete ? '包含可确定的完整文件内容' : '会话只记录了修改片段';
+    card.innerHTML = `<div class="file-change-head"><b title="${esc(path)}">${esc(path)}</b>
+      <span class="file-change-meta"><em title="${esc(scope)}">${esc(CHANGE_LABEL[change.operation] || '修改')} · ${complete ? '完整' : '片段'}</em>
+      <i class="add">+${change.added || 0}</i><i class="del">−${change.removed || 0}</i>
+      <span class="file-change-toolbar" role="group" aria-label="Diff 显示方式">
+        <button type="button" data-diff-view="unified" aria-pressed="true">统一</button>
+        <button type="button" data-diff-view="split" aria-pressed="false">并排</button>
+      </span></span></div>
+      <div class="file-change-body"></div>`;
+    card.querySelector('.file-change-toolbar').onclick = e => {
+      const button = e.target.closest('[data-diff-view]');
+      if (button) paintInlineFileDiff(card, change, button.dataset.diffView);
+    };
+    paintInlineFileDiff(card, change, 'unified');
+    body.appendChild(card);
   }
   n.appendChild(body);
   return n;
@@ -1839,6 +1909,28 @@ function renderActivity(activity) {
   n.innerHTML = `<i></i><span>${label}</span>`;
   if (activity.reason) n.title = activity.reason;
   box.appendChild(n);
+}
+
+function renderQueuedMessages(uid = S.sel) {
+  const box = $('#msgs');
+  if (!box || S.agent || uid !== S.sel) return;
+  for (const item of queuedMessages(uid)) {
+    const node = msgNode({role: 'user', text: item.text, counted: false});
+    node.classList.add('client-pending');
+    node.dataset.queuedId = item.id;
+    node.appendChild(el('small', 'client-pending-state', '排队中'));
+    box.appendChild(node);
+  }
+}
+
+/** Activity 和乐观消息都是时间线尾部状态；每次重画都固定保持排队消息在最下方。 */
+function renderConversationTail(activity, uid = S.sel) {
+  const box = $('#msgs');
+  if (!box) return;
+  $('#activity')?.remove();
+  box.querySelectorAll('.client-pending').forEach(node => node.remove());
+  renderActivity(activity);
+  renderQueuedMessages(uid);
 }
 
 const CLIP = 4000;
@@ -2145,16 +2237,6 @@ $('#settings').onclick = openSettings;
 $('#settings-dialog').addEventListener('click', e => {
   if (e.target === $('#settings-dialog')) $('#settings-dialog').close();
 });
-$('#file-diff-dialog .modal-close').onclick = () => $('#file-diff-dialog').close();
-$('#file-diff-dialog').addEventListener('click', e => {
-  if (e.target === $('#file-diff-dialog')) $('#file-diff-dialog').close();
-});
-$('#file-diff-dialog .diff-toolbar').onclick = e => {
-  const button = e.target.closest('[data-diff-view]');
-  if (!button) return;
-  activeDiffView = button.dataset.diffView;
-  paintFileDiff();
-};
 $('#setting-font').onchange = e => applyFont(e.target.value, true);
 $('#setting-theme').onchange = e => applyTheme(e.target.value, true);
 $('#setting-cache').onchange = e => {
@@ -2165,7 +2247,6 @@ $('#setting-cache').onchange = e => {
 };
 
 document.addEventListener('keydown', e => {
-  if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); }
   if (e.key === 'Escape') { $('#q').blur(); }
 });
 

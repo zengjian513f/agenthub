@@ -23,7 +23,8 @@ WATCH_POLL = 0.05       # 服务端盯文件的间隔; stat 一个文件是微�
 JSON_GZIP_MIN = 1024    # 小响应省不了多少，避免反而增加压缩 CPU 和头部体积
 JSON_GZIP_LEVEL = 4     # 实测 4.5 MiB → 1.20 MiB / 75 ms，继续加级收益很小
 ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
-ATTACHMENT_DIR = ".sesman_attachments"
+ATTACHMENT_DIR = "sesman_attachments"
+ATTACHMENT_DIR_LOCK = threading.Lock()
 
 
 def _pane_for_session(session: dict, panes: list[dict],
@@ -202,6 +203,9 @@ class Handler(BaseHTTPRequestHandler):
         """把一个原始二进制附件流写入会话 cwd 下的受控子目录。"""
         uid = str(q.get("uid", [""])[0])
         original = self._attachment_name(q.get("name", ["attachment"])[0])
+        requested_id = str(q.get("id", [""])[0]).strip()
+        if requested_id and not re.fullmatch(r"[1-9]\d{0,8}", requested_id):
+            return self._json({"error": "附件目录编号无效"}, 400)
         # 新建 CLI 在写出第一条正式会话记录前只有 tmux 名，没有普通 uid。
         # pending 记录同样由服务端创建并保存可信 cwd，允许它先接收附件。
         session = None
@@ -227,10 +231,25 @@ class Handler(BaseHTTPRequestHandler):
         if not cwd.is_absolute() or not cwd.is_dir():
             return self._json({"error": "会话当前目录不存在"}, 409)
         cwd = cwd.resolve()
-        base = cwd / ATTACHMENT_DIR
-        if base.exists() and (base.is_symlink() or not base.is_dir()):
+        root = cwd / ATTACHMENT_DIR
+        if root.exists() and (root.is_symlink() or not root.is_dir()):
             return self._json({"error": f"{ATTACHMENT_DIR} 不是安全目录"}, 409)
-        base.mkdir(mode=0o700, exist_ok=True)
+        root.mkdir(mode=0o700, exist_ok=True)
+        if requested_id:
+            attachment_id = requested_id
+            base = root / attachment_id
+            if base.exists() and (base.is_symlink() or not base.is_dir()):
+                return self._json({"error": "附件编号对应的不是安全目录"}, 409)
+            base.mkdir(mode=0o700, exist_ok=True)
+        else:
+            # 正式消息编号在上传时尚未产生，因此按项目目录从 1 递增分配批次号。
+            # mkdir(exist_ok=False) 与锁共同保证多个网页并发发送时不会撞号。
+            with ATTACHMENT_DIR_LOCK:
+                used = [int(entry.name) for entry in root.iterdir()
+                        if entry.is_dir() and re.fullmatch(r"[1-9]\d{0,8}", entry.name)]
+                attachment_id = str(max(used, default=0) + 1)
+                base = root / attachment_id
+                base.mkdir(mode=0o700, exist_ok=False)
         stamp = f"{time.strftime('%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}"
         temp = base / f".{stamp}-{threading.get_ident()}.upload"
         left = size
@@ -248,9 +267,9 @@ class Handler(BaseHTTPRequestHandler):
 
             suffix = Path(original).suffix
             stem = original[:-len(suffix)] if suffix else original
-            # 第一个使用原文件名；仅在同名但内容不同时添加 Windows 风格编号。
+            # 第一个使用原文件名；同名但内容不同时用 __N，便于命令行引用。
             for number in range(10_000):
-                name = original if number == 0 else f"{stem} ({number}){suffix}"
+                name = original if number == 0 else f"{stem}__{number}{suffix}"
                 candidate = base / name
                 if candidate.is_symlink():
                     continue
@@ -281,7 +300,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({
             "ok": True, "name": target.name, "original_name": original, "path": str(target),
             "relative_path": str(target.relative_to(cwd)),
-            "mime": mime, "kind": kind, "size": size, "reused": reused,
+            "attachment_id": attachment_id, "mime": mime, "kind": kind,
+            "size": size, "reused": reused,
         })
 
     def do_GET(self):

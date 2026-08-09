@@ -15,7 +15,7 @@ const T = {
   height: store.get('termh', 320),
   mode: store.get('termmode', 'normal'), // normal | collapsed | full
   localMouse: store.get('tmouse', false),   // true = 鼠标归浏览器, 可以框选复制
-  ctrlArmed: false,                         // 手机 Ctrl：只修饰下一次输入
+  ctrlArmed: false,                         // 手机 Ctrl / 桌面右 Ctrl：只修饰下一次输入
   sources: {},
   home: '',
   pending: [],
@@ -612,6 +612,10 @@ function ensureTerm(name) {
     else restoreTermSelection(view);       // Claude 重绘清选区时，恢复刚才的框选
   });
   term.attachCustomKeyEventHandler(e => {
+    if (e.code === 'ControlRight') {
+      if (e.type === 'keydown' && !e.repeat) setTermCtrl(true);
+      return false;                        // 右 Ctrl 只锁定下一键，不交给 xterm
+    }
     const copy = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'c';
     if (copy && term.hasSelection()) {
       if (e.type === 'keydown' && !e.repeat) copyTermSelection(term);
@@ -1048,6 +1052,7 @@ function remapAttachmentReferences(text, remap) {
 
 function migrateComposerDraft(fromUid, toUid) {
   if (!fromUid || !toUid || fromUid === toUid) return;
+  if (typeof migrateQueuedMessages === 'function') migrateQueuedMessages(fromUid, toUid);
   const draft = composerDrafts.get(fromUid);
   if (!draft) return;
   const target = composerDrafts.get(toUid);
@@ -1118,14 +1123,18 @@ function syncComposerMode() {
 async function sendToSession(text, keys, uid = S.sel) {
   const name = takenOver(uid);
   if (!name) return false;
+  const queuedId = text && typeof queuePendingUserMessage === 'function'
+    ? queuePendingUserMessage(uid, text) : null;
   let d;
   try {
     d = await post('api/term/send', keys ? { name, keys } : { name, text });
   } catch (e) {
+    if (queuedId) discardQueuedUserMessage(uid, queuedId);
     alert('发送失败: ' + (e.message || e));
     return false;
   }
   if (d.error) {
+    if (queuedId) discardQueuedUserMessage(uid, queuedId);
     alert('发送失败: ' + d.error);
     return false;
   }
@@ -1303,7 +1312,7 @@ function buildComposerPrompt(text, attachments = [], quotes = []) {
   return prompt;
 }
 
-async function uploadComposerAttachment(attachment, uid) {
+async function uploadComposerAttachment(attachment, uid, attachmentId = null) {
   if (attachment.uploaded?.uid === uid) return attachment.uploaded;
   attachment.status = 'uploading';
   attachment.error = '';
@@ -1311,6 +1320,7 @@ async function uploadComposerAttachment(attachment, uid) {
   const url = new URL(appUrl('api/session/attachment'));
   url.searchParams.set('uid', uid);
   url.searchParams.set('name', attachment.file.name || 'attachment');
+  if (attachmentId) url.searchParams.set('id', attachmentId);
   try {
     const response = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': attachment.file.type || 'application/octet-stream' },
@@ -1347,10 +1357,12 @@ async function submitComposer() {
   renderComposerItems();
   try {
     const uploaded = [];
+    let attachmentId = attachments.find(x => x.uploaded?.uid === uid)?.uploaded?.attachment_id || null;
     for (let i = 0; i < attachments.length; i++) {
       button.textContent = `上传 ${i + 1}/${attachments.length}`;
-      uploaded.push({ ...(await uploadComposerAttachment(attachments[i], uid)),
-        number: attachments[i].number });
+      const result = await uploadComposerAttachment(attachments[i], uid, attachmentId);
+      attachmentId ||= result.attachment_id;
+      uploaded.push({ ...result, number: attachments[i].number });
     }
     button.textContent = '发送中…';
     const prompt = buildComposerPrompt(text, uploaded, quotes);
@@ -1474,6 +1486,7 @@ $('#composer').addEventListener('drop', e => {
 
 function setTermCtrl(on) {
   T.ctrlArmed = !!on;
+  $('#termpane').classList.toggle('ctrl-locked', T.ctrlArmed);
   const b = $('[data-term-modifier="ctrl"]');
   if (b) {
     b.classList.toggle('on', T.ctrlArmed);
@@ -1481,7 +1494,7 @@ function setTermCtrl(on) {
   }
 }
 
-/** 把 Ctrl 后的单个 ASCII 键转换为终端控制字节。多字符粘贴和中文不改写。 */
+/** 把 Ctrl 修饰的单个 ASCII 键转换为终端控制字节。多字符粘贴和中文不改写。 */
 function applyTermCtrl(data) {
   if (!T.ctrlArmed) return data;
   // focus-events、鼠标和粘贴都会产生多字节数据，它们不是用户要修饰的“下一键”。
