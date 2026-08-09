@@ -413,6 +413,8 @@ _INJECTED = re.compile(
     r"# Global User Guidance|<project_instructions>|<user_instructions>", re.I)
 _CLAUDE_INTERRUPT = re.compile(
     r"\[Request interrupted by user(?: for tool use)?\]", re.I)
+_CODEX_ABORT_MARKER = re.compile(
+    r"\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
 
 
 def _is_injected(text: str) -> bool:
@@ -995,11 +997,16 @@ class CodexAdapter:
                 continue
             k = p.get("type")
             if k == "message":
-                role = p.get("role") or "user"
+                native_role = p.get("role") or "user"
+                role = native_role
                 role = {"developer": "system", "tool": "tool_result"}.get(role, role)
                 parts = _flatten_content(p.get("content"))
                 txt = "\n".join(x["text"] for x in parts if x["kind"] == "text")
                 images = [x["media"] for x in parts if x.get("media")]
+                # Codex 会在 event_msg:turn_aborted 前额外写一条 developer XML。
+                # 后者已经提供结构化状态；把 XML 再画成系统气泡只会重复且吓人。
+                if native_role == "developer" and _CODEX_ABORT_MARKER.fullmatch(txt):
+                    continue
                 if txt.strip() or images:
                     shown = txt or "[图片]"
                     msgs.append(_msg(_user_role(role, shown), shown, ts, media_parts=images))

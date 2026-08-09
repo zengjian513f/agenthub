@@ -1462,7 +1462,31 @@ syncComposerMode();
 $('#csend').onclick = () => {
   submitComposer();
 };
-$('#cesc').onclick = () => sendToSession(null, ['Escape']);
+let composerEscAt = -Infinity;
+async function sendComposerEscape(now = performance.now()) {
+  const uid = S.sel;
+  const source = sidebarSessions().find(s => s.uid === uid)?.source;
+  const rewind = source === 'claude' && now - composerEscAt <= 650;
+  composerEscAt = rewind || source !== 'claude' ? -Infinity : now;
+  const name = takenOver(uid);
+  const sent = await sendToSession(null, ['Escape'], uid);
+  if (!rewind || !sent || !name || S.sel !== uid) return sent;
+
+  // 回滚点、恢复代码/对话的选项都由 Claude 自己维护。第二次 Esc 后直接
+  // 揭示原生 TUI，不在网页里根据 transcript 猜一个可能不一致的菜单。
+  T.uid = uid;
+  await openTermPane(name);
+  if (!MOBILE.matches && T.mode === 'collapsed') {
+    T.mode = 'full';
+    store.set('termmode', T.mode);
+    rememberTermLayout(name);
+    layoutTermPane();
+    renderTakeoverBtn();
+    setTimeout(fitTerm, 0);
+  }
+  return sent;
+}
+$('#cesc').onclick = () => sendComposerEscape();
 
 $('#cadd').onclick = e => {
   e.stopPropagation();

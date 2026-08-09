@@ -8,6 +8,33 @@ from sesman import adapters, index as session_index
 
 
 class CodexEventTests(unittest.TestCase):
+    def test_structured_abort_hides_duplicate_developer_xml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            marker = ("<turn_aborted>\nThe previous turn was interrupted on purpose. "
+                      "Commands may have partially executed.\n</turn_aborted>")
+            rows = [
+                {"timestamp": "2026-08-09T10:00:00Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "developer",
+                             "content": [{"type": "input_text", "text": marker}]}},
+                {"timestamp": "2026-08-09T10:00:00Z", "type": "event_msg",
+                 "payload": {"type": "turn_aborted", "turn_id": "turn-1",
+                             "reason": "interrupted"}},
+                {"timestamp": "2026-08-09T10:00:01Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text",
+                                          "text": marker + " 这个作为用户正文保留"}]}},
+            ]
+            rollout.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+            messages, _ = adapters.CodexAdapter().read(str(rollout))
+
+        self.assertEqual([m["state"] for m in messages if m["role"] == "status"],
+                         ["aborted"])
+        visible = [m for m in messages if m["role"] != "status"]
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(visible[0]["role"], "user")
+        self.assertIn("这个作为用户正文保留", visible[0]["text"])
+
     def test_name_and_compaction_are_visible_but_not_counted_messages(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"

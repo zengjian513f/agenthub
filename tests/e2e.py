@@ -2037,6 +2037,27 @@ def run(pw):
         p.fill("#cinput", "")
         p.evaluate("post = window.__sesmanRealPost; delete window.__sesmanRealPost")
 
+        rewind_bridge = p.evaluate("""async () => {
+          const sent = [], opened = [];
+          const realSend = sendToSession, realOpen = openTermPane;
+          sendToSession = async (text, keys, uid) => { sent.push({keys, uid}); return true; };
+          openTermPane = async name => { opened.push(name); };
+          composerEscAt = -Infinity;
+          try {
+            await sendComposerEscape(1000);
+            await sendComposerEscape(1200);
+            return {sent, opened, title:document.querySelector('#cesc').title};
+          } finally {
+            sendToSession = realSend;
+            openTermPane = realOpen;
+            composerEscAt = -Infinity;
+          }
+        }""")
+        check("对话 Esc 单击发送一次、Claude 双击发送第二次并显示原生回滚界面",
+              [x["keys"] for x in rewind_bridge["sent"]] == [["Escape"], ["Escape"]]
+              and len(rewind_bridge["opened"]) == 1
+              and "双击进入原生回滚选择" in rewind_bridge["title"], rewind_bridge)
+
         pane_before = tmux_run(tserver, "capture-pane", "-p", "-t", tname,
                                capture_output=True, text=True).stdout
         if "trust this folder" in pane_before:      # 新起的 TUI 可能停在信任确认页
