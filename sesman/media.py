@@ -150,6 +150,11 @@ _MD_IMAGE = re.compile(r'!\[([^\]]*)\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+["\'][^"\']*["
 _RAW_PATH = re.compile(
     r'(?<![\w:/])((?:~|/|\.\.?/)[^\s<>"\'`]+?\.(?:png|jpe?g|gif|webp|avif|bmp))'
     r'(?=$|[\s),;:])', re.I)
+# sesman 发送附件时使用 `附件N:./sesman_attachments/...`。普通裸路径为避免
+# 误吃 URL 而禁止前置冒号，因此附件清单必须单独识别；整行匹配也允许文件名空格。
+_ATTACHMENT_PATH = re.compile(
+    r'^\s*附件([1-9]\d*)[:：]\s*((?:~|/|\.\.?/)[^\r\n<>"\'`]+?\.(?:png|jpe?g|gif|webp|avif|bmp))\s*$',
+    re.I | re.M)
 _FENCE = re.compile(r"```.*?```", re.S)
 
 
@@ -160,6 +165,13 @@ def discover(text: str, cwd: str | None) -> list[dict]:
     scan = _FENCE.sub("", text)
     out, seen = [], set()
     markdown_spans = []
+    for m in _ATTACHMENT_PATH.finditer(scan):
+        number, ref = m.group(1), m.group(2).strip()
+        got = register_path(ref, cwd, f"附件{number} · {Path(unquote(ref)).name}")
+        if got and got["src"] not in seen:
+            got["gallery"] = True
+            out.append(got)
+            seen.add(got["src"])
     for m in _MD_IMAGE.finditer(scan):
         markdown_spans.append(m.span())
         alt, ref = m.group(1).strip() or "图片", m.group(2).strip().strip("<>")
@@ -207,4 +219,3 @@ def get(token: str) -> tuple[bytes, str, str] | None:
         return p.read_bytes(), item["mime"], item.get("name", p.name)
     except OSError:
         return None
-

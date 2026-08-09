@@ -56,6 +56,9 @@ def make_fake_session():
     sid = f.stem
     long_text = "长文本测试 " + "x" * 9000
     FAKE_IMG.write_bytes(base64.b64decode(PNG_B64))
+    attachment_image = FAKE_CWD / "sesman_attachments/4/附件 图片.png"
+    attachment_image.parent.mkdir(parents=True, exist_ok=True)
+    attachment_image.write_bytes(base64.b64decode(PNG_B64))
     render_sample = (
         "## 渲染自测\n\n| 列A | 列B | 数值 |\n|---|:---:|---:|\n"
         "| `a1` | b1 | 1 |\n| a2 | **b2** | 22 |\n\n"
@@ -65,6 +68,7 @@ def make_fake_session():
         "```text\n$code_not_math$\n```\n\n"
         "```python\ndef greet(name):\n    return f\"hello {name}\"\n```\n\n"
         f"![本地测试图]({FAKE_IMG})\n\n"
+        "附件1:./sesman_attachments/4/附件 图片.png\n\n"
         "不存在的相对图片 ![缺失图](path-or-url)"
     )
     rows = [
@@ -789,7 +793,9 @@ def run(pw):
           p.locator('script[src$="syntax.js"]').count() == 1
           and p.locator('script[src^="http"]:not([src^="' + BASE + '"])').count() == 0)
     imgs = p.locator(".mb img")
-    check("Markdown 与结构化图片都渲染", imgs.count() >= 2, imgs.count())
+    check("Markdown、附件清单与结构化图片都渲染", imgs.count() >= 3, imgs.count())
+    check("附件清单图片带稳定附件编号",
+          p.locator('.media-link img[alt^="附件1 ·"]').count() >= 1)
     check("本地及内嵌图片走受限媒体接口",
           all(x.startswith("/api/media/") for x in imgs.evaluate_all("ns => ns.map(n => new URL(n.src).pathname)")))
     imgs.first.scroll_into_view_if_needed()
