@@ -234,8 +234,23 @@ def new_session(name: str, cmd: str, cwd: str | None = None,
     return full
 
 
-def kill_session(name: str) -> None:
-    _session_tmux(name, "kill-session", "-t", name)
+def kill_session(name: str) -> bool:
+    """结束 tmux session；并发自然退出视为已经成功。
+
+    list-sessions 与 kill-session 之间不可避免存在 TOCTOU 窗口。CLI 响应
+    Ctrl-D 后会让单 pane session 自然消失，此时 tmux 的 "can't find session"
+    不是停止失败。
+    """
+    row = session_info(name)
+    if not row:
+        return False
+    try:
+        _tmux("kill-session", "-t", name, server=row["server"], no_start=True)
+        return True
+    except RuntimeError:
+        if session_info(name) is None:
+            return False
+        raise
 
 
 def rename_session(old: str, new: str) -> str:

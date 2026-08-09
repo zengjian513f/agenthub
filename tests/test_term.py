@@ -5,6 +5,22 @@ from sesman import term
 
 
 class TerminalSubmitTests(unittest.TestCase):
+    def test_kill_session_treats_concurrent_natural_exit_as_success(self):
+        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
+        with patch.object(term, "session_info", side_effect=[pane, None]), \
+                patch.object(term, "_tmux",
+                             side_effect=RuntimeError("can't find session: sesman-test")):
+            killed = term.kill_session("sesman-test")
+
+        self.assertFalse(killed)
+
+    def test_kill_session_still_reports_a_real_tmux_failure(self):
+        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
+        with patch.object(term, "session_info", side_effect=[pane, pane]), \
+                patch.object(term, "_tmux", side_effect=RuntimeError("permission denied")):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                term.kill_session("sesman-test")
+
     def test_submit_uses_bracketed_paste_before_enter(self):
         pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
         with patch.object(term, "session_info", return_value=pane), \
