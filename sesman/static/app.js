@@ -17,7 +17,7 @@ const store = {
 };
 
 // 存储结构的版本只由公共层调度；每种 CLI 自己决定怎样迁移旧队列。
-const QUEUED_MESSAGES_VERSION = 2;
+const QUEUED_MESSAGES_VERSION = 3;
 function loadQueuedMessages() {
   const saved = store.get('queuedMessages', []);
   const valid = Array.isArray(saved) ? saved : [];
@@ -228,13 +228,16 @@ function queuedAfterTimestamp(uid) {
 function queuePendingUserMessage(uid, text, media = []) {
   text = String(text || '');
   if (!uid || !text.trim()) return null;
-  const item = {
+  const cli = sesmanCli(uid);
+  if (!cli) return null;
+  const created = Date.now();
+  const item = cli.createQueuedMessage({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-    text, created: Date.now(), afterTs: queuedAfterTimestamp(uid),
+    text, created, afterTs: queuedAfterTimestamp(uid),
     // 附件消息在 CLI 真正写入 rollout 前也要能显示图片。这里只保存服务端
     // 签发的短媒体 token，不把 File/blob URL 或本地绝对路径塞进 localStorage。
     media: Array.isArray(media) ? media.filter(x => x?.src).map(x => ({ ...x })) : [],
-  };
+  });
   const items = queuedMessages(uid).slice();
   items.push(item);
   S.queued.set(uid, items);
@@ -268,10 +271,13 @@ function reconcileQueuedMessages(uid, messages) {
   if (!cli) return false;
   let changed = false;
   for (const message of messages || []) {
-    const resolvedText = cli.queueResolution(message);
-    if (resolvedText === null) continue;
+    const action = cli.queueAction(message);
+    if (!action) continue;
     const at = items.findIndex(item => {
-      if (item.text !== resolvedText) return false;
+      if (item.text !== action.text) return false;
+      // 同文指令可能连续排队；enqueue 应依次确认尚未确认的副本，
+      // 不能反复命中第一条已确认项。
+      if (action.type === 'confirm' && item.state === 'queued') return false;
       const recorded = Date.parse(message.ts || '');
       const boundary = Date.parse(item.afterTs || '');
       // 不比较浏览器 Date.now() 和 CLI 时间：手机/电脑时钟偏差、CLI 排队延迟
@@ -280,11 +286,42 @@ function reconcileQueuedMessages(uid, messages) {
       return !Number.isFinite(recorded) || !Number.isFinite(boundary)
         || recorded >= boundary - 1000;
     });
-    if (at >= 0) { items.splice(at, 1); changed = true; }
+    if (at < 0) continue;
+    if (action.type === 'confirm') {
+      items[at] = { ...items[at], state: 'queued' };
+      delete items[at].expiresAt;
+      delete items[at].legacy;
+    } else {
+      items.splice(at, 1);
+    }
+    changed = true;
   }
   if (!changed) return false;
   if (items.length) S.queued.set(uid, items); else S.queued.delete(uid);
   saveQueuedMessages();
+  return true;
+}
+
+/** 清掉只有 HTTP/tmux 成功、始终没有 CLI 原生回执的乐观消息。 */
+function expireQueuedMessages(now = Date.now()) {
+  let changed = false;
+  let selectedChanged = false;
+  for (const [uid, current] of S.queued) {
+    const cli = sesmanCli(uid);
+    if (!cli || !Array.isArray(current)) continue;
+    const hasNativeHistory = cache.has(viewKey(uid));
+    const kept = current.filter(item => !cli.queuedMessageExpired(
+      item, now, hasNativeHistory));
+    if (kept.length === current.length) continue;
+    changed = true;
+    selectedChanged ||= uid === S.sel;
+    if (kept.length) S.queued.set(uid, kept); else S.queued.delete(uid);
+  }
+  if (!changed) return false;
+  saveQueuedMessages();
+  if (selectedChanged && !S.agent) {
+    renderConversationTail(cache.get(viewKey(S.sel))?.activity, S.sel);
+  }
   return true;
 }
 
@@ -544,6 +581,7 @@ function clearUnread(uid) {
 
 /** 兜底轮询: SSE 连着的时候只是很慢地对一下账, 断了才回到自适应的快节奏。 */
 function tickSync() {
+  expireQueuedMessages();
   if (!S.sel || document.hidden) return;
   const pushing = _es && _esUid === S.sel && _es.readyState === 1;
   const gap = pushing ? BACKUP_MS : (S.live.has(S.sel) ? S.syncGap : SYNC_MS);
@@ -2080,10 +2118,11 @@ function renderQueuedMessages(uid = S.sel) {
   const box = $('#msgs');
   if (!box || S.agent || uid !== S.sel) return;
   for (const item of queuedMessages(uid)) {
+    const cli = sesmanCli(uid);
     const node = msgNode({role: 'user', text: item.text, media: item.media, counted: false});
     node.classList.add('client-pending');
     node.dataset.queuedId = item.id;
-    node.appendChild(el('small', 'client-pending-state', '排队中'));
+    node.appendChild(el('small', 'client-pending-state', cli?.queuedMessageLabel(item) || '排队中'));
     box.appendChild(node);
   }
 }

@@ -3,8 +3,8 @@
 /**
  * 前端 CLI 行为的公共基类。
  *
- * app.js 只保存和渲染乐观消息；某条原生记录是否能结束排队、旧状态如何
- * 迁移、特殊键是否取消队列，都由具体 CLI 实现决定。
+ * app.js 只保存和渲染乐观消息；某条原生记录是否能确认/结束排队、
+ * 旧状态如何迁移、特殊键是否取消队列，都由具体 CLI 实现决定。
  */
 class SesmanCli {
   constructor(source, name, icon, color) {
@@ -18,9 +18,21 @@ class SesmanCli {
     return Array.isArray(items) ? items : [];
   }
 
-  queueResolution(message) {
+  createQueuedMessage(fields) {
+    return { ...fields, state: 'queued' };
+  }
+
+  queueAction(message) {
     return ['user', 'command'].includes(message?.role)
-      ? String(message.text || '') : null;
+      ? { type: 'remove', text: String(message.text || '') } : null;
+  }
+
+  queuedMessageExpired(_item, _now, _hasNativeHistory) {
+    return false;
+  }
+
+  queuedMessageLabel(item) {
+    return item?.state === 'sending' ? '发送中' : '排队中';
   }
 
   clearsQueuedMessages(_keys) {
@@ -37,11 +49,46 @@ class ClaudeCli extends SesmanCli {
     super('claude', 'Claude', 'i-claude', 'var(--claude)');
   }
 
-  queueResolution(message) {
-    const normal = super.queueResolution(message);
+  migrateQueuedMessages(items, fromVersion, _toVersion) {
+    // v2 只能证明 tmux 粘贴成功，无法区分真实排队和幽灵气泡。
+    // 先降级为“发送中”，等该会话的原生历史读入后再对账：真队列
+    // 会被 enqueue 重新确认，幽灵副本才会过期。
+    if (fromVersion < 3) {
+      return super.migrateQueuedMessages(items).map(item => ({
+        ...item,
+        state: 'sending',
+        expiresAt: (+item?.created || 0) + 8000,
+        legacy: true,
+      }));
+    }
+    return super.migrateQueuedMessages(items);
+  }
+
+  createQueuedMessage(fields) {
+    return {
+      ...fields,
+      state: 'sending',
+      // Claude 的 user/enqueue 记录实测会立即落盘。超时仍没有任何
+      // 原生回执，只能说明 tmux 收到了按键，不能继续声称“排队中”。
+      expiresAt: fields.created + 8000,
+    };
+  }
+
+  queueAction(message) {
+    const normal = super.queueAction(message);
     if (normal !== null) return normal;
-    return message?.role === 'queue_operation' && message.operation === 'remove'
-      ? String(message.text || '') : null;
+    if (message?.role !== 'queue_operation') return null;
+    if (message.operation === 'enqueue') {
+      return { type: 'confirm', text: String(message.text || '') };
+    }
+    return message.operation === 'remove'
+      ? { type: 'remove', text: String(message.text || '') } : null;
+  }
+
+  queuedMessageExpired(item, now, hasNativeHistory) {
+    if (item?.legacy && !hasNativeHistory) return false;
+    return item?.state === 'sending' && Number.isFinite(+item.expiresAt)
+      && now >= +item.expiresAt;
   }
 
   clearsQueuedMessages(keys) {
@@ -79,8 +126,8 @@ class GrokCli extends SesmanCli {
 
   // Grok 暂无已验证的内存队列控制事件：只使用基类的正式消息对账，
   // 不把 Claude/Codex 的 Esc 假设套过来。
-  queueResolution(message) {
-    return super.queueResolution(message);
+  queueAction(message) {
+    return super.queueAction(message);
   }
 }
 
@@ -91,7 +138,13 @@ const SESMAN_CLIS = Object.freeze({
 });
 
 function sesmanCli(sourceOrUid) {
-  const source = String(sourceOrUid || '').split(':', 1)[0];
+  const value = String(sourceOrUid || '');
+  let source = value.split(':', 1)[0];
+  // 首条原生记录落盘前，新建会话的 uid 是 tmux:sesman-<cli>-...。
+  // 这个阶段也必须使用对应 CLI 的发送确认策略。
+  if (source === 'tmux') {
+    source = value.match(/^tmux:sesman-(claude|codex|grok)-/)?.[1] || source;
+  }
   return SESMAN_CLIS[source] || null;
 }
 

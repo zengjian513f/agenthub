@@ -362,6 +362,8 @@ class ToolSummaryTests(unittest.TestCase):
                  "message": {"content": "开始任务"}},
                 {"type": "assistant", "timestamp": "2026-08-09T10:00:01Z",
                  "message": {"content": "正在处理"}},
+                {"type": "queue-operation", "operation": "enqueue",
+                 "timestamp": "2026-08-09T10:00:01.250Z", "content": "排队任务"},
                 {"type": "queue-operation", "operation": "remove",
                  "timestamp": "2026-08-09T10:00:01.500Z", "content": "排队任务"},
                 {"type": "user", "timestamp": "2026-08-09T10:00:02Z",
@@ -376,11 +378,11 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertEqual(statuses, ["working", "aborted"])
         self.assertNotIn("[Request interrupted by user]",
                          [m["text"] for m in msgs])
-        queue_event = next(m for m in msgs if m["role"] == "queue_operation")
-        self.assertEqual(queue_event["text"], "排队任务")
-        self.assertEqual(queue_event["operation"], "remove")
-        self.assertTrue(queue_event["silent"])
-        self.assertFalse(queue_event["counted"])
+        queue_events = [m for m in msgs if m["role"] == "queue_operation"]
+        self.assertEqual([m["text"] for m in queue_events], ["排队任务", "排队任务"])
+        self.assertEqual([m["operation"] for m in queue_events], ["enqueue", "remove"])
+        self.assertTrue(all(m["silent"] for m in queue_events))
+        self.assertTrue(all(not m["counted"] for m in queue_events))
 
     def test_claude_notifications_recaps_and_duration_are_events(self):
         with tempfile.TemporaryDirectory() as tmp:

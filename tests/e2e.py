@@ -250,13 +250,21 @@ def run(pw):
       classes:[SESMAN_CLIS.claude instanceof ClaudeCli,
         SESMAN_CLIS.codex instanceof CodexCli, SESMAN_CLIS.grok instanceof GrokCli,
         Object.values(SESMAN_CLIS).every(x => x instanceof SesmanCli)],
-      claudeRemove:SESMAN_CLIS.claude.queueResolution({role:'queue_operation',
+      pendingSource:sesmanCli('tmux:sesman-claude-new-e2e')?.source,
+      claudeEnqueue:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
+        operation:'enqueue', text:'q'}),
+      claudeRemove:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
         operation:'remove', text:'q'}),
-      codexRemove:SESMAN_CLIS.codex.queueResolution({role:'queue_operation',
+      codexRemove:SESMAN_CLIS.codex.queueAction({role:'queue_operation',
         operation:'remove', text:'q'}),
-      migrations:[SESMAN_CLIS.claude.migrateQueuedMessages([1], 1, 2),
-        SESMAN_CLIS.codex.migrateQueuedMessages([1], 1, 2),
-        SESMAN_CLIS.grok.migrateQueuedMessages([1], 1, 2)],
+      states:[SESMAN_CLIS.claude.createQueuedMessage({created:1000}).state,
+        SESMAN_CLIS.codex.createQueuedMessage({created:1000}).state],
+      claudeExpires:SESMAN_CLIS.claude.queuedMessageExpired(
+        SESMAN_CLIS.claude.createQueuedMessage({created:1000}), 9001, true),
+      claudeMigration:SESMAN_CLIS.claude.migrateQueuedMessages(
+        [{id:'old', created:1000}], 2, 3),
+      migrations:[SESMAN_CLIS.codex.migrateQueuedMessages([1], 2, 3),
+        SESMAN_CLIS.grok.migrateQueuedMessages([1], 2, 3)],
       escape:[SESMAN_CLIS.claude.clearsQueuedMessages(['Escape']),
         SESMAN_CLIS.codex.clearsQueuedMessages(['Escape']),
         SESMAN_CLIS.grok.clearsQueuedMessages(['Escape'])],
@@ -266,8 +274,16 @@ def run(pw):
     })""")
     check("三种 CLI 继承公共基类并拥有独立队列策略",
           all(cli_layers["classes"])
-          and cli_layers["claudeRemove"] == "q" and cli_layers["codexRemove"] is None
-          and cli_layers["migrations"] == [[1], [], [1]]
+          and cli_layers["pendingSource"] == "claude"
+          and cli_layers["claudeEnqueue"] == {"type": "confirm", "text": "q"}
+          and cli_layers["claudeRemove"] == {"type": "remove", "text": "q"}
+          and cli_layers["codexRemove"] is None
+          and cli_layers["states"] == ["sending", "queued"]
+          and cli_layers["claudeExpires"] is True
+          and cli_layers["claudeMigration"] == [{"id": "old", "created": 1000,
+                                                  "state": "sending", "expiresAt": 9000,
+                                                  "legacy": True}]
+          and cli_layers["migrations"] == [[1], [1]]
           and cli_layers["escape"] == [True, True, False]
           and cli_layers["rewind"] == [True, False, False], cli_layers)
     script_order = p.locator("script[src]").evaluate_all(
@@ -1967,10 +1983,10 @@ def run(pw):
           u, '等待前一轮完成的指令', [{...media, gallery:true}])""",
                                {"u": target, "media": image_attachment_response["media"]})
         queued = p.locator('.msg.client-pending[data-role="user"]')
-        check("尚未写入 Codex rollout 的输入立即显示为排队中",
+        check("尚未获得 Claude 原生回执的输入只显示为发送中",
               bool(queued_id) and queued.count() == 1
               and "等待前一轮完成的指令" in queued.inner_text()
-              and "排队中" in queued.inner_text())
+              and "发送中" in queued.inner_text())
         check("排队副本记录原生会话边界而不依赖浏览器时钟",
               bool(p.evaluate("u => queuedMessages(u)[0]?.afterTs", target)))
         check("排队中的附件消息立即显示图片",
@@ -1978,11 +1994,24 @@ def run(pw):
               and queued.locator(".media-gallery img").get_attribute("src").endswith(
                   image_attachment_response["media"]["src"]))
         p.evaluate("""u => {
+          reconcileQueuedMessages(u, [{role:'queue_operation', operation:'enqueue',
+            text:'等待前一轮完成的指令', ts:new Date().toISOString()}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("Claude enqueue 回执后才改为排队中",
+              queued.count() == 1 and "排队中" in queued.inner_text()
+              and p.evaluate("u => queuedMessages(u)[0]?.state", target) == "queued")
+        p.evaluate("""u => {
           reconcileQueuedMessages(u, [{role:'queue_operation', operation:'remove',
             text:'等待前一轮完成的指令', ts:new Date().toISOString()}]);
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
         }""", target)
         check("Claude 从原生队列移除后撤掉乐观排队副本", queued.count() == 0)
+        p.evaluate("""u => {
+          queuePendingUserMessage(u, '没有进入 Claude 的幽灵指令');
+          expireQueuedMessages(Date.now() + 9000);
+        }""", target)
+        check("未获得原生回执的 Claude 副本会自动撤掉", queued.count() == 0)
         p.evaluate("""({u, media}) => queuePendingUserMessage(
           u, '等待前一轮完成的指令', [{...media, gallery:true}])""",
                    {"u": target, "media": image_attachment_response["media"]})

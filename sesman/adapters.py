@@ -796,12 +796,13 @@ class ClaudeAdapter:
                     msgs.append(_msg("system", _stringify(rec["content"]), ts))
             elif t == "queue-operation" and not tag:
                 # Claude 忙时会先把网页送入的 prompt 留在自己的内存队列。
-                # remove 表示该项已经不在队列里（可能被取消，也可能被转成
-                # queued_command attachment），但不一定会产生正式 user 回合。
-                # 透传一个不可见控制事件，让前端撤掉对应的乐观“排队中”。
+                # enqueue 用来证明 CLI 确实接收并排队；remove 表示该项已经不在
+                # 队列里（可能被取消，也可能被转成 queued_command
+                # attachment）。两者都作为不可见控制事件透传给前端对账。
                 operation = str(rec.get("operation") or "")
                 content = rec.get("content")
-                if operation == "remove" and isinstance(content, str) and content:
+                if (operation in {"enqueue", "remove"}
+                        and isinstance(content, str) and content):
                     msgs.append(_msg("queue_operation", content, ts,
                                      operation=operation, counted=False, silent=True))
         return msgs, end
