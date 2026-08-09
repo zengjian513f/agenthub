@@ -130,6 +130,8 @@ def version(s: dict) -> dict:
 
 
 ANCHOR = 512      # 续读前校验偏移点之前这么多字节的内容
+INITIAL_HEAD_MESSAGES = 100
+INITIAL_TAIL_MESSAGES = 500
 
 
 def _anchor_hash(f: Path, pos: int) -> str:
@@ -197,15 +199,16 @@ def session_view(s: dict, agent: str = "") -> dict:
 
 def messages(uid: str, agent: str = "",
              start: int = 0, head: str = "", anchor: str = "",
-             append_only: bool = False) -> dict:
+             append_only: bool = False, windowed: bool = False) -> dict:
     s = get(uid)
     if not s:
         raise KeyError(uid)
-    return messages_for(session_view(s, agent), start, head, anchor, append_only)
+    return messages_for(session_view(s, agent), start, head, anchor,
+                        append_only, windowed)
 
 
 def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
-                 append_only: bool = False) -> dict:
+                 append_only: bool = False, windowed: bool = False) -> dict:
     """整份或增量读取。传的是会话元数据而不是 uid —— SSE 那边每 50ms 要调一次,
     走 uid 的话每次都会连带重算索引签名(数百次 stat)甚至重建整个索引。
 
@@ -229,6 +232,7 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
         end = ver["size"]
         return {"meta": s, "version": ver, "reset": True, "start": end, "end": end,
                 "anchor": _anchor_hash(data_file(s), end), "messages": [],
+                "message_total": 0, "partial": None,
                 "activity_changed": False, "activity": None}
     if reset:
         start = 0
@@ -239,10 +243,19 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
         msgs, end = ad.read(s["path"], start=start)
     activity_events = [m for m in msgs if m.get("role") == "status"]
     msgs = [m for m in msgs if m.get("role") != "status"]
+    message_total = sum(m.get("counted") is not False for m in msgs)
+    partial = None
+    window_size = INITIAL_HEAD_MESSAGES + INITIAL_TAIL_MESSAGES
+    if windowed and reset and len(msgs) > window_size:
+        omitted = len(msgs) - window_size
+        msgs = msgs[:INITIAL_HEAD_MESSAGES] + msgs[-INITIAL_TAIL_MESSAGES:]
+        partial = {"head": INITIAL_HEAD_MESSAGES, "tail": INITIAL_TAIL_MESSAGES,
+                   "omitted": omitted}
     for msg in msgs:
         media.enrich_message(msg, s.get("cwd"))
     return {"meta": s, "version": ver, "reset": reset, "start": start, "end": end,
             "anchor": _anchor_hash(data_file(s), end), "messages": msgs,
+            "message_total": message_total, "partial": partial,
             "activity_changed": bool(activity_events),
             "activity": activity_events[-1] if activity_events else None}
 

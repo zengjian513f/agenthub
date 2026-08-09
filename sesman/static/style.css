@@ -501,6 +501,20 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
   padding: 14px 18px 24px; width: 100%;
 }
+.history-gap {
+  display: flex; align-items: center; gap: 10px; width: 100%; margin: 10px 0 16px;
+  color: var(--muted);
+}
+.history-gap::before, .history-gap::after {
+  content: ""; flex: 1; height: 1px; background: var(--border);
+}
+.history-gap-load {
+  flex: none; padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--panel); color: var(--muted); font: inherit; font-size: 12px;
+  cursor: pointer; box-shadow: var(--shadow);
+}
+.history-gap-load:hover { border-color: var(--accent); color: var(--text); background: var(--hover); }
+.history-gap-load:disabled { cursor: wait; opacity: .7; }
 .msg {
   --bubble: var(--bubble-assistant);
   position: relative; width: fit-content; max-width: 100%; min-width: 0;

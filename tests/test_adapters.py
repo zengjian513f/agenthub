@@ -147,6 +147,29 @@ class IncrementalCursorTests(unittest.TestCase):
             self.assertEqual([(m["role"], m["text"]) for m in result["messages"]],
                              [("assistant", "new reply")])
 
+    def test_initial_window_returns_first_100_and_last_500(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "long.jsonl"
+            sid = "00000000-0000-0000-0000-000000000100"
+            rows = [{
+                "type": "assistant",
+                "message": {"role": "assistant", "content": f"message {i:03d}"},
+                "timestamp": "2026-08-09T10:00:00Z", "cwd": tmp, "sessionId": sid,
+            } for i in range(650)]
+            path.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+            session = {"uid": "claude:window", "source": "claude", "sid": sid,
+                       "path": str(path), "cwd": tmp}
+
+            result = session_index.messages_for(session, windowed=True)
+
+            self.assertEqual(len(result["messages"]), 600)
+            self.assertEqual(result["message_total"], 650)
+            self.assertEqual(result["partial"], {"head": 100, "tail": 500,
+                                                  "omitted": 50})
+            self.assertEqual(result["messages"][99]["text"], "message 099")
+            self.assertEqual(result["messages"][100]["text"], "message 150")
+            self.assertEqual(result["messages"][-1]["text"], "message 649")
+
 
 class FileChangeTests(unittest.TestCase):
     def test_apply_patch_wrapper_recovers_per_file_diffs(self):

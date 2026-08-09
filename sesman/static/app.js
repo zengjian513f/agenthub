@@ -176,6 +176,8 @@ const INCOMING_ROLES = new Set([
 ]);
 const incomingCount = msgs => msgs.filter(m => m.counted !== false && INCOMING_ROLES.has(m.role)).length;
 const messageCount = msgs => msgs.filter(m => m.counted !== false).length;
+const entryTotal = entry => Number.isFinite(+entry?.total)
+  ? +entry.total : messageCount(entry?.msgs || []);
 
 function cacheGet(uid) {
   const e = cache.get(uid);
@@ -224,6 +226,7 @@ async function fetchMessages(uid, opts = {}) {
   }
   if (opts.agent) p.set('agent', opts.agent);
   if (opts.appendOnly) p.set('append', '1');
+  if (opts.windowed) p.set('window', '1');
   const r = await fetch(appUrl(`api/messages/${encodeURIComponent(uid)}?${p}`), { signal: opts.signal });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const total = +r.headers.get('Content-Length') || 0;
@@ -269,7 +272,8 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   if (!e) return 0;
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
     cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
-                    end: data.end, anchor: data.anchor, activity: data.activity, bytes });
+                    end: data.end, anchor: data.anchor, activity: data.activity, bytes,
+                    total: data.message_total, partial: data.partial || null });
     S.cursors.set(key, { end: data.end, head: data.version.head, anchor: data.anchor });
     if (S.sel === uid && S.agent === agent) {
       await renderSession(data.meta, data.messages, data.activity);
@@ -295,6 +299,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     if (S.sel === uid && S.agent === agent) renderActivity(e.activity);
     return 0;
   }
+  e.total = entryTotal(e) + messageCount(data.messages);
   e.msgs = e.msgs.concat(data.messages);
   const incoming = incomingCount(data.messages);
   const detailVisible = S.sel === uid && S.agent === agent
@@ -311,7 +316,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   mark.remove();
   renderActivity(e.activity);
   const c = $('#mcount-total');
-  const total = messageCount(e.msgs);
+  const total = entryTotal(e);
   if (c) c.textContent = `${total} 条消息`;
   const mc = $('.mobile-msg-count');
   if (mc) {
@@ -701,7 +706,7 @@ function refreshSessionMeta() {
   if (currentEventAdded && current) {
     renderSession(current.meta, current.msgs, current.activity);
   } else if (current && oldHead && headerKey(current.meta) !== beforeKey) {
-    oldHead.replaceWith(head(current.meta, messageCount(current.msgs)));
+    oldHead.replaceWith(head(current.meta, entryTotal(current)));
   }
 }
 
@@ -1021,6 +1026,7 @@ async function openSession(uid, agent = null) {
   try {
     res = await fetchMessages(uid, {
       agent: selectedAgent, signal: ac.signal,
+      windowed: true,
       onProgress: (a, b) => progress(a, b, '读取'),
     });
   } catch (e) {
@@ -1032,7 +1038,8 @@ async function openSession(uid, agent = null) {
   if (S.sel !== uid || S.agent !== selectedAgent) return; // 期间切了别的视图
   const { data, bytes } = res;
   cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
-                  end: data.end, anchor: data.anchor, activity: data.activity, bytes });
+                  end: data.end, anchor: data.anchor, activity: data.activity, bytes,
+                  total: data.message_total, partial: data.partial || null });
   S.cursors.set(key, {end: data.end, head: data.version.head, anchor: data.anchor});
   await renderSession(data.meta, data.messages, data.activity);
 }
@@ -1142,6 +1149,52 @@ addEventListener('resize', () => {
 /** 整份渲染。消息可能上万条, 分批交还主线程, 否则页面会卡住不动。 */
 let renderSeq = 0;
 
+function historyGapNode(info) {
+  const gap = el('div', 'history-gap');
+  const button = el('button', 'history-gap-load',
+    `加载中间 ${Number(info.omitted || 0).toLocaleString()} 条消息`);
+  button.type = 'button';
+  button.onclick = () => loadFullHistory(info.uid, info.agent, button);
+  gap.appendChild(button);
+  return gap;
+}
+
+async function loadFullHistory(uid, agent, button) {
+  const key = viewKey(uid, agent);
+  const old = cache.get(key);
+  if (!old?.partial) return;
+  inflight?.abort();
+  const ac = inflight = new AbortController();
+  closeWatch();
+  button.disabled = true;
+  button.textContent = '正在载入完整历史…';
+  progress(0, 0, '读取完整历史');
+  try {
+    const {data, bytes} = await fetchMessages(uid, {
+      agent, signal: ac.signal,
+      onProgress: (a, b) => progress(a, b, '读取完整历史'),
+    });
+    cachePut(key, {meta: data.meta, msgs: data.messages, version: data.version,
+                   end: data.end, anchor: data.anchor, activity: data.activity, bytes,
+                   total: data.message_total, partial: null});
+    S.cursors.set(key, {end: data.end, head: data.version.head, anchor: data.anchor});
+    if (S.sel === uid && S.agent === agent) {
+      await renderSession(data.meta, data.messages, data.activity);
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      button.disabled = false;
+      button.textContent = '载入失败，点击重试';
+    }
+  } finally {
+    progressDone();
+    const current = cache.get(key);
+    if (S.sel === uid && S.agent === agent && current?.partial && !_es) {
+      watchSession(uid, agent);
+    }
+  }
+}
+
 async function renderSession(meta, msgs, activity = null) {
   const seq = ++renderSeq;
   const uid = meta.uid;
@@ -1149,7 +1202,8 @@ async function renderSession(meta, msgs, activity = null) {
   if (S.sel !== uid || S.agent !== agent) return;
   const d = $('#detail');
   d.innerHTML = '';
-  d.appendChild(head(meta, messageCount(msgs)));
+  const entry = cache.get(viewKey(uid, agent));
+  d.appendChild(head(meta, entryTotal(entry || {msgs})));
   const box = el('div', 'msgs');
   box.id = 'msgs';
   d.appendChild(box);
@@ -1158,7 +1212,13 @@ async function renderSession(meta, msgs, activity = null) {
   // 关键: 建在游离的 fragment 里, 最后一次性挂上。
   // 若逐批插入已在文档中的容器, 每批都会触发一次全量 layout, 上万条时是 O(n²) —— 实测 0.2s 变 14s。
   // 批间让出主线程用 setTimeout 而不是 rAF: rAF 会等一次绘制, 又把 layout 成本引回来。
-  const plan = planMessages(msgs);
+  const partial = entry?.partial;
+  const split = partial ? Math.min(+partial.head || 0, msgs.length) : 0;
+  const plan = partial
+    ? [...planMessages(msgs.slice(0, split)),
+       {gap: {uid, agent, omitted: partial.omitted}},
+       ...planMessages(msgs.slice(split))]
+    : planMessages(msgs);
   const frag = document.createDocumentFragment();
   for (let i = 0; i < plan.length; i += RENDER_BATCH) {
     buildPlan(frag, plan.slice(i, i + RENDER_BATCH), null);
@@ -1386,7 +1446,7 @@ function planMessages(msgs) {
 
 function buildPlan(box, plan, before) {
   for (const p of plan) {
-    const n = p.g ? groupNode(p.g) : msgNode(p.m);
+    const n = p.gap ? historyGapNode(p.gap) : (p.g ? groupNode(p.g) : msgNode(p.m));
     before ? box.insertBefore(n, before) : box.appendChild(n);
   }
 }

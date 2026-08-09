@@ -177,6 +177,21 @@ def make_fake_session():
     return f
 
 
+def make_window_session():
+    """造一个超过首载 100+500 窗口的会话，验证中间缺口按需加载。"""
+    FAKE_PROJ.mkdir(parents=True, exist_ok=True)
+    f = FAKE_PROJ / "00000000-dead-beef-0000-000000000010.jsonl"
+    sid = f.stem
+    rows = [{"type": "ai-title", "aiTitle": "SESMAN分页载入测试", "sessionId": sid}]
+    rows.extend({
+        "type": "assistant", "message": {"role": "assistant", "content": f"分页消息 {i:03d}"},
+        "uuid": f"page-{i}", "timestamp": "2026-08-06T13:00:00.000Z",
+        "cwd": "/tmp/sesman-selftest", "sessionId": sid,
+    } for i in range(650))
+    f.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+    return f
+
+
 def cleanup():
     tmux_run("sesman", "kill-session", "-t", PENDING_TERM, capture_output=True)
     pending_store.discard(PENDING_TERM)
@@ -886,21 +901,42 @@ def run(pw):
     p.on("request", lambda r: reqs.append(r.url) if "/api/messages/" in r.url else None)
     # 先等上一次载入彻底结束, 否则它的 cachePut 会在 clear 之后落地
     p.wait_for_function("!document.querySelector('#prog').classList.contains('on')", timeout=60000)
-    big = p.locator(".item").evaluate_all(
-        "ns => ns.map((n, i) => [i, n.querySelector('.m').textContent, n.classList.contains('live')])"
-        "      .filter(([, t, live]) => !live && /(\\d+(\\.\\d+)?)M/.test(t)).map(([i]) => i)[0]")
+    window_uid = p.evaluate(
+        "() => S.sessions.find(s => s.title === 'SESMAN分页载入测试').uid")
     # 上一段可能还有没落地的载入, 清两次并等一拍, 否则它的 cachePut 会落在 clear 之后
     p.evaluate("cache.clear()")
     p.wait_for_load_state("networkidle")
     p.wait_for_timeout(400)
-    p.evaluate("cache.clear()")
+    p.evaluate("uid => cache.delete(uid)", window_uid)
     reqs.clear()
-    p.locator(".item").nth(big).click()
-    p.wait_for_selector(".msg", timeout=120000)
+    p.evaluate("uid => openSession(uid)", window_uid)
+    p.wait_for_selector(".history-gap", timeout=120000)
     p.wait_for_function("!document.querySelector('#prog').classList.contains('on')", timeout=120000)
     total = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
-    check("一次载入全部消息, 不再分页", p.locator(".more-page").count() == 0)
+    sparse = p.evaluate("""() => { const e = cache.get(S.sel); return {
+      shown:e.msgs.length, total:e.total, partial:e.partial,
+      text:document.querySelector('#msgs').textContent}; }""")
+    check("新会话首载最早 100 条和最新 500 条",
+          sparse["shown"] == 600 and sparse["total"] == 650
+          and sparse["partial"] == {"head": 100, "tail": 500, "omitted": 50}, sparse)
+    check("首尾消息存在而中间消息尚未载入",
+          "分页消息 099" in sparse["text"] and "分页消息 120" not in sparse["text"]
+          and "分页消息 649" in sparse["text"])
+    check("中间缺口显示一键载入按钮",
+          p.locator(".history-gap-load").count() == 1
+          and "50" in p.locator(".history-gap-load").inner_text())
+    check("首载请求启用 100+500 窗口",
+          reqs and "window=1" in reqs[0] and "start=" not in reqs[0], reqs[:2])
     check("载入时显示过进度条", p.evaluate("window.__prog"))
+
+    p.locator(".history-gap-load").click()
+    p.wait_for_function("!document.querySelector('.history-gap')", timeout=120000)
+    p.wait_for_function("!document.querySelector('#prog').classList.contains('on')", timeout=120000)
+    full = p.evaluate("() => { const e = cache.get(S.sel); return {shown:e.msgs.length, total:e.total, partial:e.partial}; }")
+    check("点击缺口按钮一次载入完整历史",
+          full == {"shown": 650, "total": 650, "partial": None}, full)
+    check("完整历史请求不再带首载窗口",
+          any("window=1" not in u and "start=" not in u for u in reqs[1:]), reqs)
     # 工具组本身不算原始消息，组内扁平 tool-entry 各算一条；调用卡片吸收的
     # tool_result 通过 data-result 标记补回计数；rename/compact 结果会显示在
     # 时间线里，但它们是辅助事件，不进入标题栏的“消息”计数。
@@ -950,13 +986,9 @@ def run(pw):
         check("滚回底部", at_bottom())
         viewport(1280, 800)
         check("回到底部后恢复跟随", at_bottom())
-    # 只看第一个请求 —— 之后的自动增量同步本来就该带 start
-    check("首次打开是整份请求", reqs and "start=" not in reqs[0], reqs[:2])
-
-    # 重新打开当前会话 —— 应命中缓存, 只发增量请求。不要先载入另一个任意
-    # 大会话，否则两者超过所设容量时触发正常的 LRU 淘汰，反而测不到命中路径。
+    # 完整历史已进入缓存，重新打开应直接命中，只允许后台增量请求。
     reqs.clear()
-    p.locator(".item").nth(big).click()
+    p.evaluate("uid => openSession(uid)", window_uid)
     p.wait_for_selector(".msg", timeout=60000)
     p.wait_for_timeout(800)
     cached = p.evaluate("() => !!cache.get(S.sel)")
@@ -2184,6 +2216,7 @@ def run(pw):
 if __name__ == "__main__":
     cleanup()
     make_fake_session()
+    make_window_session()
     import urllib.request
     urllib.request.urlopen(BASE + "/api/sessions?force=1", timeout=60).read()
     try:

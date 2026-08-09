@@ -412,6 +412,7 @@ class Handler(BaseHTTPRequestHandler):
                 head=q.get("head", [""])[0],
                 anchor=q.get("anchor", [""])[0],
                 append_only=q.get("append", ["0"])[0] == "1",
+                windowed=q.get("window", ["0"])[0] == "1",
             ))
 
         raise KeyError(path)
