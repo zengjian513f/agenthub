@@ -1838,7 +1838,7 @@ function msgNode(m) {
   const render = full => (raw
     ? `<pre>${esc(full ? m.text : clipText(m.text))}</pre>`
     : md(m.text, full, m.media)) + mediaGallery(m.media);
-  const paint = full => { body.innerHTML = render(full); renderFormulae(body); };
+  const paint = full => { body.innerHTML = render(full); renderFormulae(body); paintSyntax(body); };
   paint(hit);
   n.appendChild(body);
   const setAction = addAction(n);
@@ -1940,10 +1940,44 @@ const AUTO_OPEN_MAX = 40;    // 最多自动展开这么多条命中消息, 其�
 const MARK_MAX = 3000;       // 单页高亮节点上限
 const clipText = t => t.length > CLIP ? t.slice(0, CLIP) + '\n… (点下方按钮展开全文)' : t;
 
+let syntaxLoading = false;
+function ensureSyntax() {
+  if (syntaxLoading || window.sesmanHighlight) return;
+  syntaxLoading = true;
+  const script = document.createElement('script');
+  script.type = 'module';
+  script.src = appUrl('syntax.js');
+  script.onerror = () => { syntaxLoading = false; script.remove(); };
+  document.head.appendChild(script);
+}
+
+function paintSyntax(root = document) {
+  const nodes = [...root.querySelectorAll('code.code-block:not([data-syntax-done])')];
+  if (!nodes.length) return;
+  if (!window.sesmanHighlight) { ensureSyntax(); return; }
+  for (const code of nodes) {
+    code.dataset.syntaxDone = '1';
+    const result = window.sesmanHighlight(code.textContent, code.dataset.codeLang || '');
+    if (!result?.html) continue;
+    code.innerHTML = result.html;
+    code.classList.add('hljs');
+    if (result.language) code.classList.add(`language-${result.language}`);
+    if (result.detected) code.dataset.detected = result.language;
+  }
+}
+
+addEventListener('sesman-highlight-ready', () => paintSyntax(document));
+
 // 轻量 markdown: 代码块 / 表格 / 列表 / 引用 / 标题 / 行内标记
 function md(text, full, media = []) {
   return (full ? text : clipText(text)).split(/```/)
-    .map((b, i) => i % 2 ? `<pre>${esc(b.replace(/^[\w+-]*\n/, ''))}</pre>` : blocks(b, media))
+    .map((b, i) => {
+      if (i % 2 === 0) return blocks(b, media);
+      const head = b.match(/^([\w+-]*)[^\S\n]*\n/);
+      const language = head?.[1] || '';
+      const source = head ? b.slice(head[0].length) : b;
+      return `<pre><code class="code-block" data-code-lang="${esc(language)}">${esc(source)}</code></pre>`;
+    })
     .join('') || '<p></p>';
 }
 

@@ -63,6 +63,7 @@ def make_fake_session():
         "> 引用内容\n\n---\n\n普通段落\n\n"
         "行内公式 $E=mc^2$，块公式：\n\n$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$\n\n"
         "```text\n$code_not_math$\n```\n\n"
+        "```python\ndef greet(name):\n    return f\"hello {name}\"\n```\n\n"
         f"![本地测试图]({FAKE_IMG})\n\n"
         "不存在的相对图片 ![缺失图](path-or-url)"
     )
@@ -776,6 +777,17 @@ def run(pw):
           p.locator(".mb .katex").count())
     check("块公式使用 display 样式", p.locator(".mb .katex-display").count() >= 1)
     check("代码块里的美元符号不渲染公式", p.locator(".mb pre .katex").count() == 0)
+    p.wait_for_function("document.querySelector('code[data-code-lang=python]')?.classList.contains('hljs')",
+                        timeout=15000)
+    python_code = p.locator('code[data-code-lang="python"]')
+    check("带语言标签的代码块使用本地语法高亮",
+          python_code.locator(".hljs-keyword").count() >= 2
+          and python_code.locator(".hljs-title").count() >= 1)
+    check("纯文本代码块不误做语言检测",
+          p.locator('code[data-code-lang="text"].hljs').count() == 0)
+    check("语法高亮依赖从 sesman 本地加载",
+          p.locator('script[src$="syntax.js"]').count() == 1
+          and p.locator('script[src^="http"]:not([src^="' + BASE + '"])').count() == 0)
     imgs = p.locator(".mb img")
     check("Markdown 与结构化图片都渲染", imgs.count() >= 2, imgs.count())
     check("本地及内嵌图片走受限媒体接口",
