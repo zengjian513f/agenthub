@@ -237,7 +237,8 @@ def run(pw):
     p.on("response", lambda r: errors.append(f"HTTP {r.status}: {r.url}") if r.status >= 400 else None)
 
     p.goto(BASE, wait_until="networkidle")
-    p.wait_for_selector(".item", timeout=15000)
+    # 分组折叠状态会跨刷新保留；DOM 中可能已有 item，但第一条恰好位于已折叠分组。
+    p.wait_for_selector(".item:visible", timeout=15000)
 
     # ---- 1. 基本加载 ----
     n_items = p.locator(".item").count()
@@ -320,6 +321,17 @@ def run(pw):
           different_path.name == "测试 attachment__1.txt"
           and different_path.read_bytes() == attachment_payload + b"\x02"
           and different_response["reused"] is False, different_response)
+    image_attachment_response = p.evaluate("""async ({uid, bytes}) => {
+      const url = new URL(appUrl('api/session/attachment'));
+      url.searchParams.set('uid', uid); url.searchParams.set('name', '排队预览.png');
+      const file = new File([new Uint8Array(bytes)], '排队预览.png', {type:'image/png'});
+      const response = await fetch(url, {method:'POST', headers:{'Content-Type':file.type}, body:file});
+      return response.json();
+    }""", {"uid": fake_uid, "bytes": list(base64.b64decode(PNG_B64))})
+    check("图片上传响应附带受限预览 token",
+          re.fullmatch(r"/api/media/[0-9a-f]{32}",
+                       image_attachment_response.get("media", {}).get("src", "")) is not None,
+          image_attachment_response)
     p.set_viewport_size({"width": 1280, "height": 720})
     p.evaluate("dispatchEvent(new Event('resize'))")
     p.wait_for_timeout(300)
@@ -576,6 +588,20 @@ def run(pw):
       return {working, staleGone, waiting, idleGone};
     }""")
     check("对话栏显示 Working 状态", "Working" in (activity["working"] or ""), activity)
+    activity_style = p.evaluate("""() => {
+      const e = cache.get(S.sel), old = e.activity, wasLive = S.live.has(S.sel);
+      S.live.add(S.sel); e.activity = {state:'working', ts:new Date().toISOString()};
+      renderActivity(e.activity);
+      const s = getComputedStyle(document.querySelector('#activity'));
+      const result = {background:s.backgroundColor, shadow:s.boxShadow,
+        radius:s.borderRadius, border:s.borderTopWidth};
+      e.activity = old; if (!wasLive) S.live.delete(S.sel); renderActivity(old);
+      return result;
+    }""")
+    check("Working 使用无气泡状态行",
+          activity_style["background"] == "rgba(0, 0, 0, 0)"
+          and activity_style["shadow"] == "none"
+          and activity_style["border"] == "0px", activity_style)
     check("新进程不继承旧回合的 Working", activity["staleGone"], activity)
     check("对话栏显示等待回答状态", "等待回答" in (activity["waiting"] or ""), activity)
     check("回合完成后移除临时状态", activity["idleGone"], activity)
@@ -610,6 +636,34 @@ def run(pw):
           and preview_limits["normal"] == "a\nb"
           and preview_limits["omitted"] == 5
           and preview_limits["trailing"] == 0, preview_limits)
+    tool_line_policy = p.evaluate("""() => {
+      const entry = document.createElement('div'); entry.className = 'tool-entry';
+      addClippedPre(entry, 'tool-out', 'x'.repeat(400));
+      document.querySelector('#msgs').appendChild(entry);
+      const pre = entry.querySelector('pre'), button = entry.querySelector('.tool-wrap');
+      const before = getComputedStyle(pre).whiteSpace;
+      button.click();
+      const after = getComputedStyle(pre).whiteSpace;
+      const result = {before, after, label:button.textContent,
+        pressed:button.getAttribute('aria-pressed')};
+      entry.remove(); return result;
+    }""")
+    check("工具输出默认保留原始行且可显式切换自动换行",
+          tool_line_policy == {"before": "pre", "after": "pre-wrap",
+                               "label": "保持原行", "pressed": "true"},
+          tool_line_policy)
+    silent_result = p.evaluate("""() => {
+      const box = document.querySelector('#msgs'), mark = document.createElement('i');
+      box.appendChild(mark);
+      appendMessages(box, [{role:'tool_result', text:'', call_id:'late-empty'}]);
+      const node = mark.nextElementSibling;
+      const result = {hidden:node?.hidden, role:node?.dataset.role,
+        visibleBubble:!!node?.matches('.msg, .tool-entry')};
+      node?.remove(); mark.remove(); return result;
+    }""")
+    check("跨增量批次的空工具结果不生成空白气泡",
+          silent_result == {"hidden": True, "role": "tool_result", "visibleBubble": False},
+          silent_result)
     tool_width = single_tool.evaluate("""n => ({
       tool: n.getBoundingClientRect().width,
       available: n.parentElement.clientWidth
@@ -865,6 +919,24 @@ def run(pw):
         check("展开后预览不再占垂直空间", not grp.locator("> .fold-preview").is_visible())
         check("工具组不再包 grp-body", grp.locator("> .grp-body").count() == 0)
         check("工具组内不再嵌套 msg 气泡", grp.locator("> .msg").count() == 0)
+        first_entry = grp.locator("> .tool-entry").first
+        first_entry.locator("> .tool-head").click()
+        args_geometry = first_entry.evaluate("""n => {
+          const h = n.querySelector(':scope > .tool-head').getBoundingClientRect();
+          const a = n.querySelector(':scope > .tool-args').getBoundingClientRect();
+          return {gap:a.top - h.bottom, expanded:n.querySelector(':scope > .tool-head').ariaExpanded};
+        }""")
+        check("原始参数与命令头无缝连成一张卡片",
+              first_entry.locator("> .tool-args").is_visible()
+              and abs(args_geometry["gap"]) < 1 and args_geometry["expanded"] == "true",
+              args_geometry)
+        check("展开原始参数后显示明确收起键",
+              first_entry.locator("> .tool-args-close").is_visible()
+              and first_entry.locator("> .tool-args-close").inner_text() == "收起参数")
+        first_entry.locator("> .tool-args-close").click()
+        check("收起参数键关闭展开区",
+              not first_entry.locator("> .tool-args").is_visible()
+              and first_entry.locator("> .tool-head").get_attribute("aria-expanded") == "false")
         failed_entry = grp.locator("> .tool-entry").filter(has_text="$ echo hi2")
         check("Claude 文本退出码进入工具状态行",
               "exit 2" in failed_entry.locator(".tool-status").inner_text()
@@ -1850,12 +1922,18 @@ def run(pw):
         p.locator("#compose-items .draft-remove").evaluate_all("nodes => nodes.forEach(n => n.click())")
         p.fill("#cinput", "")
         check("附件与引用可以在发送前移除", p.locator("#compose-items .draft-card").count() == 0)
-        queued_id = p.evaluate("u => queuePendingUserMessage(u, '等待前一轮完成的指令')", target)
+        queued_id = p.evaluate("""({u, media}) => queuePendingUserMessage(
+          u, '等待前一轮完成的指令', [{...media, gallery:true}])""",
+                               {"u": target, "media": image_attachment_response["media"]})
         queued = p.locator('.msg.client-pending[data-role="user"]')
         check("尚未写入 Codex rollout 的输入立即显示为排队中",
               bool(queued_id) and queued.count() == 1
               and "等待前一轮完成的指令" in queued.inner_text()
               and "排队中" in queued.inner_text())
+        check("排队中的附件消息立即显示图片",
+              queued.locator(".media-gallery img").count() == 1
+              and queued.locator(".media-gallery img").get_attribute("src").endswith(
+                  image_attachment_response["media"]["src"]))
         p.evaluate("""u => {
           reconcileQueuedMessages(u, [{role:'user', text:'等待前一轮完成的指令',
             ts:new Date().toISOString()}]);
@@ -2332,7 +2410,8 @@ def run(pw):
     check("拖动改变侧栏宽度", abs(w1 - (w0 + 130)) < 10, f"{w0}->{w1}")
     check("详情区跟着收窄", p.locator("#detail").bounding_box()["width"] < 1600 - w1 + 10)
     p.reload(wait_until="networkidle")
-    p.wait_for_selector(".item", timeout=15000)
+    # 分组折叠状态会跨刷新保留；DOM 中可能已有 item，但第一条恰好位于已折叠分组。
+    p.wait_for_selector(".item:visible", timeout=15000)
     check("刷新后宽度保持", abs(p.locator("#left").bounding_box()["width"] - w1) < 2,
           p.locator("#left").bounding_box()["width"])
     p.dblclick("#drag")

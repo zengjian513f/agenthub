@@ -537,20 +537,16 @@ def _stringify(v) -> str:
 
 
 def _tool_output(name: str | None, value) -> tuple[str, dict]:
-    """展开 exec 及其续取工具中被 text(result) 再包一层的命令结果。
+    """展开执行工具中被 text(result) 再包一层的命令结果。
 
     Codex 会把这种结果记成 ``Script completed / Output:`` 加一段 JSON；
-    JSON 的 ``output`` 才是用户真正想看的 stdout。只识别带执行时长及
-    进程状态字段的明确 exec_command 信封，普通工具返回的 JSON 保持原样。
+    JSON 的 ``output`` 才是用户真正想看的 stdout。调用与结果可能跨增量
+    批次，也可能被 wait 再套一层提示文字，因此按严格字段识别信封，不按
+    工具名或正文内容猜测。普通工具返回的 JSON 保持原样。
     """
     text = _stringify(value)
-    key = str(name or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1]
-    # 增量批次可能只含输出，不含较早批次里的工具调用，此时 name 为空。
-    # 信封字段本身足够严格，可以照常识别；已知的非执行工具仍保持原样。
-    if key and key not in {"exec", "exec_command", "wait", "write_stdin"}:
-        return text, {}
 
-    candidates = []
+    candidates = [text]
     if isinstance(value, list):
         for part in value:
             if isinstance(part, dict) and isinstance(part.get("text"), str):
@@ -562,24 +558,33 @@ def _tool_output(name: str | None, value) -> tuple[str, dict]:
     elif isinstance(value, str):
         candidates.append(value)
 
-    for candidate in reversed(candidates):
+    envelope = None
+    for candidate in candidates:
         payloads = [candidate.strip()]
         marker = candidate.rfind("Output:\n")
         if marker >= 0:
             payloads.insert(0, candidate[marker + len("Output:\n"):].strip())
-        envelope = None
         for payload in payloads:
-            try:
-                parsed = json.loads(payload)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(parsed, dict):
-                envelope = parsed
+            # wait 的提示可能位于 JSON 前面；只尝试从行首的 ``{`` 解码到
+            # 文本结尾，绝不抽取正文中间的任意 JSON 片段。
+            starts = [0] if payload.startswith("{") else []
+            starts.extend(m.start() for m in re.finditer(r"(?m)^[ \t]*\{", payload))
+            for start in reversed(dict.fromkeys(starts)):
+                try:
+                    parsed = json.loads(payload[start:].strip())
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(parsed, dict) and "output" in parsed \
+                        and "wall_time_seconds" in parsed \
+                        and ({"exit_code", "session_id", "chunk_id"} & parsed.keys()):
+                    envelope = parsed
+                    break
+            if envelope is not None:
                 break
-        if not isinstance(envelope, dict) or "output" not in envelope \
-                or "wall_time_seconds" not in envelope \
-                or not ({"exit_code", "session_id", "chunk_id"} & envelope.keys()):
-            continue
+        if envelope is not None:
+            break
+
+    if envelope is not None:
         meta = {}
         if isinstance(envelope.get("exit_code"), int):
             meta["exit_code"] = envelope["exit_code"]

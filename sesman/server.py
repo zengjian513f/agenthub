@@ -297,11 +297,12 @@ class Handler(BaseHTTPRequestHandler):
         mime = guessed or (supplied if re.fullmatch(r"[\w.+-]+/[\w.+-]+", supplied) else None)
         mime = mime or "application/octet-stream"
         kind = mime.split("/", 1)[0] if mime.split("/", 1)[0] in {"image", "video", "audio"} else "file"
+        preview = media.register_path(str(target), name=target.name) if kind == "image" else None
         return self._json({
             "ok": True, "name": target.name, "original_name": original, "path": str(target),
             "relative_path": str(target.relative_to(cwd)),
             "attachment_id": attachment_id, "mime": mime, "kind": kind,
-            "size": size, "reused": reused,
+            "size": size, "reused": reused, "media": preview,
         })
 
     def do_GET(self):

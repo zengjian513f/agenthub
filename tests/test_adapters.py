@@ -284,6 +284,22 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertEqual(adapters._tool_output(None, waited),
                          ("line 1\nline 2\n", {"duration_s": 30.0}))
 
+        # wait 会先写一段截断提示，再在末尾放真正的执行信封。只能按严格
+        # 信封字段解包；还原后的真实换行与字面量反斜杠 n 必须保持区别。
+        nested = [
+            {"type": "input_text",
+             "text": "Script completed\nWall time 14.2 seconds\nOutput:\n"},
+            {"type": "input_text",
+             "text": "Warning: truncated output\nTotal output lines: 1\n\n" + json.dumps({
+                 "chunk_id": "nested", "session_id": 9,
+                 "wall_time_seconds": 30.0,
+                 "output": "real line 1\nreal line 2\\nkept literal\n",
+             })},
+        ]
+        self.assertEqual(adapters._tool_output("wait", nested),
+                         ("real line 1\nreal line 2\\nkept literal\n",
+                          {"duration_s": 30.0}))
+
         # 业务工具恰好返回 output 字段时，不能仅凭字段名误拆信封。
         plain = '{"output":"business value"}'
         self.assertEqual(adapters._tool_output("exec", plain), (plain, {}))

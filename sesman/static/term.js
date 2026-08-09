@@ -1164,11 +1164,11 @@ function syncComposerMode() {
   autoGrow(ta);
 }
 
-async function sendToSession(text, keys, uid = S.sel) {
+async function sendToSession(text, keys, uid = S.sel, media = []) {
   const name = takenOver(uid);
   if (!name) return false;
   const queuedId = text && typeof queuePendingUserMessage === 'function'
-    ? queuePendingUserMessage(uid, text) : null;
+    ? queuePendingUserMessage(uid, text, media) : null;
   let d;
   try {
     d = await post('api/term/send', keys ? { name, keys } : { name, text });
@@ -1410,7 +1410,8 @@ async function submitComposer() {
     }
     button.textContent = '发送中…';
     const prompt = buildComposerPrompt(text, uploaded, quotes);
-    const sent = await sendToSession(prompt, null, uid);
+    const sentMedia = uploaded.flatMap(a => a.media ? [{ ...a.media, gallery: true }] : []);
+    const sent = await sendToSession(prompt, null, uid, sentMedia);
     // 请求失败时保留草稿；等待响应期间若用户继续编辑，也不能抹掉新内容。
     if (sent) {
       if (draft.text === text || (composerUid === uid && ta.value === text)) draft.text = '';

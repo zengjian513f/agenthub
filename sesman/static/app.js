@@ -198,12 +198,15 @@ function queuedMessages(uid) {
 
 /** Codex 在忙时只把新输入留在 TUI 内存里，轮到它之前 rollout 没有任何记录。
  *  先持久化并回显；原生 user/command 记录出现后再按正文和时间精确消重。 */
-function queuePendingUserMessage(uid, text) {
+function queuePendingUserMessage(uid, text, media = []) {
   text = String(text || '');
   if (!uid || !text.trim()) return null;
   const item = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
     text, created: Date.now(),
+    // 附件消息在 CLI 真正写入 rollout 前也要能显示图片。这里只保存服务端
+    // 签发的短媒体 token，不把 File/blob URL 或本地绝对路径塞进 localStorage。
+    media: Array.isArray(media) ? media.filter(x => x?.src).map(x => ({ ...x })) : [],
   };
   const items = queuedMessages(uid).slice();
   items.push(item);
@@ -1508,6 +1511,14 @@ function planMessages(msgs) {
     run = [];
   };
   for (const m of pairTools(msgs)) {
+    // 调用与结果跨增量批次时，空结果配不到上面的调用。它仍参与消息计数，
+    // 但不能凭空生成一块黑色空卡片。
+    if (m.role === 'tool_result' && !String(m.text || '').trim()
+        && !m.media?.length && !m.changes?.length) {
+      flush();
+      plan.push({ m: { ...m, silent: true } });
+      continue;
+    }
     // 文件修改本身是用户关心的工作记录，始终作为可见卡片留在时间线；
     // 普通工具协议继续按原规则合并折叠。
     if (TOOL_ROLES.has(m.role) && !m.changes?.length) { run.push(m); continue; }
@@ -1584,6 +1595,20 @@ function addClippedPre(entry, cls, text) {
   pre.textContent = info.text;
   paintToolOutputDiff(pre);
   entry.appendChild(pre);
+  const actions = el('div', 'tool-out-actions');
+  let wrap = null;
+  if (String(text).split('\n').some(line => line.length > 160)) {
+    wrap = el('button', 'tool-wrap', '自动换行');
+    wrap.type = 'button';
+    wrap.setAttribute('aria-pressed', 'false');
+    wrap.onclick = () => {
+      const on = pre.classList.toggle('wrap');
+      wrap.classList.toggle('on', on);
+      wrap.setAttribute('aria-pressed', String(on));
+      wrap.textContent = on ? '保持原行' : '自动换行';
+    };
+    actions.appendChild(wrap);
+  }
   if (info.text !== text) {
     const rest = info.omittedLines > 0
       ? `另有 ${info.omittedLines.toLocaleString()} 行`
@@ -1593,9 +1618,11 @@ function addClippedPre(entry, cls, text) {
       pre.textContent = text;
       paintToolOutputDiff(pre);
       more.remove();
+      if (!wrap) actions.remove();
     };
-    entry.appendChild(more);
+    actions.appendChild(more);
   }
+  if (actions.childElementCount) entry.appendChild(actions);
   return pre;
 }
 
@@ -1612,23 +1639,39 @@ function toolEntry(m) {
   // 调用头: 一行语义摘要(如 `$ git status`), 点击展开原始参数
   const head = el('button', 'tool-head');
   head.type = 'button';
-  head.title = '展开/收起原始参数';
+  head.title = '展开原始参数';
+  head.setAttribute('aria-expanded', 'false');
   head.innerHTML = `<code>${esc(m.summary || m.name || 'tool')}</code>`
     + (m.name && m.summary ? `<span class="tool-meta">${esc(m.name)}</span>` : '');
   entry.appendChild(head);
   const args = el('pre', 'tool-args');
   args.hidden = !!m.summary;   // 识别不了的工具直接铺参数, 不藏
+  const closeArgs = el('button', 'tool-args-close', '收起参数');
+  closeArgs.type = 'button';
+  closeArgs.hidden = args.hidden;
   let painted = false;
   const paintArgs = () => { if (!painted) { args.textContent = m.text; painted = true; } };
+  const setArgsOpen = open => {
+    if (open) paintArgs();
+    args.hidden = !open;
+    closeArgs.hidden = !open;
+    entry.classList.toggle('args-open', open);
+    head.setAttribute('aria-expanded', String(open));
+    head.title = open ? '收起原始参数' : '展开原始参数';
+  };
   if (!args.hidden) paintArgs();
-  head.onclick = () => { paintArgs(); args.hidden = !args.hidden; };
+  head.onclick = () => setArgsOpen(args.hidden);
+  closeArgs.onclick = () => setArgsOpen(false);
   entry.appendChild(args);
+  entry.appendChild(closeArgs);
+  setArgsOpen(!args.hidden);
   if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
   const r = m.result;
   if (r) {
     entry.dataset.result = '1';   // 吸收了一条 tool_result, 计数对账用
     const status = [r.error ? '✗ 出错' : '✓ 完成'];
     if (Number.isInteger(r.exit_code)) status.push(`exit ${r.exit_code}`);
+    if (Number.isFinite(+r.duration_s)) status.push(formatDuration(+r.duration_s * 1000));
     const stats = outputStats(r.text || '');
     status.push(stats.lines > 1 ? `${stats.lines.toLocaleString()} 行`
       : `${stats.chars.toLocaleString()} 字符`);
@@ -1835,6 +1878,13 @@ function refreshFormulae() {
 }
 
 function msgNode(m) {
+  if (m.silent) {
+    const n = el('span', 'silent-tool-result');
+    n.hidden = true;
+    n.dataset.role = m.role;
+    if (m.counted === false) n.dataset.counted = 'false';
+    return n;
+  }
   if (m.role === 'event') return eventNode(m);
   if (m.changes?.length) return fileChangeNode(m);
   if (m.role === 'question') return questionNode(m);
@@ -1982,7 +2032,7 @@ function renderQueuedMessages(uid = S.sel) {
   const box = $('#msgs');
   if (!box || S.agent || uid !== S.sel) return;
   for (const item of queuedMessages(uid)) {
-    const node = msgNode({role: 'user', text: item.text, counted: false});
+    const node = msgNode({role: 'user', text: item.text, media: item.media, counted: false});
     node.classList.add('client-pending');
     node.dataset.queuedId = item.id;
     node.appendChild(el('small', 'client-pending-state', '排队中'));

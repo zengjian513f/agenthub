@@ -611,12 +611,12 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 
 .activity {
   display: inline-flex; align-items: center; gap: 7px; width: fit-content;
-  margin: 2px 0 8px; padding: 5px 9px; border-radius: 999px;
-  background: var(--panel-2); color: var(--muted); font-size: 12px;
-  box-shadow: inset 0 0 0 1px var(--border);
+  margin: 0 0 7px; padding: 2px 3px;
+  background: transparent; color: var(--muted); font-size: 11.5px;
+  box-shadow: none;
 }
-.activity i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
-.activity.waiting { color: #9a6700; background: var(--bubble-question); }
+.activity i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.activity.waiting { color: #9a6700; }
 .activity.waiting i { background: #d4a72c; }
 .activity.aborted i, .activity.failed i { background: #e5484d; }
 
@@ -675,11 +675,12 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   margin-bottom: 6px; padding: 0; border: 0; background: transparent;
 }
 .tool-entry > pre {
-  margin: 0; padding: 8px 10px; overflow-x: auto; white-space: pre-wrap;
-  word-break: break-word; border: 1px solid var(--border); border-radius: 6px;
+  margin: 0; padding: 8px 10px; overflow-x: auto; white-space: pre;
+  word-break: normal; overflow-wrap: normal; border: 1px solid var(--border); border-radius: 6px;
   background: var(--bubble-tool); color: var(--terminal-fg); box-shadow: var(--shadow);
   font: 400 var(--tool-font-size)/1.5 var(--terminal-font); font-synthesis: none;
 }
+.tool-entry > pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 .tool-entry > pre.clip { max-height: 340px; overflow: hidden; }
 
 /* 紧凑工具卡片: 摘要头(`$ cmd`) + 参数(默认收起) + 状态行 + 输出预览 */
@@ -698,8 +699,18 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .tool-head .tool-meta { flex: none; margin-left: auto; color: var(--muted); font-size: 11px; }
 .tool-entry > .tool-args {
-  margin-top: 3px; border-style: dashed; opacity: .92;
+  margin-top: 0; border-top: 0; border-radius: 0; border-style: solid;
+  box-shadow: none; opacity: .92;
 }
+.tool-entry.args-open > .tool-head { border-radius: 6px 6px 0 0; box-shadow: none; }
+.tool-entry > .tool-args-close {
+  display: block; width: 100%; margin: 0; padding: 3px 10px;
+  border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px;
+  background: var(--bubble-tool); color: var(--muted);
+  font: 400 11px/1.5 var(--terminal-font); text-align: center; cursor: pointer;
+}
+.tool-entry > .tool-args-close:hover { color: var(--terminal-fg); background: var(--hover); }
+.tool-entry > .tool-args-close[hidden] { display: none; }
 .tool-entry > .tool-status {
   padding: 2px 10px 0; color: var(--muted); font-size: 11.5px; line-height: 1.5;
 }
@@ -844,20 +855,31 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-diff-line {
   display: block; min-height: 1.5em; padding-inline: 10px; white-space: pre;
 }
+.tool-entry > pre.wrap > .tool-diff-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 .tool-diff-line.meta { color: var(--muted); }
 .tool-diff-line.hunk { background: var(--panel-2); color: var(--accent); }
 .tool-diff-line.add { background: var(--diff-add-bg); color: var(--diff-add-fg); }
 .tool-diff-line.del { background: var(--diff-del-bg); color: var(--diff-del-fg); }
 
-/* 展开入口属于工具输出本体：正文负责上圆角，按钮负责下圆角。 */
-.tool-entry > pre:has(+ .more) {
+/* 输出操作属于工具正文：正文负责上圆角，操作栏负责下圆角。 */
+.tool-entry > pre:has(+ .tool-out-actions) {
   border-bottom: 0; border-radius: 6px 6px 0 0;
 }
-.tool-entry > pre + .more {
-  margin-top: 0; border-style: solid; border-radius: 0 0 6px 6px;
+.tool-out-actions {
+  display: flex; justify-content: flex-end; margin: 0;
+  border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px;
   background: var(--bubble-tool); color: var(--terminal-fg);
 }
-.tool-entry > pre + .more:hover { background: var(--hover); }
+.tool-out-actions > button {
+  width: auto; min-width: 96px; margin: 0; padding: 4px 10px;
+  border: 0; border-left: 1px solid var(--border); border-radius: 0;
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 12px;
+}
+.tool-out-actions > button:first-child { border-left: 0; }
+.tool-out-actions > button:hover, .tool-out-actions > button.on {
+  background: var(--hover); color: var(--terminal-fg);
+}
+.tool-out-actions > .more { flex: 1; }
 
 .empty { color: var(--muted); padding: 60px 20px; text-align: center; }
 
