@@ -279,6 +279,10 @@ class ToolSummaryTests(unittest.TestCase):
                          ("line 1\nline 2\n", {"duration_s": 30.0}))
         self.assertEqual(adapters._tool_output("write_stdin", waited),
                          ("line 1\nline 2\n", {"duration_s": 30.0}))
+        # 增量读取时工具调用可能在上一批，当前批拿不到 name；明确的执行
+        # 信封仍应展开，不能把 chunk_id 等内部字段显示给用户。
+        self.assertEqual(adapters._tool_output(None, waited),
+                         ("line 1\nline 2\n", {"duration_s": 30.0}))
 
         # 业务工具恰好返回 output 字段时，不能仅凭字段名误拆信封。
         plain = '{"output":"business value"}'

@@ -498,7 +498,9 @@ def _tool_output(name: str | None, value) -> tuple[str, dict]:
     """
     text = _stringify(value)
     key = str(name or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1]
-    if key not in {"exec", "exec_command", "wait", "write_stdin"}:
+    # 增量批次可能只含输出，不含较早批次里的工具调用，此时 name 为空。
+    # 信封字段本身足够严格，可以照常识别；已知的非执行工具仍保持原样。
+    if key and key not in {"exec", "exec_command", "wait", "write_stdin"}:
         return text, {}
 
     candidates = []
