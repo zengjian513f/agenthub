@@ -175,6 +175,114 @@ def _question_message(name: str, value) -> dict | None:
             "questions": questions}
 
 
+# "bash -c '…'" / "/usr/bin/zsh -lc '…'" 一类的解释器包装, 展示时剥掉只留命令本体
+_SHELL_WRAP = re.compile(r"^\s*(?:/usr/bin/|/bin/)?(?:ba|z|da)?sh\s+(?:-[A-Za-z]+\s+)*")
+# Codex functions.exec 把命令包在 JS 里: tools.exec_command({ cmd: "..." } 或 {"cmd": "..."})
+_EXEC_CMD = re.compile(r'\bcmd["\']?\s*:\s*("(?:\\.|[^"\\])*")')
+_EXEC_STEP = re.compile(r'\bstep["\']?\s*:\s*"((?:\\.|[^"\\])*)"')
+_EXEC_TOOLS = re.compile(r'\btools\.(\w+)\s*\(')
+
+
+def _shell_cmd(cmd) -> str:
+    """把 shell 调用参数还原成一行可读命令(剥解释器包装和外层引号)。"""
+    if isinstance(cmd, list):
+        cmd = [str(x) for x in cmd]
+        if len(cmd) >= 3 and re.fullmatch(r"-[A-Za-z]*c", cmd[-2] or ""):
+            cmd = cmd[-1]          # ["zsh", "-lc", "实际命令"]
+        else:
+            cmd = " ".join(cmd)
+    s = str(cmd).strip()
+    stripped = _SHELL_WRAP.sub("", s, count=1)
+    if stripped != s and stripped[:1] in ("'", '"') and stripped[-1:] == stripped[:1]:
+        stripped = stripped[1:-1]
+    return " ".join((stripped or s).split())
+
+
+def _tool_summary(name: str, value) -> str | None:
+    """给工具调用生成一行语义摘要(对标 codex TUI 的 `$ 命令` 风格)。
+
+    只覆盖能可靠识别的工具; 识别不了返回 None, 前端退回原始参数预览。
+    """
+    data = _json_value(value)
+    key = str(name or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1]
+
+    if key in ("bash", "shell", "local_shell_call", "exec_command", "terminal",
+               "run_terminal_cmd"):
+        cmd = data
+        if isinstance(data, dict):
+            cmd = data.get("command") or data.get("cmd") \
+                or (data.get("action") or {}).get("command")
+        if cmd:
+            return _clip("$ " + _shell_cmd(cmd), 200)
+    if key == "exec" and isinstance(data, str):
+        cmds = []
+        for m in _EXEC_CMD.finditer(data):
+            try:
+                cmds.append(_shell_cmd(json.loads(m.group(1))))
+            except (TypeError, ValueError):
+                continue
+        if cmds:
+            more = f" …(+{len(cmds) - 1})" if len(cmds) > 1 else ""
+            return _clip("$ " + cmds[0], 200) + more
+        steps = _EXEC_STEP.findall(data)
+        if "update_plan" in _EXEC_TOOLS.findall(data) and steps:
+            return _clip(f"计划 ×{len(steps)}: " + "; ".join(steps[:2]), 200)
+        called = list(dict.fromkeys(_EXEC_TOOLS.findall(data)))
+        if called:
+            return _clip("tools." + "  tools.".join(called[:3]), 200)
+    if not isinstance(data, dict):
+        return None
+    path = data.get("file_path") or data.get("path") or data.get("target_file")
+    if key in ("read", "read_file", "notebookread", "open") and path:
+        span = ""
+        if data.get("offset") or data.get("limit"):
+            span = f" ⌖{data.get('offset') or 0}+{data.get('limit') or ''}".rstrip("+")
+        return _clip(f"读 {path}{span}", 200)
+    if key in ("grep", "grep_search", "search", "rg", "codebase_search"):
+        pat = data.get("pattern") or data.get("query") or data.get("regex")
+        scope = data.get("path") or data.get("glob") or data.get("include") or ""
+        if pat:
+            return _clip(f"搜 {pat}" + (f" ⌁ {scope}" if scope else ""), 200)
+    if key in ("glob", "find", "list_dir", "ls", "file_search") and (data.get("pattern") or path):
+        return _clip(f"找 {data.get('pattern') or path}", 200)
+    if key in ("webfetch", "web_fetch", "fetch") and data.get("url"):
+        return _clip(f"抓 {data['url']}", 200)
+    if key in ("websearch", "web_search") and data.get("query"):
+        return _clip(f"搜索 {data['query']}", 200)
+    if key in ("task", "agent") and (data.get("description") or data.get("prompt")):
+        kind = data.get("subagent_type") or data.get("agentType") or ""
+        head = data.get("description") or data.get("prompt")
+        return _clip(f"子代理{f'({kind})' if kind else ''}: {head}", 200)
+    if key == "todowrite":
+        todos = [t for t in data.get("todos") or [] if isinstance(t, dict)]
+        if todos:
+            subj = "; ".join(_clip(str(t.get("subject") or t.get("content") or ""), 36)
+                             for t in todos[:3])
+            return _clip(f"TODO ×{len(todos)}: {subj}", 200)
+    if key == "update_plan":
+        plan = [s for s in data.get("plan") or [] if isinstance(s, dict)]
+        if plan:
+            return _clip(f"计划 ×{len(plan)}: "
+                         + "; ".join(_clip(str(s.get("step") or ""), 36) for s in plan[:2]), 200)
+    scalars = [(k, v) for k, v in data.items()
+               if isinstance(v, (str, int, float, bool)) and str(v).strip()]
+    if scalars:
+        return _clip("  ".join(f"{k}={v}" for k, v in scalars[:4]), 200)
+    return None
+
+
+_EXIT_CODE = re.compile(r'"exit_code"\s*:\s*(-?\d+)|\bexit(?:ed)?(?: with)?(?: code| status)? (-?\d+)')
+
+
+def _output_error(text: str) -> bool | None:
+    """从输出文本头部嗅探退出码; 嗅不到返回 None(未知), 不误报。"""
+    m = _EXIT_CODE.search(str(text or "")[:400])
+    if not m:
+        return None
+    code = int(m.group(1) or m.group(2))
+    return code != 0
+
+
 def _quoted_apply_patch(text: str) -> str | None:
     """从 Codex 的 exec 包装代码里取出传给 apply_patch 的字符串。"""
     if not isinstance(text, str):
@@ -342,6 +450,7 @@ def _flatten_content(content) -> list[dict]:
                 parts.append({
                     "kind": "tool", "name": name, "call_id": it.get("id"),
                     "text": json.dumps(tool_input, ensure_ascii=False, indent=2),
+                    "summary": _tool_summary(name, tool_input),
                     "changes": _tool_file_changes(name, tool_input),
                 })
         elif t == "tool_result":
@@ -349,7 +458,8 @@ def _flatten_content(content) -> list[dict]:
             images = [p["media"] for p in nested if p.get("media")]
             texts = [p["text"] for p in nested if p.get("kind") != "image" and p.get("text")]
             parts.append({"kind": "tool_result", "text": "\n".join(texts) or "[图片]",
-                          "call_id": it.get("tool_use_id"), "media": images})
+                          "call_id": it.get("tool_use_id"), "media": images,
+                          "error": bool(it.get("is_error"))})
         elif t in ("image", "input_image") or "image_url" in it:
             image = media.from_block(it)
             parts.append({"kind": "image", "text": "[图片]", "media": image})
@@ -370,6 +480,56 @@ def _stringify(v) -> str:
             return _stringify(v["text"])
         return json.dumps(v, ensure_ascii=False, indent=2)
     return str(v)
+
+
+def _tool_output(name: str | None, value) -> tuple[str, dict]:
+    """展开 functions.exec 中被 text(result) 再包一层的命令结果。
+
+    Codex 会把这种结果记成 ``Script completed / Output:`` 加一段 JSON；
+    JSON 的 ``output`` 才是用户真正想看的 stdout。只识别带执行时长及
+    进程状态字段的明确 exec_command 信封，普通工具返回的 JSON 保持原样。
+    """
+    text = _stringify(value)
+    if str(name or "").lower().rsplit("__", 1)[-1].rsplit(".", 1)[-1] != "exec":
+        return text, {}
+
+    candidates = []
+    if isinstance(value, list):
+        for part in value:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                candidates.append(part["text"])
+            elif isinstance(part, str):
+                candidates.append(part)
+    elif isinstance(value, dict) and isinstance(value.get("text"), str):
+        candidates.append(value["text"])
+    elif isinstance(value, str):
+        candidates.append(value)
+
+    for candidate in reversed(candidates):
+        payloads = [candidate.strip()]
+        marker = candidate.rfind("Output:\n")
+        if marker >= 0:
+            payloads.insert(0, candidate[marker + len("Output:\n"):].strip())
+        envelope = None
+        for payload in payloads:
+            try:
+                parsed = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                envelope = parsed
+                break
+        if not isinstance(envelope, dict) or "output" not in envelope \
+                or "wall_time_seconds" not in envelope \
+                or not ({"exit_code", "session_id", "chunk_id"} & envelope.keys()):
+            continue
+        meta = {}
+        if isinstance(envelope.get("exit_code"), int):
+            meta["exit_code"] = envelope["exit_code"]
+        if isinstance(envelope.get("wall_time_seconds"), (int, float)):
+            meta["duration_s"] = envelope["wall_time_seconds"]
+        return _stringify(envelope.get("output")), meta
+    return text, {}
 
 
 def _msg(role, text="", ts=None, name=None, args=None, media_parts=None, **extra):
@@ -512,6 +672,8 @@ class ClaudeAdapter:
                     elif p["kind"] == "tool":
                         calls[p.get("call_id")] = p["name"]
                         msgs.append(_msg("tool", p["text"], ts, name=p["name"],
+                                         call_id=p.get("call_id"),
+                                         summary=p.get("summary"),
                                          changes=p.get("changes") or None))
                     elif p["kind"] == "question":
                         calls[p.get("call_id")] = p["name"]
@@ -524,6 +686,8 @@ class ClaudeAdapter:
                         is_answer = _is_question_tool(name)
                         msgs.append(_msg("answer" if is_answer else "tool_result",
                                          p["text"], ts, name=name,
+                                         call_id=p.get("call_id"),
+                                         error=bool(p.get("error")),
                                          media_parts=p.get("media")))
                         if is_answer and not tag:
                             msgs.append(_status("working", ts))
@@ -760,12 +924,20 @@ class CodexAdapter:
                     msgs.append(_status("waiting", ts, turn_id=p.get("turn_id")))
                 else:
                     msgs.append(_msg("tool", _pretty_json(body), ts, name=name,
+                                     call_id=p.get("call_id"),
+                                     summary=_tool_summary(name, body),
                                      changes=_tool_file_changes(name, body) or None))
             elif k in ("function_call_output", "custom_tool_call_output", "local_shell_call_output"):
                 name = calls.get(p.get("call_id"))
                 is_answer = _is_question_tool(name)
+                out_text, output_meta = _tool_output(name, p.get("output"))
+                exit_code = output_meta.get("exit_code")
                 msgs.append(_msg("answer" if is_answer else "tool_result",
-                                 _stringify(p.get("output")), ts, name=name))
+                                 out_text, ts, name=name,
+                                 call_id=p.get("call_id"),
+                                 error=(exit_code != 0 if exit_code is not None
+                                        else _output_error(out_text) or False),
+                                 **output_meta))
                 if is_answer:
                     msgs.append(_status("working", ts))
             elif k in ("web_search_call", "tool_search_call"):
@@ -862,7 +1034,9 @@ class GrokAdapter:
                 txt = "\n".join(x["text"] for x in parts if x.get("kind") != "image" and x.get("text"))
                 images = [x["media"] for x in parts if x.get("media")]
                 msgs.append(_msg("tool_result", txt or "[图片]",
-                                 name=calls.get(rec.get("tool_call_id")), media_parts=images))
+                                 name=calls.get(rec.get("tool_call_id")),
+                                 call_id=rec.get("tool_call_id"),
+                                 error=_output_error(txt) or False, media_parts=images))
             elif t in ("user", "assistant", "system"):
                 parts = _flatten_content(rec.get("content"))
                 txt = "\n".join(x["text"] for x in parts if x["kind"] == "text")
@@ -882,6 +1056,8 @@ class GrokAdapter:
                         msgs.append(_status("waiting"))
                     else:
                         msgs.append(_msg("tool", _pretty_json(args), name=name,
+                                         call_id=tc.get("id"),
+                                         summary=_tool_summary(name, args),
                                          changes=_tool_file_changes(name, args) or None))
         return msgs, end
 

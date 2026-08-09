@@ -546,27 +546,28 @@ def run(pw):
                     '.msg[data-role="context"] > .fold-preview').count() == 0)
     single_tool = p.locator('.msg[data-role="tool_result"]').filter(has_text="单行工具输出不折叠")
     check("单行工具输出也不折叠",
-          single_tool.locator(".mb").is_visible() and single_tool.locator(".fold-preview").count() == 0)
+          single_tool.locator(".tool-out").is_visible() and single_tool.locator(".fold-preview").count() == 0)
     single_tool_skin = single_tool.evaluate("""n => {
-      const body = n.querySelector(':scope > .mb'), pre = body.querySelector(':scope > pre');
-      const ns = getComputedStyle(n), bs = getComputedStyle(body), ps = getComputedStyle(pre);
-      return { bodyPadding: bs.padding, preBackground: ps.backgroundColor,
-               preBorder: ps.borderTopWidth, preMargin: ps.margin,
+      const entry = n.querySelector(':scope > .tool-entry');
+      const pre = entry.querySelector(':scope > pre.tool-out');
+      const ns = getComputedStyle(n), es = getComputedStyle(entry), ps = getComputedStyle(pre);
+      return { entryPadding: es.padding, preBackground: ps.backgroundColor,
+               preBorder: ps.borderTopWidth,
                bubbleBackground: ns.backgroundColor, textColor: ps.color,
                fontWeight: ps.fontWeight, fontSynthesis: ps.fontSynthesis,
                scrollbarWidth: ps.scrollbarWidth, scrollbarColor: ps.scrollbarColor };
     }""")
-    check("单条工具输出没有外黄里灰的双层气泡",
+    check("单条工具输出是单层终端卡片(外层无气泡)",
           all(single_tool_skin[k] == v for k, v in {
-              "bodyPadding": "0px", "preBackground": "rgba(0, 0, 0, 0)",
-              "preBorder": "0px", "preMargin": "0px"}.items()), single_tool_skin)
+              "entryPadding": "0px", "bubbleBackground": "rgba(0, 0, 0, 0)",
+              "preBorder": "1px"}.items()), single_tool_skin)
     terminal_theme = p.evaluate("termTheme()")
     light_terminal_surface = p.locator("#xterm").evaluate("""n => ({
       filter: getComputedStyle(n).filter,
       sourceBackground: getComputedStyle(n).backgroundColor
     })""")
     check("亮色模式下工具输出使用明亮浅底深字主题",
-          single_tool_skin["bubbleBackground"] == "rgb(244, 246, 248)"
+          single_tool_skin["preBackground"] == "rgb(244, 246, 248)"
           and single_tool_skin["textColor"] == "rgb(37, 42, 50)"
           and single_tool_skin["fontWeight"] == "400"
           and single_tool_skin["fontSynthesis"] == "none"
@@ -595,8 +596,8 @@ def run(pw):
     p.emulate_media(color_scheme="dark")
     p.wait_for_timeout(50)
     dark_tool_skin = single_tool.evaluate("""n => ({
-      background: getComputedStyle(n).backgroundColor,
-      color: getComputedStyle(n.querySelector(':scope > .mb > pre')).color
+      background: getComputedStyle(n.querySelector(':scope > .tool-entry > pre.tool-out')).backgroundColor,
+      color: getComputedStyle(n.querySelector(':scope > .tool-entry > pre.tool-out')).color
     })""")
     dark_terminal_theme = p.evaluate("termTheme()")
     terminal_curve = p.locator("#xterm").evaluate("""n => ({
@@ -615,8 +616,8 @@ def run(pw):
     p.emulate_media(color_scheme="light")
     p.wait_for_timeout(50)
     font_pair = p.evaluate("""() => ({
-      tool: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .mb > pre')).fontFamily,
-      toolSize: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .mb > pre')).fontSize,
+      tool: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .tool-entry > pre')).fontFamily,
+      toolSize: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .tool-entry > pre')).fontSize,
       terminal: termFont(), terminalSize: termFontSize()
     })""")
     check("工具输出与 tmux 终端共用 Cascadia/系统等宽字体栈",
@@ -750,9 +751,10 @@ def run(pw):
     grp = p.locator('.msg[data-role="toolgroup"]').first
     check("连续工具调用合并成组", grp.count() > 0)
     if grp.count():
-        check("组预览显示调用次数", re.search(r"\d+ 次工具调用", grp.locator("> .fold-preview").inner_text()),
+        check("组预览显示调用次数", re.search(r"🔧 ×\d+", grp.locator("> .fold-preview").inner_text()),
               grp.locator("> .fold-preview").inner_text())
-        check("组预览显示工具名摘要", grp.locator("> .fold-preview .peek").inner_text().strip() != "")
+        check("组预览显示语义摘要", "$ echo hi" in grp.locator("> .fold-preview .peek").inner_text(),
+              grp.locator("> .fold-preview .peek").inner_text())
         check("组默认折叠", not grp.locator("> .tool-entry").first.is_visible())
         inner = grp.locator("> .tool-entry").count()
         check("组内至少 3 条", inner >= 3, inner)
@@ -899,11 +901,13 @@ def run(pw):
     total = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
     check("一次载入全部消息, 不再分页", p.locator(".more-page").count() == 0)
     check("载入时显示过进度条", p.evaluate("window.__prog"))
-    # 工具组本身不算原始消息，组内扁平 tool-entry 各算一条；rename/compact
-    # 结果会显示在时间线里，但它们是辅助事件，不进入标题栏的“消息”计数。
+    # 工具组本身不算原始消息，组内扁平 tool-entry 各算一条；调用卡片吸收的
+    # tool_result 通过 data-result 标记补回计数；rename/compact 结果会显示在
+    # 时间线里，但它们是辅助事件，不进入标题栏的“消息”计数。
     dom_msgs = p.locator(
-        '#msgs .msg:not(.grp):not([data-counted="false"]), '
-        '#msgs .tool-entry:not([data-counted="false"])').count()
+        '#msgs .msg:not(.grp):not(.tool-msg):not([data-counted="false"]), '
+        '#msgs .tool-entry:not([data-counted="false"])').count() \
+        + p.locator('#msgs [data-result="1"]').count()
     check("消息数与顶部计数一致", dom_msgs == total, f"dom={dom_msgs} meta={total}")
     geo = p.evaluate("""() => { const b = document.querySelector('#msgs'), r = b.getBoundingClientRect();
       return { right: Math.round(r.right), win: innerWidth, scrollable: b.scrollHeight > b.clientHeight,

@@ -1247,6 +1247,28 @@ const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant�
                               'thinking', 'question', 'answer', 'command']);
 const GROUP_MIN = 3;
 
+/** 调用与其输出按 call_id 就近配对成一个视觉单元(对标 codex TUI 的 `$ 命令 + 输出`)。
+ *  只在本批消息内配对；增量批里落单的输出保持原样渲染，不会丢。 */
+function pairTools(msgs) {
+  const out = [], open = new Map();
+  for (const m of msgs) {
+    if (m.role === 'tool') {
+      const copy = { ...m };
+      out.push(copy);
+      if (m.call_id) open.set(m.call_id, copy);
+      continue;
+    }
+    if (m.role === 'tool_result' && m.call_id && open.has(m.call_id)) {
+      const owner = open.get(m.call_id);
+      open.delete(m.call_id);
+      owner.result = m;
+      continue;
+    }
+    out.push(m);
+  }
+  return out;
+}
+
 /** 先算分组(纯计算, 很快), 再分批建 DOM —— 分批不会把一个组切成两半。 */
 function planMessages(msgs) {
   const plan = [];
@@ -1256,7 +1278,7 @@ function planMessages(msgs) {
     else for (const m of run) plan.push({ m });
     run = [];
   };
-  for (const m of msgs) {
+  for (const m of pairTools(msgs)) {
     // 文件修改本身是用户关心的工作记录，始终作为可见卡片留在时间线；
     // 普通工具协议继续按原规则合并折叠。
     if (TOOL_ROLES.has(m.role) && !m.changes?.length) { run.push(m); continue; }
@@ -1303,20 +1325,66 @@ function addAction(n) {
   };
 }
 
+// 输出预览: 前几行足够判断结果, 大段日志靠"展开全文"。
+const OUT_LINES = 8;
+function outPreview(t) {
+  const lines = t.split('\n');
+  if (lines.length > OUT_LINES) return lines.slice(0, OUT_LINES).join('\n') + '\n…';
+  return t.length > CLIP ? clipText(t) : t;
+}
+
+function addClippedPre(entry, cls, text) {
+  const pre = el('pre', cls);
+  const short = outPreview(text);
+  pre.textContent = short;
+  paintToolOutputDiff(pre);
+  entry.appendChild(pre);
+  if (short !== text) {
+    const more = el('button', 'more', `展开全文 (${text.length.toLocaleString()} 字符)`);
+    more.onclick = () => {
+      pre.textContent = text;
+      paintToolOutputDiff(pre);
+      more.remove();
+    };
+    entry.appendChild(more);
+  }
+  return pre;
+}
+
 function toolEntry(m) {
   const entry = el('div', 'tool-entry');
   entry.dataset.role = m.role;
-  const pre = el('pre');
-  const text = m.name ? `${m.name}\n${m.text}` : m.text;
-  const paint = full => { pre.textContent = full ? text : clipText(text); };
-  paint(false);
-  entry.appendChild(pre);
+  if (m.role !== 'tool') {
+    // 落单的工具输出(没配到调用): 保持独立块
+    addClippedPre(entry, 'tool-out' + (m.error ? ' err' : ''),
+                  m.name ? `${m.name}\n${m.text}` : m.text);
+    if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
+    return entry;
+  }
+  // 调用头: 一行语义摘要(如 `$ git status`), 点击展开原始参数
+  const head = el('button', 'tool-head');
+  head.type = 'button';
+  head.title = '展开/收起原始参数';
+  head.innerHTML = `<code>${esc(m.summary || m.name || 'tool')}</code>`
+    + (m.name && m.summary ? `<span class="tool-meta">${esc(m.name)}</span>` : '');
+  entry.appendChild(head);
+  const args = el('pre', 'tool-args');
+  args.hidden = !!m.summary;   // 识别不了的工具直接铺参数, 不藏
+  let painted = false;
+  const paintArgs = () => { if (!painted) { args.textContent = m.text; painted = true; } };
+  if (!args.hidden) paintArgs();
+  head.onclick = () => { paintArgs(); args.hidden = !args.hidden; };
+  entry.appendChild(args);
   if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
-  if (text.length > CLIP) {
-    const more = el('button', 'more', `展开全文 (${text.length.toLocaleString()} 字符)`);
-    more.onclick = () => { pre.classList.remove('clip'); paint(true); more.remove(); };
-    pre.classList.add('clip');
-    entry.appendChild(more);
+  const r = m.result;
+  if (r) {
+    entry.dataset.result = '1';   // 吸收了一条 tool_result, 计数对账用
+    const status = [r.error ? '✗ 出错' : '✓ 完成'];
+    if (Number.isInteger(r.exit_code)) status.push(`exit ${r.exit_code}`);
+    status.push(`${(r.text || '').length.toLocaleString()} 字符`);
+    entry.appendChild(el('div', 'tool-status' + (r.error ? ' err' : ''), status.join(' · ')));
+    if (String(r.text || '').trim()) addClippedPre(entry, 'tool-out' + (r.error ? ' err' : ''), r.text);
+    if (r.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(r.media));
   }
   return entry;
 }
@@ -1326,10 +1394,29 @@ const CHANGE_LABEL = {
 };
 
 function diffKind(line) {
-  if (/^(---|\+\+\+|@@|\*\*\*)/.test(line)) return 'meta';
+  if (/^(diff --git |index |---|\+\+\+|\*\*\*)/.test(line)) return 'meta';
+  if (line.startsWith('@@')) return 'hunk';
   if (line.startsWith('+')) return 'add';
   if (line.startsWith('-')) return 'del';
   return 'ctx';
+}
+
+/** 给普通工具输出里夹带的 unified/git diff 上色；前置命令状态仍按原样显示。 */
+function paintToolOutputDiff(pre) {
+  if (!(pre instanceof HTMLElement) || pre.querySelector(':scope > .tool-diff-line')) return;
+  const lines = pre.textContent.split('\n');
+  const first = lines.findIndex(line => line.startsWith('diff --git '));
+  const unified = first >= 0 ? first : lines.findIndex((line, i) =>
+    line.startsWith('--- ') && lines.slice(i + 1, i + 4).some(x => x.startsWith('+++ ')));
+  if (unified < 0) return;
+  const fragment = document.createDocumentFragment();
+  lines.forEach((line, i) => {
+    const row = el('span', 'tool-diff-line');
+    if (i >= unified) row.classList.add(diffKind(line));
+    row.textContent = line || ' ';
+    fragment.appendChild(row);
+  });
+  pre.replaceChildren(fragment);
 }
 
 function diffRows(lines) {
@@ -1399,6 +1486,7 @@ function openFileDiff(change) {
 function fileChangeNode(m) {
   const n = el('div', 'msg file-change-msg');
   n.dataset.role = 'tool';
+  if (m.result) n.dataset.result = '1';   // 修改类调用的确认输出并入卡片
   if (m.counted === false) n.dataset.counted = 'false';
   const body = el('div', 'file-change-list');
   for (const change of m.changes) {
@@ -1423,10 +1511,14 @@ function groupNode(items) {
   const n = el('div', 'msg grp folded');
   n.dataset.role = 'toolgroup';
   const calls = items.filter(m => m.role === 'tool');
-  const tally = {};
-  calls.forEach(m => { const k = m.name || 'tool'; tally[k] = (tally[k] || 0) + 1; });
-  const summary = Object.entries(tally).map(([k, v]) => v > 1 ? `${k} ×${v}` : k).join(' · ');
-  const preview = addFoldPreview(n, `🔧 ${calls.length} 次工具调用 · ${summary}`, '工具调用组');
+  // 预览行直接给前几条语义摘要(`$ cmd` 一类), 比"Bash ×3"信息量大
+  const visible = calls.length ? calls : items;
+  const heads = visible.slice(0, 3).map(m => m.summary || m.name || 'tool');
+  const hasErr = items.some(m => m.result?.error || (m.role === 'tool_result' && m.error));
+  const preview = addFoldPreview(n,
+    `🔧 ×${visible.length}${hasErr ? ' ⚠' : ''} · ${heads.join('  ·  ')}`
+      + (visible.length > 3 ? ' · …' : ''),
+    '工具调用组');
   items.forEach(m => n.appendChild(toolEntry(m))); // 直接铺在组内，不再套 grp-body + 内层 msg
   const setAction = addAction(n);
   const fold = () => { n.classList.add('folded'); setAction(); };
@@ -1493,6 +1585,14 @@ function refreshFormulae() {
 function msgNode(m) {
   if (m.changes?.length) return fileChangeNode(m);
   if (m.role === 'question') return questionNode(m);
+  if (TOOL_ROLES.has(m.role)) {
+    // 单发工具调用与组内同款紧凑卡片: 摘要头 + 状态 + 输出预览
+    const n = el('div', 'msg tool-msg');
+    n.dataset.role = m.role;
+    if (m.counted === false) n.dataset.counted = 'false';
+    n.appendChild(toolEntry(m));
+    return n;
+  }
   // 命中的消息展开且不截断, 保证高亮可见; 但设上限, 否则搜 "a" 会把整个会话全量展开
   const found = SEARCH_ROLES.has(m.role) && hasTerm(m.text);
   const hit = found && S.autoOpen < AUTO_OPEN_MAX;

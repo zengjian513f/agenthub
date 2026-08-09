@@ -165,5 +165,85 @@ class FileChangeTests(unittest.TestCase):
         self.assertEqual((write["added"], write["removed"]), (2, 0))
 
 
+class ToolSummaryTests(unittest.TestCase):
+    def test_shell_wrapper_is_stripped(self):
+        self.assertEqual(
+            adapters._tool_summary("Bash", {"command": "bash -c 'ls -la /tmp'",
+                                            "description": "列目录"}),
+            "$ ls -la /tmp")
+        self.assertEqual(
+            adapters._tool_summary("shell", {"command": ["/usr/bin/zsh", "-lc", "git status"]}),
+            "$ git status")
+        self.assertEqual(adapters._tool_summary("Bash", {"command": "pytest -q"}),
+                         "$ pytest -q")
+
+    def test_codex_exec_js_wrapper(self):
+        js = ('const r = await tools.exec_command({\n'
+              '  cmd: "git log --oneline -3",\n  timeout_ms: 60000\n});')
+        self.assertEqual(adapters._tool_summary("exec", js), "$ git log --oneline -3")
+
+    def test_read_grep_and_fallback(self):
+        self.assertEqual(adapters._tool_summary("Read", {"file_path": "/a/b.py"}),
+                         "读 /a/b.py")
+        self.assertTrue(adapters._tool_summary(
+            "Grep", {"pattern": "veto", "path": "reports/"}).startswith("搜 veto"))
+        # 未知工具退回标量 k=v 拼接
+        got = adapters._tool_summary("mcp__foo__bar", {"cell_id": "50", "n": 3})
+        self.assertIn("cell_id=50", got)
+        # 完全无法概括时返回 None
+        self.assertIsNone(adapters._tool_summary("mystery", {"blob": {"deep": [1]}}))
+
+    def test_output_error_sniffing(self):
+        self.assertTrue(adapters._output_error('{"exit_code": 1, "output": "boom"}'))
+        self.assertFalse(adapters._output_error('{"exit_code": 0}'))
+        self.assertTrue(adapters._output_error("command exited with code -1"))
+        self.assertIsNone(adapters._output_error("plain text output"))
+
+    def test_codex_exec_result_envelope_is_unwrapped(self):
+        wrapped = [
+            {"type": "input_text",
+             "text": "Script completed\nWall time 0.0 seconds\nOutput:\n"},
+            {"type": "input_text", "text": json.dumps({
+                "chunk_id": "abc123", "wall_time_seconds": 0.04,
+                "exit_code": 0, "original_token_count": 4,
+                "output": "first\nsecond\n",
+            })},
+        ]
+        text, meta = adapters._tool_output("exec", wrapped)
+        self.assertEqual(text, "first\nsecond\n")
+        self.assertEqual(meta, {"exit_code": 0, "duration_s": 0.04})
+
+        combined = ("Script completed\nWall time 0.1 seconds\nOutput:\n\n"
+                    + json.dumps({"session_id": 12, "chunk_id": "def456",
+                                  "wall_time_seconds": 10.0,
+                                  "output": "still running\n"}))
+        self.assertEqual(adapters._tool_output("exec", combined),
+                         ("still running\n", {"duration_s": 10.0}))
+
+        # 业务工具恰好返回 output 字段时，不能仅凭字段名误拆信封。
+        plain = '{"output":"business value"}'
+        self.assertEqual(adapters._tool_output("exec", plain), (plain, {}))
+
+    def test_claude_messages_carry_summary_and_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            rows = [
+                {"type": "assistant", "timestamp": "2026-08-09T10:00:00Z",
+                 "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                          "input": {"command": "bash -c 'false'"}}]}},
+                {"type": "user", "timestamp": "2026-08-09T10:00:01Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
+                                          "is_error": True, "content": "boom"}]}},
+            ]
+            f.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+            msgs, _ = adapters.ClaudeAdapter().read(str(f))
+        tool = next(m for m in msgs if m["role"] == "tool")
+        result = next(m for m in msgs if m["role"] == "tool_result")
+        self.assertEqual(tool["summary"], "$ false")
+        self.assertEqual(tool["call_id"], "t1")
+        self.assertEqual(result["call_id"], "t1")
+        self.assertTrue(result["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
