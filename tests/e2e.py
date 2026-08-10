@@ -1167,6 +1167,21 @@ def run(pw):
     check("内联 diff 按文件扩展名叠加源码语法高亮",
           change.locator(".diff-line.del .hljs-keyword").count() >= 1
           and change.locator(".diff-line.add .hljs-keyword").count() >= 1)
+    wrap_button = change.locator("[data-diff-wrap]")
+    wrap_before = change.locator(".diff-line > code").first.evaluate(
+        "n => getComputedStyle(n).whiteSpace")
+    wrap_button.click()
+    wrap_after = change.locator(".diff-line > code").first.evaluate(
+        "n => getComputedStyle(n).whiteSpace")
+    check("diff 可以按卡片切换长行自动换行",
+          wrap_before == "pre" and wrap_after == "pre-wrap"
+          and change.get_attribute("data-diff-wrap") == "true"
+          and wrap_button.get_attribute("aria-pressed") == "true")
+    wrap_button.click()
+    check("diff 可以恢复原始行宽",
+          change.locator(".diff-line > code").first.evaluate(
+              "n => getComputedStyle(n).whiteSpace") == "pre"
+          and change.get_attribute("data-diff-wrap") == "false")
     change.locator('[data-diff-view="split"]').click()
     split = change.locator(".diff-split > section")
     check("diff 可以切换为修改前后并排", split.count() == 2
@@ -1177,6 +1192,24 @@ def run(pw):
           and split.nth(1).locator(".hljs-keyword").count() >= 1)
     check("片段不会伪装成完整文件", "片段" in change.locator(".file-change-head").inner_text())
     check("当前卡片记录并排状态", change.get_attribute("data-diff-view") == "split")
+    desktop_sides = split.evaluate_all("""nodes => nodes.map(n => {
+      const r = n.getBoundingClientRect(); return {left:r.left, top:r.top, bottom:r.bottom};
+    })""")
+    check("桌面并排 diff 保持左右布局",
+          abs(desktop_sides[0]["top"] - desktop_sides[1]["top"]) < 2
+          and desktop_sides[1]["left"] > desktop_sides[0]["left"], desktop_sides)
+    p.set_viewport_size({"width": 390, "height": 780})
+    p.evaluate("document.body.classList.add('mobile-detail')")
+    p.wait_for_timeout(150)
+    mobile_sides = split.evaluate_all("""nodes => nodes.map(n => {
+      const r = n.getBoundingClientRect(); return {left:r.left, top:r.top, bottom:r.bottom};
+    })""")
+    check("手机并排 diff 改为修改前后上下布局",
+          mobile_sides[1]["top"] >= mobile_sides[0]["bottom"] - 1,
+          mobile_sides)
+    p.set_viewport_size({"width": 1280, "height": 720})
+    p.evaluate("document.body.classList.remove('mobile-detail')")
+    p.wait_for_timeout(150)
     change.locator('[data-diff-view="unified"]').click()
     check("diff 可以切回统一视图", change.locator(".diff-unified").is_visible())
 

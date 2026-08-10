@@ -797,6 +797,11 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .diff-split .diff-line { grid-template-columns: minmax(0, 1fr); }
 .diff-split .diff-line > code { padding-left: 10px; }
+.file-change-card.diff-wrap .file-change-body { overflow-x: hidden; }
+.file-change-card.diff-wrap :is(.diff-unified, .diff-split) { min-width: 0; }
+.file-change-card.diff-wrap .diff-line > code {
+  min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+}
 .diff-unavailable, .diff-empty { padding: 18px 12px; color: var(--muted); font-size: 12px; }
 
 .mb pre {
@@ -1201,6 +1206,9 @@ body.dragging-v { cursor: row-resize; user-select: none; }
 
   .msgs { max-width: none; padding: 10px 8px max(20px, env(safe-area-inset-bottom)); }
   .msg { max-width: 100%; }
+  .diff-split { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+  .diff-split > section { border-right: 0; border-bottom: 1px solid var(--border); }
+  .diff-split > section:last-child { border-bottom: 0; }
 
   #composer {
     max-width: none; gap: 6px;

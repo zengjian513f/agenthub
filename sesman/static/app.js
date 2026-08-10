@@ -2045,6 +2045,18 @@ function paintInlineFileDiff(card, change, view) {
   paintSyntax(body);
 }
 
+function setInlineFileDiffWrap(card, on) {
+  on = !!on;
+  card.classList.toggle('diff-wrap', on);
+  card.dataset.diffWrap = String(on);
+  const button = card.querySelector('[data-diff-wrap]');
+  if (!button) return;
+  button.classList.toggle('on', on);
+  button.setAttribute('aria-pressed', String(on));
+  button.textContent = on ? '原行' : '换行';
+  button.title = on ? '保持 diff 原始行宽' : '长行自动换行';
+}
+
 function fileChangeNode(m) {
   const n = el('div', 'msg file-change-msg');
   n.dataset.role = 'tool';
@@ -2059,15 +2071,22 @@ function fileChangeNode(m) {
     card.innerHTML = `<div class="file-change-head"><b title="${esc(path)}">${esc(path)}</b>
       <span class="file-change-meta"><em title="${esc(scope)}">${esc(CHANGE_LABEL[change.operation] || '修改')} · ${complete ? '完整' : '片段'}</em>
       <i class="add">+${change.added || 0}</i><i class="del">−${change.removed || 0}</i>
-      <span class="file-change-toolbar" role="group" aria-label="Diff 显示方式">
+      <span class="file-change-toolbar" role="group" aria-label="Diff 显示选项">
         <button type="button" data-diff-view="unified" aria-pressed="true">统一</button>
         <button type="button" data-diff-view="split" aria-pressed="false">并排</button>
+        <button type="button" data-diff-wrap aria-pressed="false" title="长行自动换行">换行</button>
       </span></span></div>
       <div class="file-change-body"></div>`;
     card.querySelector('.file-change-toolbar').onclick = e => {
+      const wrap = e.target.closest('button[data-diff-wrap]');
+      if (wrap) {
+        setInlineFileDiffWrap(card, !card.classList.contains('diff-wrap'));
+        return;
+      }
       const button = e.target.closest('[data-diff-view]');
       if (button) paintInlineFileDiff(card, change, button.dataset.diffView);
     };
+    setInlineFileDiffWrap(card, false);
     paintInlineFileDiff(card, change, 'unified');
     body.appendChild(card);
   }
