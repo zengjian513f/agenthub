@@ -35,11 +35,7 @@ class SesmanCli {
     return item?.state === 'sending' ? '发送中' : '排队中';
   }
 
-  clearsQueuedMessages(_keys) {
-    return false;
-  }
-
-  repeatedEscape(_now, _previousAt) {
+  repeatedEscape(_now, _previousAt, _context = {}) {
     return { rewind: false, nextAt: -Infinity };
   }
 }
@@ -81,8 +77,14 @@ class ClaudeCli extends SesmanCli {
     if (message.operation === 'enqueue') {
       return { type: 'confirm', text: String(message.text || '') };
     }
-    return message.operation === 'remove'
-      ? { type: 'remove', text: String(message.text || '') } : null;
+    if (message.operation === 'remove') {
+      return { type: 'remove', text: String(message.text || '') };
+    }
+    // Claude 2.1.226 在当前回合结束/中断后，为每条即将提升成正式 user
+    // 消息的输入写一个无正文 dequeue；旧版本使用带正文的 popAll。
+    if (message.operation === 'dequeue') return { type: 'promote-first' };
+    if (message.operation === 'popAll') return { type: 'promote-all' };
+    return null;
   }
 
   queuedMessageExpired(item, now, hasNativeHistory) {
@@ -91,13 +93,9 @@ class ClaudeCli extends SesmanCli {
       && now >= +item.expiresAt;
   }
 
-  clearsQueuedMessages(keys) {
-    // Claude 的真实记录在 Esc 后会产生 queue-operation remove；先在 UI
-    // 撤掉副本，后续原生事件仍作为最终对账依据。
-    return Array.isArray(keys) && keys.includes('Escape');
-  }
-
-  repeatedEscape(now, previousAt) {
+  repeatedEscape(now, previousAt, context = {}) {
+    // 运行中 Esc 是中断，对话框中 Esc 是取消；两者都不是 rewind 的第一击。
+    if (context.busy) return { rewind: false, nextAt: -Infinity };
     const rewind = now - previousAt <= 650;
     return { rewind, nextAt: rewind ? -Infinity : now };
   }

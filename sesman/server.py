@@ -17,8 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import (index, live, media, pending as pending_store, send_queue,
-               session_meta, term, wsock)
+from . import (claude_bridge, index, live, media, pending as pending_store,
+               send_queue, session_meta, term, wsock)
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
@@ -35,6 +35,26 @@ ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 ATTACHMENT_DIR = "sesman_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
 OUTBOX_WAKE = threading.Event()
+
+
+def _claude_prompt(session_id: str, messages: list[dict]) -> dict | None:
+    """保留实时题卡，直到对应原生回答确实进入会话记录。"""
+    prompt = claude_bridge.prompt(session_id)
+    if not prompt:
+        return prompt
+    tool_id = str(prompt.get("id") or "")
+    # Claude 2.1.226 在网页按 Esc 拒绝 AskUserQuestion 时，不保证发出
+    # PostToolUseFailure hook；但匹配 tool_use_id 的失败 tool_result 一定会落盘。
+    # ID 在单次会话内唯一，所以即便 hook 状态仍是 waiting，也应以记录为准。
+    answered = tool_id and any(
+        str(message.get("call_id") or "") == tool_id
+        and message.get("role") in {"answer", "tool_result"}
+        for message in messages
+    )
+    if answered:
+        claude_bridge.clear(session_id, tool_id)
+        return None
+    return prompt
 
 
 def _after_terminal_keys(uid: str, keys: list[str]) -> None:
@@ -554,6 +574,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/messages/"):
             uid = unquote(path[len("/api/messages/"):])
             agent = q.get("agent", [""])[0]
+            session = index.get(uid)
             result = index.messages(
                 uid,
                 agent=agent,
@@ -567,6 +588,11 @@ class Handler(BaseHTTPRequestHandler):
                 if send_queue.observe(uid, result["messages"], result.get("activity")):
                     OUTBOX_WAKE.set()
                 result["outbox"] = send_queue.list_for(uid)
+                if session and session.get("source") == "claude":
+                    sid = str(session.get("sid") or "")
+                    result["prompt"] = _claude_prompt(sid, result["messages"])
+                else:
+                    result["prompt"] = None
             result["meta"] = session_meta.enrich_one(result["meta"])
             return self._json(result)
 
@@ -631,13 +657,19 @@ class Handler(BaseHTTPRequestHandler):
         anchor = q.get("anchor", [""])[0]
         last = None
         outbox_revision = -1
+        claude_sid = (str(s.get("sid") or "")
+                      if not s.get("agent_id") and s.get("source") == "claude" else "")
+        prompt_revision = claude_bridge.revision(claude_sid) if claude_sid else None
         beat = time.time()
         try:
             while True:
                 ver = index.version(s)
+                current_prompt_revision = (claude_bridge.revision(claude_sid)
+                                           if claude_sid else None)
                 if ver != last:
                     last = ver
                     previous_outbox_revision = outbox_revision
+                    previous_prompt_revision = prompt_revision
                     # 用 messages_for 而不是 messages: 后者要过一遍索引,
                     # 而文件刚变过, 签名对不上就会重建整个索引(百毫秒级)
                     d = index.messages_for(s, start=start, head=head, anchor=anchor)
@@ -646,12 +678,25 @@ class Handler(BaseHTTPRequestHandler):
                             OUTBOX_WAKE.set()
                         d["outbox"] = send_queue.list_for(uid)
                         outbox_revision = send_queue.revision()
+                    if claude_sid:
+                        d["prompt"] = _claude_prompt(claude_sid, d["messages"])
+                        # _claude_prompt 可能在确认答案落盘后删掉状态文件。
+                        prompt_revision = claude_bridge.revision(claude_sid)
                     if (d["reset"] or d["messages"] or d["activity_changed"]
-                            or outbox_revision != previous_outbox_revision):
+                            or outbox_revision != previous_outbox_revision
+                            or prompt_revision != previous_prompt_revision):
                         payload = json.dumps(d, ensure_ascii=False)
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
                     start, head, anchor = d["end"], d["version"]["head"], d["anchor"]
+                    beat = time.time()
+                elif claude_sid and current_prompt_revision != prompt_revision:
+                    prompt_revision = current_prompt_revision
+                    payload = json.dumps({"prompt_only": True,
+                                          "prompt": claude_bridge.prompt(claude_sid)},
+                                         ensure_ascii=False)
+                    self.wfile.write(f"data: {payload}\n\n".encode())
+                    self.wfile.flush()
                     beat = time.time()
                 elif not s.get("agent_id") and send_queue.revision() != outbox_revision:
                     outbox_revision = send_queue.revision()

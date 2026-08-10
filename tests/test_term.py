@@ -1,10 +1,41 @@
 import unittest
+import shlex
+import tempfile
 from unittest.mock import call, patch
 
 from sesman import term
 
 
 class TerminalSubmitTests(unittest.TestCase):
+    def test_claude_resume_includes_passive_question_bridge(self):
+        sid = "5bc438e2-9532-47af-9fbd-4eec1a0347d9"
+        with patch.object(term, "_which_cli", return_value="/usr/bin/claude"), \
+                patch.object(term.claude_bridge, "settings_path",
+                             return_value="/tmp/claude-bridge.json"):
+            command = term.resume_command("claude", sid)
+        self.assertEqual(shlex.split(command), [
+            "env", "-u", "CLAUDE_CODE_SESSION_ID", "-u",
+            "CODEX_COMPANION_SESSION_ID", "-u", "GROK_SESSION_ID",
+            "/usr/bin/claude", "--settings", "/tmp/claude-bridge.json",
+            "--resume", sid,
+        ])
+
+    def test_new_claude_session_includes_passive_question_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(term, "_which_cli", return_value="/usr/bin/claude"), \
+                patch.object(term.claude_bridge, "settings_path",
+                             return_value="/tmp/claude-bridge.json"), \
+                patch.object(term.uuid, "uuid4",
+                             return_value=type("U", (), {
+                                 "__str__": lambda self:
+                                 "5bc438e2-9532-47af-9fbd-4eec1a0347d9"})()), \
+                patch.object(term, "new_session", return_value="sesman-claude-test") as new:
+            result = term.new_cli_session("claude", tmp)
+        command = new.call_args.args[1]
+        self.assertIn("--settings /tmp/claude-bridge.json", command)
+        self.assertIn("--session-id 5bc438e2-9532-47af-9fbd-4eec1a0347d9", command)
+        self.assertEqual(result["name"], "sesman-claude-test")
+
     def test_kill_session_treats_concurrent_natural_exit_as_success(self):
         pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
         with patch.object(term, "session_info", side_effect=[pane, None]), \

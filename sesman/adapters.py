@@ -781,16 +781,22 @@ class ClaudeAdapter:
                     elif p["kind"] == "question":
                         calls[p.get("call_id")] = p["name"]
                         msgs.append(_msg("question", p["text"], ts,
+                                         name=p["name"], call_id=p.get("call_id"),
                                          questions=p["questions"]))
                         if not tag:
                             msgs.append(_status("waiting", ts))
                     elif p["kind"] == "tool_result":
                         name = calls.get(p.get("call_id"))
                         is_answer = _is_question_tool(name)
+                        answer_text = p["text"]
+                        if (is_answer and p.get("error")
+                                and answer_text.startswith(
+                                    "The user doesn't want to proceed with this tool use.")):
+                            answer_text = "已取消回答"
                         exit_code = _output_exit_code(p["text"])
                         output_meta = {"exit_code": exit_code} if exit_code is not None else {}
                         msgs.append(_msg("answer" if is_answer else "tool_result",
-                                         p["text"], ts, name=name,
+                                         answer_text, ts, name=name,
                                          call_id=p.get("call_id"),
                                          error=bool(p.get("error")) or
                                                (exit_code is not None and exit_code != 0),
@@ -814,14 +820,16 @@ class ClaudeAdapter:
                     msgs.append(_msg("system", _stringify(rec["content"]), ts))
             elif t == "queue-operation" and not tag:
                 # Claude 忙时会先把网页送入的 prompt 留在自己的内存队列。
-                # enqueue 用来证明 CLI 确实接收并排队；remove 表示该项已经不在
-                # 队列里（可能被取消，也可能被转成 queued_command
-                # attachment）。两者都作为不可见控制事件透传给前端对账。
+                # enqueue 证明 CLI 确实接收；dequeue/popAll 表示提升为正式 user，
+                # remove 多用于取消或内部通知迁移。都作为不可见控制事件透传。
                 operation = str(rec.get("operation") or "")
                 content = rec.get("content")
-                if (operation in {"enqueue", "remove"}
-                        and isinstance(content, str) and content):
-                    msgs.append(_msg("queue_operation", content, ts,
+                if operation in {"enqueue", "remove", "dequeue", "popAll"}:
+                    if operation in {"enqueue", "remove"} and not (
+                            isinstance(content, str) and content):
+                        continue
+                    msgs.append(_msg("queue_operation",
+                                     content if isinstance(content, str) else "", ts,
                                      operation=operation, counted=False, silent=True))
         return msgs, end
 

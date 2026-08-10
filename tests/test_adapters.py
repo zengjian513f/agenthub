@@ -416,6 +416,8 @@ class ToolSummaryTests(unittest.TestCase):
                  "timestamp": "2026-08-09T10:00:01.250Z", "content": "排队任务"},
                 {"type": "queue-operation", "operation": "remove",
                  "timestamp": "2026-08-09T10:00:01.500Z", "content": "排队任务"},
+                {"type": "queue-operation", "operation": "dequeue",
+                 "timestamp": "2026-08-09T10:00:01.600Z"},
                 {"type": "user", "timestamp": "2026-08-09T10:00:02Z",
                  "interruptedMessageId": "msg_123",
                  "message": {"content": [{"type": "text",
@@ -429,8 +431,10 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertNotIn("[Request interrupted by user]",
                          [m["text"] for m in msgs])
         queue_events = [m for m in msgs if m["role"] == "queue_operation"]
-        self.assertEqual([m["text"] for m in queue_events], ["排队任务", "排队任务"])
-        self.assertEqual([m["operation"] for m in queue_events], ["enqueue", "remove"])
+        self.assertEqual([m["text"] for m in queue_events],
+                         ["排队任务", "排队任务", ""])
+        self.assertEqual([m["operation"] for m in queue_events],
+                         ["enqueue", "remove", "dequeue"])
         self.assertTrue(all(m["silent"] for m in queue_events))
         self.assertTrue(all(not m["counted"] for m in queue_events))
 

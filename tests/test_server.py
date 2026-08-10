@@ -27,6 +27,29 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "no-store")
 
 
+class ClaudePromptTests(unittest.TestCase):
+    def test_settled_prompt_waits_for_matching_native_answer(self):
+        prompt = {"id": "ask-1", "state": "submitted", "questions": [{}]}
+        with patch.object(server.claude_bridge, "prompt", return_value=prompt), \
+                patch.object(server.claude_bridge, "clear") as clear:
+            self.assertEqual(server._claude_prompt(
+                "sid", [{"role": "question", "call_id": "ask-1"}]), prompt)
+            clear.assert_not_called()
+
+            self.assertIsNone(server._claude_prompt(
+                "sid", [{"role": "answer", "call_id": "ask-1"}]))
+            clear.assert_called_once_with("sid", "ask-1")
+
+    def test_waiting_prompt_is_cleared_by_matching_cancel_result(self):
+        prompt = {"id": "ask-1", "state": "waiting", "questions": [{}]}
+        with patch.object(server.claude_bridge, "prompt", return_value=prompt), \
+                patch.object(server.claude_bridge, "clear") as clear:
+            self.assertIsNone(server._claude_prompt(
+                "sid", [{"role": "tool_result", "call_id": "ask-1",
+                          "error": True}]))
+            clear.assert_called_once_with("sid", "ask-1")
+
+
 class StopSessionTests(unittest.TestCase):
     def test_tmux_stop_exits_cli_before_refreshing_live_state(self):
         handler = object.__new__(server.Handler)

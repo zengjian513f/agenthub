@@ -1203,13 +1203,6 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
   if (serverQueued && typeof syncServerOutbox === 'function') {
     syncServerOutbox(uid, d.outbox || []);
   }
-  // 只有 Claude 会用 Esc 清除它自己的原生内存队列；这里撤掉的只是
-  // 浏览器中的状态镜像。Codex 的服务端 outbox 必须保留，等原生回合
-  // 确认结束后自动交付队首。
-  if (sesmanCli(uid)?.clearsQueuedMessages(keys)
-      && typeof discardAllQueuedUserMessages === 'function') {
-    discardAllQueuedUserMessages(uid);
-  }
   S.live.add(uid);            // 发完立刻按最快节奏拉新消息
   S.liveTmux.add(uid);
   paintLive();
@@ -1491,18 +1484,10 @@ $('#csend').onclick = () => {
   submitComposer();
 };
 let composerEscAt = -Infinity;
-async function sendComposerEscape(now = performance.now()) {
-  const uid = S.sel;
-  const escape = sesmanCli(uid)?.repeatedEscape(now, composerEscAt)
-    || { rewind: false, nextAt: -Infinity };
-  const rewind = escape.rewind;
-  composerEscAt = escape.nextAt;
-  const name = takenOver(uid);
-  const sent = await sendToSession(null, ['Escape'], uid);
-  if (!rewind || !sent || !name || S.sel !== uid) return sent;
 
-  // 回滚点、恢复代码/对话的选项都由 Claude 自己维护。第二次 Esc 后直接
-  // 揭示原生 TUI，不在网页里根据 transcript 猜一个可能不一致的菜单。
+async function revealNativeTerminal(uid = S.sel) {
+  const name = takenOver(uid);
+  if (!name || S.sel !== uid) return false;
   T.uid = uid;
   await openTermPane(name);
   if (!MOBILE.matches && T.mode === 'collapsed') {
@@ -1513,6 +1498,47 @@ async function sendComposerEscape(now = performance.now()) {
     renderTakeoverBtn();
     setTimeout(fitTerm, 0);
   }
+  return true;
+}
+
+async function answerClaudeQuestion(uid, optionIndex) {
+  const prompt = cache.get(viewKey(uid))?.prompt;
+  const rows = prompt?.questions;
+  if (sesmanCli(uid)?.source !== 'claude' || rows?.length !== 1
+      || rows[0].multiple || !rows[0].options?.[optionIndex]) return false;
+  // Claude 的确认菜单只承诺方向键导航。先多按几次 Up 夹到第一项，
+  // 再移动到目标，避免原生终端里先前的光标位置与网页不同步。
+  const keys = [
+    ...Array(rows[0].options.length + 3).fill('Up'),
+    ...Array(optionIndex).fill('Down'), 'Enter',
+  ];
+  return sendToSession(null, keys, uid);
+}
+
+async function cancelClaudeQuestion(uid) {
+  composerEscAt = -Infinity;
+  return sendToSession(null, ['Escape'], uid);
+}
+
+async function sendComposerEscape(now = performance.now()) {
+  const uid = S.sel;
+  const entry = cache.get(viewKey(uid));
+  const visibleActivity = $('#activity')?.dataset.state;
+  // activity 缓存可能来自上一个已结束的 Claude 进程；renderActivity 会把它
+  // 隐藏。Esc 必须服从用户眼前的交互态，不能被这条旧 working 永久挡住回滚。
+  const busy = !!entry?.prompt
+    || ['working', 'waiting'].includes(visibleActivity);
+  const escape = sesmanCli(uid)?.repeatedEscape(now, composerEscAt, { busy })
+    || { rewind: false, nextAt: -Infinity };
+  const rewind = escape.rewind;
+  composerEscAt = escape.nextAt;
+  const name = takenOver(uid);
+  const sent = await sendToSession(null, ['Escape'], uid);
+  if (!rewind || !sent || !name || S.sel !== uid) return sent;
+
+  // 回滚点、恢复代码/对话的选项都由 Claude 自己维护。第二次 Esc 后直接
+  // 揭示原生 TUI，不在网页里根据 transcript 猜一个可能不一致的菜单。
+  await revealNativeTerminal(uid);
   return sent;
 }
 $('#cesc').onclick = () => sendComposerEscape();

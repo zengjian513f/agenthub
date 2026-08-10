@@ -262,6 +262,10 @@ def run(pw):
         operation:'enqueue', text:'q'}),
       claudeRemove:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
         operation:'remove', text:'q'}),
+      claudeDequeue:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
+        operation:'dequeue', text:''}),
+      claudePopAll:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
+        operation:'popAll', text:'q'}),
       codexRemove:SESMAN_CLIS.codex.queueAction({role:'queue_operation',
         operation:'remove', text:'q'}),
       states:[SESMAN_CLIS.claude.createQueuedMessage({created:1000}).state,
@@ -272,18 +276,19 @@ def run(pw):
         [{id:'old', created:1000}], 2, 3),
       migrations:[SESMAN_CLIS.codex.migrateQueuedMessages([1], 3, 4),
         SESMAN_CLIS.grok.migrateQueuedMessages([1], 3, 4)],
-      escape:[SESMAN_CLIS.claude.clearsQueuedMessages(['Escape']),
-        SESMAN_CLIS.codex.clearsQueuedMessages(['Escape']),
-        SESMAN_CLIS.grok.clearsQueuedMessages(['Escape'])],
       rewind:[SESMAN_CLIS.claude.repeatedEscape(1200, 1000).rewind,
         SESMAN_CLIS.codex.repeatedEscape(1200, 1000).rewind,
-        SESMAN_CLIS.grok.repeatedEscape(1200, 1000).rewind]
+        SESMAN_CLIS.grok.repeatedEscape(1200, 1000).rewind],
+      rewindBusy:SESMAN_CLIS.claude.repeatedEscape(
+        1200, 1000, {busy:true}).rewind
     })""")
     check("三种 CLI 继承公共基类并拥有独立队列策略",
           all(cli_layers["classes"])
           and cli_layers["pendingSource"] == "claude"
           and cli_layers["claudeEnqueue"] == {"type": "confirm", "text": "q"}
           and cli_layers["claudeRemove"] == {"type": "remove", "text": "q"}
+          and cli_layers["claudeDequeue"] == {"type": "promote-first"}
+          and cli_layers["claudePopAll"] == {"type": "promote-all"}
           and cli_layers["codexRemove"] is None
           and cli_layers["states"] == ["sending", "queued"]
           and cli_layers["claudeExpires"] is True
@@ -291,8 +296,8 @@ def run(pw):
                                                   "state": "sending", "expiresAt": 9000,
                                                   "legacy": True}]
           and cli_layers["migrations"] == [[], [1]]
-          and cli_layers["escape"] == [True, False, False]
-          and cli_layers["rewind"] == [True, False, False], cli_layers)
+          and cli_layers["rewind"] == [True, False, False]
+          and cli_layers["rewindBusy"] is False, cli_layers)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
       if (!session) return {error:'no codex session'};
@@ -703,6 +708,48 @@ def run(pw):
           "要使用哪种启动方式" in question.inner_text()
           and "tmux" in question.inner_text() and "保留可重连的终端" in question.inner_text())
     check("询问回答显示为用户气泡", "answer" in roles)
+    live_question = p.evaluate("""async () => {
+      const prompt = {id:'ask-1', questions:[{header:'实时询问',
+        question:'现在直接选择？', multiple:false, options:[
+          {label:'继续', description:'继续执行'}, {label:'停止', description:'停在这里'}]}]};
+      await applyDiff(S.sel, {prompt_only:true, prompt});
+      const live = document.querySelector('.live-question');
+      const historical = document.querySelector(
+        '.msg[data-role="question"][data-call-id="ask-1"]');
+      const oldSend = sendToSession;
+      let sent = null;
+      sendToSession = async (text, keys, uid) => { sent = {text, keys, uid}; return true; };
+      const answered = await answerClaudeQuestion(S.sel, 1);
+      sendToSession = oldSend;
+      return {live:!!live, buttons:live?.querySelectorAll('[data-question-option]').length,
+        historicalHidden:historical?.classList.contains('question-live-shadowed'),
+        answered, sent};
+    }""")
+    check("恢复会话未落盘的实时选择题可直接在对话栏回答",
+          live_question["live"] is True and live_question["buttons"] == 2
+          and live_question["historicalHidden"] is True
+          and live_question["answered"] is True
+          and live_question["sent"]["keys"] == ["Up"] * 5 + ["Down", "Enter"],
+          live_question)
+    settled_question = p.evaluate("""async () => {
+      const prompt = {id:'ask-1', state:'submitted', questions:[{
+        question:'现在直接选择？', multiple:false,
+        options:[{label:'继续'}, {label:'停止'}]}]};
+      await applyDiff(S.sel, {prompt_only:true, prompt});
+      const live = document.querySelector('.live-question');
+      return {settling:live?.classList.contains('settling'),
+        disabled:[...live.querySelectorAll('[data-question-option]')].every(x => x.disabled),
+        text:live?.textContent};
+    }""")
+    check("原生答案落盘前保留禁用的提交中题卡",
+          settled_question["settling"] is True
+          and settled_question["disabled"] is True
+          and "答案已提交，等待 Claude 记录" in settled_question["text"],
+          settled_question)
+    p.evaluate("async () => applyDiff(S.sel, {prompt_only:true, prompt:null})")
+    check("实时问题结束后恢复原有历史问题",
+          p.locator(".live-question").count() == 0
+          and not question.first.evaluate("n => n.classList.contains('question-live-shadowed')"))
     task_event = p.locator('.timeline-event.task').filter(has_text="监控事件 · 自测训练")
     check("Claude task notification 渲染成紧凑事件而非用户 XML",
           task_event.count() == 1
@@ -2285,11 +2332,19 @@ def run(pw):
               queued.count() == 1 and "排队中" in queued.inner_text()
               and p.evaluate("u => queuedMessages(u)[0]?.state", target) == "queued")
         p.evaluate("""u => {
-          reconcileQueuedMessages(u, [{role:'queue_operation', operation:'remove',
-            text:'等待前一轮完成的指令', ts:new Date().toISOString()}]);
+          reconcileQueuedMessages(u, [{role:'queue_operation', operation:'dequeue',
+            text:'', ts:new Date().toISOString()}]);
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
         }""", target)
-        check("Claude 从原生队列移除后撤掉乐观排队副本", queued.count() == 0)
+        check("Claude dequeue 后保留副本直到正式 user 消息落盘",
+              queued.count() == 1 and "发送中" in queued.inner_text()
+              and p.evaluate("u => queuedMessages(u)[0]?.state", target) == "sending")
+        p.evaluate("""u => {
+          reconcileQueuedMessages(u, [{role:'user', text:'等待前一轮完成的指令',
+            ts:new Date().toISOString()}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("Claude 正式用户消息出现后撤掉队列副本", queued.count() == 0)
         p.evaluate("""u => {
           S.queued.set(u, [{id:'server-cancel', uid:u, text:'可以主动撤销',
             created:Date.now(), state:'queued', server:true, media:[]}]);
@@ -2344,7 +2399,16 @@ def run(pw):
           try { await sendToSession(null, ['Escape'], u); }
           finally { post = realPost; }
         }""", target)
-        check("从 TUI 取消但未落盘的消息会在 Esc 后撤掉", queued.count() == 0)
+        check("Esc 请求成功也不抢在 Claude 原生事件前清空队列", queued.count() == 1)
+        p.evaluate("""u => {
+          reconcileQueuedMessages(u, [
+            {role:'queue_operation', operation:'dequeue', text:'',
+             ts:new Date().toISOString()},
+            {role:'user', text:'按 Esc 后应从页面撤掉的排队消息',
+             ts:new Date().toISOString()}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("Claude 提升排队消息后由正式 user 记录完成对账", queued.count() == 0)
         sent = []
         p.on("response", lambda r: sent.append(r.status) if "/api/term/send" in r.url else None)
         # 手机 Enter 只换行，发送必须点按钮；短 placeholder 不把单行输入框撑高。
@@ -2421,8 +2485,13 @@ def run(pw):
         rewind_bridge = p.evaluate("""async () => {
           const sent = [], opened = [];
           const realSend = sendToSession, realOpen = openTermPane;
+          const entry = cache.get(viewKey(S.sel)), oldActivity = entry.activity;
           sendToSession = async (text, keys, uid) => { sent.push({keys, uid}); return true; };
           openTermPane = async name => { opened.push(name); };
+          // 模拟旧进程遗留但已被 renderActivity 隐藏的 working。它不能让空输入
+          // 下的双 Esc 永久失去原生 rewind 语义。
+          entry.activity = {state:'working', ts:'2000-01-01T00:00:00Z'};
+          document.querySelector('#activity')?.remove();
           composerEscAt = -Infinity;
           try {
             await sendComposerEscape(1000);
@@ -2431,6 +2500,7 @@ def run(pw):
           } finally {
             sendToSession = realSend;
             openTermPane = realOpen;
+            entry.activity = oldActivity;
             composerEscAt = -Infinity;
           }
         }""")

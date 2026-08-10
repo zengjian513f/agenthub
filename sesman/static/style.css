@@ -651,7 +651,12 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .question-option {
   display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px;
   border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
+  width: 100%; color: inherit; text-align: left; font: inherit;
 }
+.question-option:is(button) { cursor: pointer; }
+.question-option:is(button):hover { border-color: var(--accent); background: var(--panel-2); }
+.question-option:is(button).submitting { border-color: var(--accent); opacity: .65; }
+.question-option:is(button):disabled { cursor: default; }
 .question-option > span {
   display: inline-flex; align-items: center; justify-content: center; flex: none;
   width: 18px; height: 18px; border-radius: 50%; background: var(--panel-2);
@@ -659,6 +664,19 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .question-option b { display: block; font-size: 12.5px; line-height: 1.35; }
 .question-option small { display: block; margin-top: 2px; color: var(--muted); line-height: 1.35; }
+.question-live-shadowed { display: none !important; }
+.question-actions {
+  display: flex; align-items: center; justify-content: flex-end; gap: 7px;
+  margin-top: 9px;
+}
+.question-actions small { margin-right: auto; color: var(--muted); }
+.question-actions .question-settling { color: var(--fg); }
+.live-question.settling .question-option { opacity: .68; }
+.question-actions button {
+  min-height: 28px; padding: 4px 9px; border: 1px solid var(--border);
+  border-radius: 7px; background: var(--panel); color: var(--fg); cursor: pointer;
+}
+.question-actions .question-cancel { color: #b42318; }
 
 .activity {
   display: inline-flex; align-items: center; gap: 7px; width: fit-content;

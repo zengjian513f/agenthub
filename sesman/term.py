@@ -27,6 +27,8 @@ import time
 import uuid
 from pathlib import Path
 
+from . import claude_bridge
+
 PREFIX = "sesman-"          # sesman 起的会话用这个前缀, 便于识别
 MANAGED_SERVER = "sesman"   # 独立 socket，不继承用户默认 tmux server 的交互配置
 LEGACY_SERVER = "default"   # 兼容改造前已经启动的 sesman-* 会话
@@ -56,7 +58,10 @@ def resume_command(source: str, sid: str) -> str:
     exe = _which_cli(source)
     if not exe:
         raise ValueError(f"找不到 {source} 命令")
-    return _clean_cli_command(exe, *RESUME[source], sid)
+    args = [*RESUME[source], sid]
+    if source == "claude":
+        args = ["--settings", claude_bridge.settings_path(), *args]
+    return _clean_cli_command(exe, *args)
 
 
 def session_name_for(source: str, sid: str) -> str:
@@ -118,6 +123,8 @@ def new_cli_session(source: str, cwd: str, cols: int = 120, rows: int = 32) -> d
     args = [exe]
     if sid:
         args += ["--session-id", sid]
+    if source == "claude":
+        args[1:1] = ["--settings", claude_bridge.settings_path()]
     command = _clean_cli_command(args[0], *args[1:])
     token = sid or str(uuid.uuid4())
     suffix = sid[:8] if sid else f"new-{token[:8]}"

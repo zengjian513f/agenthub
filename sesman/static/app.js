@@ -303,6 +303,22 @@ function reconcileQueuedMessages(uid, messages) {
   for (const message of messages || []) {
     const action = cli.queueAction(message);
     if (!action) continue;
+    if (action.type === 'promote-first') {
+      const at = items.findIndex(item => item.state === 'queued');
+      if (at >= 0) {
+        items[at] = { ...items[at], state: 'sending', expiresAt: Date.now() + 8000 };
+        changed = true;
+      }
+      continue;
+    }
+    if (action.type === 'promote-all') {
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].state !== 'queued') continue;
+        items[i] = { ...items[i], state: 'sending', expiresAt: Date.now() + 8000 };
+        changed = true;
+      }
+      continue;
+    }
     const at = items.findIndex(item => {
       if (item.text !== action.text) return false;
       // 同文指令可能连续排队；enqueue 应依次确认尚未确认的副本，
@@ -455,12 +471,29 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   const key = viewKey(uid, agent);
   const e = cache.get(key);
   if (!e) return 0;
+  if (!agent && Object.prototype.hasOwnProperty.call(data, 'prompt')) {
+    e.prompt = data.prompt || null;
+  }
   if (!agent && Array.isArray(data.outbox)) syncServerOutbox(uid, data.outbox);
+  if (data.prompt_only) {
+    if (S.sel === uid && !S.agent) renderConversationTail(e.activity, uid);
+    return 0;
+  }
   if (data.outbox_only) return 0;
   if (!agent) reconcileQueuedMessages(uid, data.messages);
+  const questionCalls = new Set([...e.msgs, ...(data.messages || [])]
+    .filter(m => m.role === 'question' && m.call_id).map(m => m.call_id));
+  data.messages = (data.messages || []).map(m => {
+    if (m.role !== 'tool_result' || !questionCalls.has(m.call_id)) return m;
+    const cancelled = m.error
+      && String(m.text || '').startsWith("The user doesn't want to proceed with this tool use.");
+    return { ...m, role: 'answer', name: m.name || 'AskUserQuestion',
+      text: cancelled ? '已取消回答' : m.text };
+  });
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
     cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
                     end: data.end, anchor: data.anchor, activity: data.activity, bytes,
+                    prompt: data.prompt || null,
                     total: data.message_total, partial: data.partial || null });
     S.cursors.set(key, { end: data.end, head: data.version.head, anchor: data.anchor });
     if (S.sel === uid && S.agent === agent) {
@@ -1317,6 +1350,7 @@ async function openSession(uid, agent = null) {
   if (!selectedAgent && Array.isArray(data.outbox)) syncServerOutbox(uid, data.outbox);
   cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
                   end: data.end, anchor: data.anchor, activity: data.activity, bytes,
+                  prompt: data.prompt || null,
                   total: data.message_total, partial: data.partial || null });
   S.cursors.set(key, {end: data.end, head: data.version.head, anchor: data.anchor});
   await renderSession(data.meta, data.messages, data.activity);
@@ -1454,6 +1488,7 @@ async function loadFullHistory(uid, agent, button) {
     });
     cachePut(key, {meta: data.meta, msgs: data.messages, version: data.version,
                    end: data.end, anchor: data.anchor, activity: data.activity, bytes,
+                   prompt: data.prompt || null,
                    total: data.message_total, partial: null});
     S.cursors.set(key, {end: data.end, head: data.version.head, anchor: data.anchor});
     if (S.sel === uid && S.agent === agent) {
@@ -2346,6 +2381,11 @@ function eventNode(m) {
 function questionNode(m) {
   const n = el('div', 'msg question');
   n.dataset.role = 'question';
+  if (m.call_id) n.dataset.callId = m.call_id;
+  const live = !!m.live;
+  if (live) n.classList.add('live-question');
+  const promptState = m.state || 'waiting';
+  if (live && promptState !== 'waiting') n.classList.add('settling');
   const body = el('div', 'mb question-body');
   const rows = Array.isArray(m.questions) && m.questions.length
     ? m.questions : [{ question: m.text, options: [] }];
@@ -2355,9 +2395,40 @@ function questionNode(m) {
       <div class="question-text">${esc(q.question || m.text)}</div>
       ${q.multiple ? '<div class="question-multiple">可多选</div>' : ''}
       ${(q.options || []).length ? `<div class="question-options">${q.options.map((o, j) => `
-        <div class="question-option"><span>${j + 1}</span><div><b>${esc(o.label)}</b>
-          ${o.description ? `<small>${esc(o.description)}</small>` : ''}</div></div>`).join('')}</div>` : ''}
+        <${live ? 'button' : 'div'} ${live ? `type="button" data-question-option="${j}"` : ''}
+          class="question-option"><span>${j + 1}</span><div><b>${esc(o.label)}</b>
+          ${o.description ? `<small>${esc(o.description)}</small>` : ''}</div></${live ? 'button' : 'div'}>`).join('')}</div>` : ''}
     </section>`).join('');
+  if (live) {
+    const waiting = promptState === 'waiting';
+    const direct = waiting && rows.length === 1 && !rows[0].multiple
+      && !!rows[0].options?.length;
+    body.querySelectorAll('[data-question-option]').forEach(button => {
+      button.disabled = !direct;
+      button.onclick = async () => {
+        body.querySelectorAll('button').forEach(x => { x.disabled = true; });
+        button.classList.add('submitting');
+        const ok = await answerClaudeQuestion(m.uid, +button.dataset.questionOption);
+        if (!ok) body.querySelectorAll('button').forEach(x => { x.disabled = false; });
+      };
+    });
+    const actions = el('div', 'question-actions');
+    if (!waiting) {
+      actions.appendChild(el('small', 'question-settling',
+        promptState === 'cancelled' ? '正在取消，等待 Claude 记录…' : '答案已提交，等待 Claude 记录…'));
+    } else if (!direct) {
+      actions.appendChild(el('small', '', '多选或多题请在原生终端回答'));
+    }
+    const terminal = el('button', '', '打开终端');
+    terminal.type = 'button';
+    terminal.onclick = () => revealNativeTerminal(m.uid);
+    const cancel = el('button', 'question-cancel', '取消');
+    cancel.type = 'button';
+    cancel.disabled = !waiting;
+    cancel.onclick = () => cancelClaudeQuestion(m.uid);
+    actions.append(terminal, cancel);
+    body.appendChild(actions);
+  }
   n.appendChild(body);
   return n;
 }
@@ -2429,8 +2500,25 @@ function renderConversationTail(activity, uid = S.sel) {
   const box = $('#msgs');
   if (!box) return;
   $('#activity')?.remove();
+  box.querySelectorAll('.live-question').forEach(node => node.remove());
+  box.querySelectorAll('.question-live-shadowed').forEach(
+    node => node.classList.remove('question-live-shadowed'));
   box.querySelectorAll('.client-pending').forEach(node => node.remove());
-  renderActivity(activity);
+  const prompt = cache.get(viewKey(uid))?.prompt;
+  if (prompt?.questions?.length) {
+    if (prompt.id) {
+      [...box.querySelectorAll('.msg[data-role="question"][data-call-id]')]
+        .find(node => node.dataset.callId === prompt.id)
+        ?.classList.add('question-live-shadowed');
+    }
+    box.appendChild(questionNode({
+      role: 'question', call_id: prompt.id, questions: prompt.questions,
+      text: prompt.questions.map(q => q.question).join('\n\n'), live: true,
+      state: prompt.state, uid,
+    }));
+  } else {
+    renderActivity(activity);
+  }
   renderQueuedMessages(uid);
 }
 
