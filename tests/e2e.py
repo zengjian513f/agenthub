@@ -1147,37 +1147,46 @@ def run(pw):
               and read_entry.locator(".tool-out .hljs-keyword").count() >= 2
               and read_entry.locator(".tool-out").get_attribute("data-code-language") == "python")
         first_entry = grp.locator("> .tool-entry").first
-        tool_head_border = first_entry.locator("> .tool-head").evaluate("""n => {
-          const s = getComputedStyle(n);
-          return {tag:n.tagName, display:s.display,
-            top:s.borderTopStyle, right:s.borderRightStyle,
-            bottom:s.borderBottomStyle, left:s.borderLeftStyle,
-            paddingTop:s.paddingTop, paddingBottom:s.paddingBottom,
-            background:s.backgroundColor, radius:s.borderRadius};
+        tool_card_frame = first_entry.evaluate("""n => {
+          const head = n.querySelector(':scope > .tool-head');
+          const out = n.querySelector(':scope > .tool-out');
+          const s = getComputedStyle(n), h = getComputedStyle(head), o = getComputedStyle(out);
+          return {tag:head.tagName,
+            outerBorders:[s.borderTopStyle,s.borderRightStyle,s.borderBottomStyle,s.borderLeftStyle],
+            outerRadius:s.borderRadius, outerBackground:s.backgroundColor,
+            headBorders:[h.borderTopWidth,h.borderRightWidth,h.borderBottomWidth,h.borderLeftWidth],
+            headPadding:[h.paddingTop,h.paddingBottom], headRadius:h.borderRadius,
+            outBorders:[o.borderTopWidth,o.borderRightWidth,o.borderBottomWidth,o.borderLeftWidth],
+            outRadius:o.borderRadius};
         }""")
-        check("工具调用头与正常输出 pre 复用同一套完整外框",
-              tool_head_border == {"tag": "BUTTON", "display": "flex",
-                                   "top": "solid",
-                                   "right": "solid", "bottom": "solid", "left": "solid",
-                                   "paddingTop": "8px", "paddingBottom": "8px",
-                                   "background": single_tool_skin["preBackground"],
-                                   "radius": "6px"},
-              tool_head_border)
+        check("同一次工具调用的命令、状态和输出共用一张外框",
+              tool_card_frame == {"tag": "BUTTON",
+                  "outerBorders": ["solid", "solid", "solid", "solid"],
+                  "outerRadius": "6px", "outerBackground": single_tool_skin["preBackground"],
+                  "headBorders": ["0px", "0px", "0px", "0px"],
+                  "headPadding": ["8px", "8px"], "headRadius": "0px",
+                  "outBorders": ["1px", "0px", "0px", "0px"], "outRadius": "0px"},
+              tool_card_frame)
         standalone_frame = p.evaluate("""() => {
           const box = document.querySelector('#msgs');
           const node = msgNode({role:'tool', name:'exec', summary:'$ echo standalone', text:'{}'});
           box.appendChild(node);
+          const card = node.querySelector(':scope > .tool-entry');
           const head = node.querySelector(':scope > .tool-entry > .tool-head');
-          const ns = getComputedStyle(node), hs = getComputedStyle(head);
+          const ns = getComputedStyle(node), cs = getComputedStyle(card), hs = getComputedStyle(head);
           const result = {outerOverflow:ns.overflow, outerRadius:ns.borderRadius,
-            headRadius:hs.borderRadius, headBorders:[hs.borderTopStyle, hs.borderRightStyle,
-              hs.borderBottomStyle, hs.borderLeftStyle]};
+            cardRadius:cs.borderRadius, cardBorders:[cs.borderTopStyle, cs.borderRightStyle,
+              cs.borderBottomStyle, cs.borderLeftStyle], headRadius:hs.borderRadius,
+            headBorders:[hs.borderTopWidth, hs.borderRightWidth,
+              hs.borderBottomWidth, hs.borderLeftWidth]};
           node.remove(); return result;
         }""")
         check("独立 exec 外层不再裁掉命令框圆角",
               standalone_frame == {"outerOverflow": "visible", "outerRadius": "0px",
-                                   "headRadius": "6px",
-                                   "headBorders": ["solid", "solid", "solid", "solid"]},
+                                   "cardRadius": "6px",
+                                   "cardBorders": ["solid", "solid", "solid", "solid"],
+                                   "headRadius": "0px",
+                                   "headBorders": ["0px", "0px", "0px", "0px"]},
               standalone_frame)
         first_entry.locator("> .tool-head").focus()
         p.keyboard.press("Enter")

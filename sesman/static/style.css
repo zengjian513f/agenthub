@@ -727,6 +727,10 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-entry {
   margin-bottom: 6px; padding: 0; border: 0; background: transparent;
 }
+.tool-entry[data-role="tool"] {
+  border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+  background: var(--bubble-tool); color: var(--terminal-fg); box-shadow: var(--shadow);
+}
 .tool-entry > pre, .tool-head {
   margin: 0; padding: 8px 10px; overflow-x: auto; white-space: pre;
   word-break: normal; overflow-wrap: normal; border: 1px solid var(--border); border-radius: 6px;
@@ -746,8 +750,16 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   overflow: hidden; white-space: normal; appearance: none; -webkit-appearance: none;
   text-align: left; cursor: pointer; user-select: none;
 }
-.tool-head:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.tool-entry[data-role="tool"] > :is(.tool-head, pre) {
+  border: 0; border-radius: 0; background: transparent; box-shadow: none;
+}
+.tool-entry[data-role="tool"]:has(> .tool-head:hover),
+.tool-entry[data-role="tool"]:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.tool-head:hover { background: color-mix(in srgb, var(--bubble-tool) 96%, var(--terminal-fg)); }
 .tool-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tool-entry[data-role="tool"] > .tool-head:focus-visible { outline-offset: -2px; }
 .tool-head > code {
   flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font: inherit;
@@ -759,21 +771,33 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   margin-top: 0; border-top: 0; border-radius: 0; border-style: solid;
   box-shadow: none; opacity: .92;
 }
-.tool-entry.args-open > .tool-head { border-radius: 6px 6px 0 0; box-shadow: none; }
+.tool-entry[data-role="tool"] > .tool-args { border-top: 1px solid var(--border); }
 .tool-entry > .tool-args-close {
   display: block; width: 100%; margin: 0; padding: 3px 10px;
   border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px;
   background: var(--bubble-tool); color: var(--muted);
   font: 400 11px/1.5 var(--terminal-font); text-align: center; cursor: pointer;
 }
+.tool-entry[data-role="tool"] > .tool-args-close {
+  border: 0; border-top: 1px solid var(--border); border-radius: 0; background: transparent;
+}
 .tool-entry > .tool-args-close:hover { color: var(--terminal-fg); background: var(--hover); }
 .tool-entry > .tool-args-close[hidden] { display: none; }
 .tool-entry > .tool-status {
-  padding: 2px 10px 0; color: var(--muted); font-size: 11.5px; line-height: 1.5;
+  padding: 1px 10px 5px; color: var(--muted); font-size: 11.5px; line-height: 1.5;
 }
 .tool-entry > .tool-status.err { color: #e5534b; }
 .tool-entry > .tool-out { margin-top: 3px; }
 .tool-entry > .tool-out.err { border-color: color-mix(in srgb, #e5534b 45%, var(--border)); }
+.tool-entry[data-role="tool"]:has(> .tool-status.err) {
+  border-color: color-mix(in srgb, #e5534b 45%, var(--border));
+}
+.tool-entry[data-role="tool"] > .tool-out {
+  margin-top: 0; border-top: 1px solid var(--border);
+}
+.tool-entry[data-role="tool"] > .tool-out.err {
+  border-top-color: color-mix(in srgb, #e5534b 45%, var(--border));
+}
 .msg.grp:not(.folded) > .disclosure { margin-top: 2px; }
 
 /* 文件修改不埋进工具组：完整 diff 直接显示在时间线里，每张卡独立切换视图。 */
@@ -937,7 +961,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-diff-line.add { background: var(--diff-add-bg); color: var(--diff-add-fg); }
 .tool-diff-line.del { background: var(--diff-del-bg); color: var(--diff-del-fg); }
 
-/* 输出操作属于工具正文：正文负责上圆角，操作栏负责下圆角。 */
+/* 落单输出仍由正文和操作栏拼成一张卡；已配对调用在下方覆盖成卡内分区。 */
 .tool-entry > pre:has(+ .tool-out-actions) {
   border-bottom: 0; border-radius: 6px 6px 0 0;
 }
@@ -956,6 +980,13 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   background: var(--hover); color: var(--terminal-fg);
 }
 .tool-out-actions > .more { flex: 1; }
+
+/* 已配对的调用、状态、输出是一张卡；操作栏只是卡内最后一个分区。 */
+.tool-entry[data-role="tool"] > pre:has(+ .tool-out-actions) { border-radius: 0; }
+.tool-entry[data-role="tool"] > .tool-out-actions {
+  border: 0; border-top: 1px solid var(--border); border-radius: 0;
+  background: transparent;
+}
 
 .empty { color: var(--muted); padding: 60px 20px; text-align: center; }
 
