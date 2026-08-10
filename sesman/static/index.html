@@ -16,7 +16,7 @@
 <link rel="stylesheet" href="vendor/xterm.css">
 <link rel="stylesheet" href="vendor/katex/katex.min.css">
 <link rel="preload" href="fonts/CascadiaMono.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=__SESMAN_ASSET_VERSION__">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🗂</text></svg>">
 </head>
 <body>
@@ -224,11 +224,11 @@
   </form>
 </dialog>
 <!-- 列表是首屏核心，必须先执行；终端和公式库较大，延后加载且不能阻塞扫描。 -->
-<script defer src="cli.js"></script>
-<script defer src="app.js"></script>
+<script defer src="cli.js?v=__SESMAN_ASSET_VERSION__"></script>
+<script defer src="app.js?v=__SESMAN_ASSET_VERSION__"></script>
 <script defer src="vendor/xterm.js"></script>
 <script defer src="vendor/addon-fit.js"></script>
-<script defer src="term.js"></script>
+<script defer src="term.js?v=__SESMAN_ASSET_VERSION__"></script>
 <script defer src="vendor/katex/katex.min.js"></script>
 <script defer src="vendor/katex/auto-render.min.js" onload="refreshFormulae()"></script>
 </body>

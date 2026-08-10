@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import html
 import json
 import mimetypes
@@ -20,6 +21,10 @@ from . import (index, live, media, pending as pending_store, send_queue,
                session_meta, term, wsock)
 
 STATIC = Path(__file__).parent / "static"
+ASSET_VERSION = hashlib.sha256(b"".join(
+    (STATIC / name).read_bytes()
+    for name in ("style.css", "cli.js", "app.js", "term.js")
+)).hexdigest()[:12]
 HOSTNAME = socket.gethostname().strip() or "localhost"
 ALLOWED_IPS: set[str] = set()
 TERMINAL = False        # 远程终端 = 远程执行, 必须显式 --terminal 打开
@@ -910,7 +915,10 @@ class Handler(BaseHTTPRequestHandler):
         if f.name == "index.html":
             data = data.replace(b"__SESMAN_HOSTNAME__",
                                 html.escape(HOSTNAME).encode("utf-8"))
-        self._send(200, data, ctype, {"Cache-Control": "no-cache"})
+            data = data.replace(b"__SESMAN_ASSET_VERSION__",
+                                ASSET_VERSION.encode("ascii"))
+        cache = "no-store" if f.name == "index.html" else "no-cache"
+        self._send(200, data, ctype, {"Cache-Control": cache})
 
 
 def main():

@@ -13,7 +13,7 @@ class StaticIdentityTests(unittest.TestCase):
 
         handler._static("/")
 
-        status, data, ctype, _ = replies[0]
+        status, data, ctype, headers = replies[0]
         page = data.decode("utf-8")
         expected = server.html.escape(server.HOSTNAME)
         self.assertEqual(status, 200)
@@ -21,6 +21,10 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn(f'>{expected}</span>', page)
         self.assertIn(f'title="{expected}"', page)
         self.assertNotIn("__SESMAN_HOSTNAME__", page)
+        self.assertNotIn("__SESMAN_ASSET_VERSION__", page)
+        self.assertIn(f"app.js?v={server.ASSET_VERSION}", page)
+        self.assertIn(f"style.css?v={server.ASSET_VERSION}", page)
+        self.assertEqual(headers["Cache-Control"], "no-store")
 
 
 class StopSessionTests(unittest.TestCase):
