@@ -360,12 +360,12 @@ def run(pw):
           and abs(mobile_header["view"]["top"] - mobile_header["actions"]["top"]) < 4
           and mobile_header["header"]["height"] >= 70,
           mobile_header)
-    check("手机顶栏恢复品牌、会话单位和视图文字",
+    check("手机顶栏显示机器名、会话单位和视图文字",
           p.locator(".brand-name").is_visible()
           and p.locator(".stat-unit").is_visible()
           and p.locator(".mobile-label").evaluate_all(
               "nodes => nodes.length === 2 && nodes.every(n => n.getClientRects().length > 0)")
-          and "sesman" in p.locator(".brand").inner_text()
+          and p.locator(".brand-name").inner_text().strip() not in {"", "__SESMAN_HOSTNAME__"}
           and "个会话" in p.locator("#stat").inner_text()
           and p.locator(".mobile-label").all_inner_texts() == ["项目树", "时间轴"])
 
@@ -2189,6 +2189,19 @@ def run(pw):
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
         }""", target)
         check("Claude 从原生队列移除后撤掉乐观排队副本", queued.count() == 0)
+        p.evaluate("""u => {
+          S.queued.set(u, [{id:'server-cancel', uid:u, text:'可以主动撤销',
+            created:Date.now(), state:'queued', server:true, media:[]}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("服务端排队项在失败前即可主动撤销",
+              queued.count() == 1
+              and queued.locator(".client-pending-actions button").all_inner_texts()
+                  == ["撤销"])
+        p.evaluate("""u => {
+          S.queued.delete(u); saveQueuedMessages();
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
         p.evaluate("""u => {
           queuePendingUserMessage(u, '没有进入 Claude 的幽灵指令');
           expireQueuedMessages(Date.now() + 9000);

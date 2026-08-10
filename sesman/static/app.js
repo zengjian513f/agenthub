@@ -2346,15 +2346,18 @@ function renderQueuedMessages(uid = S.sel) {
     node.classList.toggle('failed', item.state === 'failed');
     node.dataset.queuedId = item.id;
     node.appendChild(el('small', 'client-pending-state', cli?.queuedMessageLabel(item) || '排队中'));
-    if (item.state === 'failed' && item.server) {
+    if (item.server && ['queued', 'failed'].includes(item.state)) {
       const actions = el('span', 'client-pending-actions');
-      const retry = el('button', '', '重试');
-      retry.type = 'button';
-      retry.onclick = () => retryServerQueuedMessage(uid, item.id);
-      const discard = el('button', '', '移除');
+      if (item.state === 'failed') {
+        const retry = el('button', '', '重试');
+        retry.type = 'button';
+        retry.onclick = () => retryServerQueuedMessage(uid, item.id);
+        actions.append(retry);
+      }
+      const discard = el('button', '', item.state === 'queued' ? '撤销' : '移除');
       discard.type = 'button';
       discard.onclick = () => discardServerQueuedMessage(uid, item.id);
-      actions.append(retry, discard);
+      actions.append(discard);
       node.appendChild(actions);
       if (item.error) node.title = item.error;
     }

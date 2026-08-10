@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,6 +9,11 @@ from sesman import adapters, index as session_index
 
 
 class CodexEventTests(unittest.TestCase):
+    def test_normalized_message_timestamp_keeps_milliseconds(self):
+        got = adapters._norm_ts("2026-08-10T02:12:53.809Z")
+        self.assertIsNotNone(got)
+        self.assertEqual(datetime.fromisoformat(got).microsecond, 809000)
+
     def test_structured_abort_hides_duplicate_developer_xml(self):
         with tempfile.TemporaryDirectory() as tmp:
             rollout = Path(tmp) / "rollout.jsonl"

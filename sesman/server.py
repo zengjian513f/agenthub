@@ -40,10 +40,18 @@ def _poll_outbox() -> None:
         if not s or s.get("source") != "codex":
             continue
         try:
-            start = int(item.get("watch_start") or 0)
-            head = str(item.get("watch_head") or "")
-            anchor = str(item.get("watch_anchor") or "")
-            if start and head and anchor:
+            # 正常情况下从持续前移的 watch 游标读。到确认期限时，先从实际
+            # 注入前的固定游标复核一次，再决定失败；这样即使某次解析或匹配
+            # 漏掉了已经扫过的 user 记录，也不会留下假的“发送未确认”。
+            replay = (item.get("state") == "delivering"
+                      and time.time() - float(item.get("delivered_at") or 0)
+                      >= send_queue.CONFIRM_TIMEOUT)
+            prefix = ("confirm" if replay and item.get("confirm_start") is not None
+                      else "watch")
+            start = int(item.get(f"{prefix}_start") or 0)
+            head = str(item.get(f"{prefix}_head") or "")
+            anchor = str(item.get(f"{prefix}_anchor") or "")
+            if head and anchor:
                 result = index.messages_for(s, start=start, head=head, anchor=anchor)
             else:
                 # 没有浏览器续读点时只在当前 EOF 建基线，不能为此整读几十 MB。
@@ -92,7 +100,10 @@ def _outbox_loop() -> None:
                 if before != term.capture(name, 40):
                     send_queue.defer(item["id"])
                     continue
-                send_queue.mark_delivering(item["id"])
+                # 用户可能在 ready() 与这里之间撤销排队项。状态切换失败时
+                # 绝不能继续向 tmux 注入已经撤掉的正文。
+                if not send_queue.mark_delivering(item["id"]):
+                    continue
                 term.leave_copy_mode(name)
                 term.submit_text(name, str(item.get("text") or ""))
             except Exception as e:
@@ -689,8 +700,8 @@ class Handler(BaseHTTPRequestHandler):
     def _discard_message(self, body: dict):
         item_id = str(body.get("id") or "")
         uid = str(body.get("uid") or "")
-        if not send_queue.discard(item_id, uid):
-            return self._json({"error": "待发送消息不存在"}, 404)
+        if not send_queue.discard(item_id, uid, {"queued", "failed"}):
+            return self._json({"error": "消息不存在或已经开始发送"}, 409)
         return self._json({"ok": True, "uid": uid,
                            "outbox": send_queue.list_for(uid)})
 

@@ -171,14 +171,15 @@ def defer(item_id: str, delay: float = READY_DELAY) -> None:
     _update(item_id, lambda row: row.update(ready_at=time.time() + delay))
 
 
-def mark_delivering(item_id: str, now: float | None = None) -> None:
+def mark_delivering(item_id: str, now: float | None = None) -> bool:
     now = time.time() if now is None else now
     def change(row):
         row.update(state="delivering", delivered_at=now,
                    attempts=int(row.get("attempts") or 0) + 1)
+        _snapshot_confirmation_cursor(row)
         row.pop("ready_at", None)
         row.pop("error", None)
-    _update(item_id, change)
+    return _update(item_id, change) is not None
 
 
 def mark_failed(item_id: str, error: str) -> None:
@@ -220,11 +221,13 @@ def retry(item_id: str, activity: dict | None = None, uid: str = "") -> dict | N
     return _update(item_id, change, uid)
 
 
-def discard(item_id: str, uid: str = "") -> bool:
+def discard(item_id: str, uid: str = "",
+            states: set[str] | None = None) -> bool:
     with _lock:
         rows = _read()
         kept = [x for x in rows if not (
-            x.get("id") == item_id and (not uid or x.get("uid") == uid))]
+            x.get("id") == item_id and (not uid or x.get("uid") == uid)
+            and (states is None or x.get("state") in states))]
         if len(kept) == len(rows):
             return False
         _write(kept)
@@ -281,3 +284,16 @@ def _put_cursor(row: dict, cursor: dict | None) -> bool:
         return False
     row.update(values)
     return True
+
+
+def _snapshot_confirmation_cursor(row: dict) -> None:
+    """保留实际注入前的游标，供确认超时前重新核对已经扫过的记录。"""
+    for source, target in (
+        ("watch_start", "confirm_start"),
+        ("watch_head", "confirm_head"),
+        ("watch_anchor", "confirm_anchor"),
+    ):
+        if row.get(source) is not None:
+            row[target] = row[source]
+        else:
+            row.pop(target, None)

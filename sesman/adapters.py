@@ -40,15 +40,19 @@ def _norm_ts(v) -> str | None:
     if not v:
         return None
     if isinstance(v, (int, float)):
-        return _iso(float(v) / (1000 if v > 1e11 else 1))
-    s = str(v).replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
+        dt = datetime.fromtimestamp(
+            float(v) / (1000 if v > 1e11 else 1), timezone.utc)
+    else:
+        s = str(v).replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone().isoformat(timespec="seconds")
+    # 网页发送队列会拿记录时间与服务端入队时间做严格因果比较；截到秒会把
+    # 同一秒内稍后写入的 user 记录误判成历史消息。
+    return dt.astimezone().isoformat(timespec="milliseconds")
 
 
 def _head_lines(path: Path, limit: int = 40):

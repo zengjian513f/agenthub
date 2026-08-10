@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,45 @@ class SendQueueTests(unittest.TestCase):
                          (240, "new-head", "new-anchor"))
         self.assertTrue(row.get("ready_at"))
 
+    def test_timeout_rechecks_from_delivery_cursor_before_failing(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "已经收到", [], {"state": "idle"}, "recheck",
+            {"start": 100, "head": "old-head", "anchor": "old-anchor"})
+        send_queue.mark_delivering("recheck", now=10)
+        send_queue.observe(
+            "codex:u", [], {"state": "working"}, now=11,
+            cursor={"start": 240, "head": "new-head", "anchor": "new-anchor"})
+        row = send_queue.tracked()[0]
+        self.assertEqual(row["watch_start"], 240)
+        self.assertEqual(row["confirm_start"], 100)
+
+        session = {"uid": "codex:u", "source": "codex", "path": "/tmp/fake"}
+        result = {
+            "messages": [{"role": "user", "text": "已经收到",
+                          "ts": "2099-01-01T00:00:00.800Z"}],
+            "activity": {"state": "working", "ts": "2099-01-01T00:00:01Z"},
+            "end": 260, "version": {"head": "latest-head"},
+            "anchor": "latest-anchor",
+        }
+        with patch.object(server.time, "time", return_value=18.01), patch.object(
+                server.index, "get", return_value=session), patch.object(
+                server.index, "messages_for", return_value=result) as read:
+            server._poll_outbox()
+        read.assert_called_once_with(
+            session, start=100, head="old-head", anchor="old-anchor")
+        self.assertEqual(send_queue.list_for("codex:u"), [])
+
+    def test_subsecond_native_record_confirms_server_enqueue(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "同一秒", [], {"state": "working"}, "millis")
+        row = send_queue.tracked()[0]
+        boundary = datetime.fromisoformat(row["after_ts"])
+        accepted = (boundary + timedelta(milliseconds=800)).isoformat(
+            timespec="milliseconds")
+        send_queue.observe(
+            "codex:u", [{"role": "user", "text": "同一秒", "ts": accepted}], None)
+        self.assertEqual(send_queue.list_for("codex:u"), [])
+
     def test_idle_message_is_durable_idempotent_and_failure_is_visible(self):
         first = send_queue.enqueue("codex:u", "pane", "消息", [{"src": "token"}],
                                    {"state": "idle"}, "same-id")
@@ -96,6 +136,13 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual(send_queue.ready(10**12), [])
         self.assertTrue(send_queue.discard("one"))
         self.assertEqual([x["id"] for x in send_queue.ready(10**12)], ["two"])
+
+    def test_queued_item_can_be_cancelled_before_delivery_claim(self):
+        send_queue.enqueue("codex:u", "pane", "撤掉", [], {"state": "idle"}, "cancel")
+        self.assertTrue(send_queue.discard(
+            "cancel", "codex:u", {"queued", "failed"}))
+        self.assertFalse(send_queue.mark_delivering("cancel"))
+        self.assertEqual(send_queue.list_for("codex:u"), [])
 
 
 if __name__ == "__main__":
