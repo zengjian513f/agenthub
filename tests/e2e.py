@@ -499,6 +499,23 @@ def run(pw):
     check("目录不使用 rtl 排版",
           p.locator(".item .cwd").first.evaluate("n => getComputedStyle(n).direction") == "ltr")
     check("视图按钮高亮切换", "on" in (p.locator('#view button[data-v="date"]').get_attribute("class") or ""))
+    star_sort = p.evaluate("""() => {
+      const before = S.view;
+      const rows = [
+        {uid:'older-starred', cwd:'/tmp/sort', updated:'2026-08-08T08:00:00Z', starred:true},
+        {uid:'newer-normal', cwd:'/tmp/sort', updated:'2026-08-08T09:00:00Z', starred:false},
+      ];
+      S.view = 'tree';
+      const tree = groupBy(rows)[0][1].map(s => s.uid);
+      S.view = 'date';
+      const date = groupBy(rows)[0][1].map(s => s.uid);
+      S.view = before;
+      return {tree, date};
+    }""")
+    check("项目树不因收藏改变时间顺序",
+          star_sort["tree"] == ["newer-normal", "older-starred"], star_sort)
+    check("时间轴同日收藏会话排在前面",
+          star_sort["date"] == ["older-starred", "newer-normal"], star_sort)
     p.locator('#view button[data-v="tree"]').click()
     p.wait_for_timeout(200)
     check("切回项目树", p.locator(".ghead .gname").nth(0).inner_text() == tree_heads[0], tree_heads[:1])
@@ -688,9 +705,6 @@ def run(pw):
           star_result.get("starred") is True
           and starred_item.locator(".item-star.on").count() == 1
           and detail_star.locator('use[href="#i-star-filled"]').count() == 1)
-    check("星标会话排在当前分组最前",
-          starred_item.locator("xpath=..").locator(":scope > .item").first.get_attribute("data-uid")
-          == fake_uid)
     persisted_sessions = json.loads(urllib.request.urlopen(
         BASE + "/api/sessions?force=1", timeout=60).read())["sessions"]
     check("星标持久化在服务端而非当前浏览器",

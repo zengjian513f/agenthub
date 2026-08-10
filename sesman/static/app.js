@@ -1138,7 +1138,9 @@ function groupBy(list) {
     return tb - ta;
   });
   for (const k of keys) m.get(k).sort((a, b) =>
-    Number(!!b.starred) - Number(!!a.starred)
+    // 项目树的顺序只表达真实活动时间，点星不应让会话突然跳位。
+    // 时间轴才在同一日期内将收藏置前；收藏时间不参与排序。
+    (S.view === 'date' ? Number(!!b.starred) - Number(!!a.starred) : 0)
     || new Date(b.updated) - new Date(a.updated));
   return keys.map(k => [k, m.get(k)]);
 }
