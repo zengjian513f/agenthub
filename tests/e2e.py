@@ -291,7 +291,7 @@ def run(pw):
                                                   "state": "sending", "expiresAt": 9000,
                                                   "legacy": True}]
           and cli_layers["migrations"] == [[], [1]]
-          and cli_layers["escape"] == [True, True, False]
+          and cli_layers["escape"] == [True, False, False]
           and cli_layers["rewind"] == [True, False, False], cli_layers)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
@@ -299,16 +299,22 @@ def run(pw):
       const uid = session.uid, key = viewKey(uid), name = `sesman-codex-${session.sid.slice(0, 8)}`;
       const oldPost = post, oldList = T.list, oldEntry = cache.get(key);
       const oldQueued = S.queued.get(uid);
-      let request = null;
+      const requests = [];
       T.list = [...(T.list || []), {uid, name}];
       cache.set(key, {activity:{state:'working', ts:'2026-08-09T10:00:00Z'}, msgs:[],
         end:123, version:{head:'head-token'}, anchor:'anchor-token'});
       post = async (url, body) => {
-        request = {url, body};
-        return {ok:true, outbox:[{id:'server-1', uid, text:body.text,
-          created:1000, state:'queued', server:true}]};
+        requests.push({url, body});
+        if (url === 'api/session/send') {
+          return {ok:true, outbox:[{id:'server-1', uid, text:body.text,
+            created:1000, state:'queued', server:true}]};
+        }
+        return {ok:true};
       };
-      try { await sendToSession('由服务端托管的 Codex 消息', null, uid); }
+      try {
+        await sendToSession('由服务端托管的 Codex 消息', null, uid);
+        await sendToSession(null, ['Escape'], uid);
+      }
       finally {
         post = oldPost; T.list = oldList;
         if (oldEntry) cache.set(key, oldEntry); else cache.delete(key);
@@ -317,16 +323,20 @@ def run(pw):
       const persisted = store.get('queuedMessages', []).flatMap(x => x[1] || [])
         .some(x => x.text === '由服务端托管的 Codex 消息');
       if (oldQueued) S.queued.set(uid, oldQueued); else S.queued.delete(uid);
-      return {url:request?.url, uid:request?.body?.uid,
-        activity:request?.body?.activity?.state, shown:shown?.state,
-        cursor:request?.body?.cursor, server:shown?.server, persisted};
+      const queuedRequest = requests.find(x => x.url === 'api/session/send');
+      const escapeRequest = requests.find(x => x.url === 'api/term/send');
+      return {url:queuedRequest?.url, uid:queuedRequest?.body?.uid,
+        activity:queuedRequest?.body?.activity?.state, shown:shown?.state,
+        cursor:queuedRequest?.body?.cursor, server:shown?.server, persisted,
+        escapeKeys:escapeRequest?.body?.keys};
     }""")
     check("Codex 网页消息先进入服务端队列且不再写浏览器乐观队列",
           codex_delivery == {"url": "api/session/send", "uid": codex_delivery.get("uid"),
                              "activity": "working", "shown": "queued",
                              "cursor": {"start": 123, "head": "head-token",
                                         "anchor": "anchor-token"},
-                             "server": True, "persisted": False}
+                             "server": True, "persisted": False,
+                             "escapeKeys": ["Escape"]}
           and str(codex_delivery.get("uid", "")).startswith("codex:"), codex_delivery)
     script_order = p.locator("script[src]").evaluate_all(
         "nodes => nodes.map(n => n.getAttribute('src').split('?')[0])")

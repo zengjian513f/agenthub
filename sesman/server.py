@@ -37,6 +37,14 @@ ATTACHMENT_DIR_LOCK = threading.Lock()
 OUTBOX_WAKE = threading.Event()
 
 
+def _after_terminal_keys(uid: str, keys: list[str]) -> None:
+    """特殊键发出后唤醒相关后台工作，但不篡改 CLI 自己的队列语义。"""
+    # Esc 只负责中断当前 Codex 回合。待发送项必须继续留在持久队列；
+    # _poll_outbox 看到原生 aborted/idle 后才会放行队首。
+    if str(uid or "").startswith("codex:") and "Escape" in keys:
+        OUTBOX_WAKE.set()
+
+
 def _poll_outbox() -> None:
     """即使浏览器断开，也独立从 Codex rollout 追踪完成与接收事件。"""
     for item in send_queue.tracked():
@@ -263,8 +271,7 @@ class Handler(BaseHTTPRequestHandler):
                 term.leave_copy_mode(name)       # 正在翻历史的话先回到实时画面
                 if body.get("keys"):                 # 特殊键: Enter / Escape / C-c …
                     term.send_keys(name, *body["keys"])
-                    if "Escape" in body["keys"] and body.get("uid"):
-                        send_queue.discard_uid(str(body["uid"]))
+                    _after_terminal_keys(str(body.get("uid") or ""), body["keys"])
                 else:
                     text = body.get("text", "")
                     enter = body.get("enter", True)

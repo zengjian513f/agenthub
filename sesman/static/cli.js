@@ -120,9 +120,8 @@ class CodexCli extends SesmanCli {
     return '排队中';
   }
 
-  clearsQueuedMessages(keys) {
-    return Array.isArray(keys) && keys.includes('Escape');
-  }
+  // Codex 的待发送消息由服务端持久队列管理。Esc 只中断当前回合；
+  // 服务端确认原生状态已经结束后，仍要继续交付队首消息。
 }
 
 class GrokCli extends SesmanCli {

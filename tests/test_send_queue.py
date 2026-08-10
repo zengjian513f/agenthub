@@ -144,6 +144,30 @@ class SendQueueTests(unittest.TestCase):
         self.assertFalse(send_queue.mark_delivering("cancel"))
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
+    def test_codex_escape_keeps_queue_and_abort_releases_only_head(self):
+        activity = {"state": "working", "ts": "2026-08-09T10:00:00Z"}
+        send_queue.enqueue("codex:u", "pane", "第一条", [], activity, "first")
+        send_queue.enqueue("codex:u", "pane", "第二条", [], activity, "second")
+
+        with patch.object(server.OUTBOX_WAKE, "set") as wake:
+            server._after_terminal_keys("codex:u", ["Escape"])
+        wake.assert_called_once_with()
+        self.assertEqual(
+            [x["id"] for x in send_queue.list_for("codex:u")],
+            ["first", "second"])
+
+        send_queue.observe(
+            "codex:u", [],
+            {"state": "aborted", "ts": "2099-08-09T10:01:00Z"}, now=1000)
+        self.assertEqual(send_queue.ready(1000.29), [])
+        self.assertEqual(
+            [x["id"] for x in send_queue.ready(1000.31)], ["first"])
+
+    def test_claude_escape_does_not_touch_codex_outbox_worker(self):
+        with patch.object(server.OUTBOX_WAKE, "set") as wake:
+            server._after_terminal_keys("claude:u", ["Escape"])
+        wake.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

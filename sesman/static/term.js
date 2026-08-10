@@ -1203,8 +1203,9 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
   if (serverQueued && typeof syncServerOutbox === 'function') {
     syncServerOutbox(uid, d.outbox || []);
   }
-  // Esc 会让 CLI 丢弃当前 TUI 内存中的排队输入；那些输入未必曾写入
-  // transcript，因此不能等待后续“同文消息”来消重。
+  // 只有 Claude 会用 Esc 清除它自己的原生内存队列；这里撤掉的只是
+  // 浏览器中的状态镜像。Codex 的服务端 outbox 必须保留，等原生回合
+  // 确认结束后自动交付队首。
   if (sesmanCli(uid)?.clearsQueuedMessages(keys)
       && typeof discardAllQueuedUserMessages === 'function') {
     discardAllQueuedUserMessages(uid);
