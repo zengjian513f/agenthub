@@ -1103,6 +1103,15 @@ def run(pw):
               and read_entry.locator(".tool-out .hljs-keyword").count() >= 2
               and read_entry.locator(".tool-out").get_attribute("data-code-language") == "python")
         first_entry = grp.locator("> .tool-entry").first
+        tool_head_border = first_entry.locator("> .tool-head").evaluate("""n => {
+          const s = getComputedStyle(n);
+          return {appearance:s.appearance, top:s.borderTopStyle,
+            right:s.borderRightStyle, bottom:s.borderBottomStyle, left:s.borderLeftStyle};
+        }""")
+        check("工具调用头关闭原生按钮皮肤并显示完整四边框",
+              tool_head_border == {"appearance": "none", "top": "solid",
+                                   "right": "solid", "bottom": "solid", "left": "solid"},
+              tool_head_border)
         first_entry.locator("> .tool-head").click()
         args_geometry = first_entry.evaluate("""n => {
           const h = n.querySelector(':scope > .tool-head').getBoundingClientRect();

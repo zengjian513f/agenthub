@@ -717,6 +717,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .msg.tool-msg { width: 100%; border: 0; background: transparent; box-shadow: none; }
 .tool-head {
   display: flex; gap: 10px; align-items: baseline; width: 100%; min-width: 0;
+  appearance: none; -webkit-appearance: none;
   padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px;
   background: var(--bubble-tool); color: var(--terminal-fg); box-shadow: var(--shadow);
   font: 500 var(--tool-font-size)/1.5 var(--terminal-font); font-synthesis: none;
