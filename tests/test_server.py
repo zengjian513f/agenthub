@@ -4,6 +4,25 @@ from unittest.mock import patch
 from sesman import server
 
 
+class StaticIdentityTests(unittest.TestCase):
+    def test_index_brand_uses_server_hostname(self):
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._send = lambda status, data, ctype, headers=None: replies.append(
+            (status, data, ctype, headers))
+
+        handler._static("/")
+
+        status, data, ctype, _ = replies[0]
+        page = data.decode("utf-8")
+        expected = server.html.escape(server.HOSTNAME)
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", ctype)
+        self.assertIn(f'>{expected}</span>', page)
+        self.assertIn(f'title="{expected}"', page)
+        self.assertNotIn("__SESMAN_HOSTNAME__", page)
+
+
 class StopSessionTests(unittest.TestCase):
     def test_tmux_stop_exits_cli_before_refreshing_live_state(self):
         handler = object.__new__(server.Handler)
