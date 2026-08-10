@@ -1763,6 +1763,23 @@ def run(pw):
           and live_switch.get_attribute("aria-pressed") == "false")
     check("活动计数不再显示 tmux 文字",
           "tmux" not in live_switch.inner_text().lower(), live_switch.inner_text())
+    zero_live = p.evaluate("""() => {
+      const live = S.live, tmux = S.liveTmux;
+      const pending = typeof T !== 'undefined' ? T.pending : undefined;
+      S.live = new Set(); S.liveTmux = new Set();
+      if (typeof T !== 'undefined') T.pending = [];
+      paintLive();
+      const n = document.querySelector('#livecount');
+      const result = {text:n.innerText.trim(), display:getComputedStyle(n).display,
+                      label:n.getAttribute('aria-label')};
+      S.live = live; S.liveTmux = tmux;
+      if (typeof T !== 'undefined') T.pending = pending;
+      paintLive();
+      return result;
+    }""")
+    check("无活动会话时计数仍显示 0",
+          zero_live["text"].endswith("0") and zero_live["display"] == "inline-flex"
+          and zero_live["label"].startswith("0 个活动会话"), zero_live)
     before_live_filter = set(p.locator("#side .item").evaluate_all(
         "nodes => nodes.map(n => n.dataset.uid)"))
     live_switch.click()

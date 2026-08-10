@@ -747,7 +747,6 @@ function paintLive() {
     c.setAttribute('aria-label', `${total} 个活动会话；${S.activeOnly ? '正在只显示活动会话' : '点击只显示活动会话'}`);
     c.setAttribute('aria-pressed', String(S.activeOnly));
     c.title = S.activeOnly ? '显示全部会话' : '只显示活动会话';
-    c.classList.toggle('visible', total > 0 || S.activeOnly);
     c.classList.toggle('active-only', S.activeOnly);
   }
   syncActiveOnlyList();
