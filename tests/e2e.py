@@ -368,6 +368,19 @@ def run(pw):
           and p.locator(".brand-name").inner_text().strip() not in {"", "__SESMAN_HOSTNAME__"}
           and "个会话" in p.locator("#stat").inner_text()
           and p.locator(".mobile-label").all_inner_texts() == ["项目树", "时间轴"])
+    brand_style = p.locator(".brand-name").evaluate("""n => {
+      const s = getComputedStyle(n);
+      return {background:s.backgroundImage, family:s.fontFamily,
+        size:parseFloat(s.fontSize), style:s.fontStyle,
+        weight:parseInt(s.fontWeight), spacing:parseFloat(s.letterSpacing),
+        transform:s.textTransform, fill:s.webkitTextFillColor};
+    }""")
+    check("机器名使用醒目的渐变 display 字标",
+          brand_style["background"].startswith("linear-gradient")
+          and "serif" in brand_style["family"] and brand_style["style"] == "italic"
+          and brand_style["size"] >= 18 and brand_style["weight"] >= 700
+          and brand_style["spacing"] > 0 and brand_style["transform"] == "none"
+          and brand_style["fill"] == "rgba(0, 0, 0, 0)", brand_style)
 
     # 上传目录只能由服务端根据 uid 决定，原始二进制不走 Base64。
     fake_uid = p.evaluate("() => S.sessions.find(s => s.title === 'SESMAN自测会话请删除').uid")

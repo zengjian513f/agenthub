@@ -26,6 +26,8 @@
   --text: #1c2024;
   --muted: #6b7280;
   --accent: #3b6ef6;
+  --brand-a: #245de8;
+  --brand-b: #8b3fd7;
   --hover: #eef2fb;
   --sel: #e3ecff;
   --claude: #d97757;
@@ -75,6 +77,8 @@
     --text: #dfe3ea;
     --muted: #8b93a1;
     --accent: #6d95ff;
+    --brand-a: #8fb2ff;
+    --brand-b: #d49aff;
     --hover: #262b35;
     --sel: #2b3550;
     --terminal-bg: #000000;
@@ -142,12 +146,27 @@ header {
   padding: 9px 18px 9px 14px; background: var(--panel);
   border-bottom: 1px solid var(--border); flex: none;
 }
-.brand { font-weight: 650; letter-spacing: .3px; margin-right: 4px; }
+.brand { margin-right: 4px; }
 .brand-name {
   display: inline-block; max-width: 20ch; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+  color: var(--brand-a);
+  background: linear-gradient(110deg, var(--brand-a), var(--brand-b));
+  background-clip: text; -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-family: "Palatino Linotype", "Book Antiqua", Palatino, "Iowan Old Style",
+    "URW Palladio L", "Noto Serif", Georgia, serif;
+  font-size: 18px; font-style: italic; font-weight: 700; line-height: 1.15;
+  letter-spacing: .025em; text-transform: none;
+  filter: drop-shadow(0 1px 5px color-mix(in srgb, var(--brand-b) 18%, transparent));
 }
 .brand small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+
+@media (forced-colors: active) {
+  .brand-name {
+    color: CanvasText; background: none; -webkit-text-fill-color: currentColor; filter: none;
+  }
+}
 
 .chips { display: flex; gap: 6px; }
 .chip {
