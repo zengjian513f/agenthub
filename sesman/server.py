@@ -57,12 +57,25 @@ def _claude_prompt(session_id: str, messages: list[dict]) -> dict | None:
     return prompt
 
 
-def _after_terminal_keys(uid: str, keys: list[str]) -> None:
+def _after_terminal_keys(uid: str, keys: list[str]) -> dict | None:
     """特殊键发出后唤醒相关后台工作，但不篡改 CLI 自己的队列语义。"""
     # Esc 只负责中断当前 Codex 回合。待发送项必须继续留在持久队列；
     # _poll_outbox 看到原生 aborted/idle 后才会放行队首。
     if str(uid or "").startswith("codex:") and "Escape" in keys:
         OUTBOX_WAKE.set()
+    if str(uid or "").startswith("claude:") and "Escape" in keys:
+        # Claude 若在第一条 assistant 记录出现前被 Esc，中断不会落进 JSONL。
+        # 持久记录这次显式操作，避免尾部孤立 user 永远被推断成 working。
+        return session_meta.stop_activity(uid)
+    return None
+
+
+def _resolve_activity(uid: str, result: dict) -> dict:
+    resolved = session_meta.resolve_activity(uid, result.get("activity"))
+    if resolved != result.get("activity"):
+        result["activity"] = resolved
+        result["activity_changed"] = True
+    return result
 
 
 def _poll_outbox() -> None:
@@ -291,8 +304,10 @@ class Handler(BaseHTTPRequestHandler):
                 term.leave_copy_mode(name)       # 正在翻历史的话先回到实时画面
                 if body.get("keys"):                 # 特殊键: Enter / Escape / C-c …
                     term.send_keys(name, *body["keys"])
-                    _after_terminal_keys(str(body.get("uid") or ""), body["keys"])
+                    activity = _after_terminal_keys(
+                        str(body.get("uid") or ""), body["keys"])
                 else:
+                    activity = None
                     text = body.get("text", "")
                     enter = body.get("enter", True)
                     if text and enter:
@@ -301,7 +316,10 @@ class Handler(BaseHTTPRequestHandler):
                         term.send_text(name, text)
                     elif enter:
                         term.send_keys(name, "Enter")
-                return self._json({"ok": True})
+                response = {"ok": True}
+                if activity:
+                    response["activity"] = activity
+                return self._json(response)
         except Exception as e:
             return self._json({"error": str(e)}, 400)
         self._json({"error": "not found"}, 404)
@@ -584,6 +602,7 @@ class Handler(BaseHTTPRequestHandler):
                 append_only=q.get("append", ["0"])[0] == "1",
                 windowed=q.get("window", ["0"])[0] == "1",
             )
+            _resolve_activity(uid, result)
             if not agent:
                 if send_queue.observe(uid, result["messages"], result.get("activity")):
                     OUTBOX_WAKE.set()
@@ -660,6 +679,7 @@ class Handler(BaseHTTPRequestHandler):
         claude_sid = (str(s.get("sid") or "")
                       if not s.get("agent_id") and s.get("source") == "claude" else "")
         prompt_revision = claude_bridge.revision(claude_sid) if claude_sid else None
+        activity_revision = session_meta.activity_revision(uid)
         beat = time.time()
         try:
             while True:
@@ -673,6 +693,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 用 messages_for 而不是 messages: 后者要过一遍索引,
                     # 而文件刚变过, 签名对不上就会重建整个索引(百毫秒级)
                     d = index.messages_for(s, start=start, head=head, anchor=anchor)
+                    _resolve_activity(uid, d)
                     if not s.get("agent_id"):
                         if send_queue.observe(uid, d["messages"], d.get("activity")):
                             OUTBOX_WAKE.set()
@@ -689,6 +710,20 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
                     start, head, anchor = d["end"], d["version"]["head"], d["anchor"]
+                    beat = time.time()
+                elif (not s.get("agent_id")
+                      and session_meta.activity_revision(uid) != activity_revision):
+                    activity_revision = session_meta.activity_revision(uid)
+                    # 使用普通的空增量格式，已打开、尚未刷新到新版 JS 的页面
+                    # 也能立即清掉 Working，不需要认识额外的事件协议。
+                    payload = json.dumps({
+                        "reset": False, "start": start, "end": start,
+                        "version": ver, "anchor": anchor, "messages": [],
+                        "activity_changed": True,
+                        "activity": session_meta.stopped_activity(uid),
+                    }, ensure_ascii=False)
+                    self.wfile.write(f"data: {payload}\n\n".encode())
+                    self.wfile.flush()
                     beat = time.time()
                 elif claude_sid and current_prompt_revision != prompt_revision:
                     prompt_revision = current_prompt_revision

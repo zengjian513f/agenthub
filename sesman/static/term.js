@@ -1203,6 +1203,13 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
   if (serverQueued && typeof syncServerOutbox === 'function') {
     syncServerOutbox(uid, d.outbox || []);
   }
+  if (Object.prototype.hasOwnProperty.call(d, 'activity')) {
+    const entry = cache.get(viewKey(uid));
+    if (entry) entry.activity = d.activity || null;
+    if (S.sel === uid && !S.agent && typeof renderConversationTail === 'function') {
+      renderConversationTail(entry?.activity || null, uid);
+    }
+  }
   S.live.add(uid);            // 发完立刻按最快节奏拉新消息
   S.liveTmux.add(uid);
   paintLive();

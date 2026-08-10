@@ -44,6 +44,26 @@ class SessionMetaTests(unittest.TestCase):
             self.assertNotIn("starred", rows[0])
             self.assertTrue(rows[1]["starred"])
 
+    def test_escape_persistently_ends_only_older_busy_activity(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
+            session_meta.set_starred("claude:a", True)
+            before = session_meta.activity_revision("claude:a")
+            stopped = session_meta.stop_activity("claude:a", now=100)
+
+            self.assertEqual(stopped["state"], "aborted")
+            self.assertGreater(session_meta.activity_revision("claude:a"), before)
+            self.assertEqual(session_meta.activity_revision("claude:b"), 0)
+            self.assertEqual(session_meta.resolve_activity("claude:a", {
+                "state": "working", "ts": "1970-01-01T00:01:39+00:00",
+            })["state"], "aborted")
+            newer = {"state": "working", "ts": "1970-01-01T00:01:41+00:00"}
+            self.assertEqual(session_meta.resolve_activity("claude:a", newer), newer)
+            idle = {"state": "idle", "ts": "1970-01-01T00:01:39+00:00"}
+            self.assertEqual(session_meta.resolve_activity("claude:a", idle), idle)
+            self.assertTrue(session_meta.enrich_one({"uid": "claude:a"})["starred"])
+
 
 if __name__ == "__main__":
     unittest.main()

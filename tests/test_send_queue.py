@@ -163,10 +163,15 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual(
             [x["id"] for x in send_queue.ready(1000.31)], ["first"])
 
-    def test_claude_escape_does_not_touch_codex_outbox_worker(self):
-        with patch.object(server.OUTBOX_WAKE, "set") as wake:
-            server._after_terminal_keys("claude:u", ["Escape"])
+    def test_claude_escape_persists_activity_stop_without_touching_codex_worker(self):
+        stopped = {"state": "aborted", "ts": "2099-01-01T00:00:00Z"}
+        with patch.object(server.OUTBOX_WAKE, "set") as wake, \
+                patch.object(server.session_meta, "stop_activity",
+                             return_value=stopped) as stop:
+            result = server._after_terminal_keys("claude:u", ["Escape"])
         wake.assert_not_called()
+        stop.assert_called_once_with("claude:u")
+        self.assertEqual(result, stopped)
 
 
 if __name__ == "__main__":
