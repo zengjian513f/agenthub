@@ -78,6 +78,50 @@ class CodexEventTests(unittest.TestCase):
             self.assertIn(("event", "上下文已压缩", False), visible)
             self.assertIn(("user", "普通输入", None), visible)
 
+    def test_compaction_prompt_rebuild_is_hidden_for_full_and_incremental_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            rows = [
+                {"timestamp": "2026-08-10T05:51:38Z", "ordinal": 1,
+                 "type": "response_item", "payload": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "压缩前正文"}]}},
+                {"timestamp": "2026-08-10T05:51:39Z", "ordinal": 2,
+                 "type": "compacted", "payload": {"message": "", "replacement_history": []}},
+                {"timestamp": "2026-08-10T05:51:40Z", "ordinal": 3,
+                 "type": "response_item", "payload": {"type": "message", "role": "developer",
+                 "content": [{"type": "input_text", "text":
+                              "<skills_instructions>大量技能说明</skills_instructions>"}]}},
+                {"timestamp": "2026-08-10T05:51:40Z", "ordinal": 4,
+                 "type": "response_item", "payload": {"type": "message", "role": "developer",
+                 "content": [{"type": "input_text", "text": "You are the primary agent."}]}},
+                {"timestamp": "2026-08-10T05:51:40Z", "ordinal": 5,
+                 "type": "response_item", "payload": {"type": "message", "role": "user",
+                 "content": [
+                     {"type": "input_text", "text":
+                      "# AGENTS.md instructions\n<INSTRUCTIONS>项目规则</INSTRUCTIONS>"},
+                     {"type": "input_text", "text":
+                      "<environment_context><cwd>/tmp/project</cwd></environment_context>"},
+                 ]}},
+                {"timestamp": "2026-08-10T05:51:41Z", "ordinal": 6,
+                 "type": "response_item", "payload": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "压缩后的真实问题"}]}},
+            ]
+            lines = [json.dumps(row) + "\n" for row in rows]
+            rollout.write_text("".join(lines))
+            incremental_start = len("".join(lines[:2]).encode())
+            adapter = adapters.CodexAdapter()
+            full, _ = adapter.read(str(rollout))
+            incremental, _ = adapter.read(str(rollout), start=incremental_start)
+
+        self.assertEqual([(m["role"], m["text"]) for m in full], [
+            ("user", "压缩前正文"),
+            ("event", "上下文已压缩"),
+            ("user", "压缩后的真实问题"),
+        ])
+        self.assertEqual([(m["role"], m["text"]) for m in incremental], [
+            ("user", "压缩后的真实问题"),
+        ])
+
     def test_escape_fork_replaces_parent_and_inherits_history_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"

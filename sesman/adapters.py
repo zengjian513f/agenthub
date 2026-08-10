@@ -421,6 +421,9 @@ _CODEX_ABORT_MARKER = re.compile(
     r"\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
 _CODEX_ABORT_PREFIX = re.compile(
     r"^\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
+_CODEX_USER_PROTOCOL = re.compile(
+    r"^\s*(?:#\s*AGENTS\.md instructions\s*<INSTRUCTIONS>|"
+    r"<environment_context>|<user_info>|<project_instructions>)", re.I)
 
 
 def _is_injected(text: str) -> bool:
@@ -437,6 +440,17 @@ def _strip_codex_abort_prefix(text: str) -> str:
     while match := _CODEX_ABORT_PREFIX.match(text):
         text = text[match.end():]
     return text
+
+
+def _is_codex_protocol_injection(role: str, text: str) -> bool:
+    """Codex 重建提示词时写入 rollout 的指令，不是时间线对话。
+
+    compact 后这些记录会重新出现；判断不能依赖同时读到 compact 边界，
+    否则从字节偏移增量续读时仍会把它们画成大气泡。
+    """
+    if role == "developer":
+        return True
+    return role == "user" and bool(_CODEX_USER_PROTOCOL.match(text))
 
 
 def _notification_tag(text: str, name: str) -> str:
@@ -1023,6 +1037,8 @@ class CodexAdapter:
                     continue
                 if native_role == "user":
                     txt = _strip_codex_abort_prefix(txt)
+                if _is_codex_protocol_injection(native_role, txt):
+                    continue
                 if txt.strip() or images:
                     shown = txt or "[图片]"
                     msgs.append(_msg(_user_role(role, shown), shown, ts, media_parts=images))
