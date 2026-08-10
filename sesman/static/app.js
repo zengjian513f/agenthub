@@ -260,15 +260,6 @@ function discardQueuedUserMessage(uid, id) {
     cache.get(viewKey(uid))?.activity, uid);
 }
 
-function discardAllQueuedUserMessages(uid) {
-  if (!queuedMessages(uid).length) return false;
-  S.queued.delete(uid);
-  saveQueuedMessages();
-  if (S.sel === uid && !S.agent) renderConversationTail(
-    cache.get(viewKey(uid))?.activity, uid);
-  return true;
-}
-
 function syncServerOutbox(uid, items) {
   if (sesmanCli(uid)?.source !== 'codex' || !Array.isArray(items)) return false;
   const next = items.map(item => ({ ...item, server: true }));
@@ -1107,19 +1098,29 @@ async function toggleSessionStar(uid) {
 
 function renderChips() {
   const box = $('#chips');
-  box.innerHTML = '';
+  const wanted = new Set(Object.keys(SOURCES));
+  for (const old of box.querySelectorAll(':scope > .chip[data-source]')) {
+    if (!wanted.has(old.dataset.source)) old.remove();
+  }
   for (const [k, v] of Object.entries(SOURCES)) {
     const n = sidebarSessions().filter(s => s.source === k).length;
-    const c = el('div', 'chip' + (S.off.has(k) ? ' off' : ''),
-      `${icon(k)}<span>${v.name}</span><b>${n}</b>`);
+    let c = box.querySelector(`:scope > .chip[data-source="${CSS.escape(k)}"]`);
+    if (c && c.tagName !== 'BUTTON') { c.remove(); c = null; }
+    if (!c) {
+      c = el('button', 'chip', `${icon(k)}<span>${v.name}</span><b></b>`);
+      c.type = 'button';
+      c.dataset.source = k;
+      c.onclick = () => {
+        S.off.has(k) ? S.off.delete(k) : S.off.add(k);
+        store.set('off', [...S.off]);
+        renderChips(); renderSide();
+      };
+      box.appendChild(c);
+    }
+    c.classList.toggle('off', S.off.has(k));
+    c.querySelector(':scope > b').textContent = n;
     c.title = v.name;
     c.setAttribute('aria-label', `${v.name}，${n} 个会话`);
-    c.onclick = () => {
-      S.off.has(k) ? S.off.delete(k) : S.off.add(k);
-      store.set('off', [...S.off]);
-      renderChips(); renderSide();
-    };
-    box.appendChild(c);
   }
 }
 
@@ -1722,12 +1723,6 @@ async function del(m) {
   showMobileList();
 }
 
-const ROLE_LABEL = {
-  user: '👤 用户', assistant: '🤖 助手', 'user·subagent': '👤 子代理输入',
-  'assistant·subagent': '🤖 子代理', thinking: '💭 思考', system: '⚙️ 系统',
-  tool: '🔧 工具调用', tool_result: '📄 工具输出',
-  question: '❓ 询问', answer: '💬 回答', command: '⌘ 命令', event: '⚙️ 会话事件',
-};
 // 连续工具调用/输出合并成一个可折叠的组；正在增长的时间线尾段保持展开，
 // 等后面出现普通对话或任务结束后再自动封口。
 const TOOL_ROLES = new Set(['tool', 'tool_result']);
@@ -1842,17 +1837,16 @@ function sealToolTail(box) {
   return buildPlan(box, planMessages(items), anchor);
 }
 
-// 折叠态只是一行正文预览，不显示角色/时间 header。
-function addFoldPreview(n, text, aria, hasHiddenHit = false) {
-  n.classList.add('foldable');
+// 折叠工具组只显示语义提纲，不显示角色/时间 header。
+function addFoldPreview(n, text, aria) {
   const preview = el('button', 'fold-preview');
   preview.type = 'button';
   preview.title = '展开';
   preview.setAttribute('aria-label', `展开${aria}`);
+  preview.setAttribute('aria-expanded', 'false');
   const peek = el('span', 'peek');
   peek.textContent = text;
   preview.appendChild(peek);
-  if (hasHiddenHit) preview.appendChild(el('i', 'dot', '●'));
   n.appendChild(preview);
   return preview;
 }
@@ -1862,10 +1856,19 @@ function addAction(n) {
   action.type = 'button';
   action.hidden = true;
   n.appendChild(action);
-  return (label, fn) => {
+  return (label, fn, expanded = null) => {
     action.hidden = !label;
     action.textContent = label || '';
     action.onclick = fn || null;
+    if (label) {
+      action.title = label;
+      action.setAttribute('aria-label', label);
+    } else {
+      action.removeAttribute('title');
+      action.removeAttribute('aria-label');
+    }
+    if (expanded === null) action.removeAttribute('aria-expanded');
+    else action.setAttribute('aria-expanded', String(expanded));
   };
 }
 
@@ -1890,8 +1893,6 @@ function outPreviewInfo(t) {
     omittedChars: truncated ? Math.max(0, t.length - preview.length) : 0,
   };
 }
-
-function outPreview(t) { return outPreviewInfo(t).text; }
 
 function toolOutputPath(m) {
   const name = String(m?.name || '').toLowerCase();
@@ -1969,6 +1970,7 @@ function addClippedPre(entry, cls, text, codePath = '') {
 function toolEntry(m) {
   const entry = el('div', 'tool-entry');
   entry.dataset.role = m.role;
+  if (m.counted === false) entry.dataset.counted = 'false';
   if (m.role !== 'tool') {
     // 落单的工具输出(没配到调用): 保持独立块
     addClippedPre(entry, 'tool-out' + (m.error ? ' err' : ''),
@@ -2011,7 +2013,7 @@ function toolEntry(m) {
   if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
   const r = m.result;
   if (r) {
-    entry.dataset.result = '1';   // 吸收了一条 tool_result, 计数对账用
+    if (r.counted !== false) entry.dataset.result = '1'; // 吸收的结果单独补入计数
     const status = [r.error ? '✗ 出错' : '✓ 完成'];
     if (Number.isInteger(r.exit_code)) status.push(`exit ${r.exit_code}`);
     if (Number.isFinite(+r.duration_s)) status.push(formatDuration(+r.duration_s * 1000));
@@ -2164,7 +2166,7 @@ function setInlineFileDiffWrap(card, on) {
 function fileChangeNode(m) {
   const n = el('div', 'msg file-change-msg');
   n.dataset.role = 'tool';
-  if (m.result) n.dataset.result = '1';   // 修改类调用的确认输出并入卡片
+  if (m.result && m.result.counted !== false) n.dataset.result = '1'; // 修改确认输出并入卡片
   if (m.counted === false) n.dataset.counted = 'false';
   const body = el('div', 'file-change-list');
   for (const change of m.changes) {
@@ -2229,8 +2231,16 @@ function groupNode(items, initiallyOpen = false) {
   paintSyntax(outline);
   items.forEach(m => n.appendChild(toolEntry(m))); // 直接铺在组内，不再套 grp-body + 内层 msg
   const setAction = addAction(n);
-  const fold = () => { n.classList.add('folded'); setAction(); };
-  const open = () => { n.classList.remove('folded'); setAction('收起', fold); };
+  const fold = () => {
+    n.classList.add('folded');
+    preview.setAttribute('aria-expanded', 'false');
+    setAction();
+  };
+  const open = () => {
+    n.classList.remove('folded');
+    preview.setAttribute('aria-expanded', 'true');
+    setAction('收起', fold, true);
+  };
   n._fold = fold;
   n._open = open;
   preview.onclick = open;
@@ -2314,43 +2324,26 @@ function msgNode(m) {
   const found = SEARCH_ROLES.has(m.role) && hasTerm(m.text);
   const hit = found && S.autoOpen < AUTO_OPEN_MAX;
   if (hit) S.autoOpen++;
-  const raw = TOOL_ROLES.has(m.role);
-  // 只有多行工具内容允许整条折叠；所有对话内容只可能出现“展开全文”。
-  const foldable = raw && String(m.text || '').includes('\n');
-  const n = el('div', 'msg' + (foldable && !hit ? ' folded' : '')
-                            + (found && !hit ? ' hashit' : ''));
+  // 对话内容从不整泡折叠；长内容只在泡内提供“展开全文”。
+  const n = el('div', 'msg' + (found && !hit ? ' hashit' : ''));
   n.dataset.role = m.role;
   if (m.counted === false) n.dataset.counted = 'false';
-  const label = (ROLE_LABEL[m.role] || m.role) + (m.name ? ` · ${m.name}` : '');
-  const peek = m.text.replace(/\s+/g, ' ').slice(0, 200);
-  const preview = foldable ? addFoldPreview(n, peek, label, found && !hit) : null;
   const body = el('div', 'mb');
-  const render = full => (raw
-    ? `<pre>${esc(full ? m.text : clipText(m.text))}</pre>`
-    : md(m.text, full, m.media)) + mediaGallery(m.media);
+  const render = full => md(m.text, full, m.media) + mediaGallery(m.media);
   const paint = full => { body.innerHTML = render(full); renderFormulae(body); paintSyntax(body); };
   paint(hit);
   n.appendChild(body);
   const setAction = addAction(n);
   const long = m.text.length > CLIP;
-  const fold = () => { n.classList.add('folded'); body.classList.remove('clip'); setAction(); };
   const full = () => {
-    n.classList.remove('folded'); body.classList.remove('clip'); paint(true);
-    setAction(foldable || long ? '收起' : '', foldable ? fold : (long ? clipped : null));
+    body.classList.remove('clip'); paint(true);
+    setAction(long ? '收起' : '', long ? clipped : null, long ? true : null);
   };
   const clipped = () => {
-    n.classList.remove('folded'); body.classList.add('clip'); paint(false);
-    setAction(`展开全文 (${m.text.length.toLocaleString()} 字符)`, full);
+    body.classList.add('clip'); paint(false);
+    setAction(`展开全文 (${m.text.length.toLocaleString()} 字符)`, full, false);
   };
-  const open = () => long ? clipped() : full();
-  if (foldable) {
-    n._fold = fold;
-    n._open = open;
-    preview.onclick = open;
-    if (hit) full();
-  } else if (long) {
-    hit ? full() : clipped();
-  }
+  if (long) hit ? full() : clipped();
   return n;
 }
 
@@ -2397,6 +2390,7 @@ function eventNode(m) {
 function questionNode(m) {
   const n = el('div', 'msg question');
   n.dataset.role = 'question';
+  if (m.counted === false) n.dataset.counted = 'false';
   if (m.call_id) n.dataset.callId = m.call_id;
   const live = !!m.live;
   if (live) n.classList.add('live-question');

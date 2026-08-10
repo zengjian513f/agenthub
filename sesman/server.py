@@ -695,6 +695,9 @@ class Handler(BaseHTTPRequestHandler):
                     d = index.messages_for(s, start=start, head=head, anchor=anchor)
                     _resolve_activity(uid, d)
                     if not s.get("agent_id"):
+                        # 若文件追加和 Escape 同时发生，本批已经携带修正后的状态；
+                        # 同步游标，避免下一轮再推一份完全相同的空状态增量。
+                        activity_revision = session_meta.activity_revision(uid)
                         if send_queue.observe(uid, d["messages"], d.get("activity")):
                             OUTBOX_WAKE.set()
                         d["outbox"] = send_queue.list_for(uid)

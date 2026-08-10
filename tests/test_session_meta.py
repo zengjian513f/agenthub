@@ -37,12 +37,15 @@ class SessionMetaTests(unittest.TestCase):
                 patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
             session_meta.set_starred("claude:a", True)
             session_meta.set_starred("codex:b", True)
+            session_meta.stop_activity("claude:a", now=100)
+            self.assertGreater(session_meta.activity_revision("claude:a"), 0)
             session_meta.discard("claude:a")
             rows = session_meta.enrich([
                 {"uid": "claude:a"}, {"uid": "codex:b"},
             ])
             self.assertNotIn("starred", rows[0])
             self.assertTrue(rows[1]["starred"])
+            self.assertEqual(session_meta.activity_revision("claude:a"), 0)
 
     def test_escape_persistently_ends_only_older_busy_activity(self):
         with tempfile.TemporaryDirectory() as tmp, \

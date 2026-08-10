@@ -130,11 +130,13 @@ def set_starred(uid: str, starred: bool) -> dict:
 
 
 def discard(uid: str) -> None:
+    uid = str(uid or "").strip()
     with _lock:
         rows = _read()
         if uid in rows:
             rows.pop(uid, None)
             _write(rows)
+        _activity_revisions.pop(uid, None)
 
 
 def enrich_one(session: dict) -> dict:

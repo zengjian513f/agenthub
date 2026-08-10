@@ -64,6 +64,7 @@
   --syntax-attr: #953800;
   --syntax-built-in: #116329;
   --shadow: 0 1px 2px rgba(16, 24, 40, .06);
+  --bubble-radius: 10px;
   --side-width: 340px;
 }
 
@@ -170,7 +171,8 @@ header {
 .chip {
   display: flex; align-items: center; gap: 5px;
   padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px;
-  background: var(--panel-2); cursor: pointer; user-select: none; font-size: 13px;
+  background: var(--panel-2); color: var(--text); cursor: pointer; user-select: none;
+  font: inherit; font-size: 13px;
 }
 .chip.off { opacity: .38; }
 .chip b { font-weight: 500; color: var(--muted); font-size: 12px; }
@@ -482,8 +484,11 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .mnav { display: inline-flex; align-items: center; gap: 2px; margin-left: 3px; }
 .mnav b { color: var(--muted); font-weight: 500; font-size: 12.5px; }
 .mnav b.capped { color: #b7791f; cursor: help; }
-.msg .dot { color: #ffb020; font-style: normal; margin-left: 4px; }
-.msg.hashit > .fold-preview { background: rgba(255, 176, 32, .1); }
+.msg.hashit { border-color: color-mix(in srgb, #ffb020 70%, var(--border)); }
+.msg.hashit::after {
+  content: ""; position: absolute; z-index: 1; top: 5px; right: 5px;
+  width: 6px; height: 6px; border-radius: 50%; background: #ffb020;
+}
 
 /* ---------- 详情 ---------- */
 /* detail 自己不滚动: 头部固定, 消息区独立滚动, 滚动条就贴在消息内容边上 */
@@ -569,7 +574,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .msg {
   --bubble: var(--bubble-assistant);
   position: relative; width: fit-content; max-width: 100%; min-width: 0;
-  margin: 0 auto 8px 0; border: 1px solid var(--border); border-radius: 10px;
+  margin: 0 auto 8px 0; border: 1px solid var(--border); border-radius: var(--bubble-radius);
   background: var(--bubble); box-shadow: var(--shadow); overflow: hidden;
 }
 .msg > .fold-preview {
@@ -578,25 +583,21 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   font: inherit; font-size: 12px; line-height: 1.45;
   text-align: left; cursor: pointer; user-select: none;
 }
-.msg.folded > .fold-preview { display: flex; border-radius: inherit; background: transparent; }
-.msg.folded:hover {
+.msg.grp.folded > .fold-preview { display: flex; border-radius: inherit; background: transparent; }
+.msg.grp.folded:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   background: color-mix(in srgb, var(--bubble) 96%, var(--text));
 }
-.msg.folded > .fold-preview:hover { filter: none; background: transparent; }
+.msg.grp.folded > .fold-preview:hover { filter: none; background: transparent; }
 .msg .fold-preview .peek {
   flex: 0 1 auto; max-width: clamp(120px, 32vw, 420px);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-family: inherit; font-size: 12px; opacity: .78;
 }
-.msg.folded {
-  max-width: 72%; border-radius: 999px; box-shadow: none; opacity: .9;
-}
-.msg.folded > .fold-preview::after {
+.msg.grp.folded > .fold-preview::after {
   content: "›"; flex: none; color: var(--muted); font-size: 15px; line-height: 1;
 }
 .msg .mb { padding: 8px 12px; }
-.msg.folded .mb { display: none; }
 .msg[data-role="user"] {
   --bubble: var(--bubble-user); margin-left: auto; margin-right: 0;
 }
@@ -620,7 +621,6 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   min-height: 26px; padding: 3px 9px; border: 1px solid var(--border);
   border-radius: 7px; background: var(--panel); color: var(--fg); font-size: 11px;
 }
-.msg[data-role="event"] { --bubble: var(--panel-2); color: var(--muted); }
 .msg[data-role="assistant"], .msg[data-role="assistant·subagent"],
 .msg[data-role="user·subagent"] { --bubble: var(--bubble-assistant); }
 .msg[data-role="thinking"] { --bubble: var(--bubble-thinking); }
@@ -708,23 +708,16 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .event-detail-body > :first-child { margin-top: 0; }
 .event-detail-body > :last-child { margin-bottom: 0; }
 
-/* 单条工具输出只保留 .msg 这一层气泡；pre 只是排版容器，不再画灰色内框。 */
-.msg[data-role="tool"] > .mb,
-.msg[data-role="tool_result"] > .mb { padding: 0; }
-.msg[data-role="tool"] > .mb > pre,
-.msg[data-role="tool_result"] > .mb > pre {
-  margin: 0; padding: 8px 12px; border: 0; border-radius: 0;
-  background: transparent; box-shadow: none; font-family: var(--terminal-font);
-  font-size: var(--tool-font-size); font-weight: 400; font-synthesis: none; line-height: 1.5;
-}
-
 /* 连续工具调用合并成的组 */
 .msg.grp:not(.folded) {
   width: 100%; border: 0; border-radius: 0; background: transparent;
   box-shadow: none; overflow: visible;
 }
 .msg.grp.folded > .tool-entry { display: none; }
-.msg.grp.folded { max-width: min(78%, 720px); border-radius: 9px; }
+.msg.grp.folded {
+  max-width: min(78%, 720px); border-radius: var(--bubble-radius);
+  box-shadow: none; opacity: .9;
+}
 .msg.grp.folded > .group-preview { align-items: flex-start; padding-block: 7px; }
 .msg .fold-preview .group-peek {
   display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 9px;
@@ -743,12 +736,13 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   margin-bottom: 6px; padding: 0; border: 0; background: transparent;
 }
 .tool-entry[data-role="tool"] {
-  border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--border); border-radius: var(--bubble-radius); overflow: hidden;
   background: var(--bubble-tool); color: var(--terminal-fg); box-shadow: var(--shadow);
 }
 .tool-entry > pre, .tool-head {
   margin: 0; padding: 8px 10px; overflow-x: auto; white-space: pre;
-  word-break: normal; overflow-wrap: normal; border: 1px solid var(--border); border-radius: 6px;
+  word-break: normal; overflow-wrap: normal;
+  border: 1px solid var(--border); border-radius: var(--bubble-radius);
   background: var(--bubble-tool); color: var(--terminal-fg); box-shadow: var(--shadow);
   font: 400 var(--tool-font-size)/1.5 var(--terminal-font); font-synthesis: none;
 }
@@ -789,12 +783,9 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-entry[data-role="tool"] > .tool-args { border-top: 1px solid var(--border); }
 .tool-entry > .tool-args-close {
   display: block; width: 100%; margin: 0; padding: 3px 10px;
-  border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px;
-  background: var(--bubble-tool); color: var(--muted);
+  border: 0; border-top: 1px solid var(--border); border-radius: 0;
+  background: transparent; color: var(--muted);
   font: 400 11px/1.5 var(--terminal-font); text-align: center; cursor: pointer;
-}
-.tool-entry[data-role="tool"] > .tool-args-close {
-  border: 0; border-top: 1px solid var(--border); border-radius: 0; background: transparent;
 }
 .tool-entry > .tool-args-close:hover { color: var(--terminal-fg); background: var(--hover); }
 .tool-entry > .tool-args-close[hidden] { display: none; }
@@ -822,7 +813,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .file-change-list { display: grid; gap: 6px; width: 100%; }
 .file-change-card {
   display: block; width: 100%; min-width: 0; padding: 0; overflow: hidden;
-  border: 1px solid var(--border); border-radius: 9px;
+  border: 1px solid var(--border); border-radius: var(--bubble-radius);
   background: var(--panel); color: var(--text); box-shadow: var(--shadow);
   text-align: left;
 }
@@ -948,7 +939,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   content: ""; position: absolute; inset: auto 0 0 0; height: 46px;
   background: linear-gradient(transparent, var(--bubble));
 }
-.msg.folded .more { display: none; }
+.msg.grp.folded .more { display: none; }
 .more[hidden] { display: none; }
 .more {
   display: block; width: 100%; margin-top: 6px; border: 1px dashed var(--border);
@@ -978,11 +969,13 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 
 /* 落单输出仍由正文和操作栏拼成一张卡；已配对调用在下方覆盖成卡内分区。 */
 .tool-entry > pre:has(+ .tool-out-actions) {
-  border-bottom: 0; border-radius: 6px 6px 0 0;
+  border-bottom: 0;
+  border-radius: var(--bubble-radius) var(--bubble-radius) 0 0;
 }
 .tool-out-actions {
   display: flex; justify-content: flex-end; margin: 0;
-  border: 1px solid var(--border); border-top: 0; border-radius: 0 0 6px 6px;
+  border: 1px solid var(--border); border-top: 0;
+  border-radius: 0 0 var(--bubble-radius) var(--bubble-radius);
   background: var(--bubble-tool); color: var(--terminal-fg);
 }
 .tool-out-actions > button {

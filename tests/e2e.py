@@ -93,7 +93,7 @@ def make_fake_session():
          "uuid": "u1b", "timestamp": "2026-08-06T12:00:01.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
         {"type": "assistant", "message": {"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "自测思考内容"},
+            {"type": "thinking", "thinking": "自测思考内容；正则探针甲Q7内容"},
             {"type": "text", "text": long_text},
             {"type": "tool_use", "id": "bash-1", "name": "Bash",
              "input": {"command": "echo hi && node --check app.js"}},
@@ -112,6 +112,11 @@ def make_fake_session():
         {"type": "user", "message": {"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>注入的</INSTRUCTIONS>"},
          "uuid": "u3", "timestamp": "2026-08-06T12:00:07.000Z", "cwd": "/tmp/sesman-selftest",
          "sessionId": sid},
+        # 注入记录会被适配器过滤，不能拿它充当工具组边界；显式加入一条
+        # 可见正文，保证下面的落单 tool_result 真正覆盖独立卡片路径。
+        {"type": "assistant", "message": {"role": "assistant", "content": "工具组结束"},
+         "uuid": "a-boundary", "timestamp": "2026-08-06T12:00:07.500Z",
+         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "content": "单行工具输出不折叠"}]},
          "uuid": "u4", "timestamp": "2026-08-06T12:00:08.000Z", "cwd": "/tmp/sesman-selftest",
@@ -230,7 +235,10 @@ def cleanup():
 
 
 def run(pw):
-    b = pw.chromium.launch()
+    # 无显示器的部署机上 SwiftShader GPU 进程偶发进入不可中断等待，导致
+    # requestAnimationFrame 停摆，Playwright 会把所有可见按钮误判为“不稳定”。
+    # 几何与样式断言不依赖 GPU，强制 CPU 合成可让交互回归保持确定性。
+    b = pw.chromium.launch(args=["--disable-gpu", "--disable-software-rasterizer"])
     # 主题相关断言从确定的亮色起步，随后验证运行中切换到暗色再切回。
     ctx = b.new_context(color_scheme="light")
     ctx.grant_permissions(["clipboard-read", "clipboard-write"], origin=BASE)
@@ -252,6 +260,7 @@ def run(pw):
     check("会话列表渲染", n_items > 50, n_items)
     check("顶栏统计显示数量", re.search(r"\d+", p.locator("#stat").inner_text()), p.locator("#stat").inner_text())
     check("三个来源 chip 都在", p.locator(".chip").count() == 3)
+    check("来源筛选使用原生按钮", p.locator("button.chip").count() == 3)
     check("图标 SVG 渲染", p.locator(".item .ico svg").count() > 0)
     cli_layers = p.evaluate("""() => ({
       classes:[SESMAN_CLIS.claude instanceof ClaudeCli,
@@ -565,16 +574,16 @@ def run(pw):
     check("工具输出不进入对话正文搜索", search_hits("单行工具输出不折叠") == 0)
     check("注入上下文不进入对话正文搜索", search_hits("<INSTRUCTIONS>注入的") == 0)
 
-    rx = search_hits("自测.{0,4}内容", ["regex"])
+    rx = search_hits("正则探针.{0,3}Q7内容", ["regex"])
     check("正则匹配生效", rx >= 1, rx)
     # 列表命中不等于正文高亮: 两条路径的匹配实现是分开的
     p.locator(".item").filter(has_text="SESMAN自测").first.click()
     p.wait_for_selector(".msg", timeout=20000)
     check("正则模式下正文也高亮", p.locator("#msgs mark").count() > 0,
           p.locator("#mcount").inner_text())
-    check("正则高亮命中的是实际文本", "自测思考内容" in p.locator("#msgs mark").first.inner_text(),
+    check("正则高亮命中的是实际文本", "正则探针甲Q7内容" in p.locator("#msgs mark").first.inner_text(),
           p.locator("#msgs mark").first.inner_text())
-    lit = search_hits("自测.{0,4}内容")
+    lit = search_hits("正则探针.{0,3}Q7内容")
     check("非正则时特殊字符按字面处理", lit == 0, lit)
 
     search_hits("[", ["regex"])
@@ -599,7 +608,13 @@ def run(pw):
     p.wait_for_selector(".msg", timeout=60000)
     n_mark = p.locator("#msgs mark").count()
     check("高亮数量达到且不超过上限", n_mark == 3000, n_mark)
-    check("超限的命中消息标 ●", p.locator(".msg.hashit").count() > 0, p.locator(".msg.hashit").count())
+    hidden_hit = p.locator(".msg.hashit").first
+    hidden_hit_dot = hidden_hit.evaluate(
+        "n => { const s=getComputedStyle(n,'::after'); return [s.width,s.height,s.backgroundColor]; }")
+    check("超限的命中消息显示角标",
+          hidden_hit.count() > 0 and hidden_hit_dot[0] == "6px"
+          and hidden_hit_dot[1] == "6px" and hidden_hit_dot[2] != "rgba(0, 0, 0, 0)",
+          hidden_hit_dot)
     check("命中数显示为 N+", "+ 处匹配" in p.locator("#mcount").inner_text(),
           p.locator("#mcount").inner_text())
     check("页面仍可交互", p.locator("#a-session-action").is_enabled())
@@ -869,9 +884,9 @@ def run(pw):
     check("单行工具输出也不折叠",
           single_tool.locator(".tool-out").is_visible() and single_tool.locator(".fold-preview").count() == 0)
     preview_limits = p.evaluate("""() => ({
-      oneLine: outPreview('x'.repeat(10000)).length,
-      eightLongLines: outPreview(Array(8).fill('中'.repeat(1000)).join('\\n')).length,
-      normal: outPreview('a\\nb'),
+      oneLine: outPreviewInfo('x'.repeat(10000)).text.length,
+      eightLongLines: outPreviewInfo(Array(8).fill('中'.repeat(1000)).join('\\n')).text.length,
+      normal: outPreviewInfo('a\\nb').text,
       omitted: outPreviewInfo(Array(13).fill('line').join('\\n')).omittedLines,
       trailing: outPreviewInfo(Array(8).fill('line').join('\\n') + '\\n').omittedLines
     })""")
@@ -1052,12 +1067,16 @@ def run(pw):
       const an = document.querySelector('#msgs > .msg[data-role="assistant"]:not(.folded)');
       const u = un.getBoundingClientRect(), a = an.getBoundingClientRect();
       return { userRight: right-u.right, otherLeft: a.left-left,
-               userMax: getComputedStyle(un).maxWidth, otherMax: getComputedStyle(an).maxWidth };
+               userMax: getComputedStyle(un).maxWidth, otherMax: getComputedStyle(an).maxWidth,
+               userRadius: getComputedStyle(un).borderRadius,
+               otherRadius: getComputedStyle(an).borderRadius };
     }""")
     check("用户气泡靠右", bubble_geo["userRight"] <= 2, bubble_geo)
     check("其他气泡靠左", bubble_geo["otherLeft"] <= 2, bubble_geo)
     check("长气泡可以铺满内容区",
           bubble_geo["userMax"] == "100%" and bubble_geo["otherMax"] == "100%", bubble_geo)
+    check("用户与助手气泡使用统一外圆角",
+          bubble_geo["userRadius"] == bubble_geo["otherRadius"] == "10px", bubble_geo)
     colors = p.locator('#msgs > .msg[data-role="user"], #msgs > .msg[data-role="assistant"]').evaluate_all(
         "ns => ns.slice(0, 2).map(n => getComputedStyle(n).backgroundColor)")
     check("用户与助手用不同背景色区分", len(colors) == 2 and colors[0] != colors[1], colors)
@@ -1081,7 +1100,7 @@ def run(pw):
               preview: !!n.querySelector(':scope > .fold-preview > .peek')};
     }""")
     check("工具组折叠态是紧凑的顺序提纲卡片",
-          folded_geo["ratio"] <= .80 and folded_geo["radius"] == "9px"
+          folded_geo["ratio"] <= .80 and folded_geo["radius"] == "10px"
           and folded_geo["preview"], folded_geo)
 
     # ---- 8a. markdown 渲染 ----
@@ -1273,7 +1292,7 @@ def run(pw):
         check("同一次工具调用的命令、状态和输出共用一张外框",
               tool_card_frame == {"tag": "BUTTON",
                   "outerBorders": ["solid", "solid", "solid", "solid"],
-                  "outerRadius": "6px", "outerBackground": single_tool_skin["preBackground"],
+                  "outerRadius": "10px", "outerBackground": single_tool_skin["preBackground"],
                   "headBorders": ["0px", "0px", "0px", "0px"],
                   "headPadding": ["8px", "8px"], "headRadius": "0px",
                   "outBorders": ["1px", "0px", "0px", "0px"], "outRadius": "0px"},
@@ -1294,7 +1313,7 @@ def run(pw):
         }""")
         check("独立 exec 外层不再裁掉命令框圆角",
               standalone_frame == {"outerOverflow": "visible", "outerRadius": "0px",
-                                   "cardRadius": "6px",
+                                   "cardRadius": "10px",
                                    "cardBorders": ["solid", "solid", "solid", "solid"],
                                    "headRadius": "0px",
                                    "headBorders": ["0px", "0px", "0px", "0px"]},
@@ -1355,6 +1374,8 @@ def run(pw):
     }""")
     check("diff 卡片使用对话栏完整可用宽度",
           abs(diff_width["diff"] - diff_width["available"]) < 2, diff_width)
+    check("diff 卡片使用统一外圆角",
+          change.evaluate("n => getComputedStyle(n).borderRadius") == "10px")
     check("修改卡显示路径和增删统计",
           "demo.py" in change.inner_text() and "+1" in change.inner_text() and "−1" in change.inner_text(),
           change.inner_text())
