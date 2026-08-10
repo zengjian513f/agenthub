@@ -588,12 +588,16 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .msg.client-pending { border-style: dashed; box-shadow: none; }
 .msg.client-pending.failed { border-color: var(--danger); }
+.client-pending-footer {
+  display: flex; align-items: center; justify-content: flex-end; gap: 7px;
+  padding: 0 10px 8px; white-space: nowrap;
+}
 .client-pending-state {
-  display: block; padding: 0 12px 6px; color: var(--muted);
+  display: block; padding: 0; color: var(--muted);
   font-size: 10.5px; line-height: 1.2; text-align: right;
 }
 .client-pending-actions {
-  display: flex; justify-content: flex-end; gap: 6px; padding: 0 10px 8px;
+  display: flex; align-items: center; justify-content: flex-end; gap: 6px;
 }
 .client-pending-actions button {
   min-height: 26px; padding: 3px 9px; border: 1px solid var(--border);

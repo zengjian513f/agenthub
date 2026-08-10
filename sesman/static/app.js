@@ -2345,7 +2345,9 @@ function renderQueuedMessages(uid = S.sel) {
     node.classList.add('client-pending');
     node.classList.toggle('failed', item.state === 'failed');
     node.dataset.queuedId = item.id;
-    node.appendChild(el('small', 'client-pending-state', cli?.queuedMessageLabel(item) || '排队中'));
+    const footer = el('div', 'client-pending-footer');
+    footer.appendChild(el('small', 'client-pending-state',
+      cli?.queuedMessageLabel(item) || '排队中'));
     if (item.server && ['queued', 'failed'].includes(item.state)) {
       const actions = el('span', 'client-pending-actions');
       if (item.state === 'failed') {
@@ -2358,9 +2360,10 @@ function renderQueuedMessages(uid = S.sel) {
       discard.type = 'button';
       discard.onclick = () => discardServerQueuedMessage(uid, item.id);
       actions.append(discard);
-      node.appendChild(actions);
+      footer.appendChild(actions);
       if (item.error) node.title = item.error;
     }
+    node.appendChild(footer);
     box.appendChild(node);
   }
 }

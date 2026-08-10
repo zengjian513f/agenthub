@@ -2207,6 +2207,15 @@ def run(pw):
               queued.count() == 1
               and queued.locator(".client-pending-actions button").all_inner_texts()
                   == ["撤销"])
+        pending_footer = queued.locator(".client-pending-footer").evaluate("""n => {
+          const state = n.querySelector('.client-pending-state').getBoundingClientRect();
+          const action = n.querySelector('.client-pending-actions').getBoundingClientRect();
+          return {display:getComputedStyle(n).display,
+            centerGap:Math.abs((state.top + state.bottom) / 2 - (action.top + action.bottom) / 2)};
+        }""")
+        check("排队状态和撤销按钮在同一条紧凑状态栏",
+              pending_footer["display"] == "flex" and pending_footer["centerGap"] < 1,
+              pending_footer)
         p.evaluate("""u => {
           S.queued.delete(u); saveQueuedMessages();
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
