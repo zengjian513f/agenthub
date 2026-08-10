@@ -484,7 +484,13 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     e.activity = { role: 'status', state: 'working', text: 'working', ts: new Date().toISOString() };
   }
   if (!data.messages.length) {
-    if (S.sel === uid && S.agent === agent) renderConversationTail(e.activity, uid);
+    if (S.sel === uid && S.agent === agent) {
+      const box = $('#msgs');
+      $('#activity')?.remove();
+      box?.querySelectorAll('.client-pending').forEach(node => node.remove());
+      if (box && e.activity?.state !== 'working') sealToolTail(box);
+      renderConversationTail(e.activity, uid);
+    }
     return 0;
   }
   e.total = entryTotal(e) + messageCount(data.messages);
@@ -498,11 +504,9 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   if (!box) return data.messages.length;
   $('#activity')?.remove();
   box.querySelectorAll('.client-pending').forEach(node => node.remove());
-  const mark = el('span');
-  box.appendChild(mark);
-  appendMessages(box, data.messages, null);
-  for (let n = mark.nextSibling; n; n = n.nextSibling) markMatches(n);
-  mark.remove();
+  const built = appendMessages(box, data.messages, null,
+    {openTail: e.activity?.state === 'working'});
+  built.forEach(markMatches);
   renderConversationTail(e.activity, uid);
   const c = $('#mcount-total');
   const total = entryTotal(e);
@@ -1489,11 +1493,12 @@ async function renderSession(meta, msgs, activity = null) {
   // 批间让出主线程用 setTimeout 而不是 rAF: rAF 会等一次绘制, 又把 layout 成本引回来。
   const partial = entry?.partial;
   const split = partial ? Math.min(+partial.head || 0, msgs.length) : 0;
+  const openTail = activity?.state === 'working';
   const plan = partial
     ? [...planMessages(msgs.slice(0, split)),
        {gap: {uid, agent, omitted: partial.omitted}},
-       ...planMessages(msgs.slice(split))]
-    : planMessages(msgs);
+       ...planMessages(msgs.slice(split), {openTail})]
+    : planMessages(msgs, {openTail});
   const frag = document.createDocumentFragment();
   for (let i = 0; i < plan.length; i += RENDER_BATCH) {
     buildPlan(frag, plan.slice(i, i + RENDER_BATCH), null);
@@ -1673,11 +1678,14 @@ const ROLE_LABEL = {
   tool: '🔧 工具调用', tool_result: '📄 工具输出', context: '📎 注入上下文',
   question: '❓ 询问', answer: '💬 回答', command: '⌘ 命令', event: '⚙️ 会话事件',
 };
-// 连续 3 条以上的工具调用/输出合并成一个可折叠的组, 避免刷屏
+// 连续工具调用/输出合并成一个可折叠的组；正在增长的时间线尾段保持展开，
+// 等后面出现普通对话或任务结束后再自动封口。
 const TOOL_ROLES = new Set(['tool', 'tool_result']);
 const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent',
                               'thinking', 'question', 'answer', 'command']);
-const GROUP_MIN = 3;
+const GROUP_MIN = 2;
+
+const isGroupableTool = m => TOOL_ROLES.has(m?.role) && !m.changes?.length;
 
 /** 调用与其输出按 call_id 就近配对成一个视觉单元(对标 codex TUI 的 `$ 命令 + 输出`)。
  *  只在本批消息内配对；增量批里落单的输出保持原样渲染，不会丢。 */
@@ -1702,11 +1710,11 @@ function pairTools(msgs) {
 }
 
 /** 先算分组(纯计算, 很快), 再分批建 DOM —— 分批不会把一个组切成两半。 */
-function planMessages(msgs) {
+function planMessages(msgs, { openTail = false } = {}) {
   const plan = [];
   let run = [];
-  const flush = () => {
-    if (run.length >= GROUP_MIN) plan.push({ g: run });
+  const flush = open => {
+    if (run.length >= GROUP_MIN) plan.push({ g: run, open: !!open });
     else for (const m of run) plan.push({ m });
     run = [];
   };
@@ -1715,28 +1723,74 @@ function planMessages(msgs) {
     // 但不能凭空生成一块黑色空卡片。
     if (m.role === 'tool_result' && !String(m.text || '').trim()
         && !m.media?.length && !m.changes?.length) {
-      flush();
+      flush(false);
       plan.push({ m: { ...m, silent: true } });
       continue;
     }
     // 文件修改本身是用户关心的工作记录，始终作为可见卡片留在时间线；
     // 普通工具协议继续按原规则合并折叠。
-    if (TOOL_ROLES.has(m.role) && !m.changes?.length) { run.push(m); continue; }
-    flush();
+    if (isGroupableTool(m)) { run.push(m); continue; }
+    flush(false);
     plan.push({ m });
   }
-  flush();
+  flush(openTail);
   return plan;
 }
 
 function buildPlan(box, plan, before) {
+  const built = [];
   for (const p of plan) {
-    const n = p.gap ? historyGapNode(p.gap) : (p.g ? groupNode(p.g) : msgNode(p.m));
+    const n = p.gap ? historyGapNode(p.gap) : (p.g ? groupNode(p.g, p.open) : msgNode(p.m));
     before ? box.insertBefore(n, before) : box.appendChild(n);
+    built.push(n);
   }
+  return built;
 }
 
-const appendMessages = (box, msgs, before) => buildPlan(box, planMessages(msgs), before);
+function trailingToolNodes(box, before = null) {
+  const nodes = [];
+  let node = before ? before.previousElementSibling : box.lastElementChild;
+  while (node && Array.isArray(node._toolItems)) {
+    nodes.unshift(node);
+    node = node.previousElementSibling;
+  }
+  return nodes;
+}
+
+/** 增量批次可能把同一段工具输出切开。把现有尾段取回来一起规划，保证它们
+ *  仍是一组；一旦本批出现普通消息，这个尾段立即变成已完成的折叠组。 */
+function appendMessages(box, msgs, before = null, { openTail = false } = {}) {
+  let rest = [...msgs];
+  const trailing = trailingToolNodes(box, before);
+  let lead = 0;
+  while (lead < rest.length && isGroupableTool(rest[lead])) lead++;
+  const built = [];
+  if (trailing.length) {
+    const oldItems = trailing.flatMap(node => node._toolItems);
+    const combined = [...oldItems, ...rest.slice(0, lead)];
+    const remainsOpen = lead === rest.length && openTail;
+    const anchor = before || trailing[trailing.length - 1].nextElementSibling;
+    trailing.forEach(node => node.remove());
+    built.push(...buildPlan(box, planMessages(combined, {openTail: remainsOpen}), anchor));
+    rest = rest.slice(lead);
+  }
+  built.push(...buildPlan(box, planMessages(rest, {openTail}), before));
+  return built;
+}
+
+function sealToolTail(box) {
+  const trailing = trailingToolNodes(box);
+  if (!trailing.length) return [];
+  if (trailing.length === 1 && trailing[0].matches('.grp')) {
+    trailing[0]._fold?.();
+    return trailing;
+  }
+  const items = trailing.flatMap(node => node._toolItems);
+  if (items.length < GROUP_MIN) return trailing;
+  const anchor = trailing[trailing.length - 1].nextElementSibling;
+  trailing.forEach(node => node.remove());
+  return buildPlan(box, planMessages(items), anchor);
+}
 
 // 折叠态只是一行正文预览，不显示角色/时间 header。
 function addFoldPreview(n, text, aria, hasHiddenHit = false) {
@@ -2094,10 +2148,11 @@ function fileChangeNode(m) {
   return n;
 }
 
-function groupNode(items) {
-  // 工具协议不属于对话正文搜索范围，工具组始终按默认规则折叠。
-  const n = el('div', 'msg grp folded');
+function groupNode(items, initiallyOpen = false) {
+  // 工具协议不属于对话正文搜索范围。历史段默认折叠；正在增长的尾段展开。
+  const n = el('div', 'msg grp' + (initiallyOpen ? '' : ' folded'));
   n.dataset.role = 'toolgroup';
+  n._toolItems = items;
   const calls = items.filter(m => m.role === 'tool');
   // 预览行直接给前几条语义摘要(`$ cmd` 一类), 比"Bash ×3"信息量大
   const visible = calls.length ? calls : items;
@@ -2129,7 +2184,7 @@ function groupNode(items) {
   n._fold = fold;
   n._open = open;
   preview.onclick = open;
-  if (!n.classList.contains('folded')) open();
+  initiallyOpen ? open() : fold();
   return n;
 }
 
@@ -2200,6 +2255,7 @@ function msgNode(m) {
     // 单发工具调用与组内同款紧凑卡片: 摘要头 + 状态 + 输出预览
     const n = el('div', 'msg tool-msg');
     n.dataset.role = m.role;
+    n._toolItems = [m];
     if (m.counted === false) n.dataset.counted = 'false';
     n.appendChild(toolEntry(m));
     return n;

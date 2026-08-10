@@ -1067,6 +1067,37 @@ def run(pw):
     check("不存在的相对图片不发请求", "[图片: 缺失图]" in p.locator(".msgs").inner_text())
 
     # ---- 8b. 连续工具调用合并成组 ----
+    live_tool_grouping = p.evaluate("""() => {
+      const box = document.createElement('div');
+      const tool = n => ({role:'tool', name:'exec', summary:`$ echo ${n}`,
+                          text:`{\"n\":${n}}`, call_id:`call-${n}`});
+      appendMessages(box, [tool(1)], null, {openTail:true});
+      const firstIsSingle = box.children.length === 1
+        && box.firstElementChild.matches('.tool-msg');
+      appendMessages(box, [tool(2)], null, {openTail:true});
+      let group = box.querySelector(':scope > .grp');
+      const twoBecomeOpenGroup = box.children.length === 1 && !!group
+        && !group.classList.contains('folded') && group._toolItems.length === 2;
+      appendMessages(box, [tool(3)], null, {openTail:true});
+      group = box.querySelector(':scope > .grp');
+      const nextBatchJoinsTail = box.children.length === 1
+        && group._toolItems.length === 3 && !group.classList.contains('folded');
+      appendMessages(box, [{role:'assistant', text:'工具段结束'}], null, {openTail:false});
+      group = box.querySelector(':scope > .grp');
+      const nonToolSealsGroup = group.classList.contains('folded')
+        && group.nextElementSibling?.dataset.role === 'assistant';
+
+      const idle = document.createElement('div');
+      appendMessages(idle, [tool(4), tool(5)], null, {openTail:true});
+      const openBeforeIdle = !idle.querySelector('.grp').classList.contains('folded');
+      sealToolTail(idle);
+      const idleSealsGroup = idle.querySelector('.grp').classList.contains('folded');
+      return {firstIsSingle, twoBecomeOpenGroup, nextBatchJoinsTail,
+              nonToolSealsGroup, openBeforeIdle, idleSealsGroup};
+    }""")
+    check("连续黑色工具段工作中展开、跨推送合并并在结束后折叠",
+          all(live_tool_grouping.values()), live_tool_grouping)
+
     grp = p.locator('.msg[data-role="toolgroup"]').first
     check("连续工具调用合并成组", grp.count() > 0)
     if grp.count():
