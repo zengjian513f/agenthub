@@ -329,11 +329,11 @@ def run(pw):
                              "server": True, "persisted": False}
           and str(codex_delivery.get("uid", "")).startswith("codex:"), codex_delivery)
     script_order = p.locator("script[src]").evaluate_all(
-        "nodes => nodes.map(n => n.getAttribute('src'))")
+        "nodes => nodes.map(n => n.getAttribute('src').split('?')[0])")
     check("会话列表脚本不再被大型终端和公式库阻塞",
           script_order.index("cli.js") < script_order.index("app.js")
           < script_order.index("vendor/xterm.js")
-          and all(p.locator(f'script[src="{src}"]').get_attribute("defer") is not None
+          and all(p.locator(f'script[src^="{src}"]').get_attribute("defer") is not None
                   for src in ("cli.js", "app.js", "vendor/xterm.js",
                               "vendor/katex/katex.min.js")),
           script_order)
@@ -1118,13 +1118,42 @@ def run(pw):
         first_entry = grp.locator("> .tool-entry").first
         tool_head_border = first_entry.locator("> .tool-head").evaluate("""n => {
           const s = getComputedStyle(n);
-          return {appearance:s.appearance, top:s.borderTopStyle,
-            right:s.borderRightStyle, bottom:s.borderBottomStyle, left:s.borderLeftStyle};
+          return {tag:n.tagName, display:s.display,
+            top:s.borderTopStyle, right:s.borderRightStyle,
+            bottom:s.borderBottomStyle, left:s.borderLeftStyle,
+            paddingTop:s.paddingTop, paddingBottom:s.paddingBottom,
+            background:s.backgroundColor, radius:s.borderRadius};
         }""")
-        check("工具调用头关闭原生按钮皮肤并显示完整四边框",
-              tool_head_border == {"appearance": "none", "top": "solid",
-                                   "right": "solid", "bottom": "solid", "left": "solid"},
+        check("工具调用头与正常输出 pre 复用同一套完整外框",
+              tool_head_border == {"tag": "BUTTON", "display": "flex",
+                                   "top": "solid",
+                                   "right": "solid", "bottom": "solid", "left": "solid",
+                                   "paddingTop": "8px", "paddingBottom": "8px",
+                                   "background": single_tool_skin["preBackground"],
+                                   "radius": "6px"},
               tool_head_border)
+        standalone_frame = p.evaluate("""() => {
+          const box = document.querySelector('#msgs');
+          const node = msgNode({role:'tool', name:'exec', summary:'$ echo standalone', text:'{}'});
+          box.appendChild(node);
+          const head = node.querySelector(':scope > .tool-entry > .tool-head');
+          const ns = getComputedStyle(node), hs = getComputedStyle(head);
+          const result = {outerOverflow:ns.overflow, outerRadius:ns.borderRadius,
+            headRadius:hs.borderRadius, headBorders:[hs.borderTopStyle, hs.borderRightStyle,
+              hs.borderBottomStyle, hs.borderLeftStyle]};
+          node.remove(); return result;
+        }""")
+        check("独立 exec 外层不再裁掉命令框圆角",
+              standalone_frame == {"outerOverflow": "visible", "outerRadius": "0px",
+                                   "headRadius": "6px",
+                                   "headBorders": ["solid", "solid", "solid", "solid"]},
+              standalone_frame)
+        first_entry.locator("> .tool-head").focus()
+        p.keyboard.press("Enter")
+        check("工具调用头可用键盘展开参数",
+              first_entry.locator("> .tool-args").is_visible()
+              and first_entry.locator("> .tool-head").get_attribute("aria-expanded") == "true")
+        first_entry.locator("> .tool-args-close").click()
         first_entry.locator("> .tool-head").click()
         args_geometry = first_entry.evaluate("""n => {
           const h = n.querySelector(':scope > .tool-head').getBoundingClientRect();

@@ -727,7 +727,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-entry {
   margin-bottom: 6px; padding: 0; border: 0; background: transparent;
 }
-.tool-entry > pre {
+.tool-entry > pre, .tool-head {
   margin: 0; padding: 8px 10px; overflow-x: auto; white-space: pre;
   word-break: normal; overflow-wrap: normal; border: 1px solid var(--border); border-radius: 6px;
   background: var(--bubble-tool); color: var(--terminal-fg); box-shadow: var(--shadow);
@@ -737,21 +737,24 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-entry > pre.clip { max-height: 340px; overflow: hidden; }
 
 /* 紧凑工具卡片: 摘要头(`$ cmd`) + 参数(默认收起) + 状态行 + 输出预览 */
-.msg.tool-msg { width: 100%; border: 0; background: transparent; box-shadow: none; }
+.msg.tool-msg {
+  width: 100%; border: 0; border-radius: 0; overflow: visible;
+  background: transparent; box-shadow: none;
+}
 .tool-head {
   display: flex; gap: 10px; align-items: baseline; width: 100%; min-width: 0;
-  appearance: none; -webkit-appearance: none;
-  padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px;
-  background: var(--bubble-tool); color: var(--terminal-fg); box-shadow: var(--shadow);
-  font: 500 var(--tool-font-size)/1.5 var(--terminal-font); font-synthesis: none;
-  text-align: left; cursor: pointer;
+  overflow: hidden; white-space: normal; appearance: none; -webkit-appearance: none;
+  text-align: left; cursor: pointer; user-select: none;
 }
 .tool-head:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.tool-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .tool-head > code {
   flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font: inherit;
 }
-.tool-head .tool-meta { flex: none; margin-left: auto; color: var(--muted); font-size: 11px; }
+.tool-head > .tool-meta {
+  flex: none; margin-left: auto; color: var(--muted); font-size: 11px;
+}
 .tool-entry > .tool-args {
   margin-top: 0; border-top: 0; border-radius: 0; border-style: solid;
   box-shadow: none; opacity: .92;
