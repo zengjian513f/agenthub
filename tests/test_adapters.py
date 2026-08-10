@@ -125,7 +125,7 @@ class CodexEventTests(unittest.TestCase):
             self.assertEqual(session["renamed_to"], "测试名称")
             visible = [(m["role"], m["text"], m.get("counted")) for m in messages]
             self.assertIn(("command", "/rename 测试名称", False), visible)
-            self.assertIn(("event", "上下文已压缩", False), visible)
+            self.assertIn(("event", "已压缩", False), visible)
             self.assertIn(("user", "普通输入", None), visible)
 
     def test_compaction_prompt_rebuild_is_hidden_for_full_and_incremental_reads(self):
@@ -165,12 +165,70 @@ class CodexEventTests(unittest.TestCase):
 
         self.assertEqual([(m["role"], m["text"]) for m in full], [
             ("user", "压缩前正文"),
-            ("event", "上下文已压缩"),
+            ("event", "已压缩"),
             ("user", "压缩后的真实问题"),
         ])
         self.assertEqual([(m["role"], m["text"]) for m in incremental], [
             ("user", "压缩后的真实问题"),
         ])
+
+
+class ClaudeProtocolTests(unittest.TestCase):
+    def test_compact_protocol_becomes_one_event_for_full_and_incremental_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+            rows = [
+                {"type": "assistant", "timestamp": "2026-08-10T10:00:00Z",
+                 "message": {"role": "assistant", "content": "压缩前回答"}},
+                {"type": "user", "timestamp": "2026-08-10T10:00:01Z",
+                 "message": {"role": "user", "content": "/compact"}},
+                {"type": "system", "subtype": "compact_boundary",
+                 "uuid": "compact-1", "timestamp": "2026-08-10T10:00:02Z",
+                 "content": "Conversation compacted"},
+                {"type": "user", "isCompactSummary": True,
+                 "timestamp": "2026-08-10T10:00:02Z",
+                 "message": {"role": "user", "content":
+                             "This session is being continued from a previous conversation.\nSummary"}},
+                {"type": "user", "isMeta": True,
+                 "timestamp": "2026-08-10T10:00:02Z",
+                 "message": {"role": "user", "content":
+                             "<local-command-caveat>internal</local-command-caveat>"}},
+                {"type": "user", "timestamp": "2026-08-10T10:00:02Z",
+                 "message": {"role": "user", "content":
+                             "<command-name>/compact</command-name>"}},
+                {"type": "user", "timestamp": "2026-08-10T10:00:03Z",
+                 "message": {"role": "user", "content":
+                             "<local-command-stdout>Compacted</local-command-stdout>"}},
+                {"type": "attachment", "timestamp": "2026-08-10T10:00:03Z",
+                 "attachment": {"type": "compact_file_reference", "filename": "/tmp/a"}},
+                {"type": "user", "timestamp": "2026-08-10T10:00:04Z",
+                 "message": {"role": "user", "content":
+                             "请解释句中的 <command-name> 标签"}},
+            ]
+            lines = [json.dumps(row, ensure_ascii=False) + "\n" for row in rows]
+            transcript.write_text("".join(lines))
+            adapter = adapters.ClaudeAdapter()
+            full, _ = adapter.read(str(transcript))
+            after_boundary = len("".join(lines[:3]).encode())
+            incremental, _ = adapter.read(str(transcript), start=after_boundary)
+
+        visible = [m for m in full if m["role"] != "status"]
+        self.assertEqual([(m["role"], m["text"]) for m in visible], [
+            ("assistant", "压缩前回答"),
+            ("event", "已压缩"),
+            ("user", "请解释句中的 <command-name> 标签"),
+        ])
+        compact = visible[1]
+        self.assertEqual(compact["event_kind"], "compact")
+        self.assertFalse(compact["counted"])
+        self.assertEqual([m["state"] for m in full if m["role"] == "status"],
+                         ["idle", "working"])
+        self.assertEqual([(m["role"], m["text"]) for m in incremental
+                          if m["role"] != "status"], [
+            ("user", "请解释句中的 <command-name> 标签"),
+        ])
+        self.assertEqual([m["state"] for m in incremental if m["role"] == "status"],
+                         ["working"])
 
     def test_escape_fork_replaces_parent_and_inherits_history_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -51,7 +51,6 @@
   --bubble-thinking: #f1efff;
   --bubble-tool: var(--terminal-bg);
   --bubble-system: #eef1f5;
-  --bubble-context: #eef1f5;
   --bubble-question: #fff8dc;
   --diff-add-bg: #e8f7ed;
   --diff-add-fg: #16713a;
@@ -93,7 +92,6 @@
     --bubble-assistant: #22262d;
     --bubble-thinking: #302d45;
     --bubble-system: #292d35;
-    --bubble-context: #292d35;
     --bubble-question: #383323;
     --diff-add-bg: #173a27;
     --diff-add-fg: #72d996;
@@ -631,7 +629,6 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   --bubble: var(--bubble-tool); color: var(--terminal-fg);
 }
 .msg[data-role="system"] { --bubble: var(--bubble-system); }
-.msg[data-role="context"] { --bubble: var(--bubble-context); }
 .msg[data-role="question"] {
   --bubble: var(--bubble-question); width: min(520px, 100%); border-color: #e5c96b;
 }

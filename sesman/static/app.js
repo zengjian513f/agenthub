@@ -1725,7 +1725,7 @@ async function del(m) {
 const ROLE_LABEL = {
   user: '👤 用户', assistant: '🤖 助手', 'user·subagent': '👤 子代理输入',
   'assistant·subagent': '🤖 子代理', thinking: '💭 思考', system: '⚙️ 系统',
-  tool: '🔧 工具调用', tool_result: '📄 工具输出', context: '📎 注入上下文',
+  tool: '🔧 工具调用', tool_result: '📄 工具输出',
   question: '❓ 询问', answer: '💬 回答', command: '⌘ 命令', event: '⚙️ 会话事件',
 };
 // 连续工具调用/输出合并成一个可折叠的组；正在增长的时间线尾段保持展开，
@@ -2374,7 +2374,8 @@ function eventNode(m) {
     n.innerHTML = `<span>耗时 ${esc(formatDuration(m.duration_ms))}</span>`;
     return n;
   }
-  const label = kind === 'recap' ? '回顾' : (kind === 'task' ? '任务' : '会话');
+  const label = kind === 'recap' ? '回顾'
+    : (kind === 'task' ? '任务' : (kind === 'compact' ? '上下文' : '会话'));
   n.innerHTML = `<b>${label}</b><span>${esc(m.text || '')}</span>`;
   if (m.details) {
     n.classList.add('has-details');

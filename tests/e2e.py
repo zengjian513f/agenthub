@@ -715,7 +715,8 @@ def run(pw):
           no_gzip_res.headers.get("Content-Encoding") is None
           and json.loads(no_gzip_body)["meta"]["uid"] == p.evaluate("S.sel"))
     roles = p.locator("#msgs [data-role]").evaluate_all("ns => ns.map(n => n.dataset.role)")
-    check("消息角色齐全", {"user", "assistant", "thinking", "tool", "tool_result", "context"} <= set(roles), roles)
+    check("消息角色齐全", {"user", "assistant", "thinking", "tool", "tool_result"} <= set(roles), roles)
+    check("CLI 注入上下文不进入时间线", "context" not in roles, roles)
     check("结构化询问显示为对话气泡", "question" in roles)
     question = p.locator('.msg[data-role="question"]')
     check("询问气泡显示问题和选项",
@@ -847,6 +848,12 @@ def run(pw):
     check("回合完成后移除临时状态", activity["idleGone"], activity)
     check("compact 自动注入不会残留 Working",
           p.evaluate("cache.get(S.sel)?.activity?.state") == "idle")
+    compact_event = p.locator(".timeline-event.compact")
+    check("compact 协议只显示一条低强调事件",
+          compact_event.count() == 1
+          and "上下文" in compact_event.inner_text()
+          and "已压缩" in compact_event.inner_text(),
+          compact_event.all_inner_texts())
 
     # ---- 8. 默认折叠规则 ----
     def body_visible(role):
@@ -854,12 +861,10 @@ def run(pw):
     check("user 默认展开", body_visible("user"))
     check("assistant 默认展开", body_visible("assistant"))
     check("thinking 从不折叠", body_visible("thinking"))
-    check("注入上下文从不折叠", body_visible("context"))
     check("对话内容没有折叠入口",
           p.locator('.msg[data-role="user"] > .fold-preview, '
                     '.msg[data-role="assistant"] > .fold-preview, '
-                    '.msg[data-role="thinking"] > .fold-preview, '
-                    '.msg[data-role="context"] > .fold-preview').count() == 0)
+                    '.msg[data-role="thinking"] > .fold-preview').count() == 0)
     single_tool = p.locator('.msg[data-role="tool_result"]').filter(has_text="单行工具输出不折叠")
     check("单行工具输出也不折叠",
           single_tool.locator(".tool-out").is_visible() and single_tool.locator(".fold-preview").count() == 0)
