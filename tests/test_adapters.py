@@ -42,6 +42,56 @@ class CodexEventTests(unittest.TestCase):
         self.assertEqual(visible[0]["role"], "user")
         self.assertEqual(visible[0]["text"], "这个作为用户正文保留")
 
+    def test_request_user_input_keeps_identity_and_compacts_answers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            question = {
+                "questions": [{
+                    "header": "方式",
+                    "id": "bridge_status",
+                    "question": "要继续吗？",
+                    "options": [
+                        {"label": "继续", "description": "继续执行"},
+                        {"label": "停止", "description": "停在这里"},
+                    ],
+                }],
+            }
+            rows = [
+                {"timestamp": "2026-08-10T10:00:00Z", "type": "response_item",
+                 "payload": {"type": "function_call", "name": "request_user_input",
+                             "arguments": json.dumps(question, ensure_ascii=False),
+                             "call_id": "call-ok"}},
+                {"timestamp": "2026-08-10T10:00:01Z", "type": "response_item",
+                 "payload": {"type": "function_call_output", "call_id": "call-ok",
+                             "output": json.dumps({"answers": {"bridge_status": {
+                                 "answers": ["继续"]}}}, ensure_ascii=False)}},
+                {"timestamp": "2026-08-10T10:00:02Z", "type": "response_item",
+                 "payload": {"type": "function_call", "name": "request_user_input",
+                             "arguments": question, "call_id": "call-cancel"}},
+                {"timestamp": "2026-08-10T10:00:03Z", "type": "response_item",
+                 "payload": {"type": "function_call_output", "call_id": "call-cancel",
+                             "output": "aborted by user after 13.7s"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(x, ensure_ascii=False)
+                                           for x in rows) + "\n")
+            messages, _ = adapters.CodexAdapter().read(str(rollout))
+
+        questions = [m for m in messages if m["role"] == "question"]
+        answers = [m for m in messages if m["role"] == "answer"]
+        self.assertEqual([(m["name"], m["call_id"], m["text"])
+                          for m in questions], [
+            ("request_user_input", "call-ok", "要继续吗？"),
+            ("request_user_input", "call-cancel", "要继续吗？"),
+        ])
+        self.assertEqual(questions[0]["questions"][0]["options"][0], {
+            "label": "继续", "description": "继续执行",
+        })
+        self.assertEqual([(m["call_id"], m["text"], m["error"])
+                          for m in answers], [
+            ("call-ok", "继续", False),
+            ("call-cancel", "已取消回答", True),
+        ])
+
     def test_name_and_compaction_are_visible_but_not_counted_messages(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"

@@ -467,6 +467,23 @@ function progressDone() {
 
 /** 把服务端给的一份 diff 应用到缓存和界面上。
  *  两种情况: 追加(接到末尾) 或 reset(整份重来) —— 和服务端的判定一一对应。 */
+function normalizedQuestionAnswer(text) {
+  const raw = String(text || '');
+  if (/^aborted by user(?:\s|$)/i.test(raw.trim())
+      || raw.startsWith("The user doesn't want to proceed with this tool use.")) {
+    return '已取消回答';
+  }
+  try {
+    const answers = JSON.parse(raw)?.answers;
+    if (!answers || typeof answers !== 'object') return raw;
+    const rows = Object.values(answers).map(answer => {
+      const values = answer && typeof answer === 'object' ? answer.answers : answer;
+      return Array.isArray(values) ? values.join('、') : String(values || '').trim();
+    }).filter(Boolean);
+    return rows.join('\n') || raw;
+  } catch { return raw; }
+}
+
 async function applyDiff(uid, data, bytes = 0, agent = null) {
   const key = viewKey(uid, agent);
   const e = cache.get(key);
@@ -485,10 +502,8 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     .filter(m => m.role === 'question' && m.call_id).map(m => m.call_id));
   data.messages = (data.messages || []).map(m => {
     if (m.role !== 'tool_result' || !questionCalls.has(m.call_id)) return m;
-    const cancelled = m.error
-      && String(m.text || '').startsWith("The user doesn't want to proceed with this tool use.");
     return { ...m, role: 'answer', name: m.name || 'AskUserQuestion',
-      text: cancelled ? '已取消回答' : m.text };
+      text: normalizedQuestionAnswer(m.text) };
   });
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
     cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
@@ -2400,6 +2415,7 @@ function questionNode(m) {
           ${o.description ? `<small>${esc(o.description)}</small>` : ''}</div></${live ? 'button' : 'div'}>`).join('')}</div>` : ''}
     </section>`).join('');
   if (live) {
+    const cliName = sesmanCli(m.uid)?.name || 'CLI';
     const waiting = promptState === 'waiting';
     const direct = waiting && rows.length === 1 && !rows[0].multiple
       && !!rows[0].options?.length;
@@ -2408,14 +2424,15 @@ function questionNode(m) {
       button.onclick = async () => {
         body.querySelectorAll('button').forEach(x => { x.disabled = true; });
         button.classList.add('submitting');
-        const ok = await answerClaudeQuestion(m.uid, +button.dataset.questionOption);
+        const ok = await answerCliQuestion(m.uid, +button.dataset.questionOption);
         if (!ok) body.querySelectorAll('button').forEach(x => { x.disabled = false; });
       };
     });
     const actions = el('div', 'question-actions');
     if (!waiting) {
       actions.appendChild(el('small', 'question-settling',
-        promptState === 'cancelled' ? '正在取消，等待 Claude 记录…' : '答案已提交，等待 Claude 记录…'));
+        promptState === 'cancelled' ? `正在取消，等待 ${cliName} 记录…`
+          : `答案已提交，等待 ${cliName} 记录…`));
     } else if (!direct) {
       actions.appendChild(el('small', '', '多选或多题请在原生终端回答'));
     }
@@ -2425,7 +2442,7 @@ function questionNode(m) {
     const cancel = el('button', 'question-cancel', '取消');
     cancel.type = 'button';
     cancel.disabled = !waiting;
-    cancel.onclick = () => cancelClaudeQuestion(m.uid);
+    cancel.onclick = () => cancelCliQuestion(m.uid);
     actions.append(terminal, cancel);
     body.appendChild(actions);
   }
@@ -2496,6 +2513,15 @@ function renderQueuedMessages(uid = S.sel) {
 }
 
 /** Activity 和乐观消息都是时间线尾部状态；每次重画都固定保持排队消息在最下方。 */
+function pendingHistoryQuestion(entry) {
+  if (entry?.meta?.source !== 'codex' || entry?.activity?.state !== 'waiting') return null;
+  const answered = new Set((entry.msgs || [])
+    .filter(m => ['answer', 'tool_result'].includes(m.role) && m.call_id)
+    .map(m => m.call_id));
+  return [...(entry.msgs || [])].reverse().find(
+    m => m.role === 'question' && m.call_id && !answered.has(m.call_id)) || null;
+}
+
 function renderConversationTail(activity, uid = S.sel) {
   const box = $('#msgs');
   if (!box) return;
@@ -2504,7 +2530,9 @@ function renderConversationTail(activity, uid = S.sel) {
   box.querySelectorAll('.question-live-shadowed').forEach(
     node => node.classList.remove('question-live-shadowed'));
   box.querySelectorAll('.client-pending').forEach(node => node.remove());
-  const prompt = cache.get(viewKey(uid))?.prompt;
+  const entry = cache.get(viewKey(uid));
+  const prompt = entry?.prompt;
+  const nativeQuestion = prompt?.questions?.length ? null : pendingHistoryQuestion(entry);
   if (prompt?.questions?.length) {
     if (prompt.id) {
       [...box.querySelectorAll('.msg[data-role="question"][data-call-id]')]
@@ -2516,6 +2544,11 @@ function renderConversationTail(activity, uid = S.sel) {
       text: prompt.questions.map(q => q.question).join('\n\n'), live: true,
       state: prompt.state, uid,
     }));
+  } else if (nativeQuestion) {
+    [...box.querySelectorAll('.msg[data-role="question"][data-call-id]')]
+      .find(node => node.dataset.callId === nativeQuestion.call_id)
+      ?.classList.add('question-live-shadowed');
+    box.appendChild(questionNode({ ...nativeQuestion, live: true, uid }));
   } else {
     renderActivity(activity);
   }

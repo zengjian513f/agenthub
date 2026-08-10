@@ -180,6 +180,27 @@ def _question_message(name: str, value) -> dict | None:
             "questions": questions}
 
 
+def _question_answer_text(value) -> tuple[str, bool]:
+    """把 Codex request_user_input 的协议结果压成用户实际选择。"""
+    text = _stringify(value)
+    if re.match(r"^aborted by user(?:\s|$)", text.strip(), re.I):
+        return "已取消回答", True
+    data = _json_value(value)
+    answers = data.get("answers") if isinstance(data, dict) else None
+    if not isinstance(answers, dict):
+        return text, False
+    rows = []
+    for answer in answers.values():
+        values = answer.get("answers") if isinstance(answer, dict) else answer
+        if isinstance(values, list):
+            shown = "、".join(str(x) for x in values if str(x).strip())
+        else:
+            shown = str(values or "").strip()
+        if shown:
+            rows.append(shown)
+    return "\n".join(rows) or text, False
+
+
 # "bash -c '…'" / "/usr/bin/zsh -lc '…'" 一类的解释器包装, 展示时剥掉只留命令本体
 _SHELL_WRAP = re.compile(r"^\s*(?:/usr/bin/|/bin/)?(?:ba|z|da)?sh\s+(?:-[A-Za-z]+\s+)*")
 # Codex functions.exec 把命令包在 JS 里: tools.exec_command({ cmd: "..." } 或 {"cmd": "..."})
@@ -1060,7 +1081,8 @@ class CodexAdapter:
                 calls[p.get("call_id")] = name
                 question = _question_message(name, body)
                 if question:
-                    msgs.append(_msg("question", question["text"], ts,
+                    msgs.append(_msg("question", question["text"], ts, name=name,
+                                     call_id=p.get("call_id"),
                                      questions=question["questions"]))
                     msgs.append(_status("waiting", ts, turn_id=p.get("turn_id")))
                 else:
@@ -1072,11 +1094,14 @@ class CodexAdapter:
                 name = calls.get(p.get("call_id"))
                 is_answer = _is_question_tool(name)
                 out_text, output_meta = _tool_output(name, p.get("output"))
+                cancelled = False
+                if is_answer:
+                    out_text, cancelled = _question_answer_text(p.get("output"))
                 exit_code = output_meta.get("exit_code")
                 msgs.append(_msg("answer" if is_answer else "tool_result",
                                  out_text, ts, name=name,
                                  call_id=p.get("call_id"),
-                                 error=(exit_code != 0 if exit_code is not None
+                                 error=cancelled or (exit_code != 0 if exit_code is not None
                                         else _output_error(out_text) or False),
                                  **output_meta))
                 if is_answer:

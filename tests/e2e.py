@@ -279,8 +279,18 @@ def run(pw):
       rewind:[SESMAN_CLIS.claude.repeatedEscape(1200, 1000).rewind,
         SESMAN_CLIS.codex.repeatedEscape(1200, 1000).rewind,
         SESMAN_CLIS.grok.repeatedEscape(1200, 1000).rewind],
-      rewindBusy:SESMAN_CLIS.claude.repeatedEscape(
-        1200, 1000, {busy:true}).rewind
+      rewindBusy:[SESMAN_CLIS.claude.repeatedEscape(
+          1200, 1000, {busy:true}).rewind,
+        SESMAN_CLIS.codex.repeatedEscape(1200, 1000, {busy:true}).rewind],
+      rewindDraft:[SESMAN_CLIS.claude.repeatedEscape(
+          1200, 1000, {empty:false}).rewind,
+        SESMAN_CLIS.codex.repeatedEscape(1200, 1000, {empty:false}).rewind],
+      questionKeys:[SESMAN_CLIS.claude.questionAnswerKeys({questions:[{
+          options:[{label:'一'}, {label:'二'}]}]}, 1),
+        SESMAN_CLIS.codex.questionAnswerKeys({questions:[{
+          options:[{label:'一'}, {label:'二'}]}]}, 1),
+        SESMAN_CLIS.grok.questionAnswerKeys({questions:[{
+          options:[{label:'一'}, {label:'二'}]}]}, 1)]
     })""")
     check("三种 CLI 继承公共基类并拥有独立队列策略",
           all(cli_layers["classes"])
@@ -296,8 +306,12 @@ def run(pw):
                                                   "state": "sending", "expiresAt": 9000,
                                                   "legacy": True}]
           and cli_layers["migrations"] == [[], [1]]
-          and cli_layers["rewind"] == [True, False, False]
-          and cli_layers["rewindBusy"] is False, cli_layers)
+          and cli_layers["rewind"] == [True, True, False]
+          and cli_layers["rewindBusy"] == [False, False]
+          and cli_layers["rewindDraft"] == [False, False]
+          and cli_layers["questionKeys"] == [
+              ["Up"] * 5 + ["Down", "Enter"],
+              ["2"], None], cli_layers)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
       if (!session) return {error:'no codex session'};
@@ -719,7 +733,7 @@ def run(pw):
       const oldSend = sendToSession;
       let sent = null;
       sendToSession = async (text, keys, uid) => { sent = {text, keys, uid}; return true; };
-      const answered = await answerClaudeQuestion(S.sel, 1);
+      const answered = await answerCliQuestion(S.sel, 1);
       sendToSession = oldSend;
       return {live:!!live, buttons:live?.querySelectorAll('[data-question-option]').length,
         historicalHidden:historical?.classList.contains('question-live-shadowed'),
@@ -750,6 +764,41 @@ def run(pw):
     check("实时问题结束后恢复原有历史问题",
           p.locator(".live-question").count() == 0
           and not question.first.evaluate("n => n.classList.contains('question-live-shadowed')"))
+    codex_question = p.evaluate("""async () => {
+      const uid = 'codex:synthetic-question', key = viewKey(uid);
+      const oldEntry = cache.get(key), oldSend = sendToSession;
+      const entry = {meta:{source:'codex'}, activity:{state:'waiting'}, msgs:[{
+        role:'question', name:'request_user_input', call_id:'codex-ask-1',
+        text:'选择 Codex 操作？', questions:[{header:'Codex',
+          question:'选择 Codex 操作？', multiple:false, options:[
+            {label:'继续', description:'继续执行'}, {label:'停止', description:'停止执行'}]}]}]};
+      cache.set(key, entry);
+      const pending = pendingHistoryQuestion(entry);
+      const node = questionNode({...pending, live:true, uid});
+      const sent = [];
+      sendToSession = async (text, keys, target) => {
+        sent.push({text, keys, uid:target}); return true;
+      };
+      try {
+        const answered = await answerCliQuestion(uid, 1);
+        const cancelled = await cancelCliQuestion(uid);
+        return {pending:pending?.call_id, live:node.classList.contains('live-question'),
+          buttons:node.querySelectorAll('[data-question-option]').length,
+          answered, cancelled, sent};
+      } finally {
+        sendToSession = oldSend;
+        if (oldEntry === undefined) cache.delete(key); else cache.set(key, oldEntry);
+      }
+    }""")
+    check("Codex rollout 中未回答的原生选择题可在对话栏回答或取消",
+          codex_question["pending"] == "codex-ask-1"
+          and codex_question["live"] is True and codex_question["buttons"] == 2
+          and codex_question["answered"] is True and codex_question["cancelled"] is True
+          and codex_question["sent"] == [
+              {"text": None, "keys": ["2"],
+               "uid": "codex:synthetic-question"},
+              {"text": None, "keys": ["Escape"],
+               "uid": "codex:synthetic-question"}], codex_question)
     task_event = p.locator('.timeline-event.task').filter(has_text="监控事件 · 自测训练")
     check("Claude task notification 渲染成紧凑事件而非用户 XML",
           task_event.count() == 1

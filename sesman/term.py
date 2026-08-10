@@ -47,6 +47,10 @@ RESUME = {
 }
 
 SOURCES = ("claude", "codex", "grok")
+CODEX_QUESTION_ARGS = (
+    "--enable", "default_mode_request_user_input",
+    "-c", "suppress_unstable_features_warning=true",
+)
 
 
 def resume_command(source: str, sid: str) -> str:
@@ -61,6 +65,8 @@ def resume_command(source: str, sid: str) -> str:
     args = [*RESUME[source], sid]
     if source == "claude":
         args = ["--settings", claude_bridge.settings_path(), *args]
+    elif source == "codex":
+        args = [*CODEX_QUESTION_ARGS, *args]
     return _clean_cli_command(exe, *args)
 
 
@@ -125,6 +131,8 @@ def new_cli_session(source: str, cwd: str, cols: int = 120, rows: int = 32) -> d
         args += ["--session-id", sid]
     if source == "claude":
         args[1:1] = ["--settings", claude_bridge.settings_path()]
+    elif source == "codex":
+        args[1:1] = CODEX_QUESTION_ARGS
     command = _clean_cli_command(args[0], *args[1:])
     token = sid or str(uuid.uuid4())
     suffix = sid[:8] if sid else f"new-{token[:8]}"

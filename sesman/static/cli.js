@@ -35,6 +35,14 @@ class SesmanCli {
     return item?.state === 'sending' ? '发送中' : '排队中';
   }
 
+  questionAnswerKeys(_prompt, _optionIndex) {
+    return null;
+  }
+
+  questionCancelKeys() {
+    return ['Escape'];
+  }
+
   repeatedEscape(_now, _previousAt, _context = {}) {
     return { rewind: false, nextAt: -Infinity };
   }
@@ -93,9 +101,18 @@ class ClaudeCli extends SesmanCli {
       && now >= +item.expiresAt;
   }
 
+  questionAnswerKeys(prompt, optionIndex) {
+    const options = prompt?.questions?.[0]?.options || [];
+    if (!options[optionIndex]) return null;
+    return [...Array(options.length + 3).fill('Up'),
+      ...Array(optionIndex).fill('Down'), 'Enter'];
+  }
+
   repeatedEscape(now, previousAt, context = {}) {
     // 运行中 Esc 是中断，对话框中 Esc 是取消；两者都不是 rewind 的第一击。
-    if (context.busy) return { rewind: false, nextAt: -Infinity };
+    if (context.busy || context.empty === false) {
+      return { rewind: false, nextAt: -Infinity };
+    }
     const rewind = now - previousAt <= 650;
     return { rewind, nextAt: rewind ? -Infinity : now };
   }
@@ -116,6 +133,25 @@ class CodexCli extends SesmanCli {
     if (item?.state === 'delivering') return '发送中';
     if (item?.state === 'failed') return '发送未确认';
     return '排队中';
+  }
+
+  questionAnswerKeys(prompt, optionIndex) {
+    const options = prompt?.questions?.[0]?.options || [];
+    if (!options[optionIndex] || optionIndex >= 9) return null;
+    // Codex 的问题菜单会循环选择，不能照搬 Claude 的“多按 Up 夹到
+    // 第一项”。菜单原生支持数字直选且立即提交，位置不受另一网页或
+    // 原生终端先前移动光标的影响。request_user_input 目前最多三个选项。
+    return [String(optionIndex + 1)];
+  }
+
+  repeatedEscape(now, previousAt, context = {}) {
+    // Codex 官方语义：运行/询问中单 Esc 中断；空输入双 Esc 进入上一条
+    // 用户消息的编辑与 fork 界面。
+    if (context.busy || context.empty === false) {
+      return { rewind: false, nextAt: -Infinity };
+    }
+    const rewind = now - previousAt <= 650;
+    return { rewind, nextAt: rewind ? -Infinity : now };
   }
 
   // Codex 的待发送消息由服务端持久队列管理。Esc 只中断当前回合；

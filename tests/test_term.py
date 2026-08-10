@@ -36,6 +36,30 @@ class TerminalSubmitTests(unittest.TestCase):
         self.assertIn("--session-id 5bc438e2-9532-47af-9fbd-4eec1a0347d9", command)
         self.assertEqual(result["name"], "sesman-claude-test")
 
+    def test_codex_resume_enables_native_question_tool(self):
+        sid = "5bc438e2-9532-47af-9fbd-4eec1a0347d9"
+        with patch.object(term, "_which_cli", return_value="/usr/bin/codex"):
+            command = term.resume_command("codex", sid)
+        self.assertEqual(shlex.split(command), [
+            "env", "-u", "CLAUDE_CODE_SESSION_ID", "-u",
+            "CODEX_COMPANION_SESSION_ID", "-u", "GROK_SESSION_ID",
+            "/usr/bin/codex", "--enable", "default_mode_request_user_input",
+            "-c", "suppress_unstable_features_warning=true", "resume", sid,
+        ])
+
+    def test_new_codex_session_enables_native_question_tool(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(term, "_which_cli", return_value="/usr/bin/codex"), \
+                patch.object(term, "new_session", return_value="sesman-codex-test") as new:
+            result = term.new_cli_session("codex", tmp)
+        command = shlex.split(new.call_args.args[1])
+        self.assertIn("--enable", command)
+        self.assertIn("default_mode_request_user_input", command)
+        self.assertIn("suppress_unstable_features_warning=true", command)
+        self.assertNotIn("--session-id", command)
+        self.assertIsNone(result["sid"])
+        self.assertEqual(result["name"], "sesman-codex-test")
+
     def test_kill_session_treats_concurrent_natural_exit_as_success(self):
         pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
         with patch.object(term, "session_info", side_effect=[pane, None]), \
