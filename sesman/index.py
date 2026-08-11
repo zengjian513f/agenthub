@@ -118,7 +118,8 @@ def version(s: dict) -> dict:
     """用 (大小, mtime, 文件头哈希) 标识一个版本。
 
     会话通常是 append-only 的；续读时用旧 EOF 所对应的固定长度前缀和尾部
-    锚点确认旧内容没变。任一校验失败都说明可能被重写/回退，必须整份重来。
+    锚点确认旧内容没变。Claude 另在游标中携带树的当前叶子。任一校验失败
+    都说明内容被重写或逻辑时间线发生回退，必须整份重来。
     """
     f = data_file(s)
     try:
@@ -148,18 +149,35 @@ def _anchor_hash(f: Path, pos: int) -> str:
         return ""
 
 
+def _anchor_parts(anchor: str) -> tuple[str, str | None]:
+    """拆分内容锚点与 Claude 逻辑叶子；旧客户端只会带前半段。"""
+    raw, sep, tip = str(anchor or "").partition("@")
+    return raw, tip if sep and tip else None
+
+
+def _cursor_anchor(s: dict, pos: int) -> str:
+    """内容锚点之外，为 Claude 带上该偏移处的逻辑叶子。"""
+    raw = _anchor_hash(data_file(s), pos)
+    ad = ADAPTERS.get(s.get("source"))
+    if isinstance(ad, ClaudeAdapter):
+        tip = ad.active_tip(str(data_file(s)), pos=pos, agent=s.get("agent_id"))
+        if tip:
+            return f"{raw}@{tip}"
+    return raw
+
+
 def cursor(s: dict) -> dict:
     """供浏览器低成本跟踪后台会话追加内容的安全续读游标。"""
     ver = version(s)
     return {"end": ver["size"], "head": ver["head"],
-            "anchor": _anchor_hash(data_file(s), ver["size"])}
+            "anchor": _cursor_anchor(s, ver["size"])}
 
 
 def with_cursors(sessions: list[dict]) -> list[dict]:
     """给列表元数据附加主会话及 Claude 子代理的 EOF 游标。
 
-    这里只读取每个文件头 4 KiB 和尾部 512 B；浏览器随后只拉变化文件的
-    新增区间，不需要为了左栏未读数下载整份历史。
+    这里只读取每个文件头 4 KiB、尾部锚点和 Claude 最后一条树记录；浏览器
+    随后只拉变化文件的新增区间，不需要为了左栏未读数下载整份历史。
     """
     out = []
     for session in sessions:
@@ -213,30 +231,44 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
     走 uid 的话每次都会连带重算索引签名(数百次 stat)甚至重建整个索引。
 
     能接着上次读的条件: 文件头没变、文件没缩短、而且**偏移点之前的内容也没变**。
-    最后一条是必需的 —— 会话可以被回滚(双 Esc)截断后再写新内容, 那时文件头照旧、
-    长度也可能重新超过旧偏移, 只看头和长度会从旧偏移读到一段完全不同的内容。
+    最后一条是必需的 —— 有些会话会截断后重写。Claude 双 Esc 则更特殊：
+    文件只追加、字节锚点完全不变，但树的当前叶子会退回祖先，也必须整份重建。
     """
     ver = version(s)
     # 小于 4 KiB 的新会话追加后，当前 head 会自然变长、哈希也会变化；应当
     # 用旧 EOF 所确定的同长度前缀校验，而不是把正常追加误判成历史改写。
     ok = bool(start and head and start <= ver["size"]
               and head == _head_hash(data_file(s), min(4096, start)))
+    old_tip = None
     if ok and anchor:
-        ok = anchor == _anchor_hash(data_file(s), start)
+        raw_anchor, old_tip = _anchor_parts(anchor)
+        ok = raw_anchor == _anchor_hash(data_file(s), start)
     elif ok and not anchor:
         ok = False                       # 没带锚点就不给续读, 宁可重来
+    ad = ADAPTERS[s["source"]]
+    if ok and isinstance(ad, ClaudeAdapter):
+        # Claude 的文件在双 Esc 时不会截断，只会从旧祖先追加一个新分支。
+        # 字节锚点仍然完全匹配，因此还必须比较逻辑叶子及新增链的亲缘关系。
+        prefix_tip = ad.active_tip(str(data_file(s)), pos=start,
+                                   agent=s.get("agent_id"))
+        if prefix_tip:
+            ok = old_tip == prefix_tip
+            if ok:
+                ok = ad.append_extends(str(data_file(s)), start, old_tip,
+                                       agent=s.get("agent_id"))
+        elif old_tip:
+            ok = False
     reset = not ok
     if reset and append_only:
         # 后台未读探测绝不能因回滚/重写退化成几十 MB 的整份下载；让调用方
         # 丢弃旧缓存并以当前 EOF 重新建立基线即可。
         end = ver["size"]
         return {"meta": s, "version": ver, "reset": True, "start": end, "end": end,
-                "anchor": _anchor_hash(data_file(s), end), "messages": [],
+                "anchor": _cursor_anchor(s, end), "messages": [],
                 "message_total": 0, "partial": None,
                 "activity_changed": False, "activity": None}
     if reset:
         start = 0
-    ad = ADAPTERS[s["source"]]
     if isinstance(ad, ClaudeAdapter) and s.get("agent_id"):
         msgs, end = ad.read(s["path"], start=start, agent=s["agent_id"])
     else:
@@ -254,7 +286,7 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
     for msg in msgs:
         media.enrich_message(msg, s.get("cwd"))
     return {"meta": s, "version": ver, "reset": reset, "start": start, "end": end,
-            "anchor": _anchor_hash(data_file(s), end), "messages": msgs,
+            "anchor": _cursor_anchor(s, end), "messages": msgs,
             "message_total": message_total, "partial": partial,
             "activity_changed": bool(activity_events),
             "activity": activity_events[-1] if activity_events else None}

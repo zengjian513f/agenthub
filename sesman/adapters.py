@@ -673,6 +673,122 @@ def _status(state: str, ts=None, **extra):
 class ClaudeAdapter:
     source = "claude"
 
+    @staticmethod
+    def _graph_uuid(rec: dict, agent: str | None = None) -> str | None:
+        """返回参与 Claude 当前时间线的记录 UUID。
+
+        Claude 的 jsonl 是追加式树结构：双 Esc 只会另写一个指向旧祖先的
+        节点，不会删除已回退的分支。主会话不能让内嵌 sidechain 决定当前
+        叶子；独立读取子代理文件时则照常使用其中的树。
+        """
+        uid = rec.get("uuid")
+        if not uid or "parentUuid" not in rec:
+            return None
+        if not agent and rec.get("isSidechain"):
+            return None
+        return str(uid)
+
+    @classmethod
+    def _lineage_signal(cls, rec: dict, agent: str | None = None) -> str | None:
+        """返回一条记录声明的当前叶子；last-prompt 是 Claude 的显式叶标记。"""
+        if rec.get("type") == "last-prompt" and rec.get("leafUuid"):
+            return str(rec["leafUuid"])
+        return cls._graph_uuid(rec, agent)
+
+    @classmethod
+    def _active_lineage(cls, path: str, start: int = 0,
+                        agent: str | None = None) -> tuple[set[str] | None, int]:
+        """扫描一个读取区间，求其最后叶子的祖先链及实际 EOF。"""
+        parents: dict[str, str | None] = {}
+        tip = None
+        end = start
+        for rec, off in _iter_records(path, start):
+            end = off
+            uid = cls._graph_uuid(rec, agent)
+            if uid:
+                parent = rec.get("parentUuid")
+                parents[uid] = str(parent) if parent else None
+            signal = cls._lineage_signal(rec, agent)
+            if signal:
+                tip = signal
+        if not tip:
+            return None, end
+        active: set[str] = set()
+        node = tip
+        while node and node not in active:
+            active.add(node)
+            if node not in parents:
+                break
+            node = parents[node]
+        return active, end
+
+    @classmethod
+    def active_tip(cls, path: str, pos: int | None = None,
+                   agent: str | None = None) -> str | None:
+        """从文件尾反向找 pos 时刻的 Claude 当前叶子，避免为游标全量解析。"""
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                end = fh.tell() if pos is None else min(max(0, pos), fh.tell())
+                cursor = end
+                suffix = b""
+                while cursor > 0:
+                    lo = max(0, cursor - 64 * 1024)
+                    fh.seek(lo)
+                    data = fh.read(cursor - lo) + suffix
+                    lines = data.split(b"\n")
+                    if lo:
+                        suffix = lines[0]
+                        lines = lines[1:]
+                    else:
+                        suffix = b""
+                    for raw in reversed(lines):
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                        except Exception:
+                            continue
+                        signal = cls._lineage_signal(rec, agent)
+                        if signal:
+                            return signal
+                    cursor = lo
+        except OSError:
+            pass
+        return None
+
+    @classmethod
+    def append_extends(cls, path: str, start: int, old_tip: str,
+                       agent: str | None = None) -> bool:
+        """判断新增区间的最终叶子是否仍是旧叶子的后代。
+
+        若不是，文件虽然只做了 append，逻辑时间线却已经回退/换分支，前端
+        必须丢弃旧 DOM 并整份重建。
+        """
+        parents: dict[str, str | None] = {}
+        tip = None
+        for rec, _ in _iter_records(path, start):
+            uid = cls._graph_uuid(rec, agent)
+            if uid:
+                parent = rec.get("parentUuid")
+                parents[uid] = str(parent) if parent else None
+            signal = cls._lineage_signal(rec, agent)
+            if signal:
+                tip = signal
+        if not tip:
+            return True
+        node = tip
+        seen: set[str] = set()
+        while node and node not in seen:
+            if node == old_tip:
+                return True
+            seen.add(node)
+            if node not in parents:
+                return False
+            node = parents[node]
+        return False
+
     def list_sessions(self):
         if not CLAUDE_ROOT.is_dir():
             return []
@@ -759,9 +875,15 @@ class ClaudeAdapter:
         return self._read_one(path, start=start, agent=agent[:8] if agent else None)
 
     def _read_one(self, path: str, agent: str | None = None, start: int = 0):
-        msgs, end, calls = [], start, {}
+        # 先用轻量父指针表确定当前分支，再做原有消息解析。这样双 Esc 后留在
+        # append-only 文件里的旧输入/回答不会继续混入当前时间线。
+        active, end = self._active_lineage(path, start=start, agent=agent)
+        msgs, calls = [], {}
         for rec, off in _iter_records(path, start):
             end = off
+            uid = self._graph_uuid(rec, agent)
+            if active is not None and uid and uid not in active:
+                continue
             t = rec.get("type")
             ts = _norm_ts(rec.get("timestamp"))
             tag = agent or (rec.get("agentId", "")[:8] if rec.get("isSidechain") else None)

@@ -174,6 +174,48 @@ class CodexEventTests(unittest.TestCase):
 
 
 class ClaudeProtocolTests(unittest.TestCase):
+    def test_append_only_tree_renders_only_current_claude_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+
+            def row(kind, uid, parent, text, **extra):
+                record = {
+                    "type": kind, "uuid": uid, "parentUuid": parent,
+                    "isSidechain": False, "timestamp": "2026-08-11T08:00:00Z",
+                    **extra,
+                }
+                if kind in {"user", "assistant"}:
+                    record["message"] = {"role": kind, "content": text}
+                return record
+
+            rows = [
+                row("user", "u0", None, "共同开头"),
+                row("assistant", "a0", "u0", "共同回答"),
+                row("user", "u-old", "a0", "已放弃输入"),
+                row("assistant", "a-old", "u-old", "已放弃回答"),
+                row("user", "u-new", "a0", "改写后的输入"),
+                row("assistant", "a-new", "u-new", "改写后的回答"),
+            ]
+            transcript.write_text("\n".join(
+                json.dumps(x, ensure_ascii=False) for x in rows) + "\n")
+            adapter = adapters.ClaudeAdapter()
+
+            current, _ = adapter.read(str(transcript))
+            current_text = [m["text"] for m in current if m["role"] != "status"]
+            self.assertEqual(current_text,
+                             ["共同开头", "共同回答", "改写后的输入", "改写后的回答"])
+
+            rewind = row("system", "rewind", "a0", "", subtype="away_summary",
+                         content="已回到共同回答之后")
+            with transcript.open("a") as fh:
+                fh.write(json.dumps(rewind, ensure_ascii=False) + "\n")
+            rewound, _ = adapter.read(str(transcript))
+            rewound_text = [m["text"] for m in rewound if m["role"] != "status"]
+            self.assertEqual(adapter.active_tip(str(transcript)), "rewind")
+
+        self.assertEqual(rewound_text,
+                         ["共同开头", "共同回答", "已回到共同回答之后"])
+
     def test_compact_protocol_becomes_one_event_for_full_and_incremental_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "session.jsonl"
@@ -308,6 +350,60 @@ class ClaudeProtocolTests(unittest.TestCase):
 
 
 class IncrementalCursorTests(unittest.TestCase):
+    def test_claude_append_only_rewind_forces_full_timeline_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "branch.jsonl"
+            sid = "00000000-0000-0000-0000-000000000098"
+
+            def row(kind, uid, parent, text, **extra):
+                record = {
+                    "type": kind, "uuid": uid, "parentUuid": parent,
+                    "isSidechain": False, "timestamp": "2026-08-11T08:00:00Z",
+                    "cwd": tmp, "sessionId": sid, **extra,
+                }
+                if kind in {"user", "assistant"}:
+                    record["message"] = {"role": kind, "content": text}
+                return record
+
+            initial = [row("user", "u0", None, "共同开头"),
+                       row("assistant", "a0", "u0", "共同回答")]
+            path.write_text("\n".join(json.dumps(x, ensure_ascii=False)
+                                        for x in initial) + "\n")
+            session = {"uid": "claude:branch", "source": "claude", "sid": sid,
+                       "path": str(path), "cwd": tmp}
+            before = session_index.cursor(session)
+            self.assertTrue(before["anchor"].endswith("@a0"), before["anchor"])
+            legacy = session_index.messages_for(
+                session, start=before["end"], head=before["head"],
+                anchor=before["anchor"].split("@", 1)[0])
+            self.assertTrue(legacy["reset"])
+            self.assertEqual([m["text"] for m in legacy["messages"]],
+                             ["共同开头", "共同回答"])
+
+            with path.open("a") as fh:
+                for record in (row("user", "u1", "a0", "稍后回退的输入"),
+                               row("assistant", "a1", "u1", "稍后回退的回答")):
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            appended = session_index.messages_for(
+                session, start=before["end"], head=before["head"],
+                anchor=before["anchor"])
+            self.assertFalse(appended["reset"])
+            self.assertEqual([m["text"] for m in appended["messages"]],
+                             ["稍后回退的输入", "稍后回退的回答"])
+            self.assertTrue(appended["anchor"].endswith("@a1"), appended["anchor"])
+
+            rewind = row("system", "rewind", "a0", "", subtype="away_summary",
+                         content="已回退一个输入")
+            with path.open("a") as fh:
+                fh.write(json.dumps(rewind, ensure_ascii=False) + "\n")
+            result = session_index.messages_for(
+                session, start=appended["end"], head=appended["version"]["head"],
+                anchor=appended["anchor"])
+
+            self.assertTrue(result["reset"])
+            self.assertEqual([m["text"] for m in result["messages"]],
+                             ["共同开头", "共同回答", "已回退一个输入"])
+
     def test_small_claude_session_append_keeps_valid_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "small.jsonl"
