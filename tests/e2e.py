@@ -2382,7 +2382,17 @@ def run(pw):
         check("输入框可直接粘贴图片或文件",
               p.locator("#compose-items .draft-card:not(.draft-quote)").count() == 1
               and p.locator("#compose-items .draft-thumb img").count() == 1
-              and "[附件1]" in p.locator("#compose-items .draft-info small").inner_text())
+              and "[附件1]" in p.locator("#compose-items .draft-info small").inner_text()
+              and "4B" in p.locator("#compose-items .draft-info small").inner_text())
+        uploading_size = p.evaluate("""() => {
+          const attachment = composerDraft().attachments[0];
+          attachment.status = 'uploading'; renderComposerItems();
+          const text = document.querySelector('#compose-items .draft-info small').textContent;
+          attachment.status = ''; renderComposerItems();
+          return text;
+        }""")
+        check("附件上传中仍显示文件大小",
+              "4B" in uploading_size and "正在上传" in uploading_size, uploading_size)
         p.click("#compose-items .draft-card:not(.draft-quote)")
         check("点击附件卡在正文光标处插入稳定引用",
               p.locator("#cinput").input_value() == "[附件1]")
@@ -2415,6 +2425,67 @@ def run(pw):
         p.locator("#compose-items .draft-remove").evaluate_all("nodes => nodes.forEach(n => n.click())")
         p.fill("#cinput", "")
         check("附件与引用可以在发送前移除", p.locator("#compose-items .draft-card").count() == 0)
+        csv_paste = p.evaluate("""() => {
+          const file = new File(['symbol,price\\n000001,12.3\\n'], '行情.csv', {type:'text/csv'});
+          const transfer = new DataTransfer(); transfer.items.add(file);
+          // 模拟部分浏览器：clipboardData.files 为空，但 items 仍有 CSV File。
+          const clipboard = {files:[], items:transfer.items, types:['Files'], getData:() => ''};
+          const event = new Event('paste', {bubbles:true, cancelable:true});
+          Object.defineProperty(event, 'clipboardData', {value:clipboard});
+          document.querySelector('#cinput').dispatchEvent(event);
+          return event.defaultPrevented;
+        }""")
+        check("CSV 只出现在 clipboardData.items 时仍可粘贴为附件",
+              csv_paste
+              and p.locator("#compose-items .draft-card:not(.draft-quote)").count() == 1
+              and p.locator("#compose-items .draft-info b").inner_text() == "行情.csv")
+        gzip_paste = p.evaluate("""() => {
+          const file = new File([new Uint8Array([31,139,8,0])], '行情.csv.gz',
+            {type:'application/gzip'});
+          const transfer = new DataTransfer(); transfer.items.add(file);
+          const clipboard = {files:[], items:transfer.items, types:['Files'], getData:() => ''};
+          const event = new Event('paste', {bubbles:true, cancelable:true});
+          Object.defineProperty(event, 'clipboardData', {value:clipboard});
+          document.querySelector('#cinput').dispatchEvent(event);
+          return event.defaultPrevented;
+        }""")
+        check("任意文件类型都可从 clipboardData.items 粘贴，包括 csv.gz",
+              gzip_paste
+              and p.locator("#compose-items .draft-card:not(.draft-quote)").count() == 2
+              and p.locator("#compose-items .draft-info b").nth(1).inner_text() == "行情.csv.gz")
+        folder_paste = p.evaluate("""() => {
+          window.__folderAlert = '';
+          const originalAlert = window.alert;
+          window.alert = text => { window.__folderAlert = text; };
+          const item = {kind:'file', type:'', getAsFile:() => null,
+            webkitGetAsEntry:() => ({isDirectory:true, name:'数据目录'})};
+          const event = new Event('paste', {bubbles:true, cancelable:true});
+          Object.defineProperty(event, 'clipboardData',
+            {value:{files:[], items:[item], types:['Files'], getData:() => ''}});
+          document.querySelector('#cinput').dispatchEvent(event);
+          window.alert = originalAlert;
+          return {prevented:event.defaultPrevented, message:window.__folderAlert};
+        }""")
+        check("粘贴文件夹时明确提示压缩而不生成空文件附件",
+              folder_paste["prevented"] and "数据目录" in folder_paste["message"]
+              and "压缩" in folder_paste["message"]
+              and p.locator("#compose-items .draft-card:not(.draft-quote)").count() == 2,
+              folder_paste)
+        csv_blob_paste = p.evaluate("""() => new Promise(resolve => {
+          const item = {kind:'string', type:'text/csv', getAsString:callback =>
+            queueMicrotask(() => callback('a,b\\n1,2\\n'))};
+          const clipboard = {files:[], items:[item], types:['text/csv'], getData:() => ''};
+          const event = new Event('paste', {bubbles:true, cancelable:true});
+          Object.defineProperty(event, 'clipboardData', {value:clipboard});
+          document.querySelector('#cinput').dispatchEvent(event);
+          setTimeout(() => resolve(event.defaultPrevented), 0);
+        }))""")
+        check("只有 text/csv 剪贴板数据时生成 clipboard.csv 附件",
+              csv_blob_paste
+              and p.locator("#compose-items .draft-card:not(.draft-quote)").count() == 3
+              and p.locator("#compose-items .draft-info b").nth(2).inner_text()
+                  == "clipboard.csv")
+        p.locator("#compose-items .draft-remove").evaluate_all("nodes => nodes.forEach(n => n.click())")
         queued_id = p.evaluate("""({u, media}) => queuePendingUserMessage(
           u, '等待前一轮完成的指令', [{...media, gallery:true}])""",
                                {"u": target, "media": image_attachment_response["media"]})

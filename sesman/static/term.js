@@ -1259,9 +1259,12 @@ function renderComposerItems() {
     name.textContent = attachment.uploaded?.name || attachment.file.name || 'attachment';
     const meta = document.createElement('small');
     const ref = `[附件${attachment.number}]`;
-    meta.textContent = attachment.status === 'uploading' ? `${ref} · 正在上传…`
-      : attachment.status === 'failed' ? `${ref} · ${attachment.error || '上传失败'}`
-        : `${ref} · ${attachment.kind === 'file' ? '文件' : ({ image: '图片', video: '视频', audio: '音频' }[attachment.kind])} · ${fmtSize(attachment.file.size)}`;
+    const kindName = attachment.kind === 'file' ? '文件'
+      : ({ image: '图片', video: '视频', audio: '音频' }[attachment.kind]);
+    const summary = `${ref} · ${kindName} · ${fmtSize(attachment.file.size)}`;
+    meta.textContent = attachment.status === 'uploading' ? `${summary} · 正在上传…`
+      : attachment.status === 'failed' ? `${summary} · ${attachment.error || '上传失败'}`
+        : summary;
     info.append(name, meta);
     const remove = el('button', 'draft-remove', '×');
     remove.type = 'button';
@@ -1314,6 +1317,58 @@ function addComposerFiles(files) {
     });
   }
   renderComposerItems();
+}
+
+function clipboardAttachmentFiles(data) {
+  const files = [];
+  const seen = new Set();
+  const add = file => {
+    if (!(file instanceof File)) return;
+    const key = `${file.name}\0${file.type}\0${file.size}\0${file.lastModified}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    files.push(file);
+  };
+  // Chromium 通常把文件放在 files；部分浏览器/桌面剪贴板只在 items
+  // 暴露非图片文件（CSV 尤其常见）。两边都读并去重。
+  for (const file of [...(data?.files || [])]) add(file);
+  for (const item of [...(data?.items || [])]) {
+    if (item.kind === 'file') add(item.getAsFile?.());
+  }
+  return files;
+}
+
+function clipboardDirectoryNames(data) {
+  const names = [];
+  for (const item of [...(data?.items || [])]) {
+    if (item.kind !== 'file') continue;
+    const getEntry = item.getAsEntry || item.webkitGetAsEntry;
+    let entry = null;
+    try { entry = getEntry?.call(item); } catch { /* 浏览器不允许读取该项 */ }
+    if (entry?.isDirectory) names.push(entry.name || '文件夹');
+  }
+  return names;
+}
+
+function clipboardCsvFile(data, callback) {
+  const csvTypes = new Set([
+    'text/csv', 'text/comma-separated-values', 'application/csv',
+    'application/vnd.ms-excel',
+  ]);
+  const item = [...(data?.items || [])].find(x =>
+    x.kind === 'string' && csvTypes.has(String(x.type || '').toLowerCase()));
+  if (!item) return false;
+  const mime = String(item.type || 'text/csv').toLowerCase();
+  const accept = text => {
+    if (typeof text === 'string' && text.length) {
+      callback(new File([text], 'clipboard.csv', { type: mime, lastModified: Date.now() }));
+    }
+  };
+  // getData 是同步的，但有些 DataTransfer 实现只支持 getAsString。
+  const immediate = data.getData?.(item.type);
+  if (immediate) accept(immediate);
+  else item.getAsString?.(accept);
+  return true;
 }
 
 function insertComposerReference(number) {
@@ -1600,8 +1655,21 @@ document.addEventListener('selectionchange', () => {
   }
 });
 $('#cinput').addEventListener('paste', e => {
-  const files = [...(e.clipboardData?.files || [])];
-  if (!files.length) return;
+  const directories = clipboardDirectoryNames(e.clipboardData);
+  const files = clipboardAttachmentFiles(e.clipboardData);
+  if (directories.length) {
+    e.preventDefault();
+    if (files.length) addComposerFiles(files);
+    alert(`暂不支持直接粘贴文件夹：${directories.join('、')}。请先压缩后再粘贴。`);
+    return;
+  }
+  if (!files.length) {
+    // 表格软件偶尔只提供 text/csv 剪贴板项而不提供 File。此时保留其
+    // 二进制附件语义；普通 text/plain 粘贴仍完全交给浏览器。
+    if (!clipboardCsvFile(e.clipboardData, file => addComposerFiles([file]))) return;
+    e.preventDefault();
+    return;
+  }
   // 带附件的剪贴板常同时携带 text/plain；交给浏览器会把那份文字再粘贴一次。
   e.preventDefault();
   addComposerFiles(files);
