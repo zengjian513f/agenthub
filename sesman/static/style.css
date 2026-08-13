@@ -4,6 +4,15 @@
   font-weight: 200 700; font-style: normal; font-display: swap;
 }
 
+/* xterm 的每个汉字固定占两个西文格。优先让同一套 CJK 等宽字体同时绘制
+ * 西文和中文，避免 Cascadia 的 8.22px 西文格与 Noto 的 14.03px 汉字
+ * 拼成并非 1:2 的网格。没有安装这两套字体的平台会继续走下面的混合回退。 */
+@font-face {
+  font-family: "Sesman CJK Mono Grid";
+  src: local("Sarasa Mono SC"), local("Noto Sans Mono CJK SC");
+  font-weight: 200 700; font-style: normal; font-display: swap;
+}
+
 /* 等宽西文字体通常没有汉字。把 CJK 单独路由到无衬线字体，避免 Windows
  * 最后用 generic monospace 的宋体补字；unicode-range 让拉丁字母继续走用户所选字体。 */
 @font-face {
@@ -278,6 +287,8 @@ body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix
 .new-source legend, .new-cwd-label, .new-common-label {
   margin-bottom: 5px; color: var(--muted); font-size: 12px; font-weight: 600;
 }
+.new-cwd-label { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.new-cwd-label span { font-size: 11px; font-weight: 400; }
 .new-source legend { grid-column: 1 / -1; }
 .new-source label { min-width: 0; cursor: pointer; }
 .new-source input { position: absolute; opacity: 0; pointer-events: none; }
@@ -292,12 +303,33 @@ body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix
 .new-source input[value="claude"] + span .ico { color: var(--claude); }
 .new-source input[value="codex"] + span .ico { color: var(--codex); }
 .new-source input[value="grok"] + span .ico { color: var(--grok); }
+.new-cwd-combobox { min-width: 0; margin-top: -8px; }
 #new-cwd {
-  width: 100%; min-width: 0; margin-top: -8px; padding: 8px 10px;
+  width: 100%; min-width: 0; padding: 8px 10px;
   border: 1px solid var(--border); border-radius: 8px; outline: none;
   background: var(--panel-2); color: var(--text); font: 12.5px/1.45 var(--terminal-font);
 }
 #new-cwd:focus { border-color: var(--accent); }
+#new-cwd-completions {
+  max-height: 178px; margin-top: 5px; padding: 4px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); box-shadow: 0 7px 22px rgba(0, 0, 0, .13);
+}
+#new-cwd-completions[hidden] { display: none; }
+.new-cwd-completion {
+  display: flex; align-items: center; gap: 7px; width: 100%; min-width: 0;
+  padding: 6px 8px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--text); text-align: left;
+  font: 12px/1.4 var(--terminal-font); cursor: pointer;
+}
+.new-cwd-completion::before { content: "▸"; flex: none; color: var(--muted); }
+.new-cwd-completion span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.new-cwd-completion:is(:hover, .active) { background: var(--hover); }
+.new-cwd-completion.active { color: var(--accent); }
+.visually-hidden {
+  position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
 .new-common-label { margin: 1px 0 -7px; }
 #new-cwd-list {
   width: 100%; min-height: 150px; padding: 4px;

@@ -176,8 +176,15 @@
       <label><input type="radio" name="new-source" value="codex"><span><svg class="ico"><use href="#i-codex"/></svg>Codex</span></label>
       <label><input type="radio" name="new-source" value="grok"><span><svg class="ico"><use href="#i-grok"/></svg>Grok</span></label>
     </fieldset>
-    <label class="new-cwd-label" for="new-cwd">启动目录</label>
-    <input id="new-cwd" name="cwd" autocomplete="off" spellcheck="false" placeholder="/home/user/Projects/project">
+    <label class="new-cwd-label" for="new-cwd">启动目录<span>输入路径后按 Tab 补全</span></label>
+    <div class="new-cwd-combobox">
+      <input id="new-cwd" name="cwd" autocomplete="off" spellcheck="false"
+        role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
+        aria-controls="new-cwd-completions" aria-expanded="false"
+        placeholder="/home/user/Projects/project">
+      <div id="new-cwd-completions" role="listbox" aria-label="目录补全" hidden></div>
+      <div id="new-cwd-completion-status" class="visually-hidden" role="status" aria-live="polite"></div>
+    </div>
     <label class="new-common-label" for="new-cwd-list">常用目录</label>
     <select id="new-cwd-list" size="6" aria-label="常用启动目录"></select>
     <div id="new-session-error" role="alert"></div>
@@ -228,6 +235,8 @@
 <script defer src="app.js?v=__SESMAN_ASSET_VERSION__"></script>
 <script defer src="vendor/xterm.js"></script>
 <script defer src="vendor/addon-fit.js"></script>
+<script defer src="vendor/addon-unicode11.js"></script>
+<script defer src="vendor/addon-webgl.js"></script>
 <script defer src="term.js?v=__SESMAN_ASSET_VERSION__"></script>
 <script defer src="vendor/katex/katex.min.js"></script>
 <script defer src="vendor/katex/auto-render.min.js" onload="refreshFormulae()"></script>

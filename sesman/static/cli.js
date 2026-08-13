@@ -138,6 +138,12 @@ class CodexCli extends SesmanCli {
   questionAnswerKeys(prompt, optionIndex) {
     const options = prompt?.questions?.[0]?.options || [];
     if (!options[optionIndex] || optionIndex >= 9) return null;
+    // Command approvals are TUI-only and advertise stable mnemonic keys.  Use
+    // those instead of assuming they share request_user_input's numeric menu.
+    if (prompt?.kind === 'approval') {
+      const key = options[optionIndex]?.key;
+      return key ? [key] : null;
+    }
     // Codex 的问题菜单会循环选择，不能照搬 Claude 的“多按 Up 夹到
     // 第一项”。菜单原生支持数字直选且立即提交，位置不受另一网页或
     // 原生终端先前移动光标的影响。request_user_input 目前最多三个选项。

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ _KEYWORDS = ("claude", "codex", "grok")
 
 TTL = 3.0          # 扫描结果的缓存秒数, 前端可以放心高频轮询
 _cache = {"at": 0.0, "sids": set(), "paths": set(), "bare_claude": {}}
+_scan_lock = threading.Lock()
 _boot_time: float | None = None
 _clock_ticks = os.sysconf("SC_CLK_TCK")
 
@@ -156,10 +158,26 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
 
 
 def snapshot(force: bool = False):
-    now = time.time()
-    if force or now - _cache["at"] > TTL:
+    now = time.monotonic()
+    cached_at = _cache["at"]
+    if not force and cached_at > 0 and now - cached_at <= TTL:
+        return _cache["sids"], _cache["paths"]
+
+    # ThreadingHTTPServer 会让多个浏览器轮询同时落到这里。扫描 /proc 较慢时，
+    # 不能让每个普通请求都各扫一遍；等待者复用刚完成的结果。force 请求仍
+    # 严格绕过缓存，用于接管、停止等必须立即确认进程状态的操作。
+    with _scan_lock:
+        now = time.monotonic()
+        cached_at = _cache["at"]
+        fresh = cached_at > 0 and now - cached_at <= TTL
+        if not force and fresh:
+            return _cache["sids"], _cache["paths"]
+
         sids, paths, bare_claude = _scan()
-        _cache.update(at=now, sids=sids, paths=paths, bare_claude=bare_claude)
+        # TTL 从扫描完成开始算。若扫描本身超过 TTL，用开始时间会令新结果刚写入
+        # 就已过期，下一批轮询立刻再次扫描，形成持续高 CPU。
+        _cache.update(at=time.monotonic(), sids=sids, paths=paths,
+                      bare_claude=bare_claude)
     return _cache["sids"], _cache["paths"]
 
 

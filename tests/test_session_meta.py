@@ -67,6 +67,22 @@ class SessionMetaTests(unittest.TestCase):
             self.assertEqual(session_meta.resolve_activity("claude:a", idle), idle)
             self.assertTrue(session_meta.enrich_one({"uid": "claude:a"})["starred"])
 
+    def test_claude_timeline_changes_only_after_native_rewind_is_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
+            pending = session_meta.begin_timeline_rewind("claude:a", "old-tip", 123)
+            self.assertEqual(pending["from_tip"], "old-tip")
+            self.assertIsNone(session_meta.timeline("claude:a"))
+            self.assertEqual(session_meta.pending_timeline_rewind("claude:a"), pending)
+
+            before = session_meta.timeline_revision("claude:a")
+            fixed = session_meta.finish_timeline_rewind("claude:a", "kept-tip")
+            self.assertEqual(fixed, {"tip": "kept-tip", "stale_end": 123})
+            self.assertEqual(session_meta.timeline("claude:a"), fixed)
+            self.assertGreater(session_meta.timeline_revision("claude:a"), before)
+            self.assertIsNone(session_meta.pending_timeline_rewind("claude:a"))
+
 
 if __name__ == "__main__":
     unittest.main()

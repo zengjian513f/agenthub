@@ -1,12 +1,82 @@
 import unittest
 import shlex
+import struct
 import tempfile
 from unittest.mock import call, patch
 
 from sesman import term
 
 
+class DirectoryCompletionTests(unittest.TestCase):
+    def test_matches_directories_only_and_hides_dot_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = term.Path(tmp)
+            for name in ("Project Alpha", "Projects", ".private"):
+                (root / name).mkdir()
+            (root / "Project.txt").write_text("not a directory")
+
+            self.assertEqual(term.complete_directories(f"{root}/Pro"), [
+                f"{root}/Project Alpha/", f"{root}/Projects/",
+            ])
+            self.assertNotIn(f"{root}/.private/",
+                             term.complete_directories(f"{root}/"))
+            self.assertEqual(term.complete_directories(f"{root}/.p"),
+                             [f"{root}/.private/"])
+
+    def test_trailing_slash_descends_and_preserves_tilde_spelling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = term.Path(tmp)
+            (root / "work" / "child").mkdir(parents=True)
+            with patch.object(term.Path, "home", return_value=root):
+                self.assertEqual(term.complete_directories("~"), ["~/"])
+                self.assertEqual(term.complete_directories("~/wo"), ["~/work/"])
+                self.assertEqual(term.complete_directories("~/work/"),
+                                 ["~/work/child/"])
+            self.assertEqual(term.complete_directories("relative/path"), [])
+
+    def test_completion_limit_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = term.Path(tmp)
+            for index in range(5):
+                (root / f"dir-{index}").mkdir()
+            self.assertEqual(len(term.complete_directories(f"{root}/d", limit=2)), 2)
+            self.assertEqual(len(term.complete_directories(f"{root}/d", limit=500)), 5)
+
+
 class TerminalSubmitTests(unittest.TestCase):
+    def test_detached_window_gets_fallback_but_keeps_latest_policy(self):
+        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER,
+                "attached": False}
+        with patch.object(term, "session_info", return_value=pane), \
+                patch.object(term, "_tmux") as tmux:
+            self.assertTrue(term.normalize_detached_window("sesman-test"))
+        self.assertEqual(tmux.call_args_list, [
+            call("resize-window", "-t", "sesman-test", "-x", "120", "-y", "32",
+                 server=term.MANAGED_SERVER, no_start=True),
+            call("set-window-option", "-t", "sesman-test", "window-size", "latest",
+                 server=term.MANAGED_SERVER, no_start=True),
+        ])
+
+    def test_attached_window_is_not_normalized_behind_its_client(self):
+        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER,
+                "attached": True}
+        with patch.object(term, "session_info", return_value=pane), \
+                patch.object(term, "_tmux") as tmux:
+            self.assertFalse(term.normalize_detached_window("sesman-test"))
+        tmux.assert_not_called()
+
+    def test_attach_ignores_hidden_xterm_minimum_size(self):
+        attach = term.Attach.__new__(term.Attach)
+        attach.fd = 123
+        attach.cols, attach.rows = 120, 32
+        with patch.object(term.fcntl, "ioctl") as ioctl:
+            self.assertFalse(attach.resize(10, 6))
+            ioctl.assert_not_called()
+            self.assertTrue(attach.resize(80, 24))
+        ioctl.assert_called_once_with(
+            123, term.termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        self.assertEqual((attach.cols, attach.rows), (80, 24))
+
     def test_claude_resume_includes_passive_question_bridge(self):
         sid = "5bc438e2-9532-47af-9fbd-4eec1a0347d9"
         with patch.object(term, "_which_cli", return_value="/usr/bin/claude"), \

@@ -85,8 +85,9 @@ def recv(sock) -> tuple[int, bytes]:
             return first_op or OP_TEXT, frag
 
 
-def close(sock, code: int = 1000) -> None:
+def close(sock, code: int = 1000, reason: str = "") -> None:
     try:
-        send(sock, struct.pack(">H", code), OP_CLOSE)
+        payload = struct.pack(">H", code) + reason.encode("utf-8")[:120]
+        send(sock, payload, OP_CLOSE)
     except OSError:
         pass

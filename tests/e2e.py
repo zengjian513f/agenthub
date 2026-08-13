@@ -53,6 +53,8 @@ def make_fake_session():
     """造一个一次性会话, 用来安全地测删除。"""
     FAKE_PROJ.mkdir(parents=True, exist_ok=True)
     FAKE_CWD.mkdir(parents=True, exist_ok=True)
+    (FAKE_CWD / "autocomplete-alpha").mkdir(exist_ok=True)
+    (FAKE_CWD / "autocomplete-alpine").mkdir(exist_ok=True)
     f = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
     sid = f.stem
     long_text = "长文本测试 " + "x" * 9000
@@ -299,7 +301,10 @@ def run(pw):
         SESMAN_CLIS.codex.questionAnswerKeys({questions:[{
           options:[{label:'一'}, {label:'二'}]}]}, 1),
         SESMAN_CLIS.grok.questionAnswerKeys({questions:[{
-          options:[{label:'一'}, {label:'二'}]}]}, 1)]
+          options:[{label:'一'}, {label:'二'}]}]}, 1)],
+      codexApproval:SESMAN_CLIS.codex.questionAnswerKeys({kind:'approval', questions:[{
+          options:[{label:'允许本次', key:'y'}, {label:'始终允许', key:'p'},
+            {label:'拒绝', key:'Escape'}]}]}, 1)
     })""")
     check("三种 CLI 继承公共基类并拥有独立队列策略",
           all(cli_layers["classes"])
@@ -320,7 +325,8 @@ def run(pw):
           and cli_layers["rewindDraft"] == [False, False]
           and cli_layers["questionKeys"] == [
               ["Up"] * 5 + ["Down", "Enter"],
-              ["2"], None], cli_layers)
+              ["2"], None]
+          and cli_layers["codexApproval"] == ["p"], cli_layers)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
       if (!session) return {error:'no codex session'};
@@ -373,6 +379,7 @@ def run(pw):
           < script_order.index("vendor/xterm.js")
           and all(p.locator(f'script[src^="{src}"]').get_attribute("defer") is not None
                   for src in ("cli.js", "app.js", "vendor/xterm.js",
+                              "vendor/addon-unicode11.js", "vendor/addon-webgl.js",
                               "vendor/katex/katex.min.js")),
           script_order)
     check("首次会话列表已替换静态扫描占位", p.locator("#side > .spin").count() == 0)
@@ -1019,13 +1026,21 @@ def run(pw):
       toolSize: getComputedStyle(document.querySelector('.msg[data-role="tool_result"] > .tool-entry > pre')).fontSize,
       terminal: termFont(), terminalSize: termFontSize()
     })""")
-    check("工具输出与 tmux 终端共用 Cascadia/系统等宽字体栈",
+    check("工具输出保留所选字体且 tmux 保留安全的 CJK 字体回退",
           "Sesman CJK Sans" in font_pair["tool"] and "Sesman Cascadia Mono" in font_pair["tool"]
           and "Adwaita Mono" in font_pair["tool"]
           and "Ubuntu Mono" in font_pair["tool"] and "Consola" in font_pair["tool"]
           and "Sesman CJK Sans" in font_pair["terminal"]
           and "Sesman Cascadia Mono" in font_pair["terminal"] and "Consola" in font_pair["terminal"]
           and font_pair["toolSize"] == "12.96px" and font_pair["terminalSize"] == 14.04, font_pair)
+    cjk_grid = p.evaluate("""() => ({
+      active: termFont().includes('Sesman CJK Mono Grid'),
+      ratio: terminalFontGridRatio('"Sesman CJK Mono Grid"', termFontSize()),
+      sample: TERM_FONT_SAMPLE
+    })""")
+    check("可用时只采用汉字宽度严格等于两个西文格的 CJK 字体",
+          (not cjk_grid["active"] or abs(cjk_grid["ratio"] - 2) <= .025)
+          and "，。！？" in cjk_grid["sample"], cjk_grid)
     p.evaluate("document.fonts.load('12px \\\"Sesman CJK Sans\\\"', '中文字体')")
     check("三套等宽选项的汉字固定回退到无衬线 CJK 字体",
           p.evaluate("document.fonts.check('12px \\\"Sesman CJK Sans\\\"', '中文字体')"))
@@ -1057,7 +1072,8 @@ def run(pw):
           and settings_applied["cache"] == 512 * 1024 * 1024
           and settings_applied["saved"] == ["system", "dark", 512], settings_applied)
     p.select_option("#setting-font", "consolas")
-    consolas_stack = p.evaluate("termFont()")
+    p.wait_for_function("configuredTermFont().startsWith('\"Sesman CJK Sans\", Consolas')")
+    consolas_stack = p.evaluate("configuredTermFont()")
     check("Consola 选项不会让汉字落入 generic monospace 宋体",
           consolas_stack.startswith('"Sesman CJK Sans", Consolas, Consola')
           and consolas_stack.endswith('sans-serif') and 'monospace' not in consolas_stack,
@@ -2057,8 +2073,35 @@ def run(pw):
         p.click("#new-session")
         p.wait_for_selector("#new-session-dialog[open]")
         check("新建弹窗有三种会话类型", p.locator('input[name="new-source"]').count() == 3)
-        check("新建弹窗列出常用目录", p.locator("#new-cwd-list option").count() >= 1)
+        common_dir_count = p.locator("#new-cwd-list option").count()
+        check("新建弹窗列出常用目录", common_dir_count >= 1)
         check("启动目录可手工输入", p.locator("#new-cwd").input_value().startswith("/"))
+        completion_prefix = str(FAKE_CWD / "autocomplete-a")
+        p.fill("#new-cwd", completion_prefix)
+        p.wait_for_selector("#new-cwd-completions:not([hidden])", timeout=10000)
+        completion_paths = p.locator(".new-cwd-completion").all_inner_texts()
+        check("启动目录会自动补全真实子目录", completion_paths == [
+            str(FAKE_CWD / "autocomplete-alpha") + "/",
+            str(FAKE_CWD / "autocomplete-alpine") + "/",
+        ], completion_paths)
+        check("补全候选出现时常用目录仍然保留",
+              p.locator("#new-cwd-list").is_visible()
+              and p.locator("#new-cwd-list option").count() == common_dir_count)
+        p.press("#new-cwd", "Tab")
+        check("Tab 先补齐多个候选的公共前缀",
+              p.input_value("#new-cwd") == str(FAKE_CWD / "autocomplete-alp"),
+              p.input_value("#new-cwd"))
+        p.press("#new-cwd", "ArrowDown")
+        p.press("#new-cwd", "Enter")
+        check("方向键和 Enter 可接受目录候选",
+              p.input_value("#new-cwd") == completion_paths[0]
+              and p.locator("#new-cwd-completions").is_hidden())
+        check("手输补全不会留下冲突的常用目录高亮",
+              p.locator("#new-cwd-list").evaluate("n => n.selectedIndex") == -1)
+        common_value = p.locator("#new-cwd-list option").first.get_attribute("value")
+        p.select_option("#new-cwd-list", common_value)
+        check("常用目录仍可一键回填输入栏",
+              p.input_value("#new-cwd") == common_value)
         p.click("#new-session-dialog .modal-cancel")
 
         # 新建 CLI 写出第一条正式记录前只有 pending tmux：手机也必须能切到空
@@ -2232,6 +2275,15 @@ def run(pw):
           return s.trim().length > 40;
         }""", timeout=30000)
         check("终端里 CLI 已经在跑", True)
+        terminal_backend = p.evaluate("""() => {
+          const view = currentTermViewObject();
+          return {renderer:view.renderer, unicode:view.term.unicode.activeVersion,
+            versions:view.term.unicode.versions};
+        }""")
+        check("终端启用 Unicode 11 且 WebGL 不可用时安全回退 DOM",
+              terminal_backend["unicode"] == "11"
+              and "11" in terminal_backend["versions"]
+              and terminal_backend["renderer"] in ("webgl", "dom"), terminal_backend)
         render_batch = p.evaluate("""async () => {
           const writes = [];
           const view = {outputBuffer:'', outputTimer:null, ansiTail:'',
@@ -2283,6 +2335,19 @@ def run(pw):
         }""")
         check("同一动画帧的终端适配只执行一次且从不先清屏",
               smooth_fit == {"clears": 0, "proposals": 1}, smooth_fit)
+        collapsed_fit = p.evaluate("""() => {
+          const view = currentTermViewObject(), ws = view.ws;
+          const oldMode = T.mode, oldSend = ws.send;
+          const sent = [];
+          ws.send = data => sent.push(data);
+          T.mode = 'collapsed'; layoutTermPane();
+          try { fitTerm(true); } finally {
+            T.mode = oldMode; layoutTermPane(); ws.send = oldSend; fitTerm(true);
+          }
+          return sent.length;
+        }""")
+        check("纯对话吸附态不会把隐藏终端尺寸发送给 tmux",
+              collapsed_fit == 0, collapsed_fit)
 
         # 收起只是断开, tmux 会话必须还在 —— 这是选 tmux 承载的意义
         p.click("#a-term")
@@ -2479,7 +2544,7 @@ def run(pw):
           Object.defineProperty(event, 'clipboardData', {value:clipboard});
           document.querySelector('#cinput').dispatchEvent(event);
           setTimeout(() => resolve(event.defaultPrevented), 0);
-        }))""")
+        })""")
         check("只有 text/csv 剪贴板数据时生成 clipboard.csv 附件",
               csv_blob_paste
               and p.locator("#compose-items .draft-card:not(.draft-quote)").count() == 3
@@ -2660,11 +2725,18 @@ def run(pw):
         p.evaluate("post = window.__sesmanRealPost; delete window.__sesmanRealPost")
 
         rewind_bridge = p.evaluate("""async () => {
-          const sent = [], opened = [];
-          const realSend = sendToSession, realOpen = openTermPane;
+          const sent = [], opened = [], rewindPosts = [];
+          const realSend = sendToSession, realOpen = openTermPane, realPost = post;
           const entry = cache.get(viewKey(S.sel)), oldActivity = entry.activity;
           sendToSession = async (text, keys, uid) => { sent.push({keys, uid}); return true; };
           openTermPane = async name => { opened.push(name); };
+          post = async (url, body) => {
+            if (url === 'api/session/rewind') {
+              rewindPosts.push(body);
+              return {ok:true, pending:true};
+            }
+            return realPost(url, body);
+          };
           // 模拟旧进程遗留但已被 renderActivity 隐藏的 working。它不能让空输入
           // 下的双 Esc 永久失去原生 rewind 语义。
           entry.activity = {state:'working', ts:'2000-01-01T00:00:00Z'};
@@ -2673,17 +2745,21 @@ def run(pw):
           try {
             await sendComposerEscape(1000);
             await sendComposerEscape(1200);
-            return {sent, opened, title:document.querySelector('#cesc').title};
+            return {sent, opened, rewindPosts,
+                    title:document.querySelector('#cesc').title};
           } finally {
             sendToSession = realSend;
             openTermPane = realOpen;
+            post = realPost;
             entry.activity = oldActivity;
             composerEscAt = -Infinity;
+            claudeRewinds.clear();
           }
         }""")
         check("对话 Esc 单击发送一次、Claude 双击发送第二次并显示原生回滚界面",
               [x["keys"] for x in rewind_bridge["sent"]] == [["Escape"], ["Escape"]]
               and len(rewind_bridge["opened"]) == 1
+              and [x["action"] for x in rewind_bridge["rewindPosts"]] == ["begin"]
               and "双击进入原生回滚选择" in rewind_bridge["title"], rewind_bridge)
 
         pane_before = tmux_run(tserver, "capture-pane", "-p", "-t", tname,

@@ -6,6 +6,7 @@ import argparse
 import gzip
 import hashlib
 import html
+import ipaddress
 import json
 import mimetypes
 import os
@@ -17,8 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import (claude_bridge, index, live, media, pending as pending_store,
-               send_queue, session_meta, term, wsock)
+from . import (claude_bridge, codex_bridge, index, live, media,
+               pending as pending_store, send_queue, session_meta, term,
+               term_ownership, wsock)
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
@@ -35,6 +37,48 @@ ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 ATTACHMENT_DIR = "sesman_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
 OUTBOX_WAKE = threading.Event()
+TERM_OWNERS = term_ownership.Registry()
+
+
+def _normalize_terminal_sizes() -> None:
+    """Repair stale detached sizes after old service clients finish exiting."""
+    for delay in (0, 0.5, 2.0):
+        if delay:
+            time.sleep(delay)
+        term.normalize_detached_windows()
+
+
+class _TerminalConnection:
+    """Revocable WebSocket transport bound to one ownership lease."""
+
+    def __init__(self, sock, stop: threading.Event):
+        self.sock = sock
+        self.stop = stop
+        self.closed = threading.Event()
+        self.send_lock = threading.Lock()
+        self.replaced = False
+
+    def send(self, payload: bytes, opcode: int) -> None:
+        with self.send_lock:
+            wsock.send(self.sock, payload, opcode)
+
+    def revoke(self, new_ip: str, notify: bool = True) -> None:
+        self.replaced = True
+        self.stop.set()
+        try:
+            with self.send_lock:
+                if notify:
+                    payload = json.dumps({"t": "revoked", "ip": new_ip},
+                                         ensure_ascii=False).encode()
+                    wsock.send(self.sock, payload, wsock.OP_TEXT)
+                wsock.close(self.sock, 4001,
+                            f"revoked:{new_ip}" if notify else "replaced")
+        except OSError:
+            pass
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 def _claude_prompt(session_id: str, messages: list[dict]) -> dict | None:
@@ -156,9 +200,9 @@ def _outbox_loop() -> None:
                 send_queue.mark_failed(item["id"], str(e))
 
 
-def _sessions_signature() -> str:
+def _sessions_signature(index_sig: str | None = None) -> str:
     """原生会话与 sesman 自有元数据共同决定列表版本。"""
-    return f"{index.signature()}:{session_meta.signature()}"
+    return f"{index.signature() if index_sig is None else index_sig}:{session_meta.signature()}"
 
 
 def _pane_for_session(session: dict, panes: list[dict],
@@ -176,6 +220,34 @@ def _pane_for_session(session: dict, panes: list[dict],
     return next((pane for pane in panes if pane.get("owned") and any(
         pid > 0 and term.process_belongs_to(pid, pane["pid"]) for pid in pids
     )), None)
+
+
+def _codex_prompt(session: dict, pane_name: str = "") -> dict | None:
+    """Read a Codex approval that exists only on the live TUI screen."""
+    if session.get("agent_id") or session.get("source") != "codex":
+        return None
+    try:
+        if not pane_name:
+            pane = _pane_for_session(session, term.list_sessions())
+            pane_name = str(pane.get("name") or "") if pane else ""
+        if not pane_name:
+            return None
+        return codex_bridge.approval_prompt(term.capture_plain(pane_name, 80))
+    except (OSError, RuntimeError):
+        # Pane disappearance is a normal race while a session exits.
+        return None
+
+
+def _session_prompt(session: dict, messages: list[dict],
+                    codex_pane: str = "") -> dict | None:
+    """Return the selected CLI's live prompt through one common interface."""
+    if session.get("agent_id"):
+        return None
+    if session.get("source") == "claude":
+        return _claude_prompt(str(session.get("sid") or ""), messages)
+    if session.get("source") == "codex":
+        return _codex_prompt(session, codex_pane)
+    return None
 
 
 def _accepts_gzip(value: str) -> bool:
@@ -207,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 基础设施 ----------------------------------------------------
     # 这些是秒级轮询, 打出来只会淹没真正有用的日志
-    QUIET = ("/api/live", "/api/term/list", "sig=", "start=")
+    QUIET = ("/api/live", "/api/term/list", "/api/term/attach", "sig=", "start=")
 
     def log_message(self, format, *args):
         line = str(args[0])
@@ -215,10 +287,30 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[{self.address_string()}] {format % args}")
 
     def _allowed(self) -> bool:
-        ip = self.client_address[0]
+        ip = self._client_ip()
+        return ip in ALLOWED_IPS
+
+    def _client_ip(self) -> str:
+        """Actual TCP peer address; proxy headers never participate in identity."""
+        ip = str(self.client_address[0])
         if ip.startswith("::ffff:"):
             ip = ip[7:]
-        return ip in ALLOWED_IPS
+        return ip
+
+    def _display_ip(self) -> str:
+        """Best available client IP for ownership prompts only.
+
+        Reverse-proxy headers are deliberately excluded from authorization and
+        lease identity.  An invalid/spoofed value can at most affect this label.
+        """
+        forwarded = (self.headers.get("X-Real-IP", "").strip()
+                     or self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip())
+        if forwarded:
+            try:
+                return str(ipaddress.ip_address(forwarded))
+            except ValueError:
+                pass
+        return self._client_ip()
 
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(code)
@@ -278,8 +370,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._retry_message(body)
             if u.path == "/api/session/outbox/discard":
                 return self._discard_message(body)
+            if u.path == "/api/session/rewind":
+                return self._claude_rewind(body)
             if u.path == "/api/term/create":
                 return self._create_session(body)
+            if u.path == "/api/term/claim":
+                name = str(body.get("name") or "")
+                if not any(x["name"] == name for x in term.list_sessions()):
+                    return self._json({"error": "tmux 会话不存在"}, 404)
+                result = TERM_OWNERS.claim(
+                    name, str(body.get("page") or ""), self._display_ip(),
+                    bool(body.get("force")))
+                return self._json(result, 409 if result.get("conflict") else 200)
             if u.path == "/api/term/kill":
                 term.kill_session(body["name"])
                 pending_store.discard(body["name"])
@@ -506,17 +608,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             force = q.get("force", ["0"])[0] == "1"
             known = q.get("sig", [""])[0]
-            current_sig = _sessions_signature()
+            # load 是唯一会扫 inventory 的入口；签名必须与这批 rows 属于同一
+            # 已发布快照，不能 signature → load → signature 制造 TOCTOU。
+            sessions, index_sig, built_at = index.load_snapshot(force=force)
+            current_sig = _sessions_signature(index_sig)
             if known and not force and known == current_sig:
                 return self._json({"unchanged": True, "sig": known})
-            sessions = index.load(force=force)
             rows = session_meta.enrich(index.with_cursors(sessions))
-            return self._json({"sessions": rows, "sig": _sessions_signature(),
-                               "built_at": index._state["built_at"]})
+            return self._json({"sessions": rows, "sig": current_sig,
+                               "built_at": built_at})
 
         if path == "/api/live":
             force = q.get("force", ["0"])[0] == "1"
-            sessions = index.load()
+            sessions = index.cached()
             uids = live.live_uids(sessions, force=force)
             live_set = set(uids)
             tmux_uids = [s["uid"] for s in sessions
@@ -537,7 +641,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 把 tmux pane 映射回当前列表 uid。前端不能只从 pane 名猜 UUID，
                 # 因为 Codex 回退分支会沿用父会话启动时的旧名字。
                 linked: dict[str, dict] = {}
-                for session in index.load():
+                for session in index.cached():
                     pane = _pane_for_session(session, tmux_sessions)
                     if pane and (pane["name"] not in linked
                                  or session["updated"] > linked[pane["name"]]["updated"]):
@@ -554,6 +658,15 @@ class Handler(BaseHTTPRequestHandler):
                                "home": str(Path.home()),
                                "sessions": tmux_sessions,
                                "pending": public_pending})
+
+        if path == "/api/term/complete-dir":
+            if not TERMINAL:
+                return self._json({"error": "终端未启用"}, 403)
+            try:
+                directories = term.complete_directories(q.get("path", [""])[0])
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json({"directories": directories})
 
         if path == "/api/term/new-status":
             return self._new_session_status(q)
@@ -593,9 +706,10 @@ class Handler(BaseHTTPRequestHandler):
             uid = unquote(path[len("/api/messages/"):])
             agent = q.get("agent", [""])[0]
             session = index.get(uid)
-            result = index.messages(
-                uid,
-                agent=agent,
+            if not session:
+                raise KeyError(uid)
+            result = index.messages_for(
+                index.session_view(session, agent),
                 start=int(q.get("start", ["0"])[0]),
                 head=q.get("head", [""])[0],
                 anchor=q.get("anchor", [""])[0],
@@ -607,11 +721,7 @@ class Handler(BaseHTTPRequestHandler):
                 if send_queue.observe(uid, result["messages"], result.get("activity")):
                     OUTBOX_WAKE.set()
                 result["outbox"] = send_queue.list_for(uid)
-                if session and session.get("source") == "claude":
-                    sid = str(session.get("sid") or "")
-                    result["prompt"] = _claude_prompt(sid, result["messages"])
-                else:
-                    result["prompt"] = None
+                result["prompt"] = _session_prompt(session, result["messages"])
             result["meta"] = session_meta.enrich_one(result["meta"])
             return self._json(result)
 
@@ -679,6 +789,13 @@ class Handler(BaseHTTPRequestHandler):
         claude_sid = (str(s.get("sid") or "")
                       if not s.get("agent_id") and s.get("source") == "claude" else "")
         prompt_revision = claude_bridge.revision(claude_sid) if claude_sid else None
+        codex_session = bool(not s.get("agent_id") and s.get("source") == "codex")
+        codex_pane = ""
+        if codex_session:
+            pane = _pane_for_session(s, term.list_sessions())
+            codex_pane = str(pane.get("name") or "") if pane else ""
+        codex_prompt = None
+        next_codex_prompt_check = 0.0
         activity_revision = session_meta.activity_revision(uid)
         beat = time.time()
         try:
@@ -690,6 +807,7 @@ class Handler(BaseHTTPRequestHandler):
                     last = ver
                     previous_outbox_revision = outbox_revision
                     previous_prompt_revision = prompt_revision
+                    previous_codex_prompt = codex_prompt
                     # 用 messages_for 而不是 messages: 后者要过一遍索引,
                     # 而文件刚变过, 签名对不上就会重建整个索引(百毫秒级)
                     d = index.messages_for(s, start=start, head=head, anchor=anchor)
@@ -706,9 +824,14 @@ class Handler(BaseHTTPRequestHandler):
                         d["prompt"] = _claude_prompt(claude_sid, d["messages"])
                         # _claude_prompt 可能在确认答案落盘后删掉状态文件。
                         prompt_revision = claude_bridge.revision(claude_sid)
+                    elif codex_session:
+                        codex_prompt = _codex_prompt(s, codex_pane)
+                        d["prompt"] = codex_prompt
+                        next_codex_prompt_check = time.time() + 0.4
                     if (d["reset"] or d["messages"] or d["activity_changed"]
                             or outbox_revision != previous_outbox_revision
-                            or prompt_revision != previous_prompt_revision):
+                            or prompt_revision != previous_prompt_revision
+                            or codex_prompt != previous_codex_prompt):
                         payload = json.dumps(d, ensure_ascii=False)
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
@@ -736,6 +859,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(f"data: {payload}\n\n".encode())
                     self.wfile.flush()
                     beat = time.time()
+                elif codex_session and time.time() >= next_codex_prompt_check:
+                    next_codex_prompt_check = time.time() + 0.4
+                    current_codex_prompt = _codex_prompt(s, codex_pane)
+                    if current_codex_prompt != codex_prompt:
+                        codex_prompt = current_codex_prompt
+                        payload = json.dumps({"prompt_only": True,
+                                              "prompt": codex_prompt},
+                                             ensure_ascii=False)
+                        self.wfile.write(f"data: {payload}\n\n".encode())
+                        self.wfile.flush()
+                        beat = time.time()
                 elif not s.get("agent_id") and send_queue.revision() != outbox_revision:
                     outbox_revision = send_queue.revision()
                     payload = json.dumps({"outbox_only": True,
@@ -766,6 +900,50 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             return self._json({"error": str(e)}, 500)
         return self._json({"ok": True, "uid": uid, **meta})
+
+    def _claude_rewind(self, body: dict):
+        """把 Claude 只存在进程内的双-Esc 回滚同步到对话时间线。"""
+        uid = str(body.get("uid") or "")
+        action = str(body.get("action") or "")
+        s = index.get(uid)
+        if not s or s.get("source") != "claude" or s.get("agent_id"):
+            return self._json({"error": "这不是 Claude 主会话"}, 400)
+        pane = _pane_for_session(s, term.list_sessions())
+        name = str(body.get("name") or "")
+        if not pane or pane.get("name") != name:
+            return self._json({"error": "Claude tmux 会话未连接"}, 409)
+
+        if action == "begin":
+            tip = index._claude_effective_tip(s)
+            if not tip:
+                return self._json({"error": "无法确定当前 Claude 时间线"}, 409)
+            pending = session_meta.begin_timeline_rewind(
+                uid, tip, index.version(s)["size"])
+            return self._json({"ok": True, "pending": True,
+                               "from_tip": pending["from_tip"]})
+
+        if action != "sync":
+            return self._json({"error": "未知回滚操作"}, 400)
+        pending = session_meta.pending_timeline_rewind(uid)
+        if not pending:
+            return self._json({"ok": True, "pending": False, "changed": False})
+        try:
+            screen = term.capture_screen_plain(name)
+        except (OSError, RuntimeError) as exc:
+            return self._json({"error": str(exc)}, 409)
+        tip = index.claude_screen_tip(s, screen)
+        if not tip:
+            # 仍停在原生选择器/二级菜单；前端会在下一次 Enter 后重试。
+            return self._json({"ok": True, "pending": True, "changed": False})
+        if tip == pending.get("from_tip"):
+            if index.version(s)["size"] > int(pending.get("stale_end") or 0):
+                # 用户已回到普通输入并发出了新消息，说明没有未落盘的旧叶子可 pin。
+                session_meta.cancel_timeline_rewind(uid)
+                return self._json({"ok": True, "pending": False, "changed": False})
+            return self._json({"ok": True, "pending": True, "changed": False})
+        timeline = session_meta.finish_timeline_rewind(uid, tip)
+        return self._json({"ok": True, "pending": False, "changed": True,
+                           "tip": timeline["tip"]})
 
     def _queue_message(self, body: dict):
         uid = str(body.get("uid") or "")
@@ -945,21 +1123,42 @@ class Handler(BaseHTTPRequestHandler):
         if not TERMINAL:
             return self._send(403, b"terminal disabled", "text/plain")
         name = q.get("name", [""])[0]
+        page = q.get("page", [""])[0]
+        token = q.get("token", [""])[0]
         if not name or not any(s["name"] == name for s in term.list_sessions()):
             return self._send(404, b"no such tmux session", "text/plain")
+        # The claim endpoint issues this opaque token.  Binding is repeated
+        # after the upgrade below so a concurrent force-claim wins atomically.
+        if not page or not token:
+            return self._send(409, b"terminal ownership required", "text/plain")
         if not wsock.handshake(self):
             return self._send(400, b"expected websocket", "text/plain")
 
         sock = self.connection
-        att = term.Attach(name, int(q.get("cols", ["120"])[0]), int(q.get("rows", ["32"])[0]))
         stop = threading.Event()
+        connection = _TerminalConnection(sock, stop)
+        if not TERM_OWNERS.bind(name, page, token, connection):
+            connection.revoke("", notify=False)
+            connection.closed.set()
+            self.close_connection = True
+            return
+        att = None
+        try:
+            att = term.Attach(name, int(q.get("cols", ["120"])[0]),
+                              int(q.get("rows", ["32"])[0]))
+        except Exception:
+            TERM_OWNERS.release(name, token)
+            connection.closed.set()
+            wsock.close(sock, 1011, "attach failed")
+            self.close_connection = True
+            return
 
         def pump():                      # tmux → 浏览器
             while not stop.is_set():
                 data = att.read(0.05)
                 if data:
                     try:
-                        wsock.send(sock, data, wsock.OP_BIN)
+                        connection.send(data, wsock.OP_BIN)
                     except OSError:
                         break
                 elif not att.alive():
@@ -974,7 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
                 if op == wsock.OP_CLOSE:
                     break
                 if op == wsock.OP_PING:
-                    wsock.send(sock, payload, wsock.OP_PONG)
+                    connection.send(payload, wsock.OP_PONG)
                     continue
                 if op == wsock.OP_TEXT and payload[:1] == b"{":
                     try:                 # 控制消息只有一种: 改窗口大小
@@ -990,7 +1189,18 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stop.set()
             att.close()
-            wsock.close(sock)
+            # A direct close leaves tmux at that browser's last dimensions.
+            # Normalize only when genuinely ownerless; a reconnect/takeover is
+            # already about to attach at its own size and must not reflow twice.
+            if not connection.replaced:
+                try:
+                    term.normalize_detached_window(name)
+                except (OSError, RuntimeError):
+                    pass
+            TERM_OWNERS.release(name, token)
+            connection.closed.set()
+            with connection.send_lock:
+                wsock.close(sock)
             self.close_connection = True
 
     def _static(self, path: str):
@@ -1028,6 +1238,12 @@ def main():
         TERMINAL = False
 
     if TERMINAL:
+        # On restart, the previous process's attach children leave the systemd
+        # cgroup concurrently with this process starting.  Repeat briefly so a
+        # client that was still marked attached in the first snapshot is not
+        # left at its old mobile/hidden width.
+        threading.Thread(target=_normalize_terminal_sizes, daemon=True,
+                         name="sesman-term-size").start()
         threading.Thread(target=_outbox_loop, daemon=True, name="sesman-outbox").start()
 
     ALLOWED_IPS.update({"127.0.0.1", "::1", "localhost"})

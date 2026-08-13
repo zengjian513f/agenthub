@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import adapters, index as session_index
+from sesman import adapters, index as session_index, session_meta
 
 
 class CodexEventTests(unittest.TestCase):
@@ -174,6 +174,41 @@ class CodexEventTests(unittest.TestCase):
 
 
 class ClaudeProtocolTests(unittest.TestCase):
+    def test_current_claude_screen_identifies_rewound_tip_not_jsonl_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "screen-rewind.jsonl"
+
+            def row(kind, uid, parent, text, **extra):
+                record = {"type": kind, "uuid": uid, "parentUuid": parent,
+                          "isSidechain": False, **extra}
+                if kind in {"user", "assistant"}:
+                    record["message"] = {"role": kind, "content": text}
+                return record
+
+            rows = [
+                row("user", "u0", None, "请详细解释这段价值函数的每一项"),
+                row("assistant", "a0", "u0",
+                    "第一项是即期移动，第二项在策略继续持仓时接上下一时刻价值，第三项再扣除真实交易成本与持有租金。"),
+                row("system", "recap", "a0", "", subtype="away_summary",
+                    content="我们刚梳理完价值公式与符号方向，下一步准备验证新的实验分支，并对照完整真实回测检查训练目标是否一致可靠。"),
+                row("user", "discarded", "recap",
+                    "这条输入已经被双 ESC 回退，但追加式文件仍然保留它。"),
+            ]
+            transcript.write_text("\n".join(
+                json.dumps(item, ensure_ascii=False) for item in rows) + "\n")
+            screen = """第一项是即期移动，第二项在策略继续持仓时接上下一时刻价值，第三项再扣除真实交易成本与持有租金。
+※ recap: 我们刚梳理完价值公式与符号方向，下一步准备验证新的实验分支，并对照完整真实回测检查训练目标是否一致可靠。
+────────────────────────
+❯
+────────────────────────
+"""
+            adapter = adapters.ClaudeAdapter()
+
+            self.assertEqual(adapter.active_tip(str(transcript)), "discarded")
+            self.assertEqual(adapter.match_screen_tip(str(transcript), screen), "recap")
+            self.assertIsNone(adapter.match_screen_tip(
+                str(transcript), screen.replace("❯", "Select a message to rewind to")))
+
     def test_append_only_tree_renders_only_current_claude_branch(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "session.jsonl"
@@ -348,8 +383,100 @@ class ClaudeProtocolTests(unittest.TestCase):
                 incremental, _ = adapter.read(session["path"], start=end)
                 self.assertEqual([m["text"] for m in incremental], ["仅增量"])
 
+    def test_multi_agent_rollouts_do_not_hide_parent_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            day = root / "2026" / "08" / "12"
+            day.mkdir(parents=True)
+            parent_id = "00000000-0000-0000-0000-000000000020"
+            parent = day / f"rollout-parent-{parent_id}.jsonl"
+
+            def write(path, payload, title=None):
+                rows = [{"type": "session_meta", "payload": payload}]
+                if title:
+                    rows.append({
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "user",
+                                    "content": [{"type": "input_text", "text": title}]},
+                    })
+                path.write_text("\n".join(json.dumps(row, ensure_ascii=False)
+                                           for row in rows) + "\n")
+
+            write(parent, {
+                "id": parent_id, "session_id": parent_id,
+                "thread_source": "user", "timestamp": "2026-08-12T02:00:00Z",
+                "cwd": "/tmp/project",
+            }, "正在运行的主会话")
+            agent_ids = []
+            for number in range(3):
+                agent_id = f"00000000-0000-0000-0000-00000000002{number + 1}"
+                agent_ids.append(agent_id)
+                write(day / f"rollout-agent-{agent_id}.jsonl", {
+                    "id": agent_id, "session_id": parent_id,
+                    "forked_from_id": parent_id, "parent_thread_id": parent_id,
+                    "thread_source": "subagent", "source": {
+                        "subagent": {"thread_spawn": {
+                            "parent_thread_id": parent_id, "depth": 1,
+                            "agent_path": f"/root/review_{number}",
+                        }}},
+                    "timestamp": f"2026-08-12T02:00:0{number + 1}Z",
+                    "cwd": "/tmp/project",
+                })
+
+            with patch.object(adapters, "CODEX_ROOT", root), \
+                    patch.object(adapters, "CODEX_INDEX", Path(tmp) / "missing-index"):
+                adapter = adapters.CodexAdapter()
+                raw = adapter.scan_sessions()
+                public = adapter.finalize_sessions(raw)
+
+            self.assertEqual(len(raw), 4)
+            self.assertEqual({row["sid"] for row in raw if row["_is_subagent"]},
+                             set(agent_ids))
+            self.assertEqual([row["sid"] for row in public], [parent_id])
+            self.assertEqual(public[0]["title"], "正在运行的主会话")
+            self.assertEqual(adapter._sid_paths, {parent_id: parent})
+
 
 class IncrementalCursorTests(unittest.TestCase):
+    def test_confirmed_in_memory_claude_rewind_pins_history_until_new_branch_appends(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
+            path = Path(tmp) / "in-memory-rewind.jsonl"
+            sid = "00000000-0000-0000-0000-000000000097"
+
+            def row(kind, uid, parent, text):
+                return {"type": kind, "uuid": uid, "parentUuid": parent,
+                        "isSidechain": False, "timestamp": "2026-08-11T08:00:00Z",
+                        "cwd": tmp, "sessionId": sid,
+                        "message": {"role": kind, "content": text}}
+
+            initial = [row("user", "u0", None, "共同开头"),
+                       row("assistant", "a0", "u0", "共同回答"),
+                       row("user", "discarded", "a0", "已在 TUI 回退的输入")]
+            path.write_text("\n".join(json.dumps(x, ensure_ascii=False)
+                                        for x in initial) + "\n")
+            session = {"uid": "claude:pinned", "source": "claude", "sid": sid,
+                       "path": str(path), "cwd": tmp}
+            stale_end = path.stat().st_size
+            session_meta.begin_timeline_rewind(session["uid"], "discarded", stale_end)
+            session_meta.finish_timeline_rewind(session["uid"], "a0")
+
+            pinned = session_index.messages_for(session)
+            self.assertEqual([m["text"] for m in pinned["messages"]],
+                             ["共同开头", "共同回答"])
+            self.assertTrue(pinned["anchor"].endswith("@a0"), pinned["anchor"])
+
+            with path.open("a") as fh:
+                fh.write(json.dumps(row("user", "replacement", "a0", "改写后的输入"),
+                                    ensure_ascii=False) + "\n")
+            appended = session_index.messages_for(
+                session, start=pinned["end"], head=pinned["version"]["head"],
+                anchor=pinned["anchor"])
+            self.assertFalse(appended["reset"])
+            self.assertEqual([m["text"] for m in appended["messages"]], ["改写后的输入"])
+            self.assertTrue(appended["anchor"].endswith("@replacement"), appended["anchor"])
+
     def test_claude_append_only_rewind_forces_full_timeline_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "branch.jsonl"

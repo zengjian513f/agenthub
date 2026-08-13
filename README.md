@@ -19,7 +19,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 | 来源 | 路径 | 说明 |
 |---|---|---|
 | Claude | `~/.claude/projects/<编码cwd>/<uuid>.jsonl` | 标题取会话内的 `ai-title`；`<uuid>/subagents/*.jsonl` 为子代理会话，不单列，在详情标题下拉中单独切换 |
-| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 元数据取首行 `session_meta`；标题优先用 `~/.codex/session_index.jsonl` 的 `thread_name` |
+| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 元数据取首行 `session_meta`；标题优先用 `~/.codex/session_index.jsonl` 的 `thread_name`；`thread_source=subagent` 的协作 agent 不单列，也不会被误作回滚分支隐藏父会话 |
 | Grok | `~/.grok/sessions/<urlencoded-cwd>/<uuid>/` | 元数据取 `summary.json`，正文取 `chat_history.jsonl` |
 
 只读原始文件，不改动任何 CLI 的数据。
@@ -124,6 +124,8 @@ systemd 部署使用独立的 [`deploy/sesman-tmux.service`](deploy/sesman-tmux.
 
 服务端起一个 PTY 跑 `tmux attach`，WebSocket 双向转发原始字节。专用 server 不让 attach 切换浏览器 xterm 的 alternate screen；连接时只做一次 `capture-pane` 历史回放，之后滚轮完全使用 xterm 本地 scrollback，不再触发 tmux copy-mode 或把滚轮改成方向键。方向键、`Ctrl-C`、批准提示和 CLI 全屏 TUI 仍按真实终端字节传递。WebSocket 是按 RFC 6455 手写的最小实现（`wsock.py`，约 100 行），后端仍然零第三方依赖。
 
+浏览器终端静态内置 xterm.js 6、Unicode 11 和 WebGL renderer，不从 CDN 下载。WebGL2 可用时用单一纹理提交 Codex 的同步重画帧；不可用或 context loss 时自动退回 DOM renderer。Linux 安装了 Sarasa Mono SC / Noto Sans Mono CJK SC 时还会实测中英文格宽，只在汉字宽度严格接近两个西文格时把它作为整套终端字体，避免混合字体造成中文标点错位。
+
 要杀掉哪个进程也不是猜的：裸 `claude` 启动的会话命令行里没有 session id，只有子 shell 的环境变量能认出来，所以要顺着 `/proc` 的进程树往上找到真正的 CLI 主进程。会话 id 只允许 UUID 字符，避免拼命令时被注入。
 
 ## 活跃会话检测
@@ -167,7 +169,9 @@ Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex
 
 两个让它快下来的细节：
 
-- 服务端检测循环用 `messages_for(session)` 而不是 `messages(uid)`。后者要过一遍索引，而文件刚变过、签名对不上就会**重建整个索引**（百毫秒级）—— 一开始就栽在这，延迟卡在 180ms 下不去，服务端 CPU 也到 24%。绕开之后降到 5%。
+- 服务端检测循环持有已发布的 session 快照并调用 `messages_for(session)`，每次只
+  `stat` 当前文件。普通 `get(uid)` 也走内存 UID map，不会在消息、live、终端或
+  outbox 热路径里隐式扫描磁盘。
 - 客户端保留一条 20s 的兜底对账；SSE 断开时才回到自适应轮询（350ms~3s）。EventSource 自带的重连会沿用旧 URL（旧偏移），所以断开时自己关掉重连、带上新偏移。
 
 实测（最大的会话，23MB 文件 / 4775 条消息）：
@@ -188,9 +192,21 @@ Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex
 
 ## 索引缓存与列表自动刷新
 
-索引缓存在 `~/.cache/sesman/index.json`，用全部会话文件的 `(路径, mtime, 大小)` 摘要做失效判断：文件有变动就自动重建（全量约 0.1s，元数据只读每个文件的前 96KB）。顶栏 `↻ 刷新` 强制重建。
+索引缓存在 `~/.cache/sesman/index.json`。缓存同时保存每个主会话的 raw 元数据、
+公开列表和上次 inventory，文件用 `(路径, size, mtime_ns, inode)` 判断变化。普通 append
+只重读对应会话：Claude 同时更新尾部标题与子代理，Codex 在内存中重算分叉继承，
+Grok 重读对应 summary；新增、删除和移动也只增删相关 raw row。顶栏 `↻ 刷新`
+仍会强制全量重建。当前 175 个真实会话中，全量约 0.40s，单 owner 元数据重读约
+4–6ms，一次含 inventory 与缓存落盘的完整增量协调约 20–25ms；缓存过期后的进程
+冷启动也只协调变化 owner，当前实测约 27ms。
 
-列表每 8s 自动跟进磁盘变化：前端带上手里的签名请求 `/api/sessions?sig=<签名>`，一致时服务端只回 `{"unchanged": true}` —— 全量 stat 会话及子代理文件为个位数毫秒，响应约 70 字节。新会话出现、rename（Claude 的最新 `custom-title`、Codex 的 `session_index.jsonl`、Grok 的 summary）、时间重排和子代理增删都会自动反映，**不打断当前的选中和滚动位置**，搜索态下也不会把结果冲掉。
+`load()` 是唯一执行 inventory 协调的入口；`get()`、`/api/live` 和
+`/api/term/list` 都读取一次性发布的稳定快照。并发刷新由同一把锁 singleflight，
+解析期间再次 append 会把快照标成 dirty，下一轮继续追赶而不会把新签名配给旧列表。
+列表游标按 `(路径, size, mtime_ns, ctime_ns, inode)` 缓存；多客户端同时刷新时，同一
+文件版本只解析一次，之后只 `stat` 检查，单文件 append 也只重算该文件的游标。
+
+列表每 8s 自动跟进磁盘变化：前端带上手里的签名请求 `/api/sessions?sig=<签名>`，一致时服务端只回 `{"unchanged": true}` —— inventory 会话及子代理文件为个位数毫秒，响应约 70 字节。新会话出现、rename（Claude 的最新 `custom-title`、Codex 的 `session_index.jsonl`、Grok 的 summary）、时间重排和子代理增删都会自动反映，**不打断当前的选中和滚动位置**，搜索态下也不会把结果冲掉。
 
 **拿到新列表也不等于要重画**。活跃会话每隔几秒就变一次大小和时间，每次都重建左栏 DOM 的话，看起来就是一直在闪。所以先比对结构（顺序、标题、目录，时间轴视图下还要比日期分组）：只有结构真变了才重建，否则只把那一行的文字改掉，DOM 节点原地不动。
 

@@ -47,6 +47,7 @@ RESUME = {
 }
 
 SOURCES = ("claude", "codex", "grok")
+DIRECTORY_COMPLETION_LIMIT = 24
 CODEX_QUESTION_ARGS = (
     "--enable", "default_mode_request_user_input",
     "-c", "suppress_unstable_features_warning=true",
@@ -91,6 +92,57 @@ def _which_cli(source: str) -> str | None:
 
 def available_sources() -> dict[str, bool]:
     return {source: _which_cli(source) is not None for source in SOURCES}
+
+
+def complete_directories(raw: str, limit: int = DIRECTORY_COMPLETION_LIMIT) -> list[str]:
+    """Return shell-style directory completions without resolving the shown path.
+
+    The caller may use an absolute path or ``~/``.  Only the last path component
+    is matched, hidden entries stay hidden until ``.`` is typed, and every result
+    ends in ``/`` so accepting it can immediately continue into the next level.
+    Symlink spelling is deliberately preserved in the browser even though the
+    final session creation still resolves and validates the selected directory.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if len(text) > 4096:
+        raise ValueError("启动目录路径过长")
+    limit = max(1, min(int(limit), 50))
+
+    if text == "~":
+        return ["~/"] if Path.home().is_dir() else []
+    if text.startswith("~") and not text.startswith("~/"):
+        return []
+
+    expanded = Path.home() / text[2:] if text.startswith("~/") else Path(text)
+    if not expanded.is_absolute():
+        return []
+    if text.endswith("/"):
+        parent, prefix = expanded, ""
+        display_parent = text
+    else:
+        parent, prefix = expanded.parent, expanded.name
+        display_parent = text[:text.rfind("/") + 1]
+
+    rows: list[str] = []
+    try:
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                name = entry.name
+                if (not prefix.startswith(".") and name.startswith(".")) \
+                        or not name.startswith(prefix):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=True):
+                        continue
+                except OSError:
+                    continue
+                rows.append(f"{display_parent}{name}/")
+    except OSError:
+        return []
+    rows.sort(key=lambda value: (value.casefold(), value))
+    return rows[:limit]
 
 
 def _clean_cli_command(exe: str, *args: str) -> str:
@@ -397,6 +449,63 @@ def capture(name: str, lines: int = 200) -> str:
     return _session_tmux(name, "capture-pane", "-p", "-e", "-t", name, "-S", f"-{lines}")
 
 
+def capture_plain(name: str, lines: int = 80) -> str:
+    """Capture screen text without ANSI escapes for native prompt detection."""
+    # -J joins terminal soft-wraps, so resizing does not alter a long command's
+    # text or the stable prompt id presented to the browser.
+    return _session_tmux(name, "capture-pane", "-J", "-p", "-t", name,
+                         "-S", f"-{lines}")
+
+
+def capture_screen_plain(name: str) -> str:
+    """只取当前可见屏，不把已经滚出视口的旧分支混进时间线判断。"""
+    return _session_tmux(name, "capture-pane", "-J", "-p", "-t", name)
+
+
+def set_window_size_policy(name: str, policy: str = "latest") -> bool:
+    """Set the tmux window sizing policy without depending on the caller's tmux."""
+    if policy not in {"latest", "largest", "smallest", "manual"}:
+        raise ValueError(f"无效的 tmux window-size: {policy}")
+    row = session_info(name)
+    if not row:
+        return False
+    _tmux("set-window-option", "-t", name, "window-size", policy,
+          server=row["server"], no_start=True)
+    return True
+
+
+def normalize_detached_window(name: str, cols: int = 120, rows: int = 32) -> bool:
+    """Give an ownerless tmux a readable fallback size while retaining latest.
+
+    ``resize-window`` temporarily selects manual sizing.  Switching back to
+    ``latest`` afterwards preserves the fallback while detached, then lets the
+    next real browser client take over immediately.
+    """
+    info = session_info(name)
+    if not info or info.get("attached"):
+        return False
+    cols, rows = max(Attach.MIN_COLS, int(cols)), max(Attach.MIN_ROWS, int(rows))
+    _tmux("resize-window", "-t", name, "-x", str(cols), "-y", str(rows),
+          server=info["server"], no_start=True)
+    _tmux("set-window-option", "-t", name, "window-size", "latest",
+          server=info["server"], no_start=True)
+    return True
+
+
+def normalize_detached_windows(cols: int = 120, rows: int = 32) -> int:
+    """Normalize all ownerless sesman panes, normally once at service startup."""
+    normalized = 0
+    for info in list_sessions():
+        if not info.get("owned") or info.get("attached"):
+            continue
+        try:
+            if normalize_detached_window(info["name"], cols, rows):
+                normalized += 1
+        except (OSError, RuntimeError):
+            pass
+    return normalized
+
+
 def in_tmux(pids: list[int]) -> bool:
     """这些进程是不是跑在 tmux 里 (祖先有 tmux server)。"""
     for pid in pids:
@@ -486,12 +595,18 @@ def graceful_stop(name: str, pids: list[int], timeout: float = 2.4) -> list[int]
 class Attach:
     """一条 pty 上的 `tmux attach`, 供 WebSocket 双向转发。"""
 
+    MIN_COLS = 20
+    MIN_ROWS = 8
+
     def __init__(self, name: str, cols: int = 120, rows: int = 32):
         row = session_info(name)
         if not row:
             raise RuntimeError(f"tmux 会话不存在: {name}")
         self.name = name
         self.server = row["server"]
+        # A one-off ``resize-window`` repair leaves this option at ``manual``.
+        # Every browser owner must restore normal client-driven sizing.
+        set_window_size_policy(name, "latest")
         self._initial = b""
         if self.server == MANAGED_SERVER:
             # tmux attach 只会重绘当前屏；先把已有 history 喂给 xterm 的正常缓冲区，
@@ -512,14 +627,23 @@ class Attach:
                     self.server, "attach-session", "-t", name, no_start=True))
             finally:
                 os._exit(1)
+        # display:none / 高度吸附到 0 时 FitAddon 会报告 xterm 的内部最小值
+        # 10×6。它不是用户可见尺寸，若交给 tmux 会把 Codex 审批屏压碎。
+        if cols < self.MIN_COLS or rows < self.MIN_ROWS:
+            cols, rows = 120, 32
+        self.cols, self.rows = cols, rows
         self.resize(cols, rows)
 
-    def resize(self, cols: int, rows: int) -> None:
+    def resize(self, cols: int, rows: int) -> bool:
+        if cols < self.MIN_COLS or rows < self.MIN_ROWS:
+            return False
         try:
             fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
                         struct.pack("HHHH", rows, cols, 0, 0))
         except OSError:
-            pass
+            return False
+        self.cols, self.rows = cols, rows
+        return True
 
     def read(self, timeout: float = 0.05) -> bytes:
         if self._initial:

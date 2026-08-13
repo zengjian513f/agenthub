@@ -4,6 +4,10 @@
 // 会话跑在 tmux 里, 所以关掉页面/重启 sesman 都不会打断它。
 const TERM_RENDER_BATCH_MS = 20;
 const TERM_RENDER_BATCH_MAX = 32 * 1024;
+// 每次页面加载独立生成；不写 local/sessionStorage，复制标签页也不会复制归属。
+const TERM_PAGE_ID = crypto.randomUUID?.()
+  || [...crypto.getRandomValues(new Uint8Array(16))]
+    .map(value => value.toString(16).padStart(2, '0')).join('');
 
 const T = {
   term: null,      // xterm 实例
@@ -24,6 +28,14 @@ const T = {
   resolveControllers: new Map(),
   openViews: new Map(store.get('termviews', [])), // tmux 名 → {mode, height}
 };
+// Claude 双 Esc 的最终叶子有时只保存在 TUI 进程内，不会追加 JSONL。
+// 以 tmux 名为键跟踪原生选择器，确认后再让服务端从当前屏幕同步时间线。
+const claudeRewinds = new Map();
+
+const TERM_FONT_SAMPLE = 'MW0il中文，。！？（）【】';
+let resolvedTermFont = '';
+let resolvedTermFontKey = '';
+let termFontResolveEpoch = 0;
 
 // 应用(claude/codex 的 TUI)申请接管鼠标的那些序列。选择模式下要拦掉,
 // 否则 xterm 会把拖拽当成给应用的鼠标事件, 没法框选。
@@ -47,14 +59,55 @@ function termTheme() {
   };
 }
 
-function termFont() {
+function configuredTermFont() {
   return getComputedStyle(document.documentElement).getPropertyValue('--terminal-font').trim();
+}
+
+function termFont() {
+  return resolvedTermFont || configuredTermFont();
 }
 
 function termFontSize() {
   const value = parseFloat(getComputedStyle(document.documentElement)
     .getPropertyValue('--terminal-font-size'));
   return Number.isFinite(value) ? value : 14.04;
+}
+
+function terminalFontGridRatio(family, size) {
+  const context = document.createElement('canvas').getContext('2d');
+  if (!context) return 0;
+  context.font = `400 ${size}px ${family}`;
+  const latin = context.measureText('0').width;
+  const cjk = context.measureText('中').width;
+  return latin > 0 ? cjk / latin : 0;
+}
+
+/** Resolve one font face whose CJK glyph is exactly two Latin cells wide.
+ * Font availability, not the browser/OS name, decides whether it is used. */
+async function prepareTerminalFont() {
+  const configured = configuredTermFont();
+  const size = termFontSize();
+  const key = `${size}\n${configured}`;
+  if (resolvedTermFont && resolvedTermFontKey === key) return resolvedTermFont;
+  // 设置项刚切换时先停止返回旧字体；异步探测期间至少立即使用新选择。
+  if (resolvedTermFontKey !== key) {
+    resolvedTermFont = '';
+    resolvedTermFontKey = '';
+  }
+  const epoch = ++termFontResolveEpoch;
+  let resolved = configured;
+  try {
+    await document.fonts?.load(`${size}px ${configured}`, TERM_FONT_SAMPLE);
+    const grid = '"Sesman CJK Mono Grid"';
+    const faces = await document.fonts?.load(`${size}px ${grid}`, TERM_FONT_SAMPLE);
+    const ratio = faces?.length ? terminalFontGridRatio(grid, size) : 0;
+    if (Math.abs(ratio - 2) <= .025) resolved = `${grid}, ${configured}`;
+  } catch { /* 本机没有 Noto/Sarasa 时保留原字体回退 */ }
+  if (epoch === termFontResolveEpoch) {
+    resolvedTermFont = resolved;
+    resolvedTermFontKey = key;
+  }
+  return resolved;
 }
 
 function reflectedLightRgb(r, g, b, background = false) {
@@ -128,7 +181,8 @@ function terminalColorChunk(view, s) {
 }
 
 async function refreshTerminalPreferences(redraw = false) {
-  try { await document.fonts?.load(`${termFontSize()}px ${termFont()}`, 'MW0il'); } catch {}
+  terminalFontReady = prepareTerminalFont();
+  try { await terminalFontReady; } catch {}
   const views = T.views ? T.views.values() : (T.term ? [{ term: T.term }] : []);
   const redrawNames = [];
   for (const view of views) {
@@ -142,9 +196,7 @@ async function refreshTerminalPreferences(redraw = false) {
 }
 
 // xterm 先测量网页字体再创建 DOM 行，避免按回退字体计算出错误的字符宽度。
-const terminalFontReady = document.fonts
-  ? document.fonts.load(`${termFontSize()}px ${termFont()}`, 'MW0il')
-  : Promise.resolve();
+let terminalFontReady = prepareTerminalFont();
 addEventListener('resize', () => { layoutTermPane(); fitTerm(); });
 
 async function loadTermList() {
@@ -279,9 +331,190 @@ function commonSessionDirs() {
     || b.updated.localeCompare(a.updated) || a.cwd.localeCompare(b.cwd)).slice(0, 18);
 }
 
+const CWD_COMPLETION_DELAY = 120;
+const cwdCompletion = {
+  timer: null, abort: null, sequence: 0,
+  rows: [], forValue: '', active: -1,
+};
+
+function comparableCwd(value) {
+  const path = String(value || '').trim();
+  return path === '/' ? path : path.replace(/\/+$/, '');
+}
+
+function syncCommonDirSelection(value) {
+  const list = $('#new-cwd-list');
+  const wanted = comparableCwd(value);
+  list.selectedIndex = [...list.options]
+    .findIndex(option => comparableCwd(option.value) === wanted);
+}
+
+function canCompleteCwd(value) {
+  const path = String(value || '').trim();
+  return path.startsWith('/') || path === '~' || path.startsWith('~/');
+}
+
+function cancelCwdCompletionRequest() {
+  if (cwdCompletion.timer) clearTimeout(cwdCompletion.timer);
+  cwdCompletion.timer = null;
+  cwdCompletion.abort?.abort();
+  cwdCompletion.abort = null;
+  cwdCompletion.sequence++;
+}
+
+function clearCwdCompletionView(message = '') {
+  const input = $('#new-cwd'), box = $('#new-cwd-completions');
+  cwdCompletion.rows = [];
+  cwdCompletion.forValue = '';
+  cwdCompletion.active = -1;
+  box.replaceChildren();
+  box.hidden = true;
+  input.setAttribute('aria-expanded', 'false');
+  input.removeAttribute('aria-activedescendant');
+  $('#new-cwd-completion-status').textContent = message;
+}
+
+function dismissCwdCompletions() {
+  cancelCwdCompletionRequest();
+  clearCwdCompletionView();
+}
+
+function renderCwdCompletions(value, rows) {
+  const input = $('#new-cwd'), box = $('#new-cwd-completions');
+  cwdCompletion.rows = rows;
+  cwdCompletion.forValue = value;
+  cwdCompletion.active = -1;
+  box.replaceChildren();
+  if (!rows.length) {
+    clearCwdCompletionView('没有匹配的目录');
+    return;
+  }
+  rows.forEach((path, index) => {
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.id = `new-cwd-completion-${index}`;
+    option.className = 'new-cwd-completion';
+    option.dataset.cwdCompletion = String(index);
+    option.setAttribute('role', 'option');
+    option.setAttribute('aria-selected', 'false');
+    option.title = path;
+    const label = document.createElement('span');
+    label.textContent = path;
+    option.appendChild(label);
+    box.appendChild(option);
+  });
+  box.hidden = false;
+  input.setAttribute('aria-expanded', 'true');
+  input.removeAttribute('aria-activedescendant');
+  $('#new-cwd-completion-status').textContent = `${rows.length} 个匹配目录`;
+}
+
+function setCwdCompletionActive(step) {
+  const rows = cwdCompletion.rows;
+  if (!rows.length) return;
+  const old = cwdCompletion.active;
+  const next = old < 0
+    ? (step > 0 ? 0 : rows.length - 1)
+    : (old + step + rows.length) % rows.length;
+  cwdCompletion.active = next;
+  const options = [...$('#new-cwd-completions').children];
+  options.forEach((option, index) => {
+    const active = index === next;
+    option.classList.toggle('active', active);
+    option.setAttribute('aria-selected', String(active));
+  });
+  const option = options[next];
+  $('#new-cwd').setAttribute('aria-activedescendant', option.id);
+  option.scrollIntoView({ block: 'nearest' });
+}
+
+function setCwdValue(value, dismiss = true) {
+  const input = $('#new-cwd');
+  input.value = value;
+  syncCommonDirSelection(value);
+  $('#new-session-error').textContent = '';
+  if (dismiss) dismissCwdCompletions();
+  input.focus();
+  input.setSelectionRange(value.length, value.length);
+}
+
+function longestCommonPrefix(values) {
+  if (!values.length) return '';
+  let prefix = values[0];
+  for (const value of values.slice(1)) {
+    let i = 0;
+    while (i < prefix.length && i < value.length && prefix[i] === value[i]) i++;
+    prefix = prefix.slice(0, i);
+    if (!prefix) break;
+  }
+  return prefix;
+}
+
+function applyCwdTabCompletion() {
+  const input = $('#new-cwd');
+  if (!cwdCompletion.rows.length) return;
+  if (cwdCompletion.active >= 0) {
+    setCwdValue(cwdCompletion.rows[cwdCompletion.active]);
+    return;
+  }
+  if (cwdCompletion.rows.length === 1) {
+    setCwdValue(cwdCompletion.rows[0]);
+    return;
+  }
+  const value = input.value.trim();
+  const prefix = longestCommonPrefix(cwdCompletion.rows);
+  if (prefix.length > value.length) {
+    setCwdValue(prefix, false);
+    cwdCompletion.forValue = prefix;
+    $('#new-cwd-completion-status').textContent =
+      `已补全公共前缀，仍有 ${cwdCompletion.rows.length} 个匹配目录`;
+  }
+}
+
+async function loadCwdCompletions(complete = false) {
+  cancelCwdCompletionRequest();
+  const input = $('#new-cwd');
+  const value = input.value.trim();
+  if (!canCompleteCwd(value)) {
+    clearCwdCompletionView();
+    return;
+  }
+  const controller = new AbortController();
+  const sequence = ++cwdCompletion.sequence;
+  cwdCompletion.abort = controller;
+  try {
+    const params = new URLSearchParams({ path: value });
+    const response = await fetch(appUrl(`api/term/complete-dir?${params}`),
+      { signal: controller.signal });
+    const data = await response.json();
+    if (sequence !== cwdCompletion.sequence || input.value.trim() !== value) return;
+    const rows = response.ok && Array.isArray(data.directories)
+      ? data.directories.filter(path => typeof path === 'string' && canCompleteCwd(path)).slice(0, 24)
+      : [];
+    renderCwdCompletions(value, rows);
+    if (complete) applyCwdTabCompletion();
+  } catch (error) {
+    if (error.name !== 'AbortError' && sequence === cwdCompletion.sequence) {
+      clearCwdCompletionView('目录补全暂不可用');
+    }
+  } finally {
+    if (cwdCompletion.abort === controller) cwdCompletion.abort = null;
+  }
+}
+
+function scheduleCwdCompletions() {
+  cancelCwdCompletionRequest();
+  clearCwdCompletionView();
+  const value = $('#new-cwd').value.trim();
+  syncCommonDirSelection(value);
+  if (!canCompleteCwd(value)) return;
+  cwdCompletion.timer = setTimeout(() => loadCwdCompletions(false), CWD_COMPLETION_DELAY);
+}
+
 function openNewSessionDialog() {
   const dialog = $('#new-session-dialog');
   const list = $('#new-cwd-list');
+  dismissCwdCompletions();
   const rows = commonSessionDirs();
   list.innerHTML = '';
   for (const d of rows) {
@@ -298,7 +531,7 @@ function openNewSessionDialog() {
   const selected = S.sessions.find(s => s.uid === S.sel)?.cwd;
   const cwd = selected || store.get('newDirs', [])[0] || rows[0]?.cwd || T.home || '';
   $('#new-cwd').value = cwd;
-  list.value = cwd;
+  syncCommonDirSelection(cwd);
   $('#new-session-error').textContent = '';
   $('#new-session-go').disabled = false;
   dialog.showModal();
@@ -498,8 +731,53 @@ $('#new-session').onclick = openNewSessionDialog;
 $('#new-session-form').onsubmit = createNewSession;
 $('#new-session-dialog .modal-close').onclick = () => $('#new-session-dialog').close();
 $('#new-session-dialog .modal-cancel').onclick = () => $('#new-session-dialog').close();
-$('#new-cwd-list').onchange = e => { $('#new-cwd').value = e.target.value; };
+$('#new-cwd').oninput = () => {
+  $('#new-session-error').textContent = '';
+  scheduleCwdCompletions();
+};
+$('#new-cwd').onkeydown = e => {
+  if (e.isComposing) return;
+  if (e.key === 'Tab' && !e.shiftKey && canCompleteCwd(e.currentTarget.value)) {
+    e.preventDefault();
+    if (!$('#new-cwd-completions').hidden
+        && cwdCompletion.forValue === e.currentTarget.value.trim()) {
+      applyCwdTabCompletion();
+    } else {
+      loadCwdCompletions(true);
+    }
+  } else if (e.key === 'ArrowDown' && !$('#new-cwd-completions').hidden) {
+    e.preventDefault();
+    setCwdCompletionActive(1);
+  } else if (e.key === 'ArrowUp' && !$('#new-cwd-completions').hidden) {
+    e.preventDefault();
+    setCwdCompletionActive(-1);
+  } else if (e.key === 'Enter' && cwdCompletion.active >= 0
+             && !$('#new-cwd-completions').hidden) {
+    e.preventDefault();
+    setCwdValue(cwdCompletion.rows[cwdCompletion.active]);
+  } else if (e.key === 'Escape' && !$('#new-cwd-completions').hidden) {
+    e.preventDefault();
+    e.stopPropagation();
+    dismissCwdCompletions();
+  }
+};
+$('#new-cwd').onblur = () => setTimeout(() => {
+  if (!$('#new-cwd-completions').contains(document.activeElement)) dismissCwdCompletions();
+}, 0);
+$('#new-cwd-completions').onpointerdown = e => {
+  const option = e.target.closest('[data-cwd-completion]');
+  if (!option || (e.button !== undefined && e.button !== 0)) return;
+  e.preventDefault();
+  const path = cwdCompletion.rows[Number(option.dataset.cwdCompletion)];
+  if (path) setCwdValue(path);
+};
+$('#new-cwd-list').onchange = e => {
+  dismissCwdCompletions();
+  $('#new-cwd').value = e.target.value;
+  $('#new-session-error').textContent = '';
+};
 $('#new-cwd-list').ondblclick = () => $('#new-session-form').requestSubmit();
+$('#new-session-dialog').addEventListener('close', dismissCwdCompletions);
 $('#new-session-dialog').addEventListener('click', e => {
   if (e.target === $('#new-session-dialog')) $('#new-session-dialog').close();
 });
@@ -628,6 +906,7 @@ function ensureTerm(name) {
   host.hidden = true;
   $('#xterm').appendChild(host);
   const term = new Terminal({
+    allowProposedApi: true,
     fontFamily: termFont(),
     fontSize: termFontSize(), fontWeight: '400', fontWeightBold: '600',
     cursorBlink: true, scrollback: 10000,
@@ -639,11 +918,38 @@ function ensureTerm(name) {
     reconnectDelay: 500, scrollPos: 0, ansiTail: '',
     outputBuffer: '', outputTimer: null, fitFrame: null,
     lastResizeKey: '', lastResizeWs: null,
+    attachPromise: null, revoked: false,
+    renderer: 'dom', webgl: null, unicode11: null,
     selectionLocked: false, selectionSnapshot: null, restoringSelection: false,
   };
   T.views.set(name, view);
   term.loadAddon(fit);
+  if (globalThis.Unicode11Addon?.Unicode11Addon) {
+    try {
+      view.unicode11 = new Unicode11Addon.Unicode11Addon();
+      term.loadAddon(view.unicode11);
+      term.unicode.activeVersion = '11';
+    } catch { view.unicode11 = null; }
+  }
   term.open(host);
+  // Codex 用 DEC ?2026 同步输出重画输入框。DOM renderer 在 Chromium/Wayland
+  // 会偶发只提交清行的中间图层；WebGL 把整帧画进同一纹理。不可用或 context
+  // loss 时官方 addon 会被 dispose，xterm 自动恢复 DOM renderer。
+  if (globalThis.WebglAddon?.WebglAddon) {
+    try {
+      const webgl = new WebglAddon.WebglAddon();
+      webgl.onContextLoss(() => {
+        if (view.webgl !== webgl) return;
+        view.webgl = null;
+        view.renderer = 'dom';
+        webgl.dispose();
+        requestAnimationFrame(() => term.refresh(0, term.rows - 1));
+      });
+      term.loadAddon(webgl);
+      view.webgl = webgl;
+      view.renderer = 'webgl';
+    } catch { /* WebGL2/硬件加速不可用时保留 DOM renderer */ }
+  }
   host.addEventListener('mousedown', e => {
     const selecting = e.shiftKey || T.localMouse;
     view.selectionLocked = selecting;
@@ -689,6 +995,9 @@ function ensureTerm(name) {
       return;
     }
     view.ws.send(new TextEncoder().encode(d));
+    if (claudeRewinds.has(name) && /[\r\n]/.test(d)) {
+      scheduleClaudeRewindSync(name);
+    }
   });
   // 专用 server 不让 tmux 接管滚动：外层不进 alternate screen，直接使用
   // xterm 的正常 scrollback。改造前遗留在默认 server 的会话仍走旧兼容路径。
@@ -734,9 +1043,16 @@ function clearTermOutput(view) {
   view.outputBuffer = '';
 }
 
+function termPaneRenderable(view = currentTermViewObject()) {
+  if (!view || view !== currentTermViewObject()) return false;
+  const pane = $('#termpane');
+  return !pane.classList.contains('hidden')
+    && (MOBILE.matches || T.mode !== 'collapsed')
+    && !pane.classList.contains('term-collapsed');
+}
+
 function performTermFit(view) {
-  if (!view || view !== currentTermViewObject()
-      || $('#termpane').classList.contains('hidden')) return;
+  if (!termPaneRenderable(view)) return;
   let dimensions;
   try { dimensions = view.fit.proposeDimensions(); } catch { return; }
   if (!dimensions || !Number.isFinite(dimensions.cols) || !Number.isFinite(dimensions.rows)) return;
@@ -757,7 +1073,7 @@ function performTermFit(view) {
 
 function fitTerm(immediate = false) {
   const view = currentTermViewObject();
-  if (!view || $('#termpane').classList.contains('hidden')) return;
+  if (!termPaneRenderable(view)) return;
   if (view.fitFrame) cancelAnimationFrame(view.fitFrame);
   view.fitFrame = null;
   if (immediate) {
@@ -814,9 +1130,13 @@ async function openTermPane(name) {
   if (pane.classList.contains('hidden')) return;
   const view = ensureTerm(name);
   activateTermView(view);
-  fitTerm(true);                         // 连接前先确定尺寸，避免 80×24 → 实际尺寸的首屏跳变
-  if (view.ws?.readyState !== 1) attachTerm(name);
-  else view.term.focus();
+  // 桌面“纯对话”吸附态高度为 0。此时保留 xterm 对象和已有连接，但不要
+  // 新连或 fit；否则内部最小尺寸会把真实 tmux pane 压成 10×6。
+  if (termPaneRenderable(view)) {
+    fitTerm(true);                       // 连接前先确定尺寸，避免 80×24 → 实际尺寸的首屏跳变
+    if (view.ws?.readyState !== 1) await attachTerm(name);
+    else view.term.focus();
+  }
 }
 
 /** 普通高度下按钮仍是展开/收起；吸附到边缘后改为纯对话/纯终端切换。 */
@@ -836,7 +1156,7 @@ function toggleTermPane(name) {
     rememberTermLayout(name);
     layoutTermPane();
     renderTakeoverBtn();
-    if (T.mode === 'full') setTimeout(fitTerm, 0);
+    if (T.mode === 'full') openTermPane(name);
     return;
   }
   closeTermPane();
@@ -874,12 +1194,52 @@ function layoutTermPane() {
   }
 }
 
+async function claimTermOwnership(name) {
+  let result = await post('api/term/claim', {name, page: TERM_PAGE_ID});
+  if (result.conflict) {
+    const ownerIp = result.owner?.ip || '另一地址';
+    if (!confirm(`该终端正由 ${ownerIp} 控制。\n\n是否抢占终端？`)) return null;
+    result = await post('api/term/claim', {name, page: TERM_PAGE_ID, force: true});
+  }
+  if (result.error || !result.token) {
+    alert('打开终端失败：' + (result.error || '无法取得终端控制权'));
+    return null;
+  }
+  return result.token;
+}
+
+function handleTermRevoked(view, ip = '') {
+  if (view.revoked) return;
+  view.revoked = true;
+  cancelTermReconnect(view);
+  if (T.name === view.name) closeTermPane();
+  try { view.ws?.close(); } catch {}
+  alert(`终端已被 ${ip || '另一页面'} 接管，本页面的终端已关闭。`);
+}
+
 function attachTerm(name) {
   const view = ensureTerm(name);
+  if (view.attachPromise) return view.attachPromise;
+  const job = attachOwnedTerm(view).finally(() => {
+    if (view.attachPromise === job) view.attachPromise = null;
+  });
+  view.attachPromise = job;
+  return job;
+}
+
+async function attachOwnedTerm(view) {
+  const name = view.name;
   const active = !$('#termpane').classList.contains('hidden') && T.name === name;
   if (active) activateTermView(view);
   cancelTermReconnect(view);
   dropTermSocket(view);
+  const token = await claimTermOwnership(name);
+  if (!token) {
+    view.revoked = true;
+    if (T.name === name) closeTermPane();
+    return false;
+  }
+  view.revoked = false;
   clearTermOutput(view);
   view.ansiTail = '';
   view.selectionLocked = false;
@@ -889,7 +1249,8 @@ function attachTerm(name) {
   const wsUrl = new URL(appUrl('api/term/attach'));
   wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const cols = view.term.cols || 120, rows = view.term.rows || termRows();
-  wsUrl.search = `name=${encodeURIComponent(name)}&cols=${cols}&rows=${rows}`;
+  wsUrl.search = new URLSearchParams({name, page: TERM_PAGE_ID, token,
+                                      cols: String(cols), rows: String(rows)});
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   view.ws = ws;
@@ -897,6 +1258,15 @@ function attachTerm(name) {
   const dec = new TextDecoder();
   ws.onmessage = e => {
     if (view.ws !== ws) return;           // 已替换连接的尾包不能重画新终端
+    if (typeof e.data === 'string') {
+      try {
+        const message = JSON.parse(e.data);
+        if (message?.t === 'revoked') {
+          handleTermRevoked(view, message.ip);
+          return;
+        }
+      } catch { /* 普通终端字符串按原样渲染 */ }
+    }
     const s = typeof e.data === 'string' ? e.data : dec.decode(e.data, { stream: true });
     queueTermOutput(view, s);
   };
@@ -910,7 +1280,7 @@ function attachTerm(name) {
       view.term.focus();
     }
   };
-  ws.onclose = () => {
+  ws.onclose = event => {
     if (view.ws !== ws) return;           // 主动换 socket 后，旧 close 事件作废
     queueTermOutput(view, dec.decode());
     flushTermOutput(view);
@@ -918,6 +1288,11 @@ function attachTerm(name) {
     if (T.name === name) {
       T.ws = null;
     }
+    if (event.code === 4001 && event.reason.startsWith('revoked:')) {
+      handleTermRevoked(view, event.reason.slice('revoked:'.length));
+      return;
+    }
+    if (view.revoked) return;
     // 先刷新 tmux 列表再决定是否重连。若进程刚退出，旧 T.list 仍会短暂把它
     // 判为存活；先排一个重连定时器会向已消失的会话握手，产生 404/close race。
     Promise.resolve(pollLive(true)).finally(() => {
@@ -925,6 +1300,7 @@ function attachTerm(name) {
     });
   };
   ws.onerror = () => {};
+  return true;
 }
 
 // ---- 滚轮翻历史 ----
@@ -999,7 +1375,7 @@ function dropTermSocket(view = currentTermViewObject()) {
 
 /** 网络短断后自动恢复。tmux 才是会话本体，WebSocket 只是可随时重建的视图。 */
 function scheduleTermReconnect(view = currentTermViewObject()) {
-  if (!view || document.hidden || !navigator.onLine || view.reconnectTimer) return;
+  if (!view || view.revoked || document.hidden || !navigator.onLine || view.reconnectTimer) return;
   const stillAlive = [...(T.list || []), ...(T.pending || [])].some(x => x.name === view.name);
   if (!stillAlive) return;
   const delay = view.reconnectDelay;
@@ -1014,6 +1390,7 @@ function scheduleTermReconnect(view = currentTermViewObject()) {
 /** 手机锁屏会冻结一个看似仍 OPEN、实际已经失效的 socket；恢复时必须强制换新。 */
 function reconnectTerm(view = currentTermViewObject()) {
   if (!view || document.hidden || !navigator.onLine) return;
+  if (view === currentTermViewObject() && !termPaneRenderable(view)) return;
   attachTerm(view.name);
   if (T.name === view.name) setTimeout(() => { layoutTermPane(); fitTerm(); }, 20);
 }
@@ -1215,6 +1592,9 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
   paintLive();
   S.syncGap = FAST_MIN;
   S.lastSync = 0;
+  if (keys?.includes('Enter') && claudeRewinds.has(name)) {
+    scheduleClaudeRewindSync(name);
+  }
   return true;
 }
 
@@ -1547,6 +1927,36 @@ $('#csend').onclick = () => {
 };
 let composerEscAt = -Infinity;
 
+function scheduleClaudeRewindSync(name, delay = 450) {
+  const state = claudeRewinds.get(name);
+  if (!state) return;
+  clearTimeout(state.timer);
+  state.timer = setTimeout(() => syncClaudeRewind(name), delay);
+}
+
+async function syncClaudeRewind(name) {
+  const state = claudeRewinds.get(name);
+  if (!state || state.syncing) return;
+  state.syncing = true;
+  try {
+    const result = await post('api/session/rewind', {
+      action: 'sync', uid: state.uid, name,
+    });
+    if (result.error) return;
+    if (!result.pending) claudeRewinds.delete(name);
+    if (result.changed) {
+      // timeline pin 会改变 cursor 的逻辑叶子，即便 JSONL 一个字节都没变；
+      // 用现有增量接口拿 reset，原子替换缓存和当前 DOM。
+      S.lastSync = 0;
+      await syncSession(state.uid);
+    }
+  } catch { /* 终端仍可继续使用；下一次 Enter 会重试同步 */ }
+  finally {
+    const current = claudeRewinds.get(name);
+    if (current) current.syncing = false;
+  }
+}
+
 async function revealNativeTerminal(uid = S.sel) {
   const name = takenOver(uid);
   if (!name || S.sel !== uid) return false;
@@ -1609,7 +2019,11 @@ async function sendComposerEscape(now = performance.now()) {
   if (!rewind || !sent || !name || S.sel !== uid) return sent;
 
   // 回滚点、恢复代码/对话的选项都由原生 CLI 自己维护。第二次 Esc 后直接
-  // 揭示原生 TUI，不在网页里根据 transcript 猜一个可能不一致的菜单。
+  // 揭示原生 TUI；这里只记住进入选择器前的叶子，最终选择仍服从原生菜单。
+  try {
+    const began = await post('api/session/rewind', {action: 'begin', uid, name});
+    if (began.ok) claudeRewinds.set(name, {uid, timer: null, syncing: false});
+  } catch { /* 记录失败不应阻止原生回滚 */ }
   await revealNativeTerminal(uid);
   return sent;
 }
@@ -1785,7 +2199,12 @@ function backgroundTerm() {
 function foregroundTerm(force = false) {
   if (document.hidden || (!force && !termWasBackgrounded)) return;
   termWasBackgrounded = false;
-  for (const view of T.views.values()) reconnectTerm(view);
+  for (const view of T.views.values()) {
+    if (view.webgl) {
+      try { view.term.clearTextureAtlas(); } catch {}
+    }
+    reconnectTerm(view);
+  }
 }
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) backgroundTerm();

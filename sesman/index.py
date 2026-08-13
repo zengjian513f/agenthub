@@ -11,98 +11,406 @@ from datetime import datetime
 from pathlib import Path
 
 from .adapters import ADAPTERS, ClaudeAdapter
-from . import media
+from . import media, session_meta
 
 CACHE_DIR = Path.home() / ".cache" / "sesman"
 CACHE_FILE = CACHE_DIR / "index.json"
-CACHE_VERSION = 2
+CACHE_VERSION = 4
 TRASH_DIR = Path.home() / ".local" / "share" / "sesman" / "trash"
+CHECK_TTL = 0.5       # 高频热路径复用已发布快照；列表轮询仍会及时发现磁盘变化
 
 _lock = threading.Lock()
-_state = {"sessions": [], "built_at": 0.0, "sig": None}
 
 
-def signature() -> str:
-    """当前磁盘状态的签名。全量 stat 为个位数毫秒, 可供前端低频轮询。"""
-    return _signature()
+def _empty_state() -> dict:
+    return {
+        "initialized": False,
+        "sessions": [],
+        "by_uid": {},
+        "raw": {name: {} for name in ADAPTERS},
+        "files": {},
+        "built_at": 0.0,
+        "checked_at": 0.0,
+        "dirty": False,
+        "sig": None,
+    }
 
 
-def _signature() -> str:
-    """所有会话文件的 (path, mtime, size) 摘要, 用来判断缓存是否过期。"""
-    import hashlib
-    h = hashlib.sha1()
+_state = _empty_state()
+
+
+# inventory value: (kind, owning primary path, size, mtime_ns, inode)
+_KIND_SOURCE = {
+    "claude-main": "claude",
+    "claude-agent": "claude",
+    "claude-agent-meta": "claude",
+    "codex-main": "codex",
+    "grok-summary": "grok",
+    "grok-chat": "grok",
+}
+
+
+def _inventory() -> dict[str, tuple[str, str, int, int, int]]:
+    """枚举索引依赖，但不解析会话正文。子文件同时记录其主会话 owner。"""
     from .adapters import CLAUDE_ROOT, CODEX_ROOT, CODEX_INDEX, GROK_ROOT
-    roots = [(CLAUDE_ROOT, "*/*.jsonl"),
-             (CLAUDE_ROOT, "*/*/subagents/*.jsonl"),
-             (CLAUDE_ROOT, "*/*/subagents/*.meta.json"),
-             (CODEX_ROOT, "**/*.jsonl"),
-             (GROK_ROOT, "*/*/summary.json"), (GROK_ROOT, "*/*/chat_history.jsonl")]
-    for root, pat in roots:
-        if not root.is_dir():
-            continue
-        for f in sorted(root.glob(pat)):
-            try:
-                st = f.stat()
-            except OSError:
-                continue
-            h.update(f"{f}|{int(st.st_mtime)}|{st.st_size}\n".encode())
-    try:
-        st = CODEX_INDEX.stat()
-        h.update(f"{CODEX_INDEX}|{st.st_mtime_ns}|{st.st_size}\n".encode())
-    except OSError:
-        pass
+
+    files = {}
+
+    def add(path: Path, kind: str, owner: Path | str):
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        files[str(path)] = (kind, str(owner), st.st_size, st.st_mtime_ns,
+                            int(getattr(st, "st_ino", 0)))
+
+    if CLAUDE_ROOT.is_dir():
+        for f in CLAUDE_ROOT.glob("*/*.jsonl"):
+            add(f, "claude-main", f)
+        for f in CLAUDE_ROOT.glob("*/*/subagents/*.jsonl"):
+            session_dir = f.parent.parent
+            add(f, "claude-agent", session_dir.parent / f"{session_dir.name}.jsonl")
+        for f in CLAUDE_ROOT.glob("*/*/subagents/*.meta.json"):
+            session_dir = f.parent.parent
+            add(f, "claude-agent-meta",
+                session_dir.parent / f"{session_dir.name}.jsonl")
+    if CODEX_ROOT.is_dir():
+        for f in CODEX_ROOT.glob("**/*.jsonl"):
+            add(f, "codex-main", f)
+    if GROK_ROOT.is_dir():
+        for f in GROK_ROOT.glob("*/*/summary.json"):
+            add(f, "grok-summary", f.parent)
+        for f in GROK_ROOT.glob("*/*/chat_history.jsonl"):
+            add(f, "grok-chat", f.parent)
+    if CODEX_INDEX.exists():
+        add(CODEX_INDEX, "codex-index", "")
+    return files
+
+
+def _signature(files=None) -> str:
+    """为一次已经枚举完成的 inventory 生成稳定签名。"""
+    import hashlib
+    files = _inventory() if files is None else files
+    h = hashlib.sha1()
+    # 文件没有变化时，索引语义升级也必须让已打开的浏览器换新列表；否则
+    # 它会拿旧 sig 得到 unchanged，并永久保留升级前被误隐藏的会话。
+    h.update(f"schema:{CACHE_VERSION}\n".encode())
+    for path, (kind, owner, size, mtime_ns, inode) in sorted(files.items()):
+        h.update(f"{kind}|{owner}|{path}|{size}|{mtime_ns}|{inode}\n".encode())
     return h.hexdigest()
 
 
-def _build() -> list[dict]:
+_PRIMARY_KIND = {
+    "claude": "claude-main",
+    "codex": "codex-main",
+    "grok": "grok-summary",
+}
+
+
+def _read_owner(source: str, owner: str, files: dict) -> dict | None:
+    """严格读取 inventory 中的 owner；瞬时 I/O 失败不能伪装成删除。"""
+    refresh = getattr(ADAPTERS[source], "session_meta", None)
+    if refresh is None:
+        raise RuntimeError(f"{source} adapter does not support indexed scan")
+    row = refresh(owner)
+    if row is None:
+        primary = _PRIMARY_KIND[source]
+        still_present = any(kind == primary and entry_owner == owner and size > 0
+                            for kind, entry_owner, size, *_ in files.values())
+        if still_present:
+            raise OSError(f"{source} owner disappeared while reading: {owner}")
+        return None
+
+    if source == "claude":
+        expected = {
+            Path(path).stem.removeprefix("agent-")
+            for path, (kind, entry_owner, *_rest) in files.items()
+            if kind == "claude-agent" and entry_owner == owner
+        }
+        actual = {str(item.get("id") or "") for item in row.get("agent_items") or []}
+        if actual != expected:
+            raise OSError(f"claude subagent inventory changed while reading: {owner}")
+    return row
+
+
+def _scan_raw(files: dict | None = None) -> dict[str, dict[str, dict]]:
+    """按同一份 inventory 全量解析，避免独立枚举产生幽灵或漏行。"""
+    files = _inventory() if files is None else files
+    raw = {name: {} for name in ADAPTERS}
+    owners = set()
+    for kind, owner, *_ in files.values():
+        source = _KIND_SOURCE.get(kind)
+        if source and owner:
+            owners.add((source, owner))
+    for source, owner in sorted(owners):
+        row = _read_owner(source, owner, files)
+        if row is not None:
+            raw[source][owner] = row
+    return raw
+
+
+def _finalize(raw: dict[str, dict[str, dict]]) -> list[dict]:
+    """从每文件 raw 元数据生成公开列表；拓扑计算只操作内存。"""
     out = []
     for name, ad in ADAPTERS.items():
-        try:
-            out.extend(ad.list_sessions())
-        except Exception as e:  # 单一来源异常不应拖垮整个索引
-            print(f"[sesman] {name} 扫描失败: {e}")
+        rows = list(raw.get(name, {}).values())
+        if hasattr(ad, "finalize_sessions"):
+            rows = ad.finalize_sessions(rows)
+        else:
+            rows = [dict(row) for row in rows]
+        out.extend(rows)
     out.sort(key=lambda s: s["updated"], reverse=True)
     return out
 
 
+def _build() -> list[dict]:
+    """兼容显式全量构建调用；正常 append 由 load() 做单 owner 刷新。"""
+    files = _inventory()
+    return _finalize(_scan_raw(files))
+
+
+def _refresh_raw(raw: dict[str, dict[str, dict]], old_files: dict,
+                 new_files: dict) -> dict[str, dict[str, dict]] | None:
+    """只重读变化文件所属的主会话；返回 None 表示 adapter 不支持局部刷新。"""
+    changed = {path for path in old_files.keys() | new_files.keys()
+               if old_files.get(path) != new_files.get(path)}
+    owners = set()
+    for path in changed:
+        entry = new_files.get(path) or old_files.get(path)
+        kind, owner = entry[0], entry[1]
+        if kind == "codex-index":
+            continue  # 名称在 Codex finalize 阶段从小型全局文件重新套用
+        source = _KIND_SOURCE.get(kind)
+        if source and owner:
+            owners.add((source, owner))
+
+    updated = {name: dict(raw.get(name, {})) for name in ADAPTERS}
+    for source, owner in sorted(owners):
+        row = _read_owner(source, owner, new_files)
+        if row is None:
+            updated[source].pop(owner, None)
+        else:
+            updated[source][owner] = row
+    return updated
+
+
+def _cache_raw(value) -> dict[str, dict[str, dict]]:
+    """严格恢复 v3 raw schema；任何异常都让调用方安全回退全量扫描。"""
+    if not isinstance(value, dict):
+        raise ValueError("missing raw cache")
+    raw = {name: {} for name in ADAPTERS}
+    for name in ADAPTERS:
+        rows = value.get(name)
+        if not isinstance(rows, list):
+            raise ValueError(f"invalid {name} raw cache")
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("path"):
+                raise ValueError(f"invalid {name} row")
+            raw[name][str(row["path"])] = row
+    return raw
+
+
+def _cache_files(value) -> dict[str, tuple[str, str, int, int, int]]:
+    if not isinstance(value, dict):
+        raise ValueError("missing inventory cache")
+    files = {}
+    for path, entry in value.items():
+        if not isinstance(path, str) or not isinstance(entry, list) or len(entry) != 5:
+            raise ValueError("invalid inventory cache")
+        kind, owner, size, mtime_ns, inode = entry
+        files[path] = (str(kind), str(owner), int(size), int(mtime_ns), int(inode))
+    return files
+
+
+def _read_cache() -> tuple[dict, dict, str, float] | None:
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        cached = json.loads(CACHE_FILE.read_text())
+        if not isinstance(cached, dict):
+            return None
+        if cached.get("version") != CACHE_VERSION or not cached.get("sig"):
+            return None
+        return (_cache_raw(cached.get("raw")), _cache_files(cached.get("files")),
+                str(cached["sig"]), float(cached.get("built_at", 0)))
+    except (OSError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _write_cache(raw: dict, sessions: list[dict], files: dict,
+                 sig: str, built_at: float):
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({
+            "version": CACHE_VERSION,
+            "sig": sig,
+            "built_at": built_at,
+            "sessions": sessions,
+            "raw": {name: list(raw.get(name, {}).values()) for name in ADAPTERS},
+            "files": {path: list(entry) for path, entry in files.items()},
+        }, ensure_ascii=False)
+        temp = CACHE_FILE.with_name(CACHE_FILE.name + ".tmp")
+        temp.write_text(payload)
+        temp.replace(CACHE_FILE)
+    except OSError:
+        pass
+
+
+def _publish(raw: dict, sessions: list[dict], files: dict, sig: str,
+             built_at: float, checked_at: float, dirty: bool):
+    """一次替换完整快照，HTTP 读者不会看到半新半旧的组合。"""
+    global _state
+    _state = {
+        "initialized": True,
+        "sessions": sessions,
+        "by_uid": {row["uid"]: row for row in sessions},
+        "raw": raw,
+        "files": files,
+        "built_at": built_at,
+        "checked_at": checked_at,
+        "dirty": dirty,
+        "sig": sig,
+    }
+
+
+def signature() -> str:
+    """返回已发布列表对应的签名，不在普通读请求里偷偷扫描磁盘。"""
+    cached()
+    return str(_state["sig"] or "")
+
+
 def load(force: bool = False) -> list[dict]:
+    """扫描 inventory 并增量协调；同一时刻只允许一个刷新者。"""
     with _lock:
-        sig = _signature()
-        if not force and _state["sessions"] and _state["sig"] == sig:
+        now = time.monotonic()
+        if (not force and _state["initialized"]
+                and _state["checked_at"] > 0
+                and now - _state["checked_at"] <= CHECK_TTL):
             return _state["sessions"]
-        if not force and not _state["sessions"] and CACHE_FILE.exists():
-            try:
-                cached = json.loads(CACHE_FILE.read_text())
-                if cached.get("version") == CACHE_VERSION and cached.get("sig") == sig:
-                    _state.update(sessions=cached["sessions"], sig=sig, built_at=cached.get("built_at", 0))
-                    return _state["sessions"]
-            except Exception:
-                pass
+
+        files = _inventory()
+        sig = _signature(files)
+        if (not force and _state["initialized"] and not _state["dirty"]
+                and _state["sig"] == sig):
+            _publish(_state["raw"], _state["sessions"], files, sig,
+                     _state["built_at"], time.monotonic(), False)
+            return _state["sessions"]
+
+        if not force and not _state["initialized"]:
+            restored = _read_cache()
+            if restored is not None:
+                raw, cached_files, cached_sig, built_at = restored
+                try:
+                    if cached_sig != sig:
+                        raw = _refresh_raw(raw, cached_files, files)
+                        if raw is None:
+                            raise ValueError("cache cannot be incrementally refreshed")
+                        built_at = time.time()
+                    sessions = _finalize(raw)
+                except Exception:
+                    pass
+                else:
+                    dirty = _inventory() != files
+                    _publish(raw, sessions, files, sig, built_at,
+                             time.monotonic(), dirty)
+                    if not dirty and cached_sig != sig:
+                        _write_cache(raw, sessions, files, sig, built_at)
+                    return sessions
+
         t0 = time.time()
-        sessions = _build()
-        _state.update(sessions=sessions, sig=sig, built_at=time.time())
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # dirty 且 inventory 又回到原签名时，空 diff 无法证明候选 raw 与磁盘
+        # 一致（例如解析窗口里短暂出现又消失的文件），必须按本次 inventory
+        # 重读，而不是直接清掉 dirty。
+        full = (force or not _state["initialized"]
+                or (_state["dirty"] and _state["sig"] == sig))
         try:
-            CACHE_FILE.write_text(json.dumps(
-                {"version": CACHE_VERSION, "sig": sig,
-                 "built_at": _state["built_at"], "sessions": sessions}, ensure_ascii=False))
-        except OSError:
-            pass
-        print(f"[sesman] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")
-        return sessions
+            raw = _scan_raw(files) if full else _refresh_raw(
+                _state["raw"], _state["files"], files)
+            if raw is None:
+                full = True
+                raw = _scan_raw(files)
+            sessions = _finalize(raw)
+        except Exception as e:
+            # 局部文件可能正写到一半。保留上一份完整快照且不认领新 stamp，
+            # 下一次 load 即使磁盘没有再次变化也会重试。
+            if _state["initialized"]:
+                _publish(_state["raw"], _state["sessions"], _state["files"],
+                         _state["sig"], _state["built_at"], time.monotonic(), True)
+                print(f"[sesman] 索引增量刷新失败，稍后重试: {e}")
+                return _state["sessions"]
+            raise
+
+        built_at = time.time()
+        # 若解析期间又有 append，只发布本轮起点对应的签名并立即标 dirty；
+        # 不能拿更新的签名给较旧 rows 背书。下一轮只会再读变化 owner。
+        dirty = _inventory() != files
+        _publish(raw, sessions, files, sig, built_at, time.monotonic(), dirty)
+        if not dirty:
+            _write_cache(raw, sessions, files, sig, built_at)
+        if full:
+            print(f"[sesman] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")
+        return _state["sessions"]
+
+
+def load_snapshot(force: bool = False) -> tuple[list[dict], str, float]:
+    """原子取得同一发布版本的列表、签名和构建时间。"""
+    while True:
+        sessions = load(force=force)
+        force = False
+        with _lock:
+            if sessions is _state["sessions"]:
+                return sessions, str(_state["sig"] or ""), _state["built_at"]
+
+
+def cached() -> list[dict]:
+    """读取最近一次完整快照；只有进程尚未初始化时才扫描磁盘。"""
+    if not _state["initialized"]:
+        return load()
+    return _state["sessions"]
 
 
 def get(uid: str) -> dict | None:
-    for s in load():
-        if s["uid"] == uid:
-            return s
-    return None
+    """O(1) 查询已发布 UID，不让消息、live、outbox 热路径触发刷新。"""
+    if not _state["initialized"]:
+        load()
+    return _state["by_uid"].get(uid)
 
 
 def data_file(s: dict) -> Path:
     """会话真正的数据文件 (grok 的 path 是目录)。"""
     p = Path(s["path"])
     return p / "chat_history.jsonl" if s["source"] == "grok" else p
+
+
+def _claude_effective_tip(s: dict, pos: int | None = None) -> str | None:
+    """合并 Claude 磁盘树与 sesman 从原生 TUI 确认的未落盘回滚。"""
+    ad = ADAPTERS.get(s.get("source"))
+    if not isinstance(ad, ClaudeAdapter):
+        return None
+    path = str(data_file(s))
+    agent = s.get("agent_id")
+    if agent:
+        return ad.active_tip(path, pos=pos, agent=agent)
+    timeline = session_meta.timeline(str(s.get("uid") or ""))
+    if not timeline:
+        return ad.active_tip(path, pos=pos)
+    if pos is None:
+        try:
+            pos = data_file(s).stat().st_size
+        except OSError:
+            pos = 0
+    stale_end = int(timeline["stale_end"])
+    # 回滚以后真正发送的新输入会在旧 EOF 后追加一条带 parentUuid 的记录；
+    # 从那一刻起新记录再次成为权威。仅有 sidechain/无图事件追加则继续用 pin。
+    appended = ad.latest_tip_after(path, stale_end, end=pos) if pos > stale_end else None
+    return appended or str(timeline["tip"])
+
+
+def claude_screen_tip(s: dict, screen: str) -> str | None:
+    ad = ADAPTERS.get(s.get("source"))
+    if not isinstance(ad, ClaudeAdapter) or s.get("agent_id"):
+        return None
+    return ad.match_screen_tip(str(data_file(s)), screen)
 
 
 def _head_hash(f: Path, limit: int = 4096) -> str:
@@ -160,7 +468,7 @@ def _cursor_anchor(s: dict, pos: int) -> str:
     raw = _anchor_hash(data_file(s), pos)
     ad = ADAPTERS.get(s.get("source"))
     if isinstance(ad, ClaudeAdapter):
-        tip = ad.active_tip(str(data_file(s)), pos=pos, agent=s.get("agent_id"))
+        tip = _claude_effective_tip(s, pos=pos)
         if tip:
             return f"{raw}@{tip}"
     return raw
@@ -173,6 +481,53 @@ def cursor(s: dict) -> dict:
             "anchor": _cursor_anchor(s, ver["size"])}
 
 
+_cursor_cache: dict[tuple[str, str, str], tuple[tuple, dict]] = {}
+_cursor_cache_lock = threading.Lock()
+
+
+def _cursor_stamp(s: dict) -> tuple:
+    """游标缓存版本；ctime/inode 补上同尺寸重写和路径复用的边界。"""
+    f = data_file(s)
+    try:
+        st = f.stat()
+    except OSError:
+        return (str(f), 0, 0, 0, 0,
+                session_meta.timeline_revision(s.get("uid", "")))
+    return (str(f), st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            int(getattr(st, "st_ino", 0)),
+            session_meta.timeline_revision(s.get("uid", "")))
+
+
+def _cached_cursor(s: dict) -> dict:
+    """按文件版本复用游标；同一新版本并发到达时只允许一次重读。"""
+    cache_id = (str(s.get("source") or ""), str(data_file(s)),
+                str(s.get("agent_id") or ""))
+    stamp = _cursor_stamp(s)
+    cached_value = _cursor_cache.get(cache_id)
+    if cached_value and cached_value[0] == stamp:
+        return dict(cached_value[1])
+
+    with _cursor_cache_lock:
+        # 等锁期间另一个请求可能已经完成同一版本，锁内必须二次检查。
+        stamp = _cursor_stamp(s)
+        cached_value = _cursor_cache.get(cache_id)
+        if cached_value and cached_value[0] == stamp:
+            return dict(cached_value[1])
+
+        value = cursor(s)
+        after = _cursor_stamp(s)
+        if after == stamp:
+            _cursor_cache[cache_id] = (stamp, value)
+            if len(_cursor_cache) > 4096:
+                # 路径是 append-only key，不按版本增长；这里只限制长期频繁删除、
+                # 移动后留下的旧路径。删最早的一批至多令静态会话重算一次。
+                for old_key in list(_cursor_cache)[:1024]:
+                    _cursor_cache.pop(old_key, None)
+        # 若读取期间文件继续 append，本次结果仍与旧逻辑一样可用于响应，但不
+        # 写缓存；下一个请求会按新 stamp 重算，不能给混合游标错误背书。
+        return dict(value)
+
+
 def with_cursors(sessions: list[dict]) -> list[dict]:
     """给列表元数据附加主会话及 Claude 子代理的 EOF 游标。
 
@@ -181,12 +536,13 @@ def with_cursors(sessions: list[dict]) -> list[dict]:
     """
     out = []
     for session in sessions:
-        row = {**session, "cursor": cursor(session)}
+        row = {**session, "cursor": _cached_cursor(session)}
         items = []
         for item in session.get("agent_items") or []:
             copy = dict(item)
             try:
-                copy["cursor"] = cursor(session_view(session, str(item.get("id") or "")))
+                copy["cursor"] = _cached_cursor(
+                    session_view(session, str(item.get("id") or "")))
             except KeyError:
                 pass
             items.append(copy)
@@ -227,8 +583,7 @@ def messages(uid: str, agent: str = "",
 
 def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
                  append_only: bool = False, windowed: bool = False) -> dict:
-    """整份或增量读取。传的是会话元数据而不是 uid —— SSE 那边每 50ms 要调一次,
-    走 uid 的话每次都会连带重算索引签名(数百次 stat)甚至重建整个索引。
+    """整份或增量读取。直接持有会话快照，SSE 每 50ms 只检查目标文件。
 
     能接着上次读的条件: 文件头没变、文件没缩短、而且**偏移点之前的内容也没变**。
     最后一条是必需的 —— 有些会话会截断后重写。Claude 双 Esc 则更特殊：
@@ -249,8 +604,7 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
     if ok and isinstance(ad, ClaudeAdapter):
         # Claude 的文件在双 Esc 时不会截断，只会从旧祖先追加一个新分支。
         # 字节锚点仍然完全匹配，因此还必须比较逻辑叶子及新增链的亲缘关系。
-        prefix_tip = ad.active_tip(str(data_file(s)), pos=start,
-                                   agent=s.get("agent_id"))
+        prefix_tip = _claude_effective_tip(s, pos=start)
         if prefix_tip:
             ok = old_tip == prefix_tip
             if ok:
@@ -269,8 +623,10 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
                 "activity_changed": False, "activity": None}
     if reset:
         start = 0
-    if isinstance(ad, ClaudeAdapter) and s.get("agent_id"):
-        msgs, end = ad.read(s["path"], start=start, agent=s["agent_id"])
+    if isinstance(ad, ClaudeAdapter):
+        msgs, end = ad.read(
+            s["path"], start=start, agent=s.get("agent_id"),
+            declared_tip=_claude_effective_tip(s, pos=ver["size"]))
     else:
         msgs, end = ad.read(s["path"], start=start)
     activity_events = [m for m in msgs if m.get("role") == "status"]
@@ -304,8 +660,21 @@ def delete(uid: str) -> str:
     dest = dest_dir / f"{stamp}-{src.name}"
     shutil.move(str(src), str(dest))
     with _lock:
-        _state["sessions"] = [x for x in _state["sessions"] if x["uid"] != uid]
-        _state["sig"] = None
+        raw = {name: dict(rows) for name, rows in _state["raw"].items()}
+        raw.get(s["source"], {}).pop(str(s["path"]), None)
+        try:
+            sessions = _finalize(raw)
+        except Exception as e:
+            # 文件移动已经完成，不能因随后一次瞬时元数据读错把成功删除误报
+            # 成 500。先从公开快照移除目标，保留 dirty 让下一轮恢复 Codex
+            # 隐藏祖先等拓扑；源文件不会因用户重试而进一步受损。
+            sessions = [row for row in _state["sessions"] if row.get("uid") != uid]
+            print(f"[sesman] 删除后的索引协调失败，稍后重试: {e}")
+        # 不用移动后的新 inventory 给尚未协调的其他变化背书；下一次 load
+        # 会从旧 files 做完整 diff。Codex 叶子删除后这里已能立即恢复父项。
+        _publish(raw, sessions, _state["files"], None, time.time(), 0.0, True)
+        with _search_text_lock:
+            _search_text_cache.pop(uid, None)
     return str(dest)
 
 
@@ -335,7 +704,8 @@ def _search_text(s: dict) -> str:
     f = data_file(s)
     try:
         st = f.stat()
-        key = (str(f), st.st_size, st.st_mtime_ns)
+        key = (str(f), st.st_size, st.st_mtime_ns,
+               session_meta.timeline_revision(s.get("uid", "")))
     except OSError:
         return ""
     with _search_text_lock:
@@ -343,7 +713,12 @@ def _search_text(s: dict) -> str:
         if cached and cached[0] == key:
             return cached[1]
     try:
-        msgs, _ = ADAPTERS[s["source"]].read(s["path"])
+        ad = ADAPTERS[s["source"]]
+        if isinstance(ad, ClaudeAdapter):
+            msgs, _ = ad.read(s["path"], agent=s.get("agent_id"),
+                              declared_tip=_claude_effective_tip(s))
+        else:
+            msgs, _ = ad.read(s["path"])
     except Exception:
         return ""
     text = "\n".join(m.get("text", "") for m in msgs

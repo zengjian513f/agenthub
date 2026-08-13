@@ -12,6 +12,8 @@ import hashlib
 import html
 import json
 import re
+import stat as statmod
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,13 +57,15 @@ def _norm_ts(v) -> str | None:
     return dt.astimezone().isoformat(timespec="milliseconds")
 
 
-def _head_lines(path: Path, limit: int = 40):
+def _head_lines(path: Path, limit: int = 40, *, strict: bool = False):
     """读文件头若干行并解析 JSON, 跳过坏行。"""
     out = []
     try:
         with open(path, "rb") as fh:
             blob = fh.read(HEAD_BYTES)
     except OSError:
+        if strict:
+            raise
         return out
     for raw in blob.split(b"\n")[:limit]:
         raw = raw.strip()
@@ -74,7 +78,7 @@ def _head_lines(path: Path, limit: int = 40):
     return out
 
 
-def _tail_lines(path: Path):
+def _tail_lines(path: Path, *, strict: bool = False):
     """解析文件尾部的完整 JSONL 记录，用于读取后追加的 rename 元数据。"""
     try:
         size = path.stat().st_size
@@ -83,6 +87,8 @@ def _tail_lines(path: Path):
             fh.seek(start)
             blob = fh.read()
     except OSError:
+        if strict:
+            raise
         return []
     lines = blob.split(b"\n")
     if start:
@@ -697,10 +703,11 @@ class ClaudeAdapter:
 
     @classmethod
     def _active_lineage(cls, path: str, start: int = 0,
-                        agent: str | None = None) -> tuple[set[str] | None, int]:
+                        agent: str | None = None,
+                        declared_tip: str | None = None) -> tuple[set[str] | None, int]:
         """扫描一个读取区间，求其最后叶子的祖先链及实际 EOF。"""
         parents: dict[str, str | None] = {}
-        tip = None
+        tip = str(declared_tip) if declared_tip else None
         end = start
         for rec, off in _iter_records(path, start):
             end = off
@@ -709,7 +716,7 @@ class ClaudeAdapter:
                 parent = rec.get("parentUuid")
                 parents[uid] = str(parent) if parent else None
             signal = cls._lineage_signal(rec, agent)
-            if signal:
+            if signal and not declared_tip:
                 tip = signal
         if not tip:
             return None, end
@@ -721,6 +728,70 @@ class ClaudeAdapter:
                 break
             node = parents[node]
         return active, end
+
+    @classmethod
+    def latest_tip_after(cls, path: str, start: int, end: int | None = None,
+                         agent: str | None = None) -> str | None:
+        """返回一个追加区间自己声明的最后叶子，不回看区间以前的旧分支。"""
+        tip = None
+        for rec, off in _iter_records(path, start):
+            if end is not None and off > end:
+                break
+            signal = cls._lineage_signal(rec, agent)
+            if signal:
+                tip = signal
+        return tip
+
+    @staticmethod
+    def _screen_key(value) -> str:
+        # capture-pane -J 已经拼回软换行；这里再忽略所有布局空白，避免终端宽度
+        # 或 Markdown 段落换行影响同一条原生记录的匹配。
+        return "".join(str(value or "").replace("\u00a0", " ").split())
+
+    @classmethod
+    def _record_screen_text(cls, rec: dict) -> str:
+        """取 Claude TUI 会实际画出的自然语言，不拿工具协议 JSON 去碰运气。"""
+        kind = rec.get("type")
+        if kind in {"user", "assistant"}:
+            parts = _flatten_content((rec.get("message") or {}).get("content"))
+            rows = [str(part.get("text") or "") for part in parts
+                    if part.get("kind") in {"text", "thinking"}]
+            if kind == "user":
+                rows = [row for row in rows if not _is_injected(row)
+                        and not _is_timeline_protocol(row)]
+            return "\n".join(row for row in rows if row.strip())
+        if kind == "system" and rec.get("subtype") == "away_summary":
+            return _stringify(rec.get("content"))
+        return ""
+
+    @classmethod
+    def match_screen_tip(cls, path: str, screen: str,
+                         agent: str | None = None) -> str | None:
+        """从 Claude 当前屏幕找最后一条仍可见的图节点。
+
+        Claude 在双 Esc 最终确认后只改进程内的 current leaf，不一定落一条 JSONL
+        事件。终端却会立即重画到选中的时间线。只接受正常输入提示符下至少 48
+        个连续非空白字符的匹配，宁可稍后重试，也不靠短词猜错分支。
+        """
+        if not re.search(r"(?m)^\s*❯", str(screen or "")):
+            return None
+        haystack = cls._screen_key(screen)
+        if not haystack:
+            return None
+        matched = None
+        width = 48
+        for rec, _ in _iter_records(path):
+            uid = cls._graph_uuid(rec, agent)
+            if not uid:
+                continue
+            needle = cls._screen_key(cls._record_screen_text(rec))
+            if len(needle) < width:
+                continue
+            starts = list(range(0, max(1, len(needle) - width + 1), width // 2))
+            starts.append(max(0, len(needle) - width))
+            if any(needle[at:at + width] in haystack for at in starts):
+                matched = uid
+        return matched
 
     @classmethod
     def active_tip(cls, path: str, pos: int | None = None,
@@ -806,10 +877,23 @@ class ClaudeAdapter:
                 out.append(self._meta(f, st, proj.name))
         return out
 
+    def session_meta(self, path: str | Path) -> dict | None:
+        """只刷新一个主会话的列表元数据。"""
+        f = Path(path)
+        try:
+            st = f.stat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise
+        if st.st_size == 0:
+            return None
+        return self._meta(f, st, f.parent.name)
+
     def _meta(self, f: Path, st, proj_name: str):
         generated_title = cwd = branch = created = sid = None
         first_user = None
-        for rec in _head_lines(f):
+        for rec in _head_lines(f, strict=True):
             t = rec.get("type")
             if t == "ai-title" and not generated_title:
                 generated_title = rec.get("aiTitle")
@@ -828,7 +912,7 @@ class ClaudeAdapter:
                     first_user = txt
         custom_title = latest_ai_title = None
         tail_cwds = {}
-        for rec in _tail_lines(f):
+        for rec in _tail_lines(f, strict=True):
             if rec.get("cwd"):
                 value = str(rec["cwd"])
                 tail_cwds[value] = tail_cwds.get(value, 0) + 1
@@ -851,12 +935,18 @@ class ClaudeAdapter:
             agent_id = af.stem.removeprefix("agent-")
             try:
                 info = json.loads(af.with_suffix(".meta.json").read_text(errors="replace"))
-            except (OSError, ValueError):
+            except FileNotFoundError:
+                info = {}
+            except OSError:
+                raise
+            except ValueError:
                 info = {}
             try:
                 ast = af.stat()
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError:
+                raise
             agent_items.append({
                 "id": agent_id,
                 "title": str(info.get("description") or f"子代理 {agent_id[:8]}"),
@@ -871,13 +961,17 @@ class ClaudeAdapter:
             "agent_items": agent_items,
         }
 
-    def read(self, path: str, start: int = 0, agent: str | None = None):
-        return self._read_one(path, start=start, agent=agent[:8] if agent else None)
+    def read(self, path: str, start: int = 0, agent: str | None = None,
+             declared_tip: str | None = None):
+        return self._read_one(path, start=start, agent=agent[:8] if agent else None,
+                              declared_tip=declared_tip)
 
-    def _read_one(self, path: str, agent: str | None = None, start: int = 0):
+    def _read_one(self, path: str, agent: str | None = None, start: int = 0,
+                  declared_tip: str | None = None):
         # 先用轻量父指针表确定当前分支，再做原有消息解析。这样双 Esc 后留在
         # append-only 文件里的旧输入/回答不会继续混入当前时间线。
-        active, end = self._active_lineage(path, start=start, agent=agent)
+        active, end = self._active_lineage(path, start=start, agent=agent,
+                                           declared_tip=declared_tip)
         msgs, calls = [], {}
         for rec, off in _iter_records(path, start):
             end = off
@@ -1002,81 +1096,125 @@ class CodexAdapter:
     def __init__(self):
         self._names = None
         self._names_key = None
+        self._names_lock = threading.Lock()
         self._sid_paths: dict[str, Path] = {}
 
     def _thread_names(self):
-        try:
-            st = CODEX_INDEX.stat()
-            key = (st.st_size, st.st_mtime_ns)
-        except OSError:
-            key = None
-        if self._names is None or key != self._names_key:
-            self._names = {}
-            self._names_key = key
-            if CODEX_INDEX.exists():
-                with open(CODEX_INDEX, "r", errors="replace") as fh:
-                    for line in fh:
-                        try:
-                            r = json.loads(line)
-                        except Exception:
-                            continue
-                        if r.get("id") and r.get("thread_name"):
-                            self._names[r["id"]] = {
-                                "name": str(r["thread_name"]),
-                                "updated": _norm_ts(r.get("updated_at")),
-                            }
-        return self._names
+        with self._names_lock:
+            try:
+                st = CODEX_INDEX.stat()
+                key = (st.st_size, st.st_mtime_ns, int(getattr(st, "st_ino", 0)))
+            except FileNotFoundError:
+                key = None
+            except OSError:
+                raise
+            if self._names is None or key != self._names_key:
+                names = {}
+                if key is not None:
+                    with open(CODEX_INDEX, "r", errors="replace") as fh:
+                        for line in fh:
+                            try:
+                                r = json.loads(line)
+                            except Exception:
+                                continue
+                            if r.get("id") and r.get("thread_name"):
+                                names[r["id"]] = {
+                                    "name": str(r["thread_name"]),
+                                    "updated": _norm_ts(r.get("updated_at")),
+                                }
+                # stat、读取和两个缓存字段必须同属一个临界区；否则不同版本
+                # 的并发读可交错成“旧内容 + 新 key”，并永久命中错误缓存。
+                self._names = names
+                self._names_key = key
+            return self._names
 
     def _name_event(self, sid: str) -> dict | None:
         """session_index 只保留最终名称和更新时间，不保留原始 /rename 输入。"""
         row = self._thread_names().get(sid)
         return row if row and row.get("updated") else None
 
-    def list_sessions(self):
+    @staticmethod
+    def _raw_meta(f: Path, st) -> dict:
+        """读取一个 rollout 的本地元数据，不在这里处理分叉继承与隐藏。"""
+        meta, first_user, model = {}, None, None
+        for rec in _head_lines(f, 120, strict=True):
+            p = rec.get("payload") or {}
+            if rec.get("type") == "session_meta" and not meta:
+                meta = p
+            if rec.get("type") == "turn_context" and not model:
+                model = p.get("model")
+            if first_user is None and rec.get("type") == "response_item" \
+                    and p.get("type") == "message" and p.get("role") == "user":
+                txt = "\n".join(x["text"] for x in _flatten_content(p.get("content"))
+                                  if x["kind"] == "text")
+                if txt.strip() and not _is_injected(txt):
+                    first_user = txt
+        thread_source = str(meta.get("thread_source") or "")
+        source_meta = meta.get("source")
+        is_subagent = (thread_source == "subagent"
+                       or isinstance(source_meta, dict) and "subagent" in source_meta)
+        # Codex multi-agent rollout 的 session_id 指向父线程，真正唯一的是 id。
+        # 若仍优先 session_id，多个 agent 会覆盖父 row；其 forked_from_id 又
+        # 等于父 SID，最终会把正在运行的父会话从公开列表完全隐藏。
+        sid = str((meta.get("id") if is_subagent else meta.get("session_id"))
+                  or meta.get("id") or f.stem)
+        base_title = (_title_from_text(first_user) if first_user
+                      else "(无标题) " + f.stem.replace("rollout-", "")[:16])
+        return {
+            "uid": _uid("codex", str(f)), "source": "codex", "sid": sid,
+            "title": _clip(base_title, 110), "cwd": meta.get("cwd") or "(未知)",
+            "created": _norm_ts(meta.get("timestamp")) or _iso(st.st_mtime),
+            "updated": _iso(st.st_mtime), "size": st.st_size, "path": str(f),
+            "model": model, "branch": None,
+            "forked_from_id": str(meta.get("forked_from_id") or ""),
+            "history_base": meta.get("history_base")
+                if isinstance(meta.get("history_base"), dict) else None,
+            "renamed_at": None, "renamed_to": None,
+            "_base_title": base_title, "_named": False, "_local_size": st.st_size,
+            "_is_subagent": is_subagent,
+        }
+
+    def session_meta(self, path: str | Path) -> dict | None:
+        """只解析一个 rollout，返回供索引保存的未归并元数据。"""
+        f = Path(path)
+        try:
+            st = f.stat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise
+        if st.st_size == 0:
+            return None
+        return self._raw_meta(f, st)
+
+    def scan_sessions(self) -> list[dict]:
+        """枚举全部 rollout，但保留被新分支隐藏的父项。"""
         if not CODEX_ROOT.is_dir():
             return []
-        names = self._thread_names()
         out = []
-        self._sid_paths = {}
         for f in CODEX_ROOT.rglob("*.jsonl"):
-            try:
-                st = f.stat()
-            except OSError:
-                continue
-            if st.st_size == 0:
-                continue
-            meta, first_user, model = {}, None, None
-            for rec in _head_lines(f, 120):
-                p = rec.get("payload") or {}
-                if rec.get("type") == "session_meta" and not meta:
-                    meta = p
-                if rec.get("type") == "turn_context" and not model:
-                    model = p.get("model")
-                if first_user is None and rec.get("type") == "response_item" \
-                        and p.get("type") == "message" and p.get("role") == "user":
-                    txt = "\n".join(x["text"] for x in _flatten_content(p.get("content")) if x["kind"] == "text")
-                    if txt.strip() and not _is_injected(txt):
-                        first_user = txt
-            sid = str(meta.get("session_id") or meta.get("id") or f.stem)
-            self._sid_paths[sid] = f
-            created = _norm_ts(meta.get("timestamp")) or _iso(st.st_mtime)
-            named = names.get(sid)
-            title = (named or {}).get("name") or (_title_from_text(first_user) if first_user
-                                                   else "(无标题) " + f.stem.replace("rollout-", "")[:16])
-            name_event = self._name_event(sid)
-            out.append({
-                "uid": _uid("codex", str(f)), "source": "codex", "sid": sid,
-                "title": _clip(title, 110), "cwd": meta.get("cwd") or "(未知)",
-                "created": created,
-                "updated": _iso(st.st_mtime), "size": st.st_size, "path": str(f),
-                "model": model, "branch": None,
-                "forked_from_id": str(meta.get("forked_from_id") or ""),
-                "history_base": meta.get("history_base")
-                    if isinstance(meta.get("history_base"), dict) else None,
-                "renamed_at": name_event.get("updated") if name_event else None,
-                "renamed_to": name_event.get("name") if name_event else None,
-                "_named": bool(named), "_local_size": st.st_size,
-            })
+            row = self.session_meta(f)
+            if row is not None:
+                out.append(row)
+        return out
+
+    def finalize_sessions(self, sessions: list[dict]) -> list[dict]:
+        """只在内存中套用 rename、分叉继承、逻辑大小和父项隐藏。"""
+        names = self._thread_names()
+        # 协作 agent rollout 是父线程的内部执行记录，不是用户的回滚分支。
+        # 暂留在 raw cache 供将来做 agent 视图，但不参与公开列表、fork 替代
+        # 和 history path 映射。
+        out = [dict(s) for s in sessions if not s.get("_is_subagent")]
+        self._sid_paths = {str(s["sid"]): Path(s["path"]) for s in out}
+        for s in out:
+            named = names.get(str(s["sid"]))
+            s["_named"] = bool(named)
+            s["title"] = _clip((named or {}).get("name")
+                               or s.get("_base_title") or s.get("title") or "", 110)
+            name_event = named if named and named.get("updated") else None
+            s["renamed_at"] = name_event.get("updated") if name_event else None
+            s["renamed_to"] = name_event.get("name") if name_event else None
+
         by_sid = {str(s["sid"]): s for s in out}
         superseded = {s["forked_from_id"] for s in out
                       if s.get("forked_from_id") in by_sid}
@@ -1114,9 +1252,14 @@ class CodexAdapter:
                     cur = parent
                 s["size"] = s["_local_size"] + history_size
         for s in out:
+            s.pop("_base_title", None)
             s.pop("_named", None)
             s.pop("_local_size", None)
+            s.pop("_is_subagent", None)
         return [s for s in out if str(s["sid"]) not in superseded]
+
+    def list_sessions(self):
+        return self.finalize_sessions(self.scan_sessions())
 
     @staticmethod
     def _session_meta(path: str | Path) -> dict:
@@ -1298,27 +1441,47 @@ class GrokAdapter:
             return []
         out = []
         for sj in GROK_ROOT.glob("*/*/summary.json"):
-            sess_dir = sj.parent
-            try:
-                st = (sess_dir / "chat_history.jsonl").stat()
-            except OSError:
-                st = sj.stat()  # 会话尚未落盘聊天记录时退回 summary
-            try:
-                info = json.loads(sj.read_text(errors="replace"))
-            except Exception:
-                info = {}
-            base = info.get("info") or {}
-            title = info.get("generated_title") or info.get("session_summary") or sess_dir.name[:8]
-            out.append({
-                "uid": _uid("grok", str(sess_dir)), "source": "grok",
-                "sid": base.get("id") or sess_dir.name, "title": _clip(title, 110),
-                "cwd": base.get("cwd") or _unquote_cwd(sess_dir.parent.name),
-                "created": _norm_ts(info.get("created_at")) or _iso(st.st_mtime),
-                "updated": _norm_ts(info.get("last_active_at") or info.get("updated_at")) or _iso(st.st_mtime),
-                "size": _dir_size(sess_dir), "path": str(sess_dir),
-                "model": info.get("current_model_id"), "branch": info.get("agent_name"),
-            })
+            row = self.session_meta(sj.parent)
+            if row is not None:
+                out.append(row)
         return out
+
+    def session_meta(self, path: str | Path) -> dict | None:
+        """只刷新一个 Grok 会话目录的 summary 与动态大小。"""
+        sess_dir = Path(path)
+        sj = sess_dir / "summary.json"
+        try:
+            summary_st = sj.stat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise
+        if not statmod.S_ISREG(summary_st.st_mode):
+            return None
+        try:
+            st = (sess_dir / "chat_history.jsonl").stat()
+        except FileNotFoundError:
+            st = summary_st  # 会话尚未落盘聊天记录时退回 summary
+        except OSError:
+            raise
+        try:
+            info = json.loads(sj.read_text(errors="replace"))
+        except OSError:
+            raise
+        except (TypeError, ValueError):
+            info = {}
+        base = info.get("info") or {}
+        title = info.get("generated_title") or info.get("session_summary") or sess_dir.name[:8]
+        return {
+            "uid": _uid("grok", str(sess_dir)), "source": "grok",
+            "sid": base.get("id") or sess_dir.name, "title": _clip(title, 110),
+            "cwd": base.get("cwd") or _unquote_cwd(sess_dir.parent.name),
+            "created": _norm_ts(info.get("created_at")) or _iso(st.st_mtime),
+            "updated": _norm_ts(info.get("last_active_at") or info.get("updated_at"))
+                or _iso(st.st_mtime),
+            "size": _dir_size(sess_dir), "path": str(sess_dir),
+            "model": info.get("current_model_id"), "branch": info.get("agent_name"),
+        }
 
     def read(self, path: str, start: int = 0):
         chat = Path(path) / "chat_history.jsonl"

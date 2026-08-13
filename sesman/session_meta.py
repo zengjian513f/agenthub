@@ -16,6 +16,7 @@ META_FILE = DATA_DIR / "session-meta.json"
 VERSION = 1
 _lock = threading.RLock()
 _activity_revisions: dict[str, int] = {}
+_timeline_revisions: dict[str, int] = {}
 
 
 def _read() -> dict:
@@ -41,6 +42,11 @@ def _write(rows: dict) -> None:
 def activity_revision(uid: str) -> int:
     with _lock:
         return _activity_revisions.get(str(uid or ""), 0)
+
+
+def timeline_revision(uid: str) -> int:
+    with _lock:
+        return _timeline_revisions.get(str(uid or ""), 0)
 
 
 def _epoch(value) -> float | None:
@@ -95,6 +101,84 @@ def resolve_activity(uid: str, activity: dict | None) -> dict | None:
     return stopped
 
 
+def begin_timeline_rewind(uid: str, from_tip: str, stale_end: int) -> dict:
+    """记录 Claude 原生回滚选择器的起点，但尚不改变已显示时间线。"""
+    uid = str(uid or "").strip()
+    from_tip = str(from_tip or "").strip()
+    if not uid or not from_tip or int(stale_end) < 0:
+        raise ValueError("回滚起点无效")
+    pending = {
+        "from_tip": from_tip, "stale_end": int(stale_end),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _lock:
+        rows = _read()
+        previous = rows.get(uid) if isinstance(rows.get(uid), dict) else {}
+        rows[uid] = {**previous, "timeline_rewind": pending}
+        _write(rows)
+    return dict(pending)
+
+
+def pending_timeline_rewind(uid: str) -> dict | None:
+    with _lock:
+        row = _read().get(str(uid or ""), {})
+    pending = row.get("timeline_rewind") if isinstance(row, dict) else None
+    return dict(pending) if isinstance(pending, dict) else None
+
+
+def finish_timeline_rewind(uid: str, tip: str) -> dict:
+    """把终端已经确认的 Claude 叶子保存为 sesman 的显示时间线。"""
+    uid = str(uid or "").strip()
+    tip = str(tip or "").strip()
+    if not uid or not tip:
+        raise ValueError("回滚叶子无效")
+    with _lock:
+        rows = _read()
+        previous = rows.get(uid) if isinstance(rows.get(uid), dict) else {}
+        pending = previous.get("timeline_rewind")
+        if not isinstance(pending, dict):
+            raise ValueError("没有待确认的回滚")
+        stale_end = int(pending.get("stale_end") or 0)
+        row = {**previous, "timeline_tip": tip,
+               "timeline_stale_end": stale_end}
+        row.pop("timeline_rewind", None)
+        rows[uid] = row
+        _write(rows)
+        _timeline_revisions[uid] = _timeline_revisions.get(uid, 0) + 1
+    return {"tip": tip, "stale_end": stale_end}
+
+
+def cancel_timeline_rewind(uid: str) -> None:
+    uid = str(uid or "").strip()
+    with _lock:
+        rows = _read()
+        previous = rows.get(uid) if isinstance(rows.get(uid), dict) else None
+        if not previous or "timeline_rewind" not in previous:
+            return
+        row = dict(previous)
+        row.pop("timeline_rewind", None)
+        rows[uid] = row
+        _write(rows)
+
+
+def timeline(uid: str) -> dict | None:
+    """返回已确认的显示叶子；pending 选择器绝不能提前改变历史。"""
+    with _lock:
+        row = _read().get(str(uid or ""), {})
+    if not isinstance(row, dict) or not row.get("timeline_tip"):
+        return None
+    try:
+        stale_end = int(row.get("timeline_stale_end") or 0)
+    except (TypeError, ValueError):
+        return None
+    return {"tip": str(row["timeline_tip"]), "stale_end": stale_end}
+
+
+def timeline_stamp(uid: str) -> tuple[str, int]:
+    value = timeline(uid)
+    return ((value or {}).get("tip", ""), int((value or {}).get("stale_end", 0)))
+
+
 def signature() -> str:
     """供会话列表 ETag 式签名使用；文件很小，直接散列可避免时间戳碰撞。"""
     with _lock:
@@ -137,6 +221,7 @@ def discard(uid: str) -> None:
             rows.pop(uid, None)
             _write(rows)
         _activity_revisions.pop(uid, None)
+        _timeline_revisions.pop(uid, None)
 
 
 def enrich_one(session: dict) -> dict:
