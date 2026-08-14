@@ -59,6 +59,19 @@ class CodexBridgeTests(unittest.TestCase):
                   "  Context 19% used · Ready · Full Access")
         self.assertEqual(codex_bridge.composer_state(screen), "empty")
 
+    def test_current_model_footer_marks_live_composer(self):
+        footer = "  gpt-5.6-sol xhigh fast · ~/Projects/sesman"
+        empty = "\x1b[1m›\x1b[0m \x1b[2mUse /skills to list available skills\x1b[0m\n\n" + footer
+        restored = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
+        self.assertEqual(codex_bridge.composer_state(empty), "empty")
+        self.assertEqual(codex_bridge.composer_state(restored), "editing")
+
+    def test_current_working_screen_is_not_treated_as_ready(self):
+        screen = ("\x1b[1m• Working\x1b[0m \x1b[2m(12s • esc to interrupt)\x1b[0m\n\n"
+                  "\x1b[1m›\x1b[0m \x1b[2mRun /review on my current changes\x1b[0m\n\n"
+                  "  gpt-5.6-sol xhigh fast · ~/Projects/sesman")
+        self.assertEqual(codex_bridge.composer_state(screen), "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

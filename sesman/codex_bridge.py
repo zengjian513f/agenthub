@@ -20,6 +20,9 @@ _FOOTER = re.compile(
 _SHORTCUT = re.compile(r"\s*\((y|p|esc)\)\s*$", re.IGNORECASE)
 _CONTEXT_FOOTER = re.compile(r"\bContext\s+\d+%\s+used\b", re.IGNORECASE)
 _READY_FOOTER = re.compile(r"\bReady\b", re.IGNORECASE)
+_MODEL_FOOTER = re.compile(
+    r"^\s*(?:gpt|codex|o\d)[\w.-]*(?:\s+\S+)*\s+·\s+\S.*$", re.IGNORECASE)
+_BUSY_STATUS = re.compile(r"\bWorking\b.*\besc to interrupt\b", re.IGNORECASE)
 _SGR = re.compile(r"\x1b\[([0-9;:]*)m")
 
 
@@ -53,8 +56,10 @@ def composer_state(screen: str) -> str:
     """Classify the live Codex composer as ``empty``, ``editing`` or ``unknown``.
 
     Codex renders its empty rotating placeholder with SGR dim, while restored
-    rewind text and normal drafts are not dim.  The Ready footer is required so
-    transcript output containing a ``›`` cannot be mistaken for the composer.
+    rewind text and normal drafts are not dim.  A live model/status footer is
+    required so transcript output containing a ``›`` cannot be mistaken for
+    the composer.  Recent Codex builds no longer print the old Context/Ready
+    labels, so their final ``model · cwd`` status line is also accepted.
     """
     raw_lines = str(screen or "").replace("\r", "").splitlines()
     clean_lines = [_ANSI.sub("", line) for line in raw_lines]
@@ -66,17 +71,24 @@ def composer_state(screen: str) -> str:
                     if _CONTEXT_FOOTER.search(clean_lines[i])]
         if contexts:
             status.append((ready, contexts[-1]))
-    if not status:
-        return "unknown"
-    ready, context = status[-1]
-    footer = min(ready, context)
-    # A narrow terminal may wrap the status bar.  Exclude its whole nonblank
-    # block, otherwise model/account text above Ready would look like a draft.
-    while footer > 0 and clean_lines[footer - 1].strip():
-        footer -= 1
+    if status:
+        ready, context = status[-1]
+        footer = min(ready, context)
+        # A narrow terminal may wrap the status bar.  Exclude its whole nonblank
+        # block, otherwise model/account text above Ready would look like a draft.
+        while footer > 0 and clean_lines[footer - 1].strip():
+            footer -= 1
+    else:
+        nonblank = [i for i, line in enumerate(clean_lines) if line.strip()]
+        if not nonblank or not _MODEL_FOOTER.match(clean_lines[nonblank[-1]]):
+            return "unknown"
+        footer = nonblank[-1]
     prompts = [i for i in range(max(0, footer - 20), footer)
                if clean_lines[i].lstrip().startswith("›")]
     if not prompts:
+        return "unknown"
+    if any(_BUSY_STATUS.search(clean_lines[i])
+           for i in range(max(0, prompts[-1] - 6), prompts[-1])):
         return "unknown"
 
     styled = _styled_chars("\n".join(raw_lines[prompts[-1]:footer]))
