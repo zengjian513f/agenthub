@@ -4,6 +4,34 @@ from unittest.mock import patch
 from sesman import server
 
 
+class AccessAllowlistTests(unittest.TestCase):
+    def setUp(self):
+        self.allowed_ips = set(server.ALLOWED_IPS)
+        self.allowed_networks = list(server.ALLOWED_NETWORKS)
+        server.ALLOWED_IPS.clear()
+        server.ALLOWED_NETWORKS.clear()
+
+    def tearDown(self):
+        server.ALLOWED_IPS.clear()
+        server.ALLOWED_IPS.update(self.allowed_ips)
+        server.ALLOWED_NETWORKS.clear()
+        server.ALLOWED_NETWORKS.extend(self.allowed_networks)
+
+    def test_exact_ip_still_matches(self):
+        server._add_allowed("192.0.2.134")
+        self.assertTrue(server._ip_allowed("192.0.2.134"))
+        self.assertFalse(server._ip_allowed("192.0.2.135"))
+
+    def test_ipv4_cidr_matches_only_addresses_in_network(self):
+        server._add_allowed("10.0.0.0/24")
+        self.assertTrue(server._ip_allowed("10.0.0.7"))
+        self.assertFalse(server._ip_allowed("10.0.1.1"))
+
+    def test_cidr_with_host_bits_is_normalized(self):
+        server._add_allowed("10.0.0.7/24")
+        self.assertEqual(str(server.ALLOWED_NETWORKS[0]), "10.0.0.0/24")
+
+
 class StaticIdentityTests(unittest.TestCase):
     def test_forwarded_ip_is_display_only_and_validated(self):
         handler = object.__new__(server.Handler)

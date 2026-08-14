@@ -29,6 +29,7 @@ ASSET_VERSION = hashlib.sha256(b"".join(
 )).hexdigest()[:12]
 HOSTNAME = socket.gethostname().strip() or "localhost"
 ALLOWED_IPS: set[str] = set()
+ALLOWED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 TERMINAL = False        # 远程终端 = 远程执行, 必须显式 --terminal 打开
 WATCH_POLL = 0.05       # 服务端盯文件的间隔; stat 一个文件是微秒级, 这里很便宜
 JSON_GZIP_MIN = 1024    # 小响应省不了多少，避免反而增加压缩 CPU 和头部体积
@@ -38,6 +39,27 @@ ATTACHMENT_DIR = "sesman_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
 OUTBOX_WAKE = threading.Event()
 TERM_OWNERS = term_ownership.Registry()
+
+
+def _add_allowed(value: str) -> None:
+    """Add an exact address or CIDR network to the access allowlist."""
+    value = value.strip()
+    if not value:
+        return
+    if "/" in value:
+        ALLOWED_NETWORKS.append(ipaddress.ip_network(value, strict=False))
+    else:
+        ALLOWED_IPS.add(value)
+
+
+def _ip_allowed(value: str) -> bool:
+    if value in ALLOWED_IPS:
+        return True
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(address in network for network in ALLOWED_NETWORKS)
 
 
 def _normalize_terminal_sizes() -> None:
@@ -304,7 +326,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _allowed(self) -> bool:
         ip = self._client_ip()
-        return ip in ALLOWED_IPS
+        return _ip_allowed(ip)
 
     def _client_ip(self) -> str:
         """Actual TCP peer address; proxy headers never participate in identity."""
@@ -1283,7 +1305,7 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8710)
     ap.add_argument("--allow", default="192.0.2.134",
-                    help="除本机外允许访问的 IP, 逗号分隔")
+                    help="除本机外允许访问的 IP 或 CIDR, 逗号分隔")
     ap.add_argument("--terminal", action="store_true",
                     help="开启 tmux 远程终端。这等于给白名单 IP 开放本机 shell, 谨慎使用")
     args = ap.parse_args()
@@ -1304,13 +1326,18 @@ def main():
         threading.Thread(target=_outbox_loop, daemon=True, name="sesman-outbox").start()
 
     ALLOWED_IPS.update({"127.0.0.1", "::1", "localhost"})
-    ALLOWED_IPS.update(x.strip() for x in args.allow.split(",") if x.strip())
+    try:
+        for value in args.allow.split(","):
+            _add_allowed(value)
+    except ValueError as exc:
+        ap.error(f"--allow 包含无效的 IP/CIDR: {exc}")
 
     threading.Thread(target=index.load, daemon=True).start()  # 后台预热索引
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
-    print(f"[sesman] http://{args.host}:{args.port}  允许: {sorted(ALLOWED_IPS)}"
+    allowed = sorted(ALLOWED_IPS) + [str(network) for network in ALLOWED_NETWORKS]
+    print(f"[sesman] http://{args.host}:{args.port}  允许: {allowed}"
           + ("  [终端已开启]" if TERMINAL else ""))
     try:
         srv.serve_forever()
