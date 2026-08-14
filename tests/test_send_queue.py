@@ -114,6 +114,30 @@ class SendQueueTests(unittest.TestCase):
             "codex:u", [{"role": "user", "text": "同一秒", "ts": accepted}], None)
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
+    def test_codex_native_trim_does_not_leave_a_duplicate_queue_bubble(self):
+        send_queue.enqueue(
+            "codex:u", "pane", " 2016年到底怎么了\n", [],
+            {"state": "idle"}, "trimmed")
+        row = send_queue.tracked()[0]
+        boundary = datetime.fromisoformat(row["after_ts"])
+        accepted = (boundary + timedelta(milliseconds=800)).isoformat(
+            timespec="milliseconds")
+
+        send_queue.observe("codex:u", [{
+            "role": "user", "text": "2016年到底怎么了", "ts": accepted,
+        }], {"state": "working"})
+
+        self.assertEqual(send_queue.list_for("codex:u"), [])
+
+    def test_codex_confirmation_keeps_internal_whitespace_significant(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "echo  one", [], {"state": "idle"}, "spaces")
+        send_queue.observe("codex:u", [{
+            "role": "user", "text": "echo one",
+        }], {"state": "working"})
+
+        self.assertEqual(len(send_queue.list_for("codex:u")), 1)
+
     def test_idle_message_is_durable_idempotent_and_failure_is_visible(self):
         first = send_queue.enqueue("codex:u", "pane", "消息", [{"src": "token"}],
                                    {"state": "idle"}, "same-id")
@@ -136,6 +160,69 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual(send_queue.ready(10**12), [])
         self.assertTrue(send_queue.discard("one"))
         self.assertEqual([x["id"] for x in send_queue.ready(10**12)], ["two"])
+
+    def test_delivery_never_appends_to_restored_codex_editor(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "新消息", [],
+            {"state": "idle"}, "restored")
+        row = send_queue.tracked()[0]
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        footer = "gpt-5.6-sol · Context 19% used · Ready"
+        screen = "\x1b[1;2m› \x1b[0m旧消息仍在编辑框\n\n" + footer
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture", return_value=screen), \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.time, "sleep"):
+            server._deliver_outbox_item(row, [pane])
+
+        submit.assert_not_called()
+        failed = send_queue.list_for("codex:u")[0]
+        self.assertEqual(failed["state"], "failed")
+        self.assertIn("输入框已有内容", failed["error"])
+
+    def test_new_message_is_rejected_while_failed_head_blocks_fifo(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "失败消息", [],
+            {"state": "idle"}, "failed")
+        send_queue.mark_failed("failed", "未确认")
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane):
+            result = handler._queue_message({
+                "uid": "codex:u", "name": pane["name"], "text": "后一条",
+            })
+
+        self.assertEqual(result["_status"], 409)
+        self.assertIn("先重试或移除", result["error"])
+        self.assertEqual(len(send_queue.list_for("codex:u")), 1)
+
+    def test_web_send_rejects_nonempty_codex_composer_before_enqueue(self):
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        footer = "gpt-5.6-sol · Context 19% used · Ready"
+        screen = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture", return_value=screen):
+            result = handler._queue_message({
+                "uid": "codex:u", "name": pane["name"], "text": "网页新消息",
+            })
+
+        self.assertEqual(result["_status"], 409)
+        self.assertIn("输入框已有内容", result["error"])
+        self.assertEqual(send_queue.list_for("codex:u"), [])
 
     def test_queued_item_can_be_cancelled_before_delivery_claim(self):
         send_queue.enqueue("codex:u", "pane", "撤掉", [], {"state": "idle"}, "cancel")

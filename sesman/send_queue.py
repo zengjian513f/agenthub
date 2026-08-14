@@ -123,7 +123,11 @@ def observe(uid: str, messages: list[dict] | None,
         for message in native:
             at = next((i for i, row in enumerate(rows)
                        if row.get("uid") == uid
-                       and row.get("text") == str(message.get("text") or "")
+                       # Codex TUI 会去掉提交内容两端的空白再写 rollout；
+                       # 队列必须按它的实际输入语义确认，正文仍保留原样显示和投递。
+                       # 只 strip 两端，不能折叠内部空格或换行。
+                       and _prompt_key(row.get("text"))
+                           == _prompt_key(message.get("text"))
                        and _causal(message.get("ts"), row.get("after_ts"))), None)
             if at is not None:
                 rows.pop(at)
@@ -266,6 +270,11 @@ def _causal(recorded, boundary) -> bool:
         return left.timestamp() >= right.timestamp()
     except (TypeError, ValueError):
         return True
+
+
+def _prompt_key(value) -> str:
+    """Codex 写入 rollout 前会裁掉 prompt 两端空白。"""
+    return str(value or "").strip()
 
 
 def _put_cursor(row: dict, cursor: dict | None) -> bool:

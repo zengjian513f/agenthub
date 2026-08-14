@@ -62,6 +62,52 @@ class DirectoryCompletionRouteTests(unittest.TestCase):
         complete.assert_called_once_with("/tmp/se")
 
 
+class CreateSessionDirectoryTests(unittest.TestCase):
+    @staticmethod
+    def handler():
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        return handler
+
+    def test_missing_directory_returns_confirmation_without_pending_record(self):
+        required = server.term.DirectoryCreationRequired(
+            server.Path("/tmp/new-project"))
+        with patch.object(server.index, "load", return_value=[]), \
+                patch.object(server.term, "new_cli_session",
+                             side_effect=required) as new, \
+                patch.object(server.pending_store, "put") as put:
+            result = self.handler()._create_session({
+                "source": "codex", "cwd": "/tmp/new-project",
+                "cols": 100, "rows": 30,
+            })
+
+        self.assertEqual(result, {
+            "error": "启动目录不存在", "needs_create": True,
+            "cwd": "/tmp/new-project", "_status": 409,
+        })
+        new.assert_called_once_with(
+            "codex", "/tmp/new-project", 100, 30, create_cwd=False)
+        put.assert_not_called()
+
+    def test_explicit_confirmation_is_forwarded_to_directory_creator(self):
+        info = {"name": "sesman-codex-new-test", "source": "codex",
+                "sid": None, "cwd": "/tmp/new-project", "token": "token"}
+        with patch.object(server.index, "load", return_value=[]), \
+                patch.object(server.term, "new_cli_session",
+                             return_value=info) as new, \
+                patch.object(server.pending_store, "put") as put:
+            result = self.handler()._create_session({
+                "source": "codex", "cwd": "/tmp/new-project",
+                "create_cwd": True, "cols": 100, "rows": 30,
+            })
+
+        self.assertEqual(result["name"], info["name"])
+        self.assertEqual(result["_status"], 200)
+        new.assert_called_once_with(
+            "codex", "/tmp/new-project", 100, 30, create_cwd=True)
+        put.assert_called_once()
+
+
 class ClaudePromptTests(unittest.TestCase):
     def test_settled_prompt_waits_for_matching_native_answer(self):
         prompt = {"id": "ask-1", "state": "submitted", "questions": [{}]}
@@ -211,6 +257,34 @@ class MessagesRouteTests(unittest.TestCase):
         messages_for.assert_called_once()
         self.assertEqual(result["messages"], [])
         self.assertEqual(result["prompt"], None)
+
+    def test_input_history_returns_only_real_user_inputs(self):
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        session = {"uid": "codex:test", "source": "codex", "sid": "sid"}
+        parsed = {
+            "messages": [
+                {"role": "assistant", "text": "回复", "ts": "a"},
+                {"role": "user", "text": "第一条", "ts": "b"},
+                {"role": "command", "text": "/rename 新标题", "ts": "c"},
+                {"role": "user", "text": "隐藏输入", "counted": False, "ts": "d"},
+                {"role": "tool_result", "text": "输出", "ts": "e"},
+            ],
+            "end": 321, "version": {"head": "head"},
+        }
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.index, "session_view", return_value=session), \
+                patch.object(server.index, "messages_for", return_value=parsed):
+            result = handler._api_get(
+                "/api/session/input-history", {"uid": [session["uid"]]})
+
+        self.assertEqual(result["_status"], 200)
+        self.assertEqual(result["history"], [
+            {"text": "第一条", "ts": "b"},
+            {"text": "/rename 新标题", "ts": "c"},
+        ])
+        self.assertEqual(result["end"], 321)
 
 
 if __name__ == "__main__":

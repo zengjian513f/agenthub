@@ -41,6 +41,46 @@ class DirectoryCompletionTests(unittest.TestCase):
                 (root / f"dir-{index}").mkdir()
             self.assertEqual(len(term.complete_directories(f"{root}/d", limit=2)), 2)
             self.assertEqual(len(term.complete_directories(f"{root}/d", limit=500)), 5)
+        self.assertEqual(term.complete_directories("/tmp/\0invalid"), [])
+        with self.assertRaisesRegex(ValueError, "路径过长"):
+            term.complete_directories("/" + "x" * 4096)
+
+
+class NewSessionDirectoryTests(unittest.TestCase):
+    def test_missing_directory_requires_confirmation_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = term.Path(tmp) / "parent" / "project"
+            with patch.object(term, "_which_cli", return_value="/usr/bin/codex"), \
+                    patch.object(term, "new_session") as new:
+                with self.assertRaises(term.DirectoryCreationRequired) as raised:
+                    term.new_cli_session("codex", str(missing))
+
+            self.assertEqual(raised.exception.path,
+                             str(missing.resolve(strict=False)))
+            self.assertFalse(missing.exists())
+            new.assert_not_called()
+
+    def test_confirmed_missing_directory_is_created_recursively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = term.Path(tmp) / "parent" / "project"
+            with patch.object(term, "_which_cli", return_value="/usr/bin/codex"), \
+                    patch.object(term, "new_session",
+                                 return_value="sesman-codex-test") as new:
+                result = term.new_cli_session(
+                    "codex", str(missing), create_cwd=True)
+
+            self.assertTrue(missing.is_dir())
+            self.assertEqual(new.call_args.args[2], str(missing.resolve()))
+            self.assertEqual(result["cwd"], str(missing.resolve()))
+
+    def test_existing_file_cannot_be_used_or_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = term.Path(tmp) / "project"
+            target.write_text("file")
+            with patch.object(term, "_which_cli", return_value="/usr/bin/codex"), \
+                    self.assertRaisesRegex(ValueError, "不是目录"):
+                term.new_cli_session("codex", str(target), create_cwd=True)
+            self.assertTrue(target.is_file())
 
 
 class TerminalSubmitTests(unittest.TestCase):

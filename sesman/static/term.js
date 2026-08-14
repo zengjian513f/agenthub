@@ -309,11 +309,19 @@ async function post(url, body) {
 }
 
 // ---------------------------------------------------------------- 新建会话
+function suggestedSessionDir(cwd) {
+  const path = String(cwd || '').replace(/\/+$/, '') || '/';
+  // CLI/SDK 经常在这些易失根目录里生成一次性测试会话。它们仍属于会话
+  // 历史，但不该因一次自动任务污染“最近使用”的新建目录建议。
+  return path.startsWith('/') && !['/tmp', '/var/tmp', '/dev/shm'].some(
+    root => path === root || path.startsWith(root + '/'));
+}
+
 function commonSessionDirs() {
   const dirs = new Map();
   for (const s of S.sessions) {
     const cwd = String(s.cwd || '');
-    if (!cwd.startsWith('/')) continue;
+    if (!suggestedSessionDir(cwd)) continue;
     const row = dirs.get(cwd) || { cwd, count: 0, updated: '' };
     row.count++;
     if ((s.updated || '') > row.updated) row.updated = s.updated || '';
@@ -328,26 +336,14 @@ function commonSessionDirs() {
   if (T.home && !dirs.has(T.home)) dirs.set(T.home, { cwd: T.home, count: 0, updated: '' });
   return [...dirs.values()].sort((a, b) =>
     (b.recent || 0) - (a.recent || 0) || b.count - a.count
-    || b.updated.localeCompare(a.updated) || a.cwd.localeCompare(b.cwd)).slice(0, 18);
+    || b.updated.localeCompare(a.updated) || a.cwd.localeCompare(b.cwd));
 }
 
 const CWD_COMPLETION_DELAY = 120;
 const cwdCompletion = {
   timer: null, abort: null, sequence: 0,
-  rows: [], forValue: '', active: -1,
+  rows: [], completions: [], forValue: '', active: -1, mode: 'common', common: [],
 };
-
-function comparableCwd(value) {
-  const path = String(value || '').trim();
-  return path === '/' ? path : path.replace(/\/+$/, '');
-}
-
-function syncCommonDirSelection(value) {
-  const list = $('#new-cwd-list');
-  const wanted = comparableCwd(value);
-  list.selectedIndex = [...list.options]
-    .findIndex(option => comparableCwd(option.value) === wanted);
-}
 
 function canCompleteCwd(value) {
   const path = String(value || '').trim();
@@ -362,51 +358,133 @@ function cancelCwdCompletionRequest() {
   cwdCompletion.sequence++;
 }
 
-function clearCwdCompletionView(message = '') {
-  const input = $('#new-cwd'), box = $('#new-cwd-completions');
+function closeCwdPicker() {
+  const input = $('#new-cwd'), picker = $('#new-cwd-picker');
+  cancelCwdCompletionRequest();
   cwdCompletion.rows = [];
+  cwdCompletion.completions = [];
   cwdCompletion.forValue = '';
   cwdCompletion.active = -1;
-  box.replaceChildren();
-  box.hidden = true;
+  $('#new-cwd-options').replaceChildren();
+  picker.hidden = true;
   input.setAttribute('aria-expanded', 'false');
   input.removeAttribute('aria-activedescendant');
-  $('#new-cwd-completion-status').textContent = message;
 }
 
-function dismissCwdCompletions() {
-  cancelCwdCompletionRequest();
-  clearCwdCompletionView();
+function cwdOption(path, meta = '', kind = 'recent') {
+  return { path: String(path || ''), meta: String(meta || ''), kind };
 }
 
-function renderCwdCompletions(value, rows) {
-  const input = $('#new-cwd'), box = $('#new-cwd-completions');
-  cwdCompletion.rows = rows;
+function cwdPathKey(path) {
+  const value = String(path || '');
+  return value === '/' ? value : value.replace(/\/+$/, '');
+}
+
+function matchingRecentCwdOptions(value = '') {
+  const query = String(value || '').trim().toLocaleLowerCase();
+  return cwdCompletion.common
+    .filter(row => !query || String(row.cwd || '').toLocaleLowerCase().includes(query))
+    .map(row => cwdOption(row.cwd, row.count ? `${row.count} 个会话` : '', 'recent'));
+}
+
+function renderCwdOptions(value, recentRows, completionRows = [], completionNote = '') {
+  const input = $('#new-cwd'), picker = $('#new-cwd-picker');
+  const box = $('#new-cwd-options');
+  const rawRecent = recentRows.map(row => typeof row === 'string'
+    ? cwdOption(row, '', 'recent') : row);
+  const rawCompletions = completionRows.map(row => typeof row === 'string'
+    ? cwdOption(row, '', 'completion') : row);
+  const completionFirst = String(value || '').startsWith('/');
+  const seen = new Set();
+  const unique = rows => rows.filter(row => {
+    const key = cwdPathKey(row.path);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const completions = completionFirst ? unique(rawCompletions) : [];
+  const recent = unique(rawRecent);
+  if (!completionFirst) completions.push(...unique(rawCompletions));
+  const options = completionFirst
+    ? [...completions, ...recent] : [...recent, ...completions];
+  cwdCompletion.mode = value ? 'matching' : 'common';
+  cwdCompletion.rows = options.map(row => row.path);
+  // recent 与建议中的同一路径只画一次，但它仍是文件系统补全候选；
+  // Tab 计算公共前缀时不能因为视觉去重而把它漏掉。
+  cwdCompletion.completions = rawCompletions.map(row => row.path);
   cwdCompletion.forValue = value;
   cwdCompletion.active = -1;
   box.replaceChildren();
-  if (!rows.length) {
-    clearCwdCompletionView('没有匹配的目录');
-    return;
-  }
-  rows.forEach((path, index) => {
+  $('#new-cwd-options-title').textContent = value ? '匹配目录' : '最近使用';
+  picker.hidden = false;
+
+  const section = label => {
+    const heading = document.createElement('div');
+    heading.className = 'new-cwd-section';
+    heading.setAttribute('role', 'presentation');
+    heading.textContent = label;
+    box.appendChild(heading);
+  };
+  const note = message => {
+    const messageNode = document.createElement('div');
+    messageNode.className = 'new-cwd-empty';
+    messageNode.textContent = message;
+    box.appendChild(messageNode);
+  };
+  const addOption = ({path, meta, kind}, index) => {
     const option = document.createElement('button');
     option.type = 'button';
-    option.id = `new-cwd-completion-${index}`;
-    option.className = 'new-cwd-completion';
-    option.dataset.cwdCompletion = String(index);
+    option.id = `new-cwd-option-${index}`;
+    option.className = 'new-cwd-option';
+    option.dataset.cwdKind = kind;
+    option.dataset.cwdOption = String(index);
     option.setAttribute('role', 'option');
     option.setAttribute('aria-selected', 'false');
     option.title = path;
     const label = document.createElement('span');
+    label.className = 'new-cwd-option-path';
     label.textContent = path;
     option.appendChild(label);
+    if (meta) {
+      const detail = document.createElement('span');
+      detail.className = 'new-cwd-option-meta';
+      detail.textContent = meta;
+      option.appendChild(detail);
+    }
     box.appendChild(option);
-  });
-  box.hidden = false;
+  };
+
+  if (!value) {
+    recent.forEach(addOption);
+    if (!recent.length) note('还没有使用过的目录');
+  } else {
+    let offset = 0;
+    const addGroup = (label, rows, empty = '') => {
+      if (!rows.length && !empty) return;
+      section(label);
+      rows.forEach((row, index) => addOption(row, offset + index));
+      offset += rows.length;
+      if (!rows.length && empty) note(empty);
+    };
+    if (completionFirst) {
+      addGroup('补全建议', completions, completionNote);
+      addGroup('最近匹配', recent);
+    } else {
+      addGroup('最近匹配', recent);
+      addGroup('补全建议', completions, completionNote);
+    }
+    if (!recent.length && !completions.length && !completionNote) note('没有匹配的目录');
+  }
   input.setAttribute('aria-expanded', 'true');
   input.removeAttribute('aria-activedescendant');
-  $('#new-cwd-completion-status').textContent = `${rows.length} 个匹配目录`;
+  $('#new-cwd-completion-status').textContent = options.length
+    ? (value ? `${recent.length} 个最近匹配，${completions.length} 个补全建议`
+             : `${recent.length} 个最近目录`)
+    : (completionNote || '没有匹配的目录');
+}
+
+function renderCommonCwdOptions() {
+  renderCwdOptions('', matchingRecentCwdOptions());
 }
 
 function setCwdCompletionActive(step) {
@@ -417,7 +495,7 @@ function setCwdCompletionActive(step) {
     ? (step > 0 ? 0 : rows.length - 1)
     : (old + step + rows.length) % rows.length;
   cwdCompletion.active = next;
-  const options = [...$('#new-cwd-completions').children];
+  const options = [...$('#new-cwd-options').querySelectorAll('[data-cwd-option]')];
   options.forEach((option, index) => {
     const active = index === next;
     option.classList.toggle('active', active);
@@ -428,14 +506,13 @@ function setCwdCompletionActive(step) {
   option.scrollIntoView({ block: 'nearest' });
 }
 
-function setCwdValue(value, dismiss = true) {
+function setCwdValue(value, refresh = true) {
   const input = $('#new-cwd');
   input.value = value;
-  syncCommonDirSelection(value);
   $('#new-session-error').textContent = '';
-  if (dismiss) dismissCwdCompletions();
   input.focus();
   input.setSelectionRange(value.length, value.length);
+  if (refresh) scheduleCwdCompletions();
 }
 
 function longestCommonPrefix(values) {
@@ -457,17 +534,19 @@ function applyCwdTabCompletion() {
     setCwdValue(cwdCompletion.rows[cwdCompletion.active]);
     return;
   }
-  if (cwdCompletion.rows.length === 1) {
-    setCwdValue(cwdCompletion.rows[0]);
+  const rows = cwdCompletion.completions;
+  if (!rows.length) return;
+  if (rows.length === 1) {
+    setCwdValue(rows[0]);
     return;
   }
   const value = input.value.trim();
-  const prefix = longestCommonPrefix(cwdCompletion.rows);
+  const prefix = longestCommonPrefix(rows);
   if (prefix.length > value.length) {
     setCwdValue(prefix, false);
     cwdCompletion.forValue = prefix;
     $('#new-cwd-completion-status').textContent =
-      `已补全公共前缀，仍有 ${cwdCompletion.rows.length} 个匹配目录`;
+      `已补全公共前缀，仍有 ${rows.length} 个补全建议`;
   }
 }
 
@@ -475,8 +554,9 @@ async function loadCwdCompletions(complete = false) {
   cancelCwdCompletionRequest();
   const input = $('#new-cwd');
   const value = input.value.trim();
+  const recent = matchingRecentCwdOptions(value);
   if (!canCompleteCwd(value)) {
-    clearCwdCompletionView();
+    renderCwdOptions(value, recent);
     return;
   }
   const controller = new AbortController();
@@ -485,17 +565,19 @@ async function loadCwdCompletions(complete = false) {
   try {
     const params = new URLSearchParams({ path: value });
     const response = await fetch(appUrl(`api/term/complete-dir?${params}`),
-      { signal: controller.signal });
+      { signal: controller.signal, cache: 'no-store' });
     const data = await response.json();
     if (sequence !== cwdCompletion.sequence || input.value.trim() !== value) return;
     const rows = response.ok && Array.isArray(data.directories)
       ? data.directories.filter(path => typeof path === 'string' && canCompleteCwd(path)).slice(0, 24)
       : [];
-    renderCwdCompletions(value, rows);
+    renderCwdOptions(value, recent, rows, response.ok
+      ? (rows.length ? '' : '没有补全建议')
+      : (data.error || '目录补全暂不可用'));
     if (complete) applyCwdTabCompletion();
   } catch (error) {
     if (error.name !== 'AbortError' && sequence === cwdCompletion.sequence) {
-      clearCwdCompletionView('目录补全暂不可用');
+      renderCwdOptions(value, recent, [], '目录补全暂不可用');
     }
   } finally {
     if (cwdCompletion.abort === controller) cwdCompletion.abort = null;
@@ -504,25 +586,25 @@ async function loadCwdCompletions(complete = false) {
 
 function scheduleCwdCompletions() {
   cancelCwdCompletionRequest();
-  clearCwdCompletionView();
   const value = $('#new-cwd').value.trim();
-  syncCommonDirSelection(value);
-  if (!canCompleteCwd(value)) return;
+  if (!value) {
+    renderCommonCwdOptions();
+    return;
+  }
+  const recent = matchingRecentCwdOptions(value);
+  if (!canCompleteCwd(value)) {
+    renderCwdOptions(value, recent);
+    return;
+  }
+  renderCwdOptions(value, recent, [], '正在查找目录…');
   cwdCompletion.timer = setTimeout(() => loadCwdCompletions(false), CWD_COMPLETION_DELAY);
 }
 
 function openNewSessionDialog() {
   const dialog = $('#new-session-dialog');
-  const list = $('#new-cwd-list');
-  dismissCwdCompletions();
+  closeCwdPicker();
   const rows = commonSessionDirs();
-  list.innerHTML = '';
-  for (const d of rows) {
-    const o = document.createElement('option');
-    o.value = d.cwd;
-    o.textContent = d.count ? `${d.cwd}  ·  ${d.count} 个会话` : d.cwd;
-    list.appendChild(o);
-  }
+  cwdCompletion.common = rows;
   for (const input of dialog.querySelectorAll('input[name="new-source"]')) {
     input.disabled = !T.sources[input.value];
   }
@@ -531,10 +613,10 @@ function openNewSessionDialog() {
   const selected = S.sessions.find(s => s.uid === S.sel)?.cwd;
   const cwd = selected || store.get('newDirs', [])[0] || rows[0]?.cwd || T.home || '';
   $('#new-cwd').value = cwd;
-  syncCommonDirSelection(cwd);
   $('#new-session-error').textContent = '';
   $('#new-session-go').disabled = false;
   dialog.showModal();
+  renderCommonCwdOptions();
   setTimeout(() => { $('#new-cwd').focus(); $('#new-cwd').select(); }, 0);
 }
 
@@ -710,7 +792,17 @@ async function createNewSession(e) {
   go.disabled = true;
   go.textContent = '创建中…';
   try {
-    const d = await post('api/term/create', { source, cwd, cols: 120, rows: termRows() });
+    const request = { source, cwd, cols: 120, rows: termRows() };
+    let d = await post('api/term/create', request);
+    if (d.needs_create) {
+      const target = String(d.cwd || cwd);
+      if (!confirm(`启动目录不存在：\n${target}\n\n是否创建该目录并继续？`)) {
+        $('#new-cwd').focus();
+        return;
+      }
+      go.textContent = '创建目录中…';
+      d = await post('api/term/create', { ...request, cwd: target, create_cwd: true });
+    }
     if (d.error) { error.textContent = d.error; return; }
     const recent = [d.cwd, ...store.get('newDirs', []).filter(x => x !== d.cwd)].slice(0, 8);
     store.set('newDirs', recent);
@@ -739,45 +831,31 @@ $('#new-cwd').onkeydown = e => {
   if (e.isComposing) return;
   if (e.key === 'Tab' && !e.shiftKey && canCompleteCwd(e.currentTarget.value)) {
     e.preventDefault();
-    if (!$('#new-cwd-completions').hidden
+    if (cwdCompletion.mode === 'matching' && cwdCompletion.completions.length
         && cwdCompletion.forValue === e.currentTarget.value.trim()) {
       applyCwdTabCompletion();
     } else {
       loadCwdCompletions(true);
     }
-  } else if (e.key === 'ArrowDown' && !$('#new-cwd-completions').hidden) {
+  } else if (e.key === 'ArrowDown' && cwdCompletion.rows.length) {
     e.preventDefault();
     setCwdCompletionActive(1);
-  } else if (e.key === 'ArrowUp' && !$('#new-cwd-completions').hidden) {
+  } else if (e.key === 'ArrowUp' && cwdCompletion.rows.length) {
     e.preventDefault();
     setCwdCompletionActive(-1);
-  } else if (e.key === 'Enter' && cwdCompletion.active >= 0
-             && !$('#new-cwd-completions').hidden) {
+  } else if (e.key === 'Enter' && cwdCompletion.active >= 0) {
     e.preventDefault();
     setCwdValue(cwdCompletion.rows[cwdCompletion.active]);
-  } else if (e.key === 'Escape' && !$('#new-cwd-completions').hidden) {
-    e.preventDefault();
-    e.stopPropagation();
-    dismissCwdCompletions();
   }
 };
-$('#new-cwd').onblur = () => setTimeout(() => {
-  if (!$('#new-cwd-completions').contains(document.activeElement)) dismissCwdCompletions();
-}, 0);
-$('#new-cwd-completions').onpointerdown = e => {
-  const option = e.target.closest('[data-cwd-completion]');
-  if (!option || (e.button !== undefined && e.button !== 0)) return;
+$('#new-cwd-options').onclick = e => {
+  const option = e.target.closest('[data-cwd-option]');
+  if (!option) return;
   e.preventDefault();
-  const path = cwdCompletion.rows[Number(option.dataset.cwdCompletion)];
+  const path = cwdCompletion.rows[Number(option.dataset.cwdOption)];
   if (path) setCwdValue(path);
 };
-$('#new-cwd-list').onchange = e => {
-  dismissCwdCompletions();
-  $('#new-cwd').value = e.target.value;
-  $('#new-session-error').textContent = '';
-};
-$('#new-cwd-list').ondblclick = () => $('#new-session-form').requestSubmit();
-$('#new-session-dialog').addEventListener('close', dismissCwdCompletions);
+$('#new-session-dialog').addEventListener('close', closeCwdPicker);
 $('#new-session-dialog').addEventListener('click', e => {
   if (e.target === $('#new-session-dialog')) $('#new-session-dialog').close();
 });
@@ -1433,6 +1511,10 @@ const COMPOSER_MAX_FILES = 12;
 const COMPOSER_MAX_FILE_BYTES = 512 * 1024 * 1024;
 const ATTACH_ACCEPT = { image: 'image/*', video: 'video/*', audio: 'audio/*', file: '' };
 const composerDrafts = new Map();
+const composerInputHistoryCache = new Map();
+const composerHistoryPicker = {
+  open: false, uid: null, items: [], index: -1, seq: 0,
+};
 let composerUid = null;
 let composerDraftSeq = 0;
 let lastMessageSelection = '';
@@ -1445,6 +1527,182 @@ function composerDraft(uid = composerUid, create = true) {
   const draft = composerDrafts.get(uid) || null;
   if (draft) ensureComposerAttachmentNumbers(draft);
   return draft;
+}
+
+function composerHistoryStamp(entry) {
+  return `${entry?.end || 0}:${entry?.version?.head || ''}:${entry?.anchor || ''}`;
+}
+
+function nativeComposerHistory(messages) {
+  return (messages || []).filter(message =>
+    ['user', 'command'].includes(message?.role)
+    && message.counted !== false && String(message.text || '').trim()
+  ).map((message, index) => ({
+    id: `native-${index}`, text: String(message.text), ts: message.ts || null,
+  }));
+}
+
+function withQueuedComposerHistory(uid, items) {
+  const result = items.map(item => ({ ...item }));
+  for (const [index, item] of queuedMessages(uid).entries()) {
+    if (!String(item?.text || '').trim()) continue;
+    result.push({
+      id: `queued-${item.id || index}`, text: String(item.text),
+      ts: item.created || null,
+    });
+  }
+  return result;
+}
+
+async function composerHistoryItems(uid) {
+  const entry = cache.get(viewKey(uid));
+  let items;
+  if (entry && !entry.partial) {
+    items = nativeComposerHistory(entry.msgs);
+  } else {
+    const stamp = composerHistoryStamp(entry);
+    const cached = composerInputHistoryCache.get(uid);
+    if (cached?.stamp === stamp) {
+      items = cached.items.map(item => ({ ...item }));
+    } else {
+      const query = new URLSearchParams({uid});
+      const response = await fetch(appUrl(`api/session/input-history?${query}`));
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+      items = (data.history || []).map((item, index) => ({
+        id: `native-${index}`, text: String(item.text || ''), ts: item.ts || null,
+      })).filter(item => item.text.trim());
+      const resultStamp = `${data.end || 0}:${data.version?.head || ''}:${data.anchor || ''}`;
+      composerInputHistoryCache.set(uid, {
+        stamp: resultStamp, items: items.map(item => ({ ...item })),
+      });
+    }
+  }
+  return withQueuedComposerHistory(uid, items);
+}
+
+function closeComposerHistory() {
+  const box = $('#input-history');
+  composerHistoryPicker.open = false;
+  composerHistoryPicker.uid = null;
+  composerHistoryPicker.seq++;
+  box.classList.add('hidden');
+  box.replaceChildren();
+  $('#cinput').setAttribute('aria-expanded', 'false');
+  $('#cinput').removeAttribute('aria-activedescendant');
+}
+
+function setComposerHistoryIndex(index) {
+  const picker = composerHistoryPicker;
+  if (!picker.open || !picker.items.length) return;
+  picker.index = Math.max(0, Math.min(index, picker.items.length - 1));
+  const box = $('#input-history');
+  box.querySelectorAll('.input-history-item.selected').forEach(node => {
+    node.classList.remove('selected');
+    node.setAttribute('aria-selected', 'false');
+  });
+  const selected = box.querySelector(`[data-history-index="${picker.index}"]`);
+  selected?.classList.add('selected');
+  selected?.setAttribute('aria-selected', 'true');
+  box.querySelector('.input-history-position').textContent =
+    `${picker.index + 1} / ${picker.items.length}`;
+  if (selected?.id) $('#cinput').setAttribute('aria-activedescendant', selected.id);
+  selected?.scrollIntoView({block: 'nearest'});
+}
+
+function renderComposerHistory(state = 'ready') {
+  const picker = composerHistoryPicker;
+  const box = $('#input-history');
+  box.replaceChildren();
+  box.classList.remove('hidden');
+  $('#cinput').setAttribute('aria-expanded', 'true');
+  const head = el('div', 'input-history-head');
+  head.appendChild(el('span', '', '输入历史'));
+  const position = el('span', 'input-history-position',
+    state === 'loading' ? '加载中…'
+      : `${Math.max(0, picker.index + 1)} / ${picker.items.length}`
+        + (state === 'refreshing' ? ' · 加载全部…' : ''));
+  head.appendChild(position);
+  box.appendChild(head);
+  if (state === 'loading' || !picker.items.length) {
+    box.appendChild(el('div', 'input-history-empty',
+      state === 'loading' ? '正在加载输入历史…' : '暂无输入历史'));
+    return;
+  }
+  const list = el('div', 'input-history-list');
+  picker.items.forEach((item, index) => {
+    const button = el('button', 'input-history-item');
+    button.type = 'button';
+    button.id = `input-history-option-${index}`;
+    button.dataset.historyIndex = index;
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', 'false');
+    const text = el('span', 'input-history-text');
+    text.textContent = item.text.slice(0, 600);
+    const meta = document.createElement('small');
+    meta.textContent = item.ts ? fmtTime(item.ts) : `${index + 1}`;
+    button.append(text, meta);
+    button.onmouseenter = () => setComposerHistoryIndex(index);
+    button.onmousedown = event => event.preventDefault();
+    button.onclick = () => {
+      setComposerHistoryIndex(index);
+      acceptComposerHistory();
+    };
+    list.appendChild(button);
+  });
+  box.appendChild(list);
+  setComposerHistoryIndex(picker.index);
+}
+
+async function openComposerHistory() {
+  const ta = $('#cinput');
+  const uid = composerUid;
+  if (!uid || composerSending || ta.value !== '') return;
+  closeAttachMenu();
+  const seq = ++composerHistoryPicker.seq;
+  Object.assign(composerHistoryPicker, {
+    open: true, uid, items: [], index: -1,
+  });
+  const entry = cache.get(viewKey(uid));
+  const seed = withQueuedComposerHistory(uid, nativeComposerHistory(entry?.msgs));
+  if (seed.length) {
+    composerHistoryPicker.items = seed;
+    composerHistoryPicker.index = seed.length - 1;
+    renderComposerHistory(entry?.partial ? 'refreshing' : 'ready');
+  } else {
+    renderComposerHistory('loading');
+  }
+  try {
+    const items = await composerHistoryItems(uid);
+    if (!composerHistoryPicker.open || composerHistoryPicker.uid !== uid
+        || composerHistoryPicker.seq !== seq || composerUid !== uid || ta.value !== '') return;
+    const selected = composerHistoryPicker.items[composerHistoryPicker.index];
+    composerHistoryPicker.items = items;
+    const preserved = selected ? items.findLastIndex(item =>
+      item.text === selected.text && item.ts === selected.ts) : -1;
+    composerHistoryPicker.index = preserved >= 0 ? preserved : items.length - 1;
+    renderComposerHistory();
+  } catch (error) {
+    if (!composerHistoryPicker.open || composerHistoryPicker.seq !== seq) return;
+    composerHistoryPicker.items = [];
+    composerHistoryPicker.index = -1;
+    renderComposerHistory();
+    $('#input-history .input-history-empty').textContent =
+      `读取失败：${error.message || error}`;
+  }
+}
+
+function acceptComposerHistory() {
+  const picker = composerHistoryPicker;
+  const item = picker.items[picker.index];
+  if (!picker.open || !item) return false;
+  const ta = $('#cinput');
+  closeComposerHistory();
+  ta.value = item.text;
+  ta.dispatchEvent(new Event('input', {bubbles: true}));
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  return true;
 }
 
 function ensureComposerAttachmentNumbers(draft) {
@@ -1514,6 +1772,7 @@ function switchComposerDraft(uid) {
   const ta = $('#cinput');
   if (composerUid && ta) composerDraft(composerUid).text = ta.value;
   if (composerUid === uid) return;
+  closeComposerHistory();
   composerUid = uid;
   const draft = composerDraft(uid, !!uid);
   ta.value = draft?.text || '';
@@ -1858,6 +2117,7 @@ async function submitComposer() {
   const attachments = [...(draft?.attachments || [])];
   const quotes = (draft?.quotes || []).map(x => ({ id: x.id, text: x.text })).filter(x => x.text.trim());
   if (composerSending || (!text.trim() && !attachments.length && !quotes.length)) return;
+  closeComposerHistory();
   composerSending = true;
   button.disabled = true;
   add.disabled = true;
@@ -1908,9 +2168,38 @@ async function submitComposer() {
 $('#cinput').addEventListener('input', e => {
   const draft = composerDraft();
   if (draft) draft.text = e.target.value;
+  if (composerHistoryPicker.open && e.target.value !== '') closeComposerHistory();
   autoGrow(e.target);
 });
 $('#cinput').addEventListener('keydown', e => {
+  if (e.isComposing) return;
+  if (composerHistoryPicker.open) {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setComposerHistoryIndex(composerHistoryPicker.index - 1);
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setComposerHistoryIndex(composerHistoryPicker.index + 1);
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      acceptComposerHistory();
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeComposerHistory();
+      return;
+    }
+    if (!['Shift', 'Control', 'Alt', 'Meta'].includes(e.key)) closeComposerHistory();
+  } else if (e.key === 'ArrowUp' && e.currentTarget.value === '') {
+    e.preventDefault();
+    openComposerHistory();
+    return;
+  }
   // 手机软键盘没有方便的 Shift+Enter：Enter 始终换行，只允许按钮发送。
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !MOBILE.matches) {
     e.preventDefault();
@@ -2031,6 +2320,7 @@ $('#cesc').onclick = () => sendComposerEscape();
 
 $('#cadd').onclick = e => {
   e.stopPropagation();
+  closeComposerHistory();
   const menu = $('#attach-menu');
   const open = menu.classList.toggle('hidden');
   $('#cadd').classList.toggle('on', !open);
@@ -2058,6 +2348,7 @@ $('#cfile').onchange = e => {
 };
 document.addEventListener('click', e => {
   if (!e.target.closest('.attach-picker')) closeAttachMenu();
+  if (!e.target.closest('.composer-input-wrap')) closeComposerHistory();
 });
 document.addEventListener('selectionchange', () => {
   const selection = getSelection();

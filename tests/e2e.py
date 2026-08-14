@@ -372,6 +372,47 @@ def run(pw):
                              "server": True, "persisted": False,
                              "escapeKeys": ["Escape"]}
           and str(codex_delivery.get("uid", "")).startswith("codex:"), codex_delivery)
+    diff_race = p.evaluate("""async () => {
+      const uid = 'codex:synthetic-diff-race', key = viewKey(uid);
+      const oldEntry = cache.get(key), oldQueued = S.queued.get(uid);
+      const pending = () => ({id:'server-race', uid, text:'不能消失的消息',
+        created:1000, state:'delivering', server:true});
+      const entry = () => ({meta:{uid, source:'codex'}, msgs:[],
+        version:{head:'head-a'}, end:100, anchor:'anchor-a', activity:null,
+        bytes:0, total:0, prompt:null});
+      try {
+        cache.set(key, entry()); S.queued.set(uid, [pending()]);
+        await applyDiff(uid, {reset:false, start:90, end:120,
+          version:{head:'head-a'}, anchor:'anchor-b', messages:[{
+            role:'user', text:'不能消失的消息', ts:'2026-08-13T00:00:00Z'}],
+          outbox:[], activity_changed:false, activity:null});
+        const stale = {queued:queuedMessages(uid).length,
+          messages:cache.get(key).msgs.length, end:cache.get(key).end};
+
+        cache.set(key, entry()); S.queued.set(uid, [pending()]);
+        await applyDiff(uid, {reset:false, start:100, end:120,
+          version:{head:'head-a'}, anchor:'anchor-b', messages:[{
+            role:'user', text:'不能消失的消息', ts:'2026-08-13T00:00:00Z'}],
+          outbox:[], activity_changed:false, activity:null});
+        const current = {queued:queuedMessages(uid).length,
+          messages:cache.get(key).msgs.map(x => x.text), end:cache.get(key).end};
+
+        cache.set(key, entry()); S.queued.set(uid, [pending()]);
+        await applyDiff(uid, {outbox_only:true, outbox:[]});
+        const outboxOnly = {queued:queuedMessages(uid).length,
+          messages:cache.get(key).msgs.length, end:cache.get(key).end};
+        return {stale, current, outboxOnly};
+      } finally {
+        if (oldEntry) cache.set(key, oldEntry); else cache.delete(key);
+        if (oldQueued) S.queued.set(uid, oldQueued); else S.queued.delete(uid);
+      }
+    }""")
+    check("Codex 乱序增量和先到的空队列通知不会吞掉发送气泡",
+          diff_race == {
+              "stale": {"queued": 1, "messages": 0, "end": 100},
+              "current": {"queued": 0, "messages": ["不能消失的消息"], "end": 120},
+              "outboxOnly": {"queued": 1, "messages": 0, "end": 100},
+          }, diff_race)
     script_order = p.locator("script[src]").evaluate_all(
         "nodes => nodes.map(n => n.getAttribute('src').split('?')[0])")
     check("会话列表脚本不再被大型终端和公式库阻塞",
@@ -2073,20 +2114,85 @@ def run(pw):
         p.click("#new-session")
         p.wait_for_selector("#new-session-dialog[open]")
         check("新建弹窗有三种会话类型", p.locator('input[name="new-source"]').count() == 3)
-        common_dir_count = p.locator("#new-cwd-list option").count()
-        check("新建弹窗列出常用目录", common_dir_count >= 1)
+        recent_policy = p.evaluate("""() => {
+          const sessions = S.sessions, recent = store.get('newDirs', []);
+          try {
+            S.sessions = [
+              {cwd:'/tmp/claude-1000/scratchpad/hooktest', updated:'2099-01-01'},
+              {cwd:'/var/tmp/generated', updated:'2099-01-01'},
+              {cwd:'/work/real-project', updated:'2099-01-01'},
+            ];
+            store.set('newDirs', ['/tmp/explicit-choice']);
+            return commonSessionDirs().map(row => row.cwd);
+          } finally {
+            S.sessions = sessions;
+            store.set('newDirs', recent);
+          }
+        }""")
+        check("自动最近目录排除易失会话但保留用户主动选择",
+              "/tmp/claude-1000/scratchpad/hooktest" not in recent_policy
+              and "/var/tmp/generated" not in recent_policy
+              and "/work/real-project" in recent_policy
+              and "/tmp/explicit-choice" in recent_policy, recent_policy)
+        common_dir_count = p.locator("#new-cwd-options .new-cwd-option").count()
+        common_value = p.locator("#new-cwd-options .new-cwd-option").first.get_attribute("title")
+        check("新建目录面板默认列出最近使用", common_dir_count >= 1
+              and p.locator("#new-cwd-options-title").inner_text() == "最近使用"
+              and common_dir_count == p.evaluate("cwdCompletion.common.length"))
+        check("新建弹窗只有一个目录选择面板",
+              p.locator("#new-cwd-picker").count() == 1
+              and p.locator("#new-session-dialog select").count() == 0)
         check("启动目录可手工输入", p.locator("#new-cwd").input_value().startswith("/"))
+        recent_filter = p.evaluate("""() => {
+          const common = cwdCompletion.common;
+          try {
+            cwdCompletion.common = [
+              {cwd:'/work/flux-main', count:3},
+              {cwd:'/work/unrelated', count:2},
+              {cwd:'/archive/FLUX-lab', count:1},
+            ];
+            $('#new-cwd').value = 'flux';
+            scheduleCwdCompletions();
+            return {
+              paths:[...document.querySelectorAll('#new-cwd-options .new-cwd-option')]
+                .map(node => node.title),
+              groups:[...document.querySelectorAll('#new-cwd-options .new-cwd-section')]
+                .map(node => node.textContent),
+              title:$('#new-cwd-options-title').textContent,
+            };
+          } finally {
+            cwdCompletion.common = common;
+            $('#new-cwd').value = '';
+            renderCommonCwdOptions();
+          }
+        }""")
+        check("普通关键词会全文匹配 recent dir 且忽略大小写",
+              recent_filter == {
+                  "paths": ["/work/flux-main", "/archive/FLUX-lab"],
+                  "groups": ["最近匹配"], "title": "匹配目录",
+              }, recent_filter)
         completion_prefix = str(FAKE_CWD / "autocomplete-a")
+        recent_match = completion_prefix + "-recent"
+        p.evaluate("row => cwdCompletion.common.unshift(row)",
+                   {"cwd": recent_match, "count": 4})
         p.fill("#new-cwd", completion_prefix)
-        p.wait_for_selector("#new-cwd-completions:not([hidden])", timeout=10000)
-        completion_paths = p.locator(".new-cwd-completion").all_inner_texts()
-        check("启动目录会自动补全真实子目录", completion_paths == [
+        p.wait_for_function("""() => document.querySelector('#new-cwd-options-title')?.textContent
+          === '匹配目录' && document.querySelectorAll('#new-cwd-options .new-cwd-option').length === 3""",
+                            timeout=10000)
+        completion_paths = p.locator("#new-cwd-options .new-cwd-option-path").all_inner_texts()
+        check("斜杠开头时补全建议排在 recent 匹配之前", completion_paths == [
             str(FAKE_CWD / "autocomplete-alpha") + "/",
             str(FAKE_CWD / "autocomplete-alpine") + "/",
-        ], completion_paths)
-        check("补全候选出现时常用目录仍然保留",
-              p.locator("#new-cwd-list").is_visible()
-              and p.locator("#new-cwd-list option").count() == common_dir_count)
+            recent_match,
+        ] and p.locator("#new-cwd-options .new-cwd-section").all_inner_texts()
+            == ["补全建议", "最近匹配"], completion_paths)
+        p.locator("#new-cwd-options .new-cwd-option").first.hover()
+        p.wait_for_timeout(250)
+        check("鼠标移入目录候选后面板不会消失",
+              p.locator("#new-cwd-picker").is_visible()
+              and p.locator("#new-cwd-options .new-cwd-option").count() == 3)
+        check("recent 与补全建议共用一个目录面板",
+              p.locator("#new-cwd-picker").count() == 1)
         p.press("#new-cwd", "Tab")
         check("Tab 先补齐多个候选的公共前缀",
               p.input_value("#new-cwd") == str(FAKE_CWD / "autocomplete-alp"),
@@ -2094,14 +2200,58 @@ def run(pw):
         p.press("#new-cwd", "ArrowDown")
         p.press("#new-cwd", "Enter")
         check("方向键和 Enter 可接受目录候选",
-              p.input_value("#new-cwd") == completion_paths[0]
-              and p.locator("#new-cwd-completions").is_hidden())
-        check("手输补全不会留下冲突的常用目录高亮",
-              p.locator("#new-cwd-list").evaluate("n => n.selectedIndex") == -1)
-        common_value = p.locator("#new-cwd-list option").first.get_attribute("value")
-        p.select_option("#new-cwd-list", common_value)
-        check("常用目录仍可一键回填输入栏",
-              p.input_value("#new-cwd") == common_value)
+              p.input_value("#new-cwd") == completion_paths[0])
+        p.evaluate("path => { cwdCompletion.common = cwdCompletion.common.filter(row => row.cwd !== path); }",
+                   recent_match)
+        p.fill("#new-cwd", "")
+        check("清空输入后同一面板恢复最近目录",
+              p.locator("#new-cwd-options-title").inner_text() == "最近使用"
+              and p.locator("#new-cwd-options .new-cwd-option").count() == common_dir_count)
+        p.locator("#new-cwd-options .new-cwd-option").first.click()
+        check("最近目录可一键回填输入栏", p.input_value("#new-cwd") == common_value)
+        creation_confirmation = p.evaluate("""async () => {
+          const oldPost = post, oldConfirm = window.confirm;
+          const requests = [];
+          const prompts = [];
+          let allow = false;
+          $('#new-cwd').value = '/tmp/typed-missing-project';
+          post = async (url, body) => {
+            requests.push({url, body});
+            return body.create_cwd
+              ? {error:'模拟创建结束'}
+              : {error:'启动目录不存在', needs_create:true,
+                 cwd:'/tmp/resolved-missing-project'};
+          };
+          window.confirm = message => { prompts.push(message); return allow; };
+          try {
+            await createNewSession({preventDefault() {}});
+            const cancelledAt = requests.length;
+            allow = true;
+            await createNewSession({preventDefault() {}});
+            return {requests, prompts, cancelledAt,
+                    error:$('#new-session-error').textContent,
+                    button:$('#new-session-go').textContent};
+          } finally {
+            post = oldPost;
+            window.confirm = oldConfirm;
+            $('#new-session-error').textContent = '';
+          }
+        }""")
+        check("不存在的启动目录先询问再显式创建",
+              creation_confirmation["cancelledAt"] == 1
+              and len(creation_confirmation["requests"]) == 3
+              and "create_cwd" not in creation_confirmation["requests"][0]["body"]
+              and "create_cwd" not in creation_confirmation["requests"][1]["body"]
+              and creation_confirmation["requests"][2]["body"].get("create_cwd") is True
+              and creation_confirmation["requests"][2]["body"]["cwd"]
+                  == "/tmp/resolved-missing-project"
+              and len(creation_confirmation["prompts"]) == 2
+              and all("/tmp/resolved-missing-project" in prompt
+                      and "是否创建" in prompt
+                      for prompt in creation_confirmation["prompts"])
+              and creation_confirmation["error"] == "模拟创建结束"
+              and creation_confirmation["button"] == "创建并打开",
+              creation_confirmation)
         p.click("#new-session-dialog .modal-cancel")
 
         # 新建 CLI 写出第一条正式记录前只有 pending tmux：手机也必须能切到空
@@ -2421,6 +2571,46 @@ def run(pw):
               composer_single_line["overflow"] == "hidden", composer_single_line)
         check("Esc 和发送按钮使用完全相同的垂直尺寸",
               composer_single_line["esc"] == composer_single_line["send"], composer_single_line)
+
+        # 空输入时用 ↑ 取回当前会话的历史输入；Enter 只回填，不直接发送。
+        p.fill("#cinput", "")
+        p.press("#cinput", "ArrowUp")
+        p.wait_for_selector("#input-history .input-history-item", timeout=10000)
+        history_open = p.evaluate("""() => ({
+          count:composerHistoryPicker.items.length,
+          index:composerHistoryPicker.index,
+          selected:document.querySelector('.input-history-item.selected')?.dataset.historyIndex,
+          popup:document.querySelector('#input-history').getBoundingClientRect(),
+          input:document.querySelector('#cinput').getBoundingClientRect(),
+        })""")
+        check("空输入按上键打开全部输入历史并默认最后一条",
+              history_open["count"] >= 3
+              and history_open["index"] == history_open["count"] - 1
+              and int(history_open["selected"]) == history_open["index"], history_open)
+        check("输入历史上拉框与输入框等宽并位于其上方",
+              abs(history_open["popup"]["width"] - history_open["input"]["width"]) <= 1
+              and history_open["popup"]["bottom"] <= history_open["input"]["top"], history_open)
+        latest_history = p.evaluate("composerHistoryPicker.items.at(-1).text")
+        p.press("#cinput", "Enter")
+        check("历史项回车只送入编辑框而不发送",
+              p.input_value("#cinput") == latest_history
+              and p.locator("#input-history").is_hidden(), repr(p.input_value("#cinput")))
+        p.fill("#cinput", "")
+        p.press("#cinput", "ArrowUp")
+        p.wait_for_selector("#input-history .input-history-item")
+        p.press("#cinput", "ArrowUp")
+        previous_history = p.evaluate("composerHistoryPicker.items[composerHistoryPicker.index].text")
+        p.press("#cinput", "Enter")
+        check("历史上拉框可用上下键浏览",
+              p.input_value("#cinput") == previous_history
+              and previous_history != latest_history)
+        p.fill("#cinput", "已有草稿")
+        p.press("#cinput", "ArrowUp")
+        check("输入框有内容时上键保持普通编辑行为",
+              p.locator("#input-history").is_hidden()
+              and p.input_value("#cinput") == "已有草稿")
+        p.fill("#cinput", "")
+
         p.click("#cadd")
         check("加号菜单提供图片视频音频文件和引用",
               p.locator("#attach-menu button").evaluate_all(

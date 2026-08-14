@@ -76,7 +76,6 @@ const S = {
   markCapped: false,  // 高亮是否因数量上限被截断
   results: null,      // 全文搜索结果, null 表示未处于搜索态
   agent: null,        // 当前查看的子代理 id；null = 主会话
-  syncing: false,     // 增量同步进行中
   syncGap: 350,       // 当前会话的同步间隔, 随有无新内容自适应
   live: new Set(),    // 仍在运行的会话 uid
   liveTmux: new Set(),// 其中运行在 tmux 里的会话 uid
@@ -479,15 +478,37 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   const key = viewKey(uid, agent);
   const e = cache.get(key);
   if (!e) return 0;
+  if (data.prompt_only) {
+    if (!agent && Object.prototype.hasOwnProperty.call(data, 'prompt')) {
+      e.prompt = data.prompt || null;
+    }
+    if (S.sel === uid && !S.agent) renderConversationTail(e.activity, uid);
+    return 0;
+  }
+  if (data.outbox_only) {
+    if (!agent && Array.isArray(data.outbox)) {
+      const ids = new Set(data.outbox.map(item => item?.id).filter(Boolean));
+      // 后台确认线程可能先删掉服务端队列项，稍后 watch 才读到对应的
+      // rollout user 记录。此时直接照空 outbox 清 UI，会让刚发的消息
+      // 短暂消失。先从当前浏览器游标补一次正文，再原子完成替换。
+      const removesPending = queuedMessages(uid).some(
+        item => item.server && item.id && !ids.has(item.id));
+      if (removesPending) scheduleDiffRecovery(uid, agent);
+      else syncServerOutbox(uid, data.outbox);
+    }
+    return 0;
+  }
+  // 正文 diff 受游标约束。SSE 与兜底拉取可能同时从同一旧游标出发；
+  // 乱序包必须在修改 outbox、prompt 或乐观消息之前丢弃，否则正文没被
+  // 接收，发送占位却已先清掉。
+  if (!data.reset && data.start !== e.end) {
+    scheduleDiffRecovery(uid, agent);
+    return 0;
+  }
   if (!agent && Object.prototype.hasOwnProperty.call(data, 'prompt')) {
     e.prompt = data.prompt || null;
   }
   if (!agent && Array.isArray(data.outbox)) syncServerOutbox(uid, data.outbox);
-  if (data.prompt_only) {
-    if (S.sel === uid && !S.agent) renderConversationTail(e.activity, uid);
-    return 0;
-  }
-  if (data.outbox_only) return 0;
   if (!agent) reconcileQueuedMessages(uid, data.messages);
   const questionCalls = new Set([...e.msgs, ...(data.messages || [])]
     .filter(m => m.role === 'question' && m.call_id).map(m => m.call_id));
@@ -507,7 +528,6 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     }
     return data.messages.length;
   }
-  if (data.start !== e.end) return 0;       // 不是接着当前位置的(重连/乱序), 丢掉
   e.version = data.version;
   e.end = data.end;
   e.anchor = data.anchor;
@@ -560,24 +580,53 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
 
 /** 兜底用的主动拉取。正常情况下更新由服务端 SSE 推过来, 这里只在
  *  连接还没建起来或断了的时候补一手。 */
-async function syncSession(uid, agent = S.agent) {
-  const e = cache.get(viewKey(uid, agent));
-  if (!e || S.syncing) return 0;
-  S.syncing = true;
-  try {
-    const { data, bytes } = await fetchMessages(uid, {
-      agent, start: e.end, head: e.version.head, anchor: e.anchor });
-    return await applyDiff(uid, data, bytes, agent);
-  } catch {
-    return 0;
-  } finally {
-    S.syncing = false;
-  }
+const syncingViews = new Map();
+
+function syncSession(uid, agent = S.agent) {
+  const key = viewKey(uid, agent);
+  const e = cache.get(key);
+  if (!e) return Promise.resolve(0);
+  const current = syncingViews.get(key);
+  if (current) return current;
+  const task = (async () => {
+    try {
+      const { data, bytes } = await fetchMessages(uid, {
+        agent, start: e.end, head: e.version.head, anchor: e.anchor });
+      return await applyDiff(uid, data, bytes, agent);
+    } catch {
+      return 0;
+    }
+  })().finally(() => {
+    if (syncingViews.get(key) === task) syncingViews.delete(key);
+  });
+  syncingViews.set(key, task);
+  return task;
 }
 
 // ---- 服务端推送 ----
 // 服务端盯着会话文件, 一变就把 diff 推过来, 不用客户端反复问。
 let _es = null, _esUid = null, _esRetry = null;
+const diffRecoveries = new Map();
+
+/** 游标冲突或队列先于正文确认时，从当前已接受游标重新取一次并重建 watch。 */
+function scheduleDiffRecovery(uid, agent = null) {
+  const key = viewKey(uid, agent);
+  if (diffRecoveries.has(key)) return;
+  const timer = setTimeout(async () => {
+    try {
+      // 若冲突发生时已有主动拉取在途，先等旧请求收尾，再保证至少发出
+      // 一次基于最新本地游标的新请求。
+      const inFlight = syncingViews.get(key);
+      if (inFlight) await inFlight;
+      if (!cache.has(key)) return;
+      await syncSession(uid, agent);
+      if (S.sel === uid && S.agent === agent) watchSession(uid, agent);
+    } finally {
+      if (diffRecoveries.get(key) === timer) diffRecoveries.delete(key);
+    }
+  }, 0);
+  diffRecoveries.set(key, timer);
+}
 
 function watchSession(uid, agent = S.agent) {
   closeWatch();
@@ -589,6 +638,8 @@ function watchSession(uid, agent = S.agent) {
   _es = es;
   _esUid = uid;
   es.onmessage = ev => {
+    // close() 后浏览器仍可能派发已经排队的旧事件，不能让旧 watch 改新视图。
+    if (_es !== es || _esUid !== uid || S.agent !== agent) return;
     let data;
     try { data = JSON.parse(ev.data); } catch { return; }
     applyDiff(uid, data, 0, agent);

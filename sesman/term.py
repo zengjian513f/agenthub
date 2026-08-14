@@ -54,6 +54,14 @@ CODEX_QUESTION_ARGS = (
 )
 
 
+class DirectoryCreationRequired(ValueError):
+    """A validated absolute session directory is missing and needs consent."""
+
+    def __init__(self, path: Path):
+        self.path = str(path)
+        super().__init__("启动目录不存在")
+
+
 def resume_command(source: str, sid: str) -> str:
     """拼续接命令。sid 只允许 UUID 字符, 否则就成了命令注入。"""
     if source not in RESUME:
@@ -139,7 +147,7 @@ def complete_directories(raw: str, limit: int = DIRECTORY_COMPLETION_LIMIT) -> l
                 except OSError:
                     continue
                 rows.append(f"{display_parent}{name}/")
-    except OSError:
+    except (OSError, ValueError):
         return []
     rows.sort(key=lambda value: (value.casefold(), value))
     return rows[:limit]
@@ -153,7 +161,8 @@ def _clean_cli_command(exe: str, *args: str) -> str:
     ])
 
 
-def new_cli_session(source: str, cwd: str, cols: int = 120, rows: int = 32) -> dict:
+def new_cli_session(source: str, cwd: str, cols: int = 120, rows: int = 32,
+                    create_cwd: bool = False) -> dict:
     """在经过校验的目录中新建一条 CLI 会话。
 
     命令只能来自固定白名单，浏览器不能借这个接口拼任意 shell。Claude/Grok
@@ -167,13 +176,30 @@ def new_cli_session(source: str, cwd: str, cols: int = 120, rows: int = 32) -> d
     raw = str(cwd or "").strip()
     if not raw:
         raise ValueError("请选择启动目录")
-    path = Path(raw).expanduser()
+    try:
+        path = Path(raw).expanduser()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("启动目录路径无效") from None
     if not path.is_absolute():
         raise ValueError("启动目录必须是绝对路径")
     try:
         path = path.resolve(strict=True)
-    except OSError:
-        raise ValueError("启动目录不存在") from None
+    except FileNotFoundError:
+        try:
+            path = path.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError("启动目录路径无效") from None
+        if not create_cwd:
+            raise DirectoryCreationRequired(path) from None
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            path = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as e:
+            detail = getattr(e, "strerror", None) or str(e)
+            raise ValueError(f"创建启动目录失败：{detail}") from None
+    except (OSError, RuntimeError, ValueError) as e:
+        detail = getattr(e, "strerror", None) or str(e)
+        raise ValueError(f"无法访问启动目录：{detail}") from None
     if not path.is_dir():
         raise ValueError("启动路径不是目录")
 

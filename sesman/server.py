@@ -159,6 +159,43 @@ def _poll_outbox() -> None:
             continue
 
 
+def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
+    """Safely deliver one ready Codex item into a genuinely empty composer."""
+    s = index.get(str(item.get("uid") or ""))
+    pane = _pane_for_session(s, panes) if s and s.get("source") == "codex" else None
+    if not pane:
+        send_queue.mark_failed(item["id"], "Codex tmux 会话已断开")
+        return
+    name = pane["name"]
+    try:
+        # task_complete 写盘到 TUI 真正回到输入框仍有一个很短的重绘窗口。
+        # 连续两帧终端文本一致才注入，避开本次事故中的 15ms 状态切换。
+        before = term.capture(name, 40)
+        time.sleep(0.08)
+        if before != term.capture(name, 40):
+            send_queue.defer(item["id"])
+            return
+        composer = codex_bridge.composer_state(before)
+        if composer == "editing":
+            # 双 Esc 回退失败时 Codex 会把旧 prompt 留在编辑框里。绝不能
+            # 清空用户草稿，也不能把新消息粘到它后面形成一条拼接消息。
+            send_queue.mark_failed(
+                item["id"], "Codex 输入框已有内容，请在终端处理后重试")
+            return
+        if composer != "empty":
+            # 审批、选择题及重绘中的画面都是瞬态状态，等待真正 Ready。
+            send_queue.defer(item["id"])
+            return
+        # 用户可能在 ready() 与这里之间撤销排队项。状态切换失败时
+        # 绝不能继续向 tmux 注入已经撤掉的正文。
+        if not send_queue.mark_delivering(item["id"]):
+            return
+        term.leave_copy_mode(name)
+        term.submit_text(name, str(item.get("text") or ""))
+    except Exception as e:
+        send_queue.mark_failed(item["id"], str(e))
+
+
 def _outbox_loop() -> None:
     """只交付服务端已经判定可发送的 Codex 队首消息。"""
     while True:
@@ -176,28 +213,7 @@ def _outbox_loop() -> None:
             OUTBOX_WAKE.clear()
             continue
         for item in ready:
-            s = index.get(str(item.get("uid") or ""))
-            pane = _pane_for_session(s, panes) if s and s.get("source") == "codex" else None
-            if not pane:
-                send_queue.mark_failed(item["id"], "Codex tmux 会话已断开")
-                continue
-            name = pane["name"]
-            try:
-                # task_complete 写盘到 TUI 真正回到输入框仍有一个很短的重绘窗口。
-                # 连续两帧终端文本一致才注入，避开本次事故中的 15ms 状态切换。
-                before = term.capture(name, 40)
-                time.sleep(0.08)
-                if before != term.capture(name, 40):
-                    send_queue.defer(item["id"])
-                    continue
-                # 用户可能在 ready() 与这里之间撤销排队项。状态切换失败时
-                # 绝不能继续向 tmux 注入已经撤掉的正文。
-                if not send_queue.mark_delivering(item["id"]):
-                    continue
-                term.leave_copy_mode(name)
-                term.submit_text(name, str(item.get("text") or ""))
-            except Exception as e:
-                send_queue.mark_failed(item["id"], str(e))
+            _deliver_outbox_item(item, panes)
 
 
 def _sessions_signature(index_sig: str | None = None) -> str:
@@ -674,6 +690,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/session/outbox":
             return self._json({"outbox": send_queue.list_for(q.get("uid", [""])[0])})
 
+        if path == "/api/session/input-history":
+            uid = q.get("uid", [""])[0]
+            agent = q.get("agent", [""])[0]
+            session = index.get(uid)
+            if not session:
+                return self._json({"error": "会话不存在"}, 404)
+            result = index.messages_for(index.session_view(session, agent))
+            history = [{"text": str(message.get("text") or ""),
+                        "ts": message.get("ts")}
+                       for message in result["messages"]
+                       if message.get("role") in {"user", "command"}
+                       and message.get("counted") is not False
+                       and str(message.get("text") or "").strip()]
+            return self._json({"history": history, "end": result["end"],
+                               "version": result["version"],
+                               "anchor": result.get("anchor", "")})
+
         if path.startswith("/api/media/"):
             token = path[len("/api/media/"):]
             got = media.get(token)
@@ -954,6 +987,24 @@ class Handler(BaseHTTPRequestHandler):
         pane = _pane_for_session(s, panes)
         if not pane or pane["name"] != str(body.get("name") or ""):
             return self._json({"error": "Codex tmux 会话未连接"}, 409)
+        failed = next((item for item in send_queue.list_for(uid)
+                       if item.get("state") == "failed"), None)
+        if failed:
+            # 新消息排在失败项后面永远不会投递。拒绝本次请求，让浏览器保留
+            # 编辑框正文，并明确要求先处理真正的阻塞项。
+            return self._json({
+                "error": "上一条消息发送失败，请先重试或移除",
+                "outbox": send_queue.list_for(uid),
+            }, 409)
+        try:
+            composer = codex_bridge.composer_state(term.capture(pane["name"], 40))
+        except (OSError, RuntimeError):
+            composer = "unknown"
+        if composer == "editing":
+            return self._json({
+                "error": "Codex 输入框已有内容，请先在终端处理",
+                "outbox": send_queue.list_for(uid),
+            }, 409)
         item = send_queue.enqueue(
             uid, pane["name"], str(body.get("text") or ""), body.get("media"),
             body.get("activity"), str(body.get("request_id") or ""),
@@ -1038,10 +1089,16 @@ class Handler(BaseHTTPRequestHandler):
         source = str(body.get("source") or "")
         before = {str(s["sid"]) for s in index.load() if s["source"] == source}
         cols, rows = int(body.get("cols", 120)), int(body.get("rows", 32))
-        info = term.new_cli_session(
-            source, str(body.get("cwd") or ""),
-            cols, rows,
-        )
+        try:
+            info = term.new_cli_session(
+                source, str(body.get("cwd") or ""),
+                cols, rows, create_cwd=body.get("create_cwd") is True,
+            )
+        except term.DirectoryCreationRequired as e:
+            # 首次提交绝不隐式创建目录；浏览器展示规范化后的实际目标，
+            # 用户明确同意后才用 create_cwd=true 重试。
+            return self._json({"error": str(e), "needs_create": True,
+                               "cwd": e.path}, 409)
         record = {**info, "before": before, "started": time.time(),
                   "cols": cols, "rows": rows}
         try:

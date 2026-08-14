@@ -18,6 +18,76 @@ _OPTION = re.compile(r"^\s*(?:[›>]\s*)?(\d+)\.\s+(.*)$")
 _FOOTER = re.compile(
     r"^\s*Press enter to confirm or esc to cancel\s*$", re.IGNORECASE)
 _SHORTCUT = re.compile(r"\s*\((y|p|esc)\)\s*$", re.IGNORECASE)
+_CONTEXT_FOOTER = re.compile(r"\bContext\s+\d+%\s+used\b", re.IGNORECASE)
+_READY_FOOTER = re.compile(r"\bReady\b", re.IGNORECASE)
+_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+
+
+def _styled_chars(text: str) -> list[tuple[str, bool]]:
+    """Return visible characters together with their ANSI dim state."""
+    result: list[tuple[str, bool]] = []
+    dim = False
+    pos = 0
+    while pos < len(text):
+        ansi = _ANSI.match(text, pos)
+        if not ansi:
+            result.append((text[pos], dim))
+            pos += 1
+            continue
+        sgr = _SGR.fullmatch(ansi.group(0))
+        if sgr:
+            raw = sgr.group(1)
+            codes = [int(value or 0) for value in re.split(r"[;:]", raw)]
+            for code in codes:
+                if code == 0:
+                    dim = False
+                elif code == 2:
+                    dim = True
+                elif code == 22:
+                    dim = False
+        pos = ansi.end()
+    return result
+
+
+def composer_state(screen: str) -> str:
+    """Classify the live Codex composer as ``empty``, ``editing`` or ``unknown``.
+
+    Codex renders its empty rotating placeholder with SGR dim, while restored
+    rewind text and normal drafts are not dim.  The Ready footer is required so
+    transcript output containing a ``›`` cannot be mistaken for the composer.
+    """
+    raw_lines = str(screen or "").replace("\r", "").splitlines()
+    clean_lines = [_ANSI.sub("", line) for line in raw_lines]
+    status: list[tuple[int, int]] = []
+    for ready, line in enumerate(clean_lines):
+        if not _READY_FOOTER.search(line):
+            continue
+        contexts = [i for i in range(max(0, ready - 3), ready + 1)
+                    if _CONTEXT_FOOTER.search(clean_lines[i])]
+        if contexts:
+            status.append((ready, contexts[-1]))
+    if not status:
+        return "unknown"
+    ready, context = status[-1]
+    footer = min(ready, context)
+    # A narrow terminal may wrap the status bar.  Exclude its whole nonblank
+    # block, otherwise model/account text above Ready would look like a draft.
+    while footer > 0 and clean_lines[footer - 1].strip():
+        footer -= 1
+    prompts = [i for i in range(max(0, footer - 20), footer)
+               if clean_lines[i].lstrip().startswith("›")]
+    if not prompts:
+        return "unknown"
+
+    styled = _styled_chars("\n".join(raw_lines[prompts[-1]:footer]))
+    try:
+        marker = next(i for i, (char, _) in enumerate(styled) if char == "›")
+    except StopIteration:
+        return "unknown"
+    content = [(char, dim) for char, dim in styled[marker + 1:] if not char.isspace()]
+    if any(not dim for _, dim in content):
+        return "editing"
+    return "empty"
 
 
 def _option_text(text: str, key: str) -> tuple[str, str]:
