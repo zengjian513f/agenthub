@@ -579,6 +579,138 @@ class IncrementalCursorTests(unittest.TestCase):
             self.assertEqual(result["messages"][100]["text"], "message 150")
             self.assertEqual(result["messages"][-1]["text"], "message 649")
 
+    def test_initial_window_cache_survives_process_memory_reset(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_index, "WINDOW_CACHE_DIR",
+                             Path(tmp) / "window-cache"), \
+                patch.object(session_index, "WINDOW_CACHE_MIN_BYTES", 0):
+            session_index._clear_window_cache_memory()
+            self.addCleanup(session_index._clear_window_cache_memory)
+            path = Path(tmp) / "persistent.jsonl"
+            sid = "00000000-0000-0000-0000-000000000101"
+            rows = [{
+                "type": "assistant",
+                "message": {"role": "assistant", "content": f"cached {i}"},
+                "timestamp": "2026-08-09T10:00:00Z", "cwd": tmp,
+                "sessionId": sid,
+            } for i in range(3)]
+            path.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+            session = {"uid": "claude:persistent", "source": "claude", "sid": sid,
+                       "path": str(path), "cwd": tmp}
+
+            first = session_index.messages_for(session, windowed=True)
+            cache_files = list(session_index.WINDOW_CACHE_DIR.glob("*.json.gz"))
+            self.assertEqual(len(cache_files), 1)
+            self.assertEqual(session_index.WINDOW_CACHE_DIR.stat().st_mode & 0o777,
+                             0o700)
+            self.assertEqual(cache_files[0].stat().st_mode & 0o777, 0o600)
+
+            # 模拟服务重启后的空内存；第二次必须直接读持久化窗口，不能再解析。
+            session_index._clear_window_cache_memory()
+            adapter = session_index.ADAPTERS["claude"]
+            with patch.object(adapter, "read",
+                              side_effect=AssertionError("unexpected reparse")):
+                second = session_index.messages_for(session, windowed=True)
+            self.assertEqual(second["messages"], first["messages"])
+            self.assertEqual(second["message_total"], 3)
+
+    def test_initial_window_cache_invalidates_on_internal_insert_delete_and_edit(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_index, "WINDOW_CACHE_DIR",
+                             Path(tmp) / "window-cache"), \
+                patch.object(session_index, "WINDOW_CACHE_MIN_BYTES", 0):
+            session_index._clear_window_cache_memory()
+            self.addCleanup(session_index._clear_window_cache_memory)
+            path = Path(tmp) / "mutable.jsonl"
+            sid = "00000000-0000-0000-0000-000000000102"
+            session = {"uid": "claude:mutable", "source": "claude", "sid": sid,
+                       "path": str(path), "cwd": tmp}
+
+            def write(texts):
+                rows = [{
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": text},
+                    "timestamp": "2026-08-09T10:00:00Z", "cwd": tmp,
+                    "sessionId": sid,
+                } for text in texts]
+                path.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+
+            def visible():
+                return [m["text"] for m in session_index.messages_for(
+                    session, windowed=True)["messages"]]
+
+            write(["alpha", "bravo", "charlie"])
+            self.assertEqual(visible(), ["alpha", "bravo", "charlie"])
+
+            write(["alpha", "insert", "bravo", "charlie"])
+            self.assertEqual(visible(), ["alpha", "insert", "bravo", "charlie"])
+
+            write(["alpha", "insert", "charlie"])
+            self.assertEqual(visible(), ["alpha", "insert", "charlie"])
+
+            # insert -> modify 长度相同，专门覆盖“大小没有变化”的内部改写。
+            write(["alpha", "change", "charlie"])
+            self.assertEqual(visible(), ["alpha", "change", "charlie"])
+
+    def test_initial_window_cache_invalidates_when_codex_parent_prefix_changes(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_index, "WINDOW_CACHE_DIR",
+                             Path(tmp) / "window-cache"), \
+                patch.object(session_index, "WINDOW_CACHE_MIN_BYTES", 0):
+            session_index._clear_window_cache_memory()
+            self.addCleanup(session_index._clear_window_cache_memory)
+            root = Path(tmp) / "sessions"
+            day = root / "2026" / "08" / "09"
+            day.mkdir(parents=True)
+            parent_id = "00000000-0000-0000-0000-000000000103"
+            child_id = "00000000-0000-0000-0000-000000000104"
+            parent = day / f"rollout-parent-{parent_id}.jsonl"
+            child = day / f"rollout-child-{child_id}.jsonl"
+
+            def row(kind, payload):
+                return json.dumps({"type": kind, "payload": payload},
+                                  ensure_ascii=False).encode() + b"\n"
+
+            parent_rows = [
+                row("session_meta", {"id": parent_id, "session_id": parent_id,
+                                     "timestamp": "2026-08-09T10:00:00Z",
+                                     "cwd": tmp}),
+                row("response_item", {"type": "message", "role": "user",
+                                      "content": [{"type": "input_text",
+                                                   "text": "父项旧文"}]}),
+            ]
+            parent.write_bytes(b"".join(parent_rows))
+            child.write_bytes(b"".join([
+                row("session_meta", {
+                    "id": child_id, "session_id": child_id,
+                    "forked_from_id": parent_id,
+                    "history_base": {"thread_id": parent_id,
+                                     "end_byte_offset": parent.stat().st_size},
+                    "timestamp": "2026-08-09T10:01:00Z", "cwd": tmp}),
+                row("response_item", {"type": "message", "role": "assistant",
+                                      "content": [{"type": "output_text",
+                                                   "text": "子项正文"}]}),
+            ]))
+            adapter = adapters.CodexAdapter()
+            session = {"uid": "codex:child", "source": "codex", "sid": child_id,
+                       "path": str(child), "cwd": tmp,
+                       "size": parent.stat().st_size + child.stat().st_size}
+
+            with patch.object(adapters, "CODEX_ROOT", root), \
+                    patch.object(adapters, "CODEX_INDEX", Path(tmp) / "missing"), \
+                    patch.dict(session_index.ADAPTERS, {"codex": adapter}):
+                first = session_index.messages_for(session, windowed=True)
+                self.assertEqual([m["text"] for m in first["messages"]],
+                                 ["父项旧文", "子项正文"])
+
+                original = parent.read_bytes()
+                changed = original.replace("父项旧文".encode(), "父项新文".encode())
+                self.assertEqual(len(changed), len(original))
+                parent.write_bytes(changed)
+                second = session_index.messages_for(session, windowed=True)
+                self.assertEqual([m["text"] for m in second["messages"]],
+                                 ["父项新文", "子项正文"])
+
 
 class FileChangeTests(unittest.TestCase):
     def test_apply_patch_wrapper_recovers_per_file_diffs(self):

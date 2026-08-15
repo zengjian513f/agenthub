@@ -55,6 +55,7 @@ class StaticIdentityTests(unittest.TestCase):
         expected = server.html.escape(server.HOSTNAME)
         self.assertEqual(status, 200)
         self.assertIn("text/html", ctype)
+        self.assertIn(f"<title>{expected} · 会话管理</title>", page)
         self.assertIn(f'>{expected}</span>', page)
         self.assertIn(f'title="{expected}"', page)
         self.assertNotIn("__SESMAN_HOSTNAME__", page)

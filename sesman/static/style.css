@@ -690,6 +690,8 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .question-option:is(button) { cursor: pointer; }
 .question-option:is(button):hover { border-color: var(--accent); background: var(--panel-2); }
+.question-option:is(button).selected { border-color: var(--accent); background: var(--panel-2); }
+.question-option:is(button).selected > span { background: var(--accent); color: #fff; }
 .question-option:is(button).submitting { border-color: var(--accent); opacity: .65; }
 .question-option:is(button):disabled { cursor: default; }
 .question-option > span {
@@ -711,6 +713,8 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   min-height: 28px; padding: 4px 9px; border: 1px solid var(--border);
   border-radius: 7px; background: var(--panel); color: var(--fg); cursor: pointer;
 }
+.question-actions .question-submit { border-color: var(--accent); background: var(--accent); color: #fff; }
+.question-actions button:disabled { cursor: default; opacity: .55; }
 .question-actions .question-cancel { color: #b42318; }
 
 .activity {
@@ -1039,7 +1043,10 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 /* ---------- 终端 (嵌在会话详情底部) ---------- */
 .hidden { display: none !important; }
 
-#right { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+#right {
+  flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column;
+  overflow: hidden;
+}
 #right > #detail { flex: 1; min-height: 0; }
 
 /* 已接管会话的输入框 */

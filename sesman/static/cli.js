@@ -39,6 +39,18 @@ class SesmanCli {
     return null;
   }
 
+  canAnswerQuestionForm(_prompt) {
+    return false;
+  }
+
+  questionFormAnswerKeys(_prompt, _optionIndexes) {
+    return null;
+  }
+
+  questionFormAnswerKeyGroups(_prompt, _optionIndexes) {
+    return null;
+  }
+
   questionCancelKeys() {
     return ['Escape'];
   }
@@ -106,6 +118,36 @@ class ClaudeCli extends SesmanCli {
     if (!options[optionIndex]) return null;
     return [...Array(options.length + 3).fill('Up'),
       ...Array(optionIndex).fill('Down'), 'Enter'];
+  }
+
+  canAnswerQuestionForm(prompt) {
+    const questions = prompt?.questions;
+    return Array.isArray(questions) && questions.length > 1
+      && questions.every(q => !q?.multiple && q?.options?.length);
+  }
+
+  questionFormAnswerKeys(prompt, optionIndexes) {
+    const groups = this.questionFormAnswerKeyGroups(prompt, optionIndexes);
+    return groups?.flat() || null;
+  }
+
+  questionFormAnswerKeyGroups(prompt, optionIndexes) {
+    const questions = prompt?.questions;
+    if (!this.canAnswerQuestionForm(prompt) || !Array.isArray(optionIndexes)
+        || optionIndexes.length !== questions.length) return null;
+    const groups = [Array(questions.length + 1).fill('Left')];
+    for (let i = 0; i < questions.length; i++) {
+      const optionIndex = optionIndexes[i];
+      const options = questions[i].options;
+      if (!Number.isInteger(optionIndex) || !options[optionIndex]) return null;
+      // Left 先把 Claude 的问题/Review 页夹到第一题；每次 Enter 选中
+      // 当前单选项后会自动进入下一题。最后一次 Enter 进入 Review，
+      // 末尾再按一次确认 Submit answers。
+      groups.push([...Array(options.length + 3).fill('Up'),
+        ...Array(optionIndex).fill('Down'), 'Enter']);
+    }
+    groups.push(['Enter']);
+    return groups;
   }
 
   repeatedEscape(now, previousAt, context = {}) {

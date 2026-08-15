@@ -189,6 +189,9 @@ const TICK_MS = 200;
 const BACKUP_MS = 20000;    // SSE 正常时的兜底对账间隔
 const LIST_MS = 8000;       // 会话列表跟进磁盘变化的间隔
 const cache = new Map();          // viewKey → {meta, msgs, version, end, bytes}
+// 多题题卡会被 SSE、兜底对账和完整重绘反复替换 DOM。未提交选择必须独立于
+// 节点保存，否则下一次后台刷新就会让用户刚点的答案消失。
+const questionFormDrafts = new Map(); // `${uid}\0${tool id}` → option index[]
 const viewKey = (uid, agent = null) => agent ? `${uid}::${agent}` : uid;
 const INCOMING_ROLES = new Set([
   'assistant', 'assistant·subagent', 'thinking', 'tool', 'tool_result', 'question',
@@ -2457,21 +2460,48 @@ function questionNode(m) {
       <div class="question-text">${esc(q.question || m.text)}</div>
       ${q.multiple ? '<div class="question-multiple">可多选</div>' : ''}
       ${(q.options || []).length ? `<div class="question-options">${q.options.map((o, j) => `
-        <${live ? 'button' : 'div'} ${live ? `type="button" data-question-option="${j}"` : ''}
+        <${live ? 'button' : 'div'} ${live ? `type="button" data-question-index="${i}" data-question-option="${j}" aria-pressed="false"` : ''}
           class="question-option"><span>${j + 1}</span><div><b>${esc(o.label)}</b>
           ${o.description ? `<small>${esc(o.description)}</small>` : ''}</div></${live ? 'button' : 'div'}>`).join('')}</div>` : ''}
     </section>`).join('');
   if (live) {
-    const cliName = sesmanCli(m.uid)?.name || 'CLI';
+    const cli = sesmanCli(m.uid);
+    const cliName = cli?.name || 'CLI';
     const waiting = promptState === 'waiting';
     const direct = waiting && rows.length === 1 && !rows[0].multiple
       && !!rows[0].options?.length;
+    const formDirect = waiting && cli?.canAnswerQuestionForm({...m, questions: rows});
+    const draftKey = formDirect && m.uid && m.call_id ? `${m.uid}\0${m.call_id}` : '';
+    let selections = draftKey ? questionFormDrafts.get(draftKey) : null;
+    const validDraft = Array.isArray(selections) && selections.length === rows.length
+      && selections.every((optionIndex, questionIndex) => optionIndex === null
+        || (Number.isInteger(optionIndex) && !!rows[questionIndex]?.options?.[optionIndex]));
+    if (!validDraft) {
+      selections = Array(rows.length).fill(null);
+      if (draftKey) questionFormDrafts.set(draftKey, selections);
+    }
+    let formSubmit = null;
     body.querySelectorAll('[data-question-option]').forEach(button => {
-      button.disabled = !direct;
+      button.disabled = !direct && !formDirect;
+      const questionIndex = +button.dataset.questionIndex;
+      const optionIndex = +button.dataset.questionOption;
+      const selected = formDirect && selections[questionIndex] === optionIndex;
+      button.classList.toggle('selected', selected);
+      button.setAttribute('aria-pressed', String(selected));
       button.onclick = async () => {
+        if (formDirect) {
+          selections[questionIndex] = optionIndex;
+          body.querySelectorAll(`[data-question-index="${questionIndex}"]`).forEach(x => {
+            const selected = +x.dataset.questionOption === optionIndex;
+            x.classList.toggle('selected', selected);
+            x.setAttribute('aria-pressed', String(selected));
+          });
+          if (formSubmit) formSubmit.disabled = selections.some(x => x === null);
+          return;
+        }
         body.querySelectorAll('button').forEach(x => { x.disabled = true; });
         button.classList.add('submitting');
-        const ok = await answerCliQuestion(m.uid, +button.dataset.questionOption);
+        const ok = await answerCliQuestion(m.uid, optionIndex);
         if (!ok) body.querySelectorAll('button').forEach(x => { x.disabled = false; });
       };
     });
@@ -2480,6 +2510,24 @@ function questionNode(m) {
       actions.appendChild(el('small', 'question-settling',
         promptState === 'cancelled' ? `正在取消，等待 ${cliName} 记录…`
           : `答案已提交，等待 ${cliName} 记录…`));
+    } else if (formDirect) {
+      actions.appendChild(el('small', '', '请为每题选择一个答案'));
+      formSubmit = el('button', 'question-submit', '提交答案');
+      formSubmit.type = 'button';
+      formSubmit.disabled = selections.some(x => x === null);
+      formSubmit.onclick = async () => {
+        body.querySelectorAll('button').forEach(x => { x.disabled = true; });
+        formSubmit.classList.add('submitting');
+        const ok = await answerCliQuestionForm(m.uid, selections);
+        if (!ok) {
+          body.querySelectorAll('[data-question-option]').forEach(
+            x => { x.disabled = false; });
+          formSubmit.disabled = selections.some(x => x === null);
+          terminal.disabled = false;
+          cancel.disabled = false;
+        }
+      };
+      actions.appendChild(formSubmit);
     } else if (!direct) {
       actions.appendChild(el('small', '', '多选或多题请在原生终端回答'));
     }
@@ -2569,6 +2617,14 @@ function pendingHistoryQuestion(entry) {
     m => m.role === 'question' && m.call_id && !answered.has(m.call_id)) || null;
 }
 
+function pruneQuestionFormDrafts(uid, activeId = '') {
+  const prefix = `${uid}\0`;
+  const keep = activeId ? `${prefix}${activeId}` : '';
+  for (const key of questionFormDrafts.keys()) {
+    if (key.startsWith(prefix) && key !== keep) questionFormDrafts.delete(key);
+  }
+}
+
 function renderConversationTail(activity, uid = S.sel) {
   const box = $('#msgs');
   if (!box) return;
@@ -2580,6 +2636,11 @@ function renderConversationTail(activity, uid = S.sel) {
   const entry = cache.get(viewKey(uid));
   const prompt = entry?.prompt;
   const nativeQuestion = prompt?.questions?.length ? null : pendingHistoryQuestion(entry);
+  const activeQuestion = prompt?.questions?.length ? prompt : nativeQuestion;
+  const activeDraftId = activeQuestion
+    && (activeQuestion.state || 'waiting') === 'waiting'
+    ? String(activeQuestion.id || activeQuestion.call_id || '') : '';
+  pruneQuestionFormDrafts(uid, activeDraftId);
   if (prompt?.questions?.length) {
     if (prompt.id) {
       [...box.querySelectorAll('.msg[data-role="question"][data-call-id]')]

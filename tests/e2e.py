@@ -240,7 +240,10 @@ def run(pw):
     # 无显示器的部署机上 SwiftShader GPU 进程偶发进入不可中断等待，导致
     # requestAnimationFrame 停摆，Playwright 会把所有可见按钮误判为“不稳定”。
     # 几何与样式断言不依赖 GPU，强制 CPU 合成可让交互回归保持确定性。
-    b = pw.chromium.launch(args=["--disable-gpu", "--disable-software-rasterizer"])
+    launch = {"args": ["--disable-gpu", "--disable-software-rasterizer"]}
+    if executable := os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE"):
+        launch["executable_path"] = executable
+    b = pw.chromium.launch(**launch)
     # 主题相关断言从确定的亮色起步，随后验证运行中切换到暗色再切回。
     ctx = b.new_context(color_scheme="light")
     ctx.grant_permissions(["clipboard-read", "clipboard-write"], origin=BASE)
@@ -302,6 +305,10 @@ def run(pw):
           options:[{label:'一'}, {label:'二'}]}]}, 1),
         SESMAN_CLIS.grok.questionAnswerKeys({questions:[{
           options:[{label:'一'}, {label:'二'}]}]}, 1)],
+      claudeQuestionForm:SESMAN_CLIS.claude.questionFormAnswerKeys({questions:[
+        {options:[{label:'一'}, {label:'二'}]},
+        {options:[{label:'甲'}, {label:'乙'}, {label:'丙'}]}
+      ]}, [1, 2]),
       codexApproval:SESMAN_CLIS.codex.questionAnswerKeys({kind:'approval', questions:[{
           options:[{label:'允许本次', key:'y'}, {label:'始终允许', key:'p'},
             {label:'拒绝', key:'Escape'}]}]}, 1)
@@ -326,6 +333,9 @@ def run(pw):
           and cli_layers["questionKeys"] == [
               ["Up"] * 5 + ["Down", "Enter"],
               ["2"], None]
+          and cli_layers["claudeQuestionForm"] == (
+              ["Left"] * 3 + ["Up"] * 5 + ["Down", "Enter"]
+              + ["Up"] * 6 + ["Down", "Down", "Enter", "Enter"])
           and cli_layers["codexApproval"] == ["p"], cli_layers)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
@@ -823,6 +833,40 @@ def run(pw):
           and live_question["answered"] is True
           and live_question["sent"]["keys"] == ["Up"] * 5 + ["Down", "Enter"],
           live_question)
+    multi_question = p.evaluate("""async () => {
+      const prompt = {id:'ask-many', questions:[
+        {header:'第一题', question:'选择第一项？', multiple:false,
+          options:[{label:'一'}, {label:'二'}]},
+        {header:'第二题', question:'选择第二项？', multiple:false,
+          options:[{label:'甲'}, {label:'乙'}, {label:'丙'}]}
+      ]};
+      await applyDiff(S.sel, {prompt_only:true, prompt});
+      let live = document.querySelector('.live-question');
+      const oldSend = sendToSession;
+      const sent = [];
+      sendToSession = async (text, keys, uid) => { sent.push({text, keys, uid}); return true; };
+      live.querySelector('[data-question-index="0"][data-question-option="1"]').click();
+      live.querySelector('[data-question-index="1"][data-question-option="2"]').click();
+      await applyDiff(S.sel, {prompt_only:true, prompt:{...prompt}});
+      live = document.querySelector('.live-question');
+      const selectedAfterRedraw = [...live.querySelectorAll('.question-option.selected')]
+        .map(x => [x.dataset.questionIndex, x.dataset.questionOption]);
+      const submit = live.querySelector('.question-submit');
+      const enabled = !submit.disabled;
+      submit.click();
+      await new Promise(resolve => setTimeout(resolve, 180));
+      sendToSession = oldSend;
+      return {selectedAfterRedraw, enabled, sent};
+    }""")
+    check("Claude 多题选择在后台重绘后保留并可统一提交",
+          multi_question["selectedAfterRedraw"] == [["0", "1"], ["1", "2"]]
+          and multi_question["enabled"] is True
+          and [item["keys"] for item in multi_question["sent"]] == [
+              ["Left"] * 3,
+              ["Up"] * 5 + ["Down", "Enter"],
+              ["Up"] * 6 + ["Down", "Down", "Enter"],
+              ["Enter"]],
+          multi_question)
     settled_question = p.evaluate("""async () => {
       const prompt = {id:'ask-1', state:'submitted', questions:[{
         question:'现在直接选择？', multiple:false,
@@ -2434,6 +2478,19 @@ def run(pw):
               terminal_backend["unicode"] == "11"
               and "11" in terminal_backend["versions"]
               and terminal_backend["renderer"] in ("webgl", "dom"), terminal_backend)
+        p.fill("#q", "正在输入的搜索词")
+        p.locator("#q").focus()
+        focus_after_tmux_refresh = p.evaluate("""async () => {
+          restoreTermPane(S.sel, S.agent);
+          await new Promise(resolve => setTimeout(resolve, 30));
+          return {id:document.activeElement?.id, value:$('#q').value};
+        }""")
+        check("tmux 后台刷新不会抢走搜索框焦点",
+              focus_after_tmux_refresh
+              == {"id": "q", "value": "正在输入的搜索词"},
+              focus_after_tmux_refresh)
+        p.fill("#q", "")
+        p.evaluate("T.term.focus()")
         render_batch = p.evaluate("""async () => {
           const writes = [];
           const view = {outputBuffer:'', outputTimer:null, ansiTail:'',
@@ -2466,6 +2523,32 @@ def run(pw):
           return sent.filter(x => x.t === 'resize');
         }""")
         check("相同终端尺寸只向 tmux 通知一次", len(resize_dedup) == 1, resize_dedup)
+        activation_resync = p.evaluate("""async () => {
+          const view = currentTermViewObject(), ws = view.ws;
+          const oldSend = ws.send, oldRefresh = view.term.refresh.bind(view.term);
+          const sent = []; let refreshes = 0;
+          ws.send = data => sent.push(JSON.parse(data));
+          view.term.refresh = (start, end) => { refreshes += 1; oldRefresh(start, end); };
+          view.lastResizeWs = ws;
+          view.lastResizeKey = `${view.term.cols}x${view.term.rows}`;
+          try {
+            closeTermPane(true);
+            await openTermPane(view.name);
+            await new Promise(resolve => setTimeout(resolve, 180));
+          } finally {
+            ws.send = oldSend;
+            view.term.refresh = oldRefresh;
+          }
+          return {resizes:sent.filter(x => x.t === 'resize'), refreshes,
+            active:T.name, dimensions:`${view.term.cols}x${view.term.rows}`};
+        }""")
+        check("缓存终端重新显示时强制同步尺寸并重绘",
+              len(activation_resync["resizes"]) == 1
+              and activation_resync["resizes"][0]["cols"] > 0
+              and activation_resync["resizes"][0]["rows"] > 0
+              and activation_resync["refreshes"] >= 1
+              and activation_resync["active"] == tname,
+              activation_resync)
         smooth_fit = p.evaluate("""async () => {
           const view = currentTermViewObject();
           const service = view.term._core._renderService;
@@ -3222,6 +3305,39 @@ def run(pw):
               all(x > 0 for x in desktop_resize_texts), desktop_resize_texts)
 
         previous_term_layout = p.evaluate("currentTermView()")
+        # 高窗口保存的普通终端高度不能在矮窗口占满右栏。否则 detail 被压成
+        # 0 后，详情头与 composer 重叠，#a-term 看得见却会被 #cesc 截获。
+        p.set_viewport_size({"width": 980, "height": 620})
+        normal_height_bounds = p.evaluate("""() => {
+          T.mode = 'normal'; T.height = 10000;
+          layoutTermPane(); fitTerm(true);
+          const rect = node => {
+            const r = node.getBoundingClientRect();
+            return {x:r.x, y:r.y, width:r.width, height:r.height, bottom:r.bottom};
+          };
+          const right = rect($('#right')), detail = rect($('#detail'));
+          const head = rect($('#detail > .dhead')), composer = rect($('#composer'));
+          const pane = rect($('#termpane')), button = rect($('#a-term'));
+          const hit = document.elementFromPoint(
+            button.x + button.width / 2, button.y + button.height / 2);
+          return {right, detail, head, composer, pane,
+                  buttonHit: hit?.id || hit?.closest?.('[id]')?.id || '',
+                  buttonOwnsHit: $('#a-term').contains(hit)};
+        }""")
+        check("矮窗口会为详情头和输入框限制普通终端高度",
+              normal_height_bounds["detail"]["height"] + 1
+                >= normal_height_bounds["head"]["height"]
+              and normal_height_bounds["pane"]["bottom"]
+                <= normal_height_bounds["right"]["bottom"] + 1,
+              normal_height_bounds)
+        check("终端高度偏好超过窗口时顶栏按钮仍可真实点击",
+              normal_height_bounds["buttonOwnsHit"], normal_height_bounds)
+        p.set_viewport_size({"width": 1280, "height": 800})
+        p.evaluate("""layout => {
+          T.mode = layout.mode; T.height = layout.height;
+          layoutTermPane(); fitTerm(true);
+        }""", previous_term_layout)
+
         p.evaluate("T.mode = 'full'; layoutTermPane(); fitTerm(true)")
         page_overflow_frames = []
         for height in (800, 740, 680, 620, 680, 740, 800):

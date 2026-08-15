@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import copy
+import gzip
+import hashlib
 import json
+import os
 import re
 import shutil
+import tempfile
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +22,10 @@ from . import media, session_meta
 CACHE_DIR = Path.home() / ".cache" / "sesman"
 CACHE_FILE = CACHE_DIR / "index.json"
 CACHE_VERSION = 4
+WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
+WINDOW_CACHE_VERSION = 1
+WINDOW_CACHE_MIN_BYTES = 8 * 1024 * 1024
+WINDOW_CACHE_MEMORY_ITEMS = 16
 TRASH_DIR = Path.home() / ".local" / "share" / "sesman" / "trash"
 CHECK_TTL = 0.5       # 高频热路径复用已发布快照；列表轮询仍会及时发现磁盘变化
 
@@ -443,6 +453,173 @@ INITIAL_HEAD_MESSAGES = 100
 INITIAL_TAIL_MESSAGES = 500
 
 
+_window_cache_memory: OrderedDict[str, tuple[dict, dict]] = OrderedDict()
+_window_cache_locks: dict[str, threading.Lock] = {}
+_window_cache_guard = threading.Lock()
+
+
+def _window_cache_identity(s: dict) -> str:
+    """缓存文件名只暴露散列，不把会话路径或 uid 写进目录项。"""
+    raw = "\0".join((str(s.get("source") or ""), str(data_file(s)),
+                     str(s.get("agent_id") or "")))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _window_dependency(path: str | Path, role: str,
+                       limit: int | None = None) -> dict:
+    """记录能识别内部改写、截断和路径替换的文件身份。"""
+    path = Path(path)
+    row = {"role": role, "path": str(path), "limit": limit}
+    try:
+        st = path.stat()
+    except OSError:
+        return {**row, "missing": True}
+    return {**row, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+            "ctime_ns": st.st_ctime_ns, "inode": int(getattr(st, "st_ino", 0))}
+
+
+def _window_cache_stamp(s: dict, ad) -> dict:
+    """返回窗口结果的全部解析依赖，而不读取 JSONL 正文。
+
+    不能只看当前文件大小：Codex 回退会继承多个父文件前缀，而且 JSONL
+    也可能在中间增、删、等长改写。mtime/ctime/inode 共同保证这些变化令旧
+    缓存失效；继承段的路径和截止偏移也属于版本的一部分。
+    """
+    dependencies = []
+    if s.get("source") == "codex":
+        for parent, limit in ad._history_segments(s["path"]):
+            dependencies.append(_window_dependency(parent, "history", int(limit)))
+    dependencies.append(_window_dependency(data_file(s), "current"))
+
+    semantic = {}
+    if isinstance(ad, ClaudeAdapter):
+        # timeline_stamp 是落盘语义，服务重启后仍稳定；回退确认与读取都
+        # 受 session_meta 的同一把锁保护，不采用重启后会归零的内存 revision。
+        semantic["timeline"] = list(session_meta.timeline_stamp(s.get("uid", "")))
+    elif s.get("source") == "codex":
+        # /rename 不在 rollout 正文中。只依赖当前 sid 的最终名称，避免其他
+        # 会话改名导致所有大 Codex 会话的正文缓存一起失效。
+        semantic["rename"] = ad._name_event(str(s.get("sid") or ""))
+
+    return {"schema": WINDOW_CACHE_VERSION, "source": s.get("source"),
+            "agent": str(s.get("agent_id") or ""),
+            "dependencies": dependencies, "semantic": semantic}
+
+
+def _window_memory_get(key: str, stamp: dict) -> dict | None:
+    with _window_cache_guard:
+        cached = _window_cache_memory.get(key)
+        if not cached or cached[0] != stamp:
+            return None
+        _window_cache_memory.move_to_end(key)
+        return copy.deepcopy(cached[1])
+
+
+def _window_memory_put(key: str, stamp: dict, value: dict) -> None:
+    with _window_cache_guard:
+        _window_cache_memory[key] = (copy.deepcopy(stamp), copy.deepcopy(value))
+        _window_cache_memory.move_to_end(key)
+        while len(_window_cache_memory) > WINDOW_CACHE_MEMORY_ITEMS:
+            _window_cache_memory.popitem(last=False)
+
+
+def _window_key_lock(key: str) -> threading.Lock:
+    with _window_cache_guard:
+        return _window_cache_locks.setdefault(key, threading.Lock())
+
+
+def _clear_window_cache_memory() -> None:
+    """测试及维护入口；磁盘缓存不受影响。"""
+    with _window_cache_guard:
+        _window_cache_memory.clear()
+        _window_cache_locks.clear()
+
+
+def _window_disk_read(key: str, stamp: dict) -> dict | None:
+    path = WINDOW_CACHE_DIR / f"{key}.json.gz"
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            row = json.load(fh)
+    except (OSError, EOFError, ValueError, TypeError):
+        return None
+    if not isinstance(row, dict) or row.get("schema") != WINDOW_CACHE_VERSION \
+            or row.get("stamp") != stamp or not isinstance(row.get("value"), dict):
+        return None
+    return row["value"]
+
+
+def _window_disk_write(key: str, stamp: dict, value: dict) -> None:
+    """私有目录内原子落盘；消息正文绝不能沿用默认的宽松权限。"""
+    tmp_path = None
+    try:
+        WINDOW_CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(WINDOW_CACHE_DIR, 0o700)
+        fd, raw_path = tempfile.mkstemp(prefix=f".{key}.", suffix=".tmp",
+                                        dir=WINDOW_CACHE_DIR)
+        tmp_path = Path(raw_path)
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1,
+                               mtime=0) as zipped:
+                zipped.write(json.dumps(
+                    {"schema": WINDOW_CACHE_VERSION, "stamp": stamp,
+                     "value": value}, ensure_ascii=False,
+                    separators=(",", ":")).encode())
+        os.replace(tmp_path, WINDOW_CACHE_DIR / f"{key}.json.gz")
+        tmp_path = None
+    except (OSError, ValueError, TypeError):
+        # 缓存失败不能影响会话读取；下一次请求至多重新解析一次。
+        pass
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _window_cache_eligible(s: dict) -> bool:
+    try:
+        logical_size = int(s.get("size") or 0)
+    except (TypeError, ValueError):
+        logical_size = 0
+    if logical_size < WINDOW_CACHE_MIN_BYTES:
+        try:
+            logical_size = data_file(s).stat().st_size
+        except OSError:
+            logical_size = 0
+    return logical_size >= WINDOW_CACHE_MIN_BYTES
+
+
+def _cached_initial_window(s: dict, ad, build) -> dict:
+    """跨请求、跨服务重启复用大会话的首尾窗口。
+
+    同一会话只允许一个构建者。解析前后再取一次完整依赖指纹；若期间任一
+    JSONL 被修改，本次结果仍可返回，但绝不写入缓存。
+    """
+    key = _window_cache_identity(s)
+    before = _window_cache_stamp(s, ad)
+    cached = _window_memory_get(key, before)
+    if cached is not None:
+        return cached
+
+    with _window_key_lock(key):
+        before = _window_cache_stamp(s, ad)
+        cached = _window_memory_get(key, before)
+        if cached is None:
+            cached = _window_disk_read(key, before)
+        if cached is not None:
+            _window_memory_put(key, before, cached)
+            return copy.deepcopy(cached)
+
+        value = build()
+        after = _window_cache_stamp(s, ad)
+        if after == before:
+            _window_memory_put(key, before, value)
+            _window_disk_write(key, before, value)
+        return copy.deepcopy(value)
+
+
 def _anchor_hash(f: Path, pos: int) -> str:
     """偏移点之前一小段内容的哈希, 用来确认"接着读"接的是同一份内容。"""
     if pos <= 0:
@@ -581,6 +758,30 @@ def messages(uid: str, agent: str = "",
                         append_only, windowed)
 
 
+def _read_message_batch(s: dict, ad, start: int, ver: dict,
+                        initial_window: bool) -> dict:
+    """解析一批消息，并在富媒体展开前生成可安全缓存的纯 JSON 结果。"""
+    if isinstance(ad, ClaudeAdapter):
+        msgs, end = ad.read(
+            s["path"], start=start, agent=s.get("agent_id"),
+            declared_tip=_claude_effective_tip(s, pos=ver["size"]))
+    else:
+        msgs, end = ad.read(s["path"], start=start)
+    activity_events = [m for m in msgs if m.get("role") == "status"]
+    msgs = [m for m in msgs if m.get("role") != "status"]
+    message_total = sum(m.get("counted") is not False for m in msgs)
+    partial = None
+    window_size = INITIAL_HEAD_MESSAGES + INITIAL_TAIL_MESSAGES
+    if initial_window and len(msgs) > window_size:
+        omitted = len(msgs) - window_size
+        msgs = msgs[:INITIAL_HEAD_MESSAGES] + msgs[-INITIAL_TAIL_MESSAGES:]
+        partial = {"head": INITIAL_HEAD_MESSAGES, "tail": INITIAL_TAIL_MESSAGES,
+                   "omitted": omitted}
+    return {"end": end, "messages": msgs, "message_total": message_total,
+            "partial": partial, "activity_changed": bool(activity_events),
+            "activity": activity_events[-1] if activity_events else None}
+
+
 def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
                  append_only: bool = False, windowed: bool = False) -> dict:
     """整份或增量读取。直接持有会话快照，SSE 每 50ms 只检查目标文件。
@@ -623,29 +824,21 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
                 "activity_changed": False, "activity": None}
     if reset:
         start = 0
-    if isinstance(ad, ClaudeAdapter):
-        msgs, end = ad.read(
-            s["path"], start=start, agent=s.get("agent_id"),
-            declared_tip=_claude_effective_tip(s, pos=ver["size"]))
+
+    if reset and windowed and _window_cache_eligible(s):
+        batch = _cached_initial_window(
+            s, ad, lambda: _read_message_batch(s, ad, 0, ver, True))
     else:
-        msgs, end = ad.read(s["path"], start=start)
-    activity_events = [m for m in msgs if m.get("role") == "status"]
-    msgs = [m for m in msgs if m.get("role") != "status"]
-    message_total = sum(m.get("counted") is not False for m in msgs)
-    partial = None
-    window_size = INITIAL_HEAD_MESSAGES + INITIAL_TAIL_MESSAGES
-    if windowed and reset and len(msgs) > window_size:
-        omitted = len(msgs) - window_size
-        msgs = msgs[:INITIAL_HEAD_MESSAGES] + msgs[-INITIAL_TAIL_MESSAGES:]
-        partial = {"head": INITIAL_HEAD_MESSAGES, "tail": INITIAL_TAIL_MESSAGES,
-                   "omitted": omitted}
+        batch = _read_message_batch(s, ad, start, ver, windowed and reset)
+    msgs = batch["messages"]
     for msg in msgs:
         media.enrich_message(msg, s.get("cwd"))
-    return {"meta": s, "version": ver, "reset": reset, "start": start, "end": end,
-            "anchor": _cursor_anchor(s, end), "messages": msgs,
-            "message_total": message_total, "partial": partial,
-            "activity_changed": bool(activity_events),
-            "activity": activity_events[-1] if activity_events else None}
+    return {"meta": s, "version": ver, "reset": reset, "start": start,
+            "end": batch["end"],
+            "anchor": _cursor_anchor(s, batch["end"]), "messages": msgs,
+            "message_total": batch["message_total"], "partial": batch["partial"],
+            "activity_changed": batch["activity_changed"],
+            "activity": batch["activity"]}
 
 
 def delete(uid: str) -> str:

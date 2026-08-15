@@ -913,12 +913,34 @@ function syncTermAliases(view = null) {
   T.ws = view?.ws || null;
 }
 
+let termOpenEpoch = 0;
+
 function activateTermView(view) {
   for (const cached of T.views.values()) cached.host.hidden = cached !== view;
   view.host.hidden = false;
   T.name = view.name;
   syncTermAliases(view);
   setScrollPos(view.scrollPos);
+}
+
+/** 只有显式打开终端的动作才能请求焦点；异步连接期间若用户已经点到别处，
+ *  请求自动作废。这样 tmux 列表/会话正文的后台刷新不会打断搜索或编辑。 */
+function requestTermFocus(view, source = document.activeElement) {
+  view.focusRequest = source || document.body;
+}
+
+function focusTermIfRequested(view) {
+  const source = view?.focusRequest;
+  if (!source) return false;
+  view.focusRequest = null;
+  const active = document.activeElement;
+  const inside = active && view.host.contains(active);
+  const neutral = !active || active === document.body || active === document.documentElement;
+  const editing = !inside && active?.matches?.(
+    'input, textarea, select, [contenteditable="true"], [contenteditable="plaintext-only"]');
+  if (editing || (!inside && !neutral && active !== source)) return false;
+  view.term.focus();
+  return true;
 }
 
 function legacyCopyText(text, term) {
@@ -996,7 +1018,9 @@ function ensureTerm(name) {
     reconnectDelay: 500, scrollPos: 0, ansiTail: '',
     outputBuffer: '', outputTimer: null, fitFrame: null,
     lastResizeKey: '', lastResizeWs: null,
+    activationEpoch: 0,
     attachPromise: null, revoked: false,
+    focusRequest: null,
     renderer: 'dom', webgl: null, unicode11: null,
     selectionLocked: false, selectionSnapshot: null, restoringSelection: false,
   };
@@ -1129,41 +1153,63 @@ function termPaneRenderable(view = currentTermViewObject()) {
     && !pane.classList.contains('term-collapsed');
 }
 
-function performTermFit(view) {
+function repaintTermView(view) {
+  try { view.term.refresh(0, Math.max(0, view.term.rows - 1)); } catch { /* disposed */ }
+}
+
+function performTermFit(view, forceSync = false) {
   if (!termPaneRenderable(view)) return;
   let dimensions;
   try { dimensions = view.fit.proposeDimensions(); } catch { return; }
   if (!dimensions || !Number.isFinite(dimensions.cols) || !Number.isFinite(dimensions.rows)) return;
   // FitAddon.fit() 会先调用私有 _renderService.clear()，DOM renderer 因而在每次
   // 窗口缩放时先变空再重画。直接使用公开 resize API 保留旧行，并平滑增删行列。
-  if (view.term.cols !== dimensions.cols || view.term.rows !== dimensions.rows) {
+  const resized = view.term.cols !== dimensions.cols || view.term.rows !== dimensions.rows;
+  if (resized) {
     view.term.resize(dimensions.cols, dimensions.rows);
   }
   const ws = view.ws;
   const key = `${view.term.cols}x${view.term.rows}`;
   // 同一个 socket 的相同尺寸不再反复通知 tmux，避免 TUI 收到无效 SIGWINCH。
-  if (ws?.readyState === 1 && (view.lastResizeWs !== ws || view.lastResizeKey !== key)) {
+  if (ws?.readyState === 1 && (forceSync
+      || view.lastResizeWs !== ws || view.lastResizeKey !== key)) {
     ws.send(JSON.stringify({ t: 'resize', cols: view.term.cols, rows: view.term.rows }));
     view.lastResizeWs = ws;
     view.lastResizeKey = key;
   }
+  // display:none 下缓存的 WebGL/DOM surface 可能失去内容；若行列数碰巧没变，
+  // Terminal.resize 不会触发 renderer。重新激活时必须显式画回整个 viewport。
+  if (resized || forceSync) repaintTermView(view);
 }
 
-function fitTerm(immediate = false) {
+function fitTerm(immediate = false, forceSync = false) {
   const view = currentTermViewObject();
   if (!termPaneRenderable(view)) return;
   if (view.fitFrame) cancelAnimationFrame(view.fitFrame);
   view.fitFrame = null;
   if (immediate) {
-    performTermFit(view);
+    performTermFit(view, forceSync);
     return;
   }
   // 浏览器最大化、拖边界和软键盘动画都会连续发 resize；每个动画帧最多 fit
   // 一次，既跟手又不在同一帧重复测量和重排。
   view.fitFrame = requestAnimationFrame(() => {
     view.fitFrame = null;
-    performTermFit(view);
+    performTermFit(view, forceSync);
   });
+}
+
+function settleActivatedTermView(view) {
+  const epoch = ++view.activationEpoch;
+  const verify = () => {
+    if (view.activationEpoch !== epoch || !termPaneRenderable(view)) return;
+    performTermFit(view);
+    repaintTermView(view);
+  };
+  // 先等浏览器提交“hidden → visible”和详情页布局，再复核一次；字体或滚动条
+  // 稍晚稳定的浏览器再由短定时器兜底。两次都受 activationEpoch 约束。
+  requestAnimationFrame(() => requestAnimationFrame(verify));
+  setTimeout(verify, 120);
 }
 
 function currentTermView() {
@@ -1190,10 +1236,18 @@ function restoreTermPane(uid, agent = null) {
   const name = takenOver(uid);
   if (!name || !T.openViews.has(name)) return;
   T.uid = uid;
-  openTermPane(name);
+  // loadTermList 和会话 reset 都会走这里。已打开时无需反复 fit/聚焦；首次
+  // 自动恢复也只恢复视图，不应抢走用户正在使用的搜索框或输入框。
+  if (!$('#termpane').classList.contains('hidden') && T.name === name) {
+    renderTakeoverBtn();
+    return;
+  }
+  openTermPane(name, false);
 }
 
-async function openTermPane(name) {
+async function openTermPane(name, autoFocus = true) {
+  const openEpoch = ++termOpenEpoch;
+  const focusSource = autoFocus ? document.activeElement : null;
   const saved = T.openViews.get(name);
   if (saved) {
     if (['normal', 'collapsed', 'full'].includes(saved.mode)) T.mode = saved.mode;
@@ -1205,16 +1259,20 @@ async function openTermPane(name) {
   layoutTermPane();
   renderTakeoverBtn();
   try { await terminalFontReady; } catch { /* 字体失败时继续用 Consola/monospace */ }
-  if (pane.classList.contains('hidden')) return;
+  if (openEpoch !== termOpenEpoch || pane.classList.contains('hidden')) return false;
   const view = ensureTerm(name);
+  if (autoFocus) requestTermFocus(view, focusSource);
   activateTermView(view);
   // 桌面“纯对话”吸附态高度为 0。此时保留 xterm 对象和已有连接，但不要
   // 新连或 fit；否则内部最小尺寸会把真实 tmux pane 压成 10×6。
   if (termPaneRenderable(view)) {
-    fitTerm(true);                       // 连接前先确定尺寸，避免 80×24 → 实际尺寸的首屏跳变
+    // 缓存 view 即使行列数相同也可能丢了 renderer surface；强制同步并重绘。
+    fitTerm(true, true);                 // 连接前先确定尺寸，避免 80×24 → 实际尺寸的首屏跳变
+    settleActivatedTermView(view);
     if (view.ws?.readyState !== 1) await attachTerm(name);
-    else view.term.focus();
+    else focusTermIfRequested(view);
   }
+  return true;
 }
 
 /** 普通高度下按钮仍是展开/收起；吸附到边缘后改为纯对话/纯终端切换。 */
@@ -1241,6 +1299,7 @@ function toggleTermPane(name) {
 }
 
 function closeTermPane(preserveView = false) {
+  termOpenEpoch++;                       // 令仍在等待字体/连接的旧 openTermPane 作废
   if (preserveView) rememberTermLayout();
   else rememberTermOpen(T.name, false);
   deactivateTermView();
@@ -1268,7 +1327,16 @@ function layoutTermPane() {
     else if (T.mode === 'full') {
       pane.style.height = Math.max(0, right.clientHeight - $('#detail').offsetHeight) + 'px';
     }
-    else pane.style.height = Math.min(T.height, right.clientHeight) + 'px';
+    else {
+      // T.height 是跨窗口尺寸保存的用户偏好。在较高窗口拖大的终端切到较矮
+      // 窗口后，不能让旧高度占满整个 #right；否则 detail 会被压成 0，标题
+      // 与 composer 重叠，termpane 还会被推出视口（再 resize 才看似恢复）。
+      // 普通模式始终给详情头和 composer 留出它们当前实际需要的空间。
+      const detailHeadHeight = $('#detail > .dhead')?.offsetHeight || 0;
+      const composerHeight = $('#composer')?.offsetHeight || 0;
+      const maxHeight = Math.max(0, right.clientHeight - detailHeadHeight - composerHeight);
+      pane.style.height = Math.min(T.height, maxHeight) + 'px';
+    }
   }
 }
 
@@ -1314,6 +1382,7 @@ async function attachOwnedTerm(view) {
   const token = await claimTermOwnership(name);
   if (!token) {
     view.revoked = true;
+    view.focusRequest = null;
     if (T.name === name) closeTermPane();
     return false;
   }
@@ -1352,10 +1421,11 @@ async function attachOwnedTerm(view) {
     view.reconnectDelay = 500;
     if (T.name === name) {
       syncTermAliases(view);
-      fitTerm(true);
+      fitTerm(true, true);
+      settleActivatedTermView(view);
       setScrollPos(0);
       if (T.localMouse) view.term.write(MOUSE_OFF);
-      view.term.focus();
+      focusTermIfRequested(view);
     }
   };
   ws.onclose = event => {
@@ -2279,6 +2349,23 @@ async function answerCliQuestion(uid, optionIndex) {
   const keys = sesmanCli(uid)?.questionAnswerKeys(prompt, optionIndex);
   if (!keys?.length) return false;
   return sendToSession(null, keys, uid);
+}
+
+async function answerCliQuestionForm(uid, optionIndexes) {
+  const prompt = activeCliQuestion(uid);
+  const cli = sesmanCli(uid);
+  if (!cli?.canAnswerQuestionForm(prompt)) return false;
+  const groups = cli.questionFormAnswerKeyGroups(prompt, optionIndexes);
+  if (!groups?.length) return false;
+  for (let i = 0; i < groups.length; i++) {
+    if (!await sendToSession(null, groups[i], uid)) return false;
+    // Enter 会让 Claude 卸载当前题并渲染下一题或 Review。分开发送并留出
+    // 一个短事件循环间隔，避免后一题按键被旧题的输入处理器吞掉。
+    if (i < groups.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+  return true;
 }
 
 async function cancelCliQuestion(uid) {
