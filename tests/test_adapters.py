@@ -173,6 +173,80 @@ class CodexEventTests(unittest.TestCase):
         ])
 
 
+class GrokAdapterTests(unittest.TestCase):
+    def test_user_query_wrapper_is_removed_without_hiding_reasoning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            history = session / "chat_history.jsonl"
+            rows = [
+                {"type": "user", "content": [
+                    {"type": "text", "text":
+                     "<user_query>\n请检查这个结果\n</user_query>"},
+                ]},
+                {"type": "reasoning", "status": "completed",
+                 "summary": [{"type": "summary_text", "text":
+                              "内部分析。"}]},
+                {"type": "assistant", "content": [
+                    {"type": "text", "text": "这是正式回复。"},
+                ]},
+            ]
+            history.write_text("\n".join(
+                json.dumps(item, ensure_ascii=False) for item in rows) + "\n")
+            expected_end = history.stat().st_size
+
+            messages, end = adapters.GrokAdapter().read(str(session))
+
+        self.assertEqual([(m["role"], m["text"]) for m in messages], [
+            ("user", "请检查这个结果"),
+            ("thinking", "内部分析。"),
+            ("assistant", "这是正式回复。"),
+        ])
+        self.assertEqual(end, expected_end)
+
+    def test_image_metadata_envelope_is_removed_but_media_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            history = session / "chat_history.jsonl"
+            history.write_text(json.dumps({
+                "type": "user",
+                "content": [
+                    {"type": "text", "text":
+                     "<image_files>\n1. /private/injected/path.png\n</image_files>\n\n"
+                     "<user_query>\n[Image #1] 检查这张图\n</user_query>"},
+                    {"type": "image", "url": "data:image/png;base64,AA=="},
+                ],
+            }, ensure_ascii=False) + "\n")
+
+            messages, _ = adapters.GrokAdapter().read(str(session))
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["text"], "[Image #1] 检查这张图")
+        self.assertRegex(messages[0]["media"][0]["src"],
+                         r"^/api/media/[0-9a-f]{32}$")
+
+    def test_old_cursor_resets_after_parser_semantics_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp)
+            history = session_dir / "chat_history.jsonl"
+            history.write_text(json.dumps({
+                "type": "assistant",
+                "content": [{"type": "text", "text": "正式回复"}],
+            }, ensure_ascii=False) + "\n")
+            session = {
+                "uid": "grok:test", "source": "grok", "sid": "test",
+                "path": str(session_dir), "cwd": tmp,
+            }
+            cursor = session_index.cursor(session)
+            old_head = cursor["head"].split(":", 1)[-1]
+
+            result = session_index.messages_for(
+                session, start=cursor["end"], head=old_head,
+                anchor=cursor["anchor"])
+
+        self.assertTrue(result["reset"])
+        self.assertEqual(result["messages"][0]["text"], "正式回复")
+
+
 class ClaudeProtocolTests(unittest.TestCase):
     def test_current_claude_screen_identifies_rewound_tip_not_jsonl_tail(self):
         with tempfile.TemporaryDirectory() as tmp:

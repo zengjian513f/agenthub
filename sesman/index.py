@@ -23,7 +23,8 @@ CACHE_DIR = Path.home() / ".cache" / "sesman"
 CACHE_FILE = CACHE_DIR / "index.json"
 CACHE_VERSION = 4
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
-WINDOW_CACHE_VERSION = 1
+WINDOW_CACHE_VERSION = 4
+MESSAGE_CURSOR_VERSION = 4
 WINDOW_CACHE_MIN_BYTES = 8 * 1024 * 1024
 WINDOW_CACHE_MEMORY_ITEMS = 16
 TRASH_DIR = Path.home() / ".local" / "share" / "sesman" / "trash"
@@ -432,6 +433,11 @@ def _head_hash(f: Path, limit: int = 4096) -> str:
         return ""
 
 
+def _cursor_head(f: Path, limit: int = 4096) -> str:
+    """把解析语义版本带进续读游标，升级后让已打开页面自动整份重建。"""
+    return f"{MESSAGE_CURSOR_VERSION}:{_head_hash(f, limit)}"
+
+
 def version(s: dict) -> dict:
     """用 (大小, mtime, 文件头哈希) 标识一个版本。
 
@@ -445,7 +451,7 @@ def version(s: dict) -> dict:
     except OSError:
         return {"size": 0, "mtime": 0, "head": ""}
     return {"size": st.st_size, "mtime": int(st.st_mtime * 1000),
-            "head": _head_hash(f)}
+            "head": _cursor_head(f)}
 
 
 ANCHOR = 512      # 续读前校验偏移点之前这么多字节的内容
@@ -794,7 +800,7 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
     # 小于 4 KiB 的新会话追加后，当前 head 会自然变长、哈希也会变化；应当
     # 用旧 EOF 所确定的同长度前缀校验，而不是把正常追加误判成历史改写。
     ok = bool(start and head and start <= ver["size"]
-              and head == _head_hash(data_file(s), min(4096, start)))
+              and head == _cursor_head(data_file(s), min(4096, start)))
     old_tip = None
     if ok and anchor:
         raw_anchor, old_tip = _anchor_parts(anchor)

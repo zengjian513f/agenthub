@@ -455,6 +455,9 @@ _CODEX_ABORT_MARKER = re.compile(
     r"\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
 _CODEX_ABORT_PREFIX = re.compile(
     r"^\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
+_GROK_USER_QUERY = re.compile(
+    r"^\s*(?:<image_files>.*?</image_files>\s*)*"
+    r"<user_query>(.*?)</user_query>\s*$", re.I | re.S)
 
 
 def _is_injected(text: str) -> bool:
@@ -476,6 +479,16 @@ def _strip_codex_abort_prefix(text: str) -> str:
     while match := _CODEX_ABORT_PREFIX.match(text):
         text = text[match.end():]
     return text
+
+
+def _strip_grok_user_query(text: str) -> str:
+    """剥 Grok 的 user_query/image_files 信封，图片本身由结构化 part 显示。"""
+    match = _GROK_USER_QUERY.fullmatch(str(text or ""))
+    if not match:
+        return text
+    body = match.group(1)
+    body = re.sub(r"^\r?\n", "", body, count=1)
+    return re.sub(r"\r?\n$", "", body, count=1)
 
 
 def _is_codex_protocol_injection(role: str, text: str) -> bool:
@@ -1509,6 +1522,8 @@ class GrokAdapter:
                 images = [x["media"] for x in parts if x.get("media")]
                 if txt.strip() or images:
                     shown = txt or "[图片]"
+                    if t == "user":
+                        shown = _strip_grok_user_query(shown)
                     if not rec.get("synthetic_reason") \
                             and not (t == "user" and _is_timeline_protocol(shown)):
                         msgs.append(_msg(t, shown, media_parts=images))
