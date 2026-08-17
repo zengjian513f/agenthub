@@ -183,6 +183,51 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual(failed["state"], "failed")
         self.assertIn("输入框已有内容", failed["error"])
 
+    def test_idle_unknown_screen_fails_without_mutating_terminal(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "继续消息", [],
+            {"state": "idle"}, "unknown")
+        row = send_queue.tracked()[0]
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        stale_screen = "• 已完成并上线。\n\n  - 最后一条回答。\n"
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture", return_value=stale_screen), \
+                patch.object(server.term, "leave_copy_mode") as leave, \
+                patch.object(server.term, "send_keys") as keys, \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.time, "sleep"):
+            server._deliver_outbox_item(row, [pane])
+
+        leave.assert_not_called()
+        keys.assert_not_called()
+        submit.assert_not_called()
+        failed = send_queue.list_for("codex:u")[0]
+        self.assertEqual(failed["state"], "failed")
+        self.assertIn("输入框不可识别", failed["error"])
+
+    def test_unknown_busy_screen_is_deferred_from_stale_idle(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "下一条", [],
+            {"state": "idle"}, "busy-redraw")
+        row = send_queue.tracked()[0]
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        screen = "• Working (2s • esc to interrupt)\n› placeholder\n"
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture", return_value=screen), \
+                patch.object(server.term, "send_keys") as keys, \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.time, "sleep"):
+            server._deliver_outbox_item(row, [pane])
+
+        keys.assert_not_called()
+        submit.assert_not_called()
+
     def test_new_message_is_rejected_while_failed_head_blocks_fifo(self):
         send_queue.enqueue(
             "codex:u", "sesman-codex-u", "失败消息", [],

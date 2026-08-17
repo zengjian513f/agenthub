@@ -66,6 +66,12 @@ class CodexBridgeTests(unittest.TestCase):
         self.assertEqual(codex_bridge.composer_state(empty), "empty")
         self.assertEqual(codex_bridge.composer_state(restored), "editing")
 
+    def test_current_double_angle_marker_marks_empty_composer(self):
+        screen = ("\x1b[0;1m\x1b[38;5;141m»\x1b[0m "
+                  "\x1b[2mExplain this codebase\x1b[0m\n\n"
+                  "  gpt-5.6-sol ultra · /node-a-share/T0Project…")
+        self.assertEqual(codex_bridge.composer_state(screen), "empty")
+
     def test_current_working_screen_is_not_treated_as_ready(self):
         screen = ("\x1b[1m• Working\x1b[0m \x1b[2m(12s • esc to interrupt)\x1b[0m\n\n"
                   "\x1b[1m›\x1b[0m \x1b[2mRun /review on my current changes\x1b[0m\n\n"

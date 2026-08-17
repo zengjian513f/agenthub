@@ -14,7 +14,7 @@ import re
 
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _HEADING = re.compile(r"^\s*(Would you like to .+\?)\s*$", re.IGNORECASE)
-_OPTION = re.compile(r"^\s*(?:[›>]\s*)?(\d+)\.\s+(.*)$")
+_OPTION = re.compile(r"^\s*(?:[›»>]\s*)?(\d+)\.\s+(.*)$")
 _FOOTER = re.compile(
     r"^\s*Press enter to confirm or esc to cancel\s*$", re.IGNORECASE)
 _SHORTCUT = re.compile(r"\s*\((y|p|esc)\)\s*$", re.IGNORECASE)
@@ -24,6 +24,12 @@ _MODEL_FOOTER = re.compile(
     r"^\s*(?:gpt|codex|o\d)[\w.-]*(?:\s+\S+)*\s+·\s+\S.*$", re.IGNORECASE)
 _BUSY_STATUS = re.compile(r"\bWorking\b.*\besc to interrupt\b", re.IGNORECASE)
 _SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+_COMPOSER_MARKERS = {"›", "»"}
+
+
+def busy_screen(screen: str) -> bool:
+    """Whether the visible Codex screen still reports an active turn."""
+    return bool(_BUSY_STATUS.search(_ANSI.sub("", str(screen or ""))))
 
 
 def _styled_chars(text: str) -> list[tuple[str, bool]]:
@@ -57,7 +63,7 @@ def composer_state(screen: str) -> str:
 
     Codex renders its empty rotating placeholder with SGR dim, while restored
     rewind text and normal drafts are not dim.  A live model/status footer is
-    required so transcript output containing a ``›`` cannot be mistaken for
+    required so transcript output containing a composer marker cannot be mistaken for
     the composer.  Recent Codex builds no longer print the old Context/Ready
     labels, so their final ``model · cwd`` status line is also accepted.
     """
@@ -84,7 +90,7 @@ def composer_state(screen: str) -> str:
             return "unknown"
         footer = nonblank[-1]
     prompts = [i for i in range(max(0, footer - 20), footer)
-               if clean_lines[i].lstrip().startswith("›")]
+               if clean_lines[i].lstrip()[:1] in _COMPOSER_MARKERS]
     if not prompts:
         return "unknown"
     if any(_BUSY_STATUS.search(clean_lines[i])
@@ -93,7 +99,8 @@ def composer_state(screen: str) -> str:
 
     styled = _styled_chars("\n".join(raw_lines[prompts[-1]:footer]))
     try:
-        marker = next(i for i, (char, _) in enumerate(styled) if char == "›")
+        marker = next(i for i, (char, _) in enumerate(styled)
+                      if char in _COMPOSER_MARKERS)
     except StopIteration:
         return "unknown"
     content = [(char, dim) for char, dim in styled[marker + 1:] if not char.isspace()]

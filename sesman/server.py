@@ -204,6 +204,17 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
             send_queue.mark_failed(
                 item["id"], "Codex 输入框已有内容，请在终端处理后重试")
             return
+        if composer == "unknown" and str(item.get("activity_state") or "") in {
+                "idle", "aborted", "failed"}:
+            # Never mutate an unrecognised TUI with Ctrl+L: current Codex treats it as
+            # clear-screen, making an existing conversation look like a new one. Fail
+            # visibly and let the user expose a recognisable composer before retrying.
+            if codex_bridge.busy_screen(before) or codex_bridge.approval_prompt(before):
+                send_queue.defer(item["id"])
+                return
+            send_queue.mark_failed(
+                item["id"], "Codex 输入框不可识别，请打开终端后重试")
+            return
         if composer != "empty":
             # 审批、选择题及重绘中的画面都是瞬态状态，等待真正 Ready。
             send_queue.defer(item["id"])
