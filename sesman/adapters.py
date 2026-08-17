@@ -105,6 +105,56 @@ def _tail_lines(path: Path, *, strict: bool = False):
     return out
 
 
+def _latest_jsonl_timestamp(path: Path, parsed_tail: list[dict] | None = None,
+                            *, strict: bool = False) -> str | None:
+    """返回最后一条带合法时间戳的 JSONL 记录时间。
+
+    文件 mtime 只能说明文件元数据或内容被碰过，并不等于会话发生了活动。
+    Claude Code 偶尔会在没有追加记录时刷新 transcript 的 mtime；列表若直接
+    信任它，就会把数天前的静态会话突然排到最前。
+
+    元数据读取本来就解析文件尾，所以先复用 ``parsed_tail``。极端情况下最后
+    一条记录本身大于 TAIL_BYTES，``_tail_lines`` 会把它当残行丢掉；此时再从
+    EOF 分块反向寻找，不能退回会制造假活动时间的 mtime。
+    """
+    for rec in reversed(parsed_tail or []):
+        normalized = _norm_ts(rec.get("timestamp"))
+        if normalized:
+            return normalized
+
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            cursor = fh.tell()
+            suffix = b""
+            while cursor > 0:
+                lo = max(0, cursor - 64 * 1024)
+                fh.seek(lo)
+                data = fh.read(cursor - lo) + suffix
+                lines = data.split(b"\n")
+                if lo:
+                    suffix = lines[0]
+                    lines = lines[1:]
+                else:
+                    suffix = b""
+                for raw in reversed(lines):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    normalized = _norm_ts(rec.get("timestamp"))
+                    if normalized:
+                        return normalized
+                cursor = lo
+    except OSError:
+        if strict:
+            raise
+    return None
+
+
 def _iter_records(path, start: int = 0):
     """从字节偏移 start 起逐行解析 jsonl, yield (记录, 本行结束处的偏移)。
 
@@ -925,7 +975,8 @@ class ClaudeAdapter:
                     first_user = txt
         custom_title = latest_ai_title = None
         tail_cwds = {}
-        for rec in _tail_lines(f, strict=True):
+        tail_records = _tail_lines(f, strict=True)
+        for rec in tail_records:
             if rec.get("cwd"):
                 value = str(rec["cwd"])
                 tail_cwds[value] = tail_cwds.get(value, 0) + 1
@@ -960,16 +1011,20 @@ class ClaudeAdapter:
                 continue
             except OSError:
                 raise
+            agent_updated = _latest_jsonl_timestamp(af, strict=True) \
+                or _iso(ast.st_mtime)
             agent_items.append({
                 "id": agent_id,
                 "title": str(info.get("description") or f"子代理 {agent_id[:8]}"),
                 "type": str(info.get("agentType") or "subagent"),
-                "updated": _iso(ast.st_mtime), "size": ast.st_size,
+                "updated": agent_updated, "size": ast.st_size,
             })
+        updated = _latest_jsonl_timestamp(f, tail_records, strict=True) \
+            or created or _iso(st.st_mtime)
         return {
             "uid": _uid("claude", str(f)), "source": "claude", "sid": sid or f.stem,
             "title": title, "cwd": cwd, "created": created or _iso(st.st_mtime),
-            "updated": _iso(st.st_mtime), "size": st.st_size, "path": str(f),
+            "updated": updated, "size": st.st_size, "path": str(f),
             "model": None, "branch": branch, "agents": len(agent_items),
             "agent_items": agent_items,
         }

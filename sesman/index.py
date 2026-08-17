@@ -21,7 +21,7 @@ from . import media, session_meta
 
 CACHE_DIR = Path.home() / ".cache" / "sesman"
 CACHE_FILE = CACHE_DIR / "index.json"
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
 WINDOW_CACHE_VERSION = 4
 MESSAGE_CURSOR_VERSION = 4

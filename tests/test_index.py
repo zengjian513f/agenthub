@@ -103,7 +103,8 @@ class IsolatedIndexTests(unittest.TestCase):
         old_sig = index.signature()
 
         with first.open("a") as fh:
-            fh.write(json.dumps({"type": "custom-title", "customTitle": "新标题"},
+            fh.write(json.dumps({"type": "custom-title", "customTitle": "新标题",
+                                 "timestamp": "2026-08-11T09:00:00Z"},
                                 ensure_ascii=False) + "\n")
         future = time.time_ns() + 5_000_000_000
         os.utime(first, ns=(future, future))
@@ -122,6 +123,33 @@ class IsolatedIndexTests(unittest.TestCase):
         self.assertNotEqual(index.signature(), old_sig)
         self.assertEqual([str(call.args[0]) for call in parse_meta.call_args_list],
                          [str(first)])
+
+    def test_claude_mtime_only_change_does_not_reorder_session(self):
+        older = self.claude_session("older", "较早会话")
+        newer = self.claude_session("newer", "较新会话")
+        with newer.open("a") as fh:
+            fh.write(json.dumps({
+                "type": "assistant", "uuid": "newer-answer",
+                "parentUuid": "newer-user",
+                "timestamp": "2026-08-11T09:00:00Z",
+                "message": {"content": "较新回答"},
+            }, ensure_ascii=False) + "\n")
+
+        before = index.load(force=True)
+        old_row = next(row for row in before if row["path"] == str(older))
+        old_updated = old_row["updated"]
+        old_sig = index.signature()
+
+        # 复现真实故障：Claude 没有追加任何 JSONL 记录，只把旧文件的
+        # mtime 碰到未来。索引应检测到文件变化并重读，但不能制造新活动。
+        future = time.time_ns() + 86_400_000_000_000
+        os.utime(older, ns=(future, future))
+        after = index.load()
+        refreshed = next(row for row in after if row["path"] == str(older))
+
+        self.assertEqual(after[0]["path"], str(newer))
+        self.assertEqual(refreshed["updated"], old_updated)
+        self.assertNotEqual(index.signature(), old_sig)
 
     def test_new_and_deleted_main_sessions_update_raw_without_full_rebuild(self):
         first = self.claude_session("first", "第一个")

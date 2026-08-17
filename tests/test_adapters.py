@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -13,6 +14,23 @@ class CodexEventTests(unittest.TestCase):
         got = adapters._norm_ts("2026-08-10T02:12:53.809Z")
         self.assertIsNotNone(got)
         self.assertEqual(datetime.fromisoformat(got).microsecond, 809000)
+
+    def test_latest_jsonl_timestamp_ignores_mtime_and_large_untimed_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+            rows = [
+                {"type": "user", "timestamp": "2026-08-12T07:56:28.245Z"},
+                {"type": "system", "timestamp": "2026-08-12T07:56:28.409Z"},
+                {"type": "metadata", "content": "x" * (adapters.TAIL_BYTES + 1)},
+            ]
+            transcript.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            future = 2_000_000_000_000_000_000
+            os.utime(transcript, ns=(future, future))
+
+            tail = adapters._tail_lines(transcript, strict=True)
+            got = adapters._latest_jsonl_timestamp(transcript, tail, strict=True)
+
+        self.assertEqual(got, adapters._norm_ts("2026-08-12T07:56:28.409Z"))
 
     def test_structured_abort_hides_duplicate_developer_xml(self):
         with tempfile.TemporaryDirectory() as tmp:
