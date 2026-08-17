@@ -4,6 +4,16 @@
   font-weight: 200 700; font-style: normal; font-display: swap;
 }
 
+/* Ubuntu 26.04 的 Ptyxis 默认跟随 Ubuntu Sans Mono。原字体的字宽是
+ * 0.56em，而 Noto CJK 的汉字是 1em；把西文校准到 0.5em 后，xterm 的
+ * 一个西文格与一个汉字的 1:2 网格保持严格一致。字体文件本身不作修改。 */
+@font-face {
+  font-family: "Sesman Ubuntu Sans Mono";
+  src: url("fonts/UbuntuSansMono.ttf") format("truetype-variations");
+  font-weight: 100 700; font-style: normal; font-display: swap;
+  size-adjust: 89.285714%;
+}
+
 /* xterm 的每个汉字固定占两个西文格。优先让同一套 CJK 等宽字体同时绘制
  * 西文和中文，避免 Cascadia 的 8.22px 西文格与 Noto 的 14.03px 汉字
  * 拼成并非 1:2 的网格。没有安装这两套字体的平台会继续走下面的混合回退。 */
@@ -45,8 +55,9 @@
   --tool: #b7791f;
   --terminal-bg: #f4f6f8;
   --terminal-fg: #252a32;
-  --terminal-font: "Sesman CJK Sans", "Sesman Cascadia Mono", "Cascadia Mono",
-    "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif;
+  --terminal-font: "Sesman CJK Sans", "Sesman Ubuntu Sans Mono", "Ubuntu Sans Mono",
+    "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono",
+    Consola, Consolas, sans-serif;
   --tool-font-size: 12.96px;
   --terminal-font-size: 14.04px;
   --scroll-track: rgba(107, 114, 128, .08);

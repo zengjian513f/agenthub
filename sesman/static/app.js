@@ -36,6 +36,7 @@ function loadQueuedMessages() {
 }
 
 const FONT_CHOICES = {
+  ubuntu: '"Sesman CJK Sans", "Sesman Ubuntu Sans Mono", "Ubuntu Sans Mono", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
   cascadia: '"Sesman CJK Sans", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
   system: '"Sesman CJK Sans", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", "Liberation Mono", Consolas, sans-serif',
   consolas: '"Sesman CJK Sans", Consolas, Consola, "Cascadia Mono", "Liberation Mono", sans-serif',
@@ -50,8 +51,8 @@ function applyTheme(choice = store.get('theme', 'system'), persist = false) {
   if (typeof refreshTerminalPreferences === 'function') refreshTerminalPreferences(true);
 }
 
-function applyFont(choice = store.get('font', 'cascadia'), persist = false) {
-  if (!FONT_CHOICES[choice]) choice = 'cascadia';
+function applyFont(choice = store.get('font', 'ubuntu'), persist = false) {
+  if (!FONT_CHOICES[choice]) choice = 'ubuntu';
   if (persist) store.set('font', choice);
   document.documentElement.style.setProperty('--terminal-font', FONT_CHOICES[choice]);
   if (typeof refreshTerminalPreferences === 'function') refreshTerminalPreferences(false);
@@ -3051,7 +3052,7 @@ function renderOpts() {
 $('#reload').onclick = () => { S.results = null; loadSessions(true); };
 
 function openSettings() {
-  $('#setting-font').value = store.get('font', 'cascadia');
+  $('#setting-font').value = store.get('font', 'ubuntu');
   $('#setting-theme').value = store.get('theme', 'system');
   $('#setting-cache').value = String(cacheLimitMb);
   $('#settings-dialog').showModal();

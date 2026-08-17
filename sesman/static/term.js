@@ -83,7 +83,8 @@ function terminalFontGridRatio(family, size) {
 }
 
 /** Resolve one font face whose CJK glyph is exactly two Latin cells wide.
- * Font availability, not the browser/OS name, decides whether it is used. */
+ * A configured font that already has a 1:2 grid wins; otherwise font
+ * availability, not the browser/OS name, decides whether the CJK grid is used. */
 async function prepareTerminalFont() {
   const configured = configuredTermFont();
   const size = termFontSize();
@@ -98,10 +99,13 @@ async function prepareTerminalFont() {
   let resolved = configured;
   try {
     await document.fonts?.load(`${size}px ${configured}`, TERM_FONT_SAMPLE);
-    const grid = '"Sesman CJK Mono Grid"';
-    const faces = await document.fonts?.load(`${size}px ${grid}`, TERM_FONT_SAMPLE);
-    const ratio = faces?.length ? terminalFontGridRatio(grid, size) : 0;
-    if (Math.abs(ratio - 2) <= .025) resolved = `${grid}, ${configured}`;
+    const configuredRatio = terminalFontGridRatio(configured, size);
+    if (Math.abs(configuredRatio - 2) > .025) {
+      const grid = '"Sesman CJK Mono Grid"';
+      const faces = await document.fonts?.load(`${size}px ${grid}`, TERM_FONT_SAMPLE);
+      const ratio = faces?.length ? terminalFontGridRatio(grid, size) : 0;
+      if (Math.abs(ratio - 2) <= .025) resolved = `${grid}, ${configured}`;
+    }
   } catch { /* 本机没有 Noto/Sarasa 时保留原字体回退 */ }
   if (epoch === termFontResolveEpoch) {
     resolvedTermFont = resolved;
@@ -1009,6 +1013,7 @@ function ensureTerm(name) {
     allowProposedApi: true,
     fontFamily: termFont(),
     fontSize: termFontSize(), fontWeight: '400', fontWeightBold: '600',
+    rescaleOverlappingGlyphs: true,
     cursorBlink: true, scrollback: 10000,
     scrollOnUserInput: true, theme: termTheme(),
   });

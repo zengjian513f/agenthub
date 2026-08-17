@@ -1112,11 +1112,11 @@ def run(pw):
       terminal: termFont(), terminalSize: termFontSize()
     })""")
     check("工具输出保留所选字体且 tmux 保留安全的 CJK 字体回退",
-          "Sesman CJK Sans" in font_pair["tool"] and "Sesman Cascadia Mono" in font_pair["tool"]
+          "Sesman CJK Sans" in font_pair["tool"] and "Sesman Ubuntu Sans Mono" in font_pair["tool"]
           and "Adwaita Mono" in font_pair["tool"]
           and "Ubuntu Mono" in font_pair["tool"] and "Consola" in font_pair["tool"]
           and "Sesman CJK Sans" in font_pair["terminal"]
-          and "Sesman Cascadia Mono" in font_pair["terminal"] and "Consola" in font_pair["terminal"]
+          and "Sesman Ubuntu Sans Mono" in font_pair["terminal"] and "Consola" in font_pair["terminal"]
           and font_pair["toolSize"] == "12.96px" and font_pair["terminalSize"] == 14.04, font_pair)
     cjk_grid = p.evaluate("""() => ({
       active: termFont().includes('Sesman CJK Mono Grid'),
@@ -1129,17 +1129,29 @@ def run(pw):
     p.evaluate("document.fonts.load('12px \\\"Sesman CJK Sans\\\"', '中文字体')")
     check("三套等宽选项的汉字固定回退到无衬线 CJK 字体",
           p.evaluate("document.fonts.check('12px \\\"Sesman CJK Sans\\\"', '中文字体')"))
-    p.wait_for_function("document.fonts.check('12px \\\"Sesman Cascadia Mono\\\"')", timeout=15000)
+    p.wait_for_function("document.fonts.check('12px \\\"Sesman Ubuntu Sans Mono\\\"')", timeout=15000)
     bundled_font = p.evaluate("""() => ({
-      loaded: document.fonts.check('12px "Sesman Cascadia Mono"'),
-      requested: performance.getEntriesByName(location.origin + '/fonts/CascadiaMono.woff2').length
+      loaded: document.fonts.check('12px "Sesman Ubuntu Sans Mono"'),
+      requested: performance.getEntriesByName(location.origin + '/fonts/UbuntuSansMono.ttf').length,
+      ratio: terminalFontGridRatio(configuredTermFont(), termFontSize()),
+      dashRatio: (() => {
+        const context = document.createElement('canvas').getContext('2d');
+        context.font = `400 ${termFontSize()}px ${configuredTermFont()}`;
+        return context.measureText('—').width / context.measureText('0').width;
+      })(),
+      resolved: termFont()
     })""")
-    check("Cascadia Mono 网页字体由项目自带且已加载", bundled_font["loaded"] and bundled_font["requested"] > 0,
+    check("Ubuntu Sans Mono 网页字体由项目自带且保持双宽网格",
+          bundled_font["loaded"] and bundled_font["requested"] > 0
+          and abs(bundled_font["ratio"] - 2) <= .025
+          and abs(bundled_font["dashRatio"] - 1) <= .025
+          and "Sesman Ubuntu Sans Mono" in bundled_font["resolved"]
+          and "Sesman CJK Mono Grid" not in bundled_font["resolved"],
           bundled_font)
     p.click("#settings")
     check("设置窗口集中提供字体、颜色和缓存选项",
           p.locator("#settings-dialog").is_visible()
-          and p.locator("#setting-font").input_value() == "cascadia"
+          and p.locator("#setting-font").input_value() == "ubuntu"
           and p.locator("#setting-theme").input_value() == "system"
           and p.locator("#setting-cache").input_value() == "256")
     p.select_option("#setting-font", "system")
@@ -1163,7 +1175,7 @@ def run(pw):
           consolas_stack.startswith('"Sesman CJK Sans", Consolas, Consola')
           and consolas_stack.endswith('sans-serif') and 'monospace' not in consolas_stack,
           consolas_stack)
-    p.select_option("#setting-font", "cascadia")
+    p.select_option("#setting-font", "ubuntu")
     p.select_option("#setting-theme", "system")
     p.select_option("#setting-cache", "256")
     p.locator("#settings-dialog .modal-actions button").click()
@@ -3101,6 +3113,8 @@ def run(pw):
             capture_output=True, text=True).stdout.strip()
         check("网页终端使用 xterm 正常缓冲区",
               p.evaluate("T.term.buffer.active === T.term.buffer.normal"))
+        check("xterm 会把模糊宽度标点限制在自身单元格",
+              p.evaluate("T.term.options.rescaleOverlappingGlyphs === true"))
         check("连接时已把 tmux 历史送入 xterm scrollback",
               p.evaluate("T.term.buffer.normal.baseY") > 100,
               p.evaluate("T.term.buffer.normal.baseY"))
