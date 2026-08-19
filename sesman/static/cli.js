@@ -27,11 +27,12 @@ class SesmanCli {
       ? { type: 'remove', text: String(message.text || '') } : null;
   }
 
-  queuedMessageExpired(_item, _now, _hasNativeHistory) {
-    return false;
+  settleQueuedMessage(item, _now, _hasNativeHistory) {
+    return item;
   }
 
   queuedMessageLabel(item) {
+    if (item?.state === 'failed') return '发送未确认';
     return item?.state === 'sending' ? '发送中' : '排队中';
   }
 
@@ -107,10 +108,18 @@ class ClaudeCli extends SesmanCli {
     return null;
   }
 
-  queuedMessageExpired(item, now, hasNativeHistory) {
-    if (item?.legacy && !hasNativeHistory) return false;
-    return item?.state === 'sending' && Number.isFinite(+item.expiresAt)
-      && now >= +item.expiresAt;
+  settleQueuedMessage(item, now, hasNativeHistory) {
+    if (item?.legacy && !hasNativeHistory) return item;
+    if (item?.state !== 'sending' || !Number.isFinite(+item.expiresAt)
+        || now < +item.expiresAt) return item;
+    const settled = {
+      ...item,
+      state: 'failed',
+      error: 'Claude 未在会话记录中确认接收',
+    };
+    delete settled.expiresAt;
+    delete settled.legacy;
+    return settled;
   }
 
   questionAnswerKeys(prompt, optionIndex) {

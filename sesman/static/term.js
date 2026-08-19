@@ -4,6 +4,7 @@
 // 会话跑在 tmux 里, 所以关掉页面/重启 sesman 都不会打断它。
 const TERM_RENDER_BATCH_MS = 20;
 const TERM_RENDER_BATCH_MAX = 32 * 1024;
+const TERM_LAYOUT_POLICY_VERSION = 2;
 // 每次页面加载独立生成；不写 local/sessionStorage，复制标签页也不会复制归属。
 const TERM_PAGE_ID = crypto.randomUUID?.()
   || [...crypto.getRandomValues(new Uint8Array(16))]
@@ -17,7 +18,7 @@ const T = {
   views: new Map(), // 已打开过且仍存活的 tmux → xterm/WebSocket；切会话只隐藏
   enabled: false,
   height: store.get('termh', 320),
-  mode: store.get('termmode', 'normal'), // normal | collapsed | full
+  mode: store.get('termmode', 'full'), // normal(手动分屏) | collapsed(对话) | full(终端)
   localMouse: store.get('tmouse', false),   // true = 鼠标归浏览器, 可以框选复制
   ctrlArmed: false,                         // 手机 Ctrl / 桌面右 Ctrl：只修饰下一次输入
   sources: {},
@@ -28,6 +29,17 @@ const T = {
   resolveControllers: new Map(),
   openViews: new Map(store.get('termviews', [])), // tmux 名 → {mode, height}
 };
+// 旧版把 normal 当默认布局，无法区分“系统默认分屏”和“用户手动分屏”。
+// 升级时只迁移一次；此后 normal 只会由拖动分界线产生并照常按会话保存。
+if (+store.get('termLayoutPolicyVersion', 0) < TERM_LAYOUT_POLICY_VERSION) {
+  if (T.mode === 'normal') T.mode = 'full';
+  T.openViews = new Map([...T.openViews].map(([name, layout]) => [
+    name, layout?.mode === 'normal' ? { ...layout, mode: 'full' } : layout,
+  ]));
+  store.set('termmode', T.mode);
+  store.set('termviews', [...T.openViews]);
+  store.set('termLayoutPolicyVersion', TERM_LAYOUT_POLICY_VERSION);
+}
 // Claude 双 Esc 的最终叶子有时只保存在 TUI 进程内，不会追加 JSONL。
 // 以 tmux 名为键跟踪原生选择器，确认后再让服务端从当前屏幕同步时间线。
 const claudeRewinds = new Map();
@@ -188,14 +200,20 @@ async function refreshTerminalPreferences(redraw = false) {
   terminalFontReady = prepareTerminalFont();
   try { await terminalFontReady; } catch {}
   const views = T.views ? T.views.values() : (T.term ? [{ term: T.term }] : []);
+  const liveNames = new Set([...(T.list || []), ...(T.pending || [])]
+    .map(item => item.name));
   const redrawNames = [];
   for (const view of views) {
     view.term.options.fontFamily = termFont();
     view.term.options.theme = termTheme();
-    if (redraw && view.name) redrawNames.push(view.name);
+    // 已退出的临时会话可能在下一次列表轮询前仍留有一个 xterm 视图。
+    // 配色切换只重连目前确实存在的 tmux，不能拿陈旧视图去 claim 404。
+    const currentConnected = T.name === view.name && view.ws?.readyState === WebSocket.OPEN;
+    if (redraw && view.name && (liveNames.has(view.name) || currentConnected)) {
+      redrawNames.push(view.name);
+    }
   }
   for (const name of redrawNames) attachTerm(name);
-  if (redraw && !redrawNames.length && T.name) attachTerm(T.name);
   setTimeout(() => { fitTerm(); }, 0);
 }
 
@@ -203,22 +221,36 @@ async function refreshTerminalPreferences(redraw = false) {
 let terminalFontReady = prepareTerminalFont();
 addEventListener('resize', () => { layoutTermPane(); fitTerm(); });
 
+let termListRequestSeq = 0;
 async function loadTermList() {
+  const requestSeq = ++termListRequestSeq;
+  const openEpoch = termOpenEpoch;
   const fingerprint = () => [
     ...(T.list || []).map(x => `${x.name}\t${x.cwd}`),
     ...(T.pending || []).map(x => `pending\t${x.name}\t${x.cwd}`),
   ].join('\n');
   const before = fingerprint();
   let loaded = false;
+  let data = null;
   try {
-    const d = await (await fetch(appUrl('api/term/list'))).json();
+    data = await (await fetch(appUrl('api/term/list'))).json();
     loaded = true;
-    T.enabled = !!d.enabled;
-    T.list = d.sessions || [];
-    T.sources = d.sources || {};
-    T.home = d.home || '';
-    T.pending = d.pending || [];
-  } catch {
+  } catch { /* 下方统一应用失败状态 */ }
+  // 只允许最后发出的请求改状态；否则慢响应会覆盖更新的 tmux 列表。
+  if (requestSeq !== termListRequestSeq) return;
+  // 请求在终端打开/切换之前发出时，它的“没有该视图”结论已经过期。丢弃
+  // 整份结果并立刻重取，不能先销毁刚打开的常驻 xterm 再补回来。
+  if (openEpoch !== termOpenEpoch) {
+    void loadTermList();
+    return;
+  }
+  if (loaded) {
+    T.enabled = !!data.enabled;
+    T.list = data.sessions || [];
+    T.sources = data.sources || {};
+    T.home = data.home || '';
+    T.pending = data.pending || [];
+  } else {
     T.enabled = false;
     T.list = [];
     T.sources = {};
@@ -872,14 +904,12 @@ function renderTakeoverBtn() {
   if (!b) return;
   const name = takenOver(S.sel);
   const paneOpen = !!name && !$('#termpane').classList.contains('hidden');
-  const mobileSwitch = MOBILE.matches && paneOpen;
-  const snapped = !MOBILE.matches && paneOpen && (T.mode === 'collapsed' || T.mode === 'full');
+  const switchToChat = paneOpen && (MOBILE.matches || T.mode === 'full');
   const terminalVisible = paneOpen && (MOBILE.matches || T.mode !== 'collapsed');
   const label = !name ? '接管会话'
     : MOBILE.matches ? (paneOpen ? '切换到对话' : '切换到终端')
-    : snapped ? (T.mode === 'collapsed' ? '切换到终端' : '切换到对话')
-      : (paneOpen ? '收起终端' : '展开终端');
-  b.innerHTML = uiIcon(mobileSwitch ? 'chat' : 'terminal');
+    : switchToChat ? '切换到对话' : '切换到终端';
+  b.innerHTML = uiIcon(switchToChat ? 'chat' : 'terminal');
   b.title = b.ariaLabel = label;
   b.setAttribute('aria-expanded', String(terminalVisible));
   b.classList.toggle('on', !!name);
@@ -1025,7 +1055,7 @@ function ensureTerm(name) {
     lastResizeKey: '', lastResizeWs: null,
     activationEpoch: 0,
     attachPromise: null, revoked: false,
-    focusRequest: null,
+    focusRequest: null, resumeFocus: false,
     renderer: 'dom', webgl: null, unicode11: null,
     selectionLocked: false, selectionSnapshot: null, restoringSelection: false,
   };
@@ -1241,6 +1271,25 @@ function restoreTermPane(uid, agent = null) {
   const name = takenOver(uid);
   if (!name || !T.openViews.has(name)) return;
   T.uid = uid;
+  const prompt = cache.get(viewKey(uid))?.prompt || null;
+  // 刷新页面时可能先恢复了一个仍在等待回答的原生题目，再恢复终端布局。
+  // 先登记并呈现题目，不能让旧的纯终端偏好随后把题卡重新盖住。
+  const promptId = String(prompt?.id || '');
+  const waitingPrompt = !!promptId && prompt?.questions?.length
+    && (prompt.state || 'waiting') === 'waiting';
+  if (waitingPrompt && $('#termpane').classList.contains('hidden')) {
+    revealedTermPrompts.set(uid, promptId);
+    if (MOBILE.matches) {
+      renderTakeoverBtn();
+      return;
+    }
+    const savedMode = T.openViews.get(name)?.mode;
+    if (savedMode !== 'normal') {
+      openTermPane(name, false, 'collapsed');
+      return;
+    }
+  }
+  if (revealConversationForPrompt(uid, prompt)) return;
   // loadTermList 和会话 reset 都会走这里。已打开时无需反复 fit/聚焦；首次
   // 自动恢复也只恢复视图，不应抢走用户正在使用的搜索框或输入框。
   if (!$('#termpane').classList.contains('hidden') && T.name === name) {
@@ -1250,15 +1299,21 @@ function restoreTermPane(uid, agent = null) {
   openTermPane(name, false);
 }
 
-async function openTermPane(name, autoFocus = true) {
+async function openTermPane(name, autoFocus = true, requestedMode = null) {
   const openEpoch = ++termOpenEpoch;
   const focusSource = autoFocus ? document.activeElement : null;
   const saved = T.openViews.get(name);
-  if (saved) {
+  if (!MOBILE.matches && ['normal', 'collapsed', 'full'].includes(requestedMode)) {
+    T.mode = requestedMode;
+  } else if (saved) {
     if (['normal', 'collapsed', 'full'].includes(saved.mode)) T.mode = saved.mode;
     if (Number.isFinite(saved.height) && saved.height > 0) T.height = saved.height;
+  } else if (!MOBILE.matches) {
+    // 新接管或从未保存过布局的会话默认只显示终端；分屏只能由拖动产生。
+    T.mode = 'full';
   }
   rememberTermOpen(name, true);
+  rememberTermLayout(name);
   const pane = $('#termpane');
   pane.classList.remove('hidden');
   layoutTermPane();
@@ -1280,19 +1335,16 @@ async function openTermPane(name, autoFocus = true) {
   return true;
 }
 
-/** 普通高度下按钮仍是展开/收起；吸附到边缘后改为纯对话/纯终端切换。 */
+/** 顶栏按钮只切纯对话/纯终端；normal 分屏只能由用户拖动分界线产生。 */
 function toggleTermPane(name) {
   const pane = $('#termpane');
   if (pane.classList.contains('hidden')) {
-    if (!MOBILE.matches && T.mode === 'collapsed') {
-      T.mode = 'full';
-      store.set('termmode', T.mode);
-    }
-    openTermPane(name);
+    openTermPane(name, true, MOBILE.matches ? null : 'full');
     return;
   }
-  if (!MOBILE.matches && (T.mode === 'collapsed' || T.mode === 'full')) {
-    T.mode = T.mode === 'collapsed' ? 'full' : 'collapsed';
+  if (!MOBILE.matches) {
+    // 分屏状态点按钮也进入纯终端；下一次再切到纯对话。
+    T.mode = T.mode === 'full' ? 'collapsed' : 'full';
     store.set('termmode', T.mode);
     rememberTermLayout(name);
     layoutTermPane();
@@ -1301,6 +1353,38 @@ function toggleTermPane(name) {
     return;
   }
   closeTermPane();
+}
+
+// 同一个题目只自动呈现一次。用户看过以后仍可以主动切回原生终端；后台的
+// 0.4 秒审批轮询和 tmux 列表刷新不能再把界面强行切回来。
+const revealedTermPrompts = new Map();
+
+/** 纯终端会遮住对话题卡。当前会话第一次收到待回答题目时切到对话；手动
+ *  split 本来就能同时看到题卡，不改变它。prompt 结束后允许同一命令再次提问。 */
+function revealConversationForPrompt(uid, prompt) {
+  const id = String(prompt?.id || '');
+  const waiting = !!id && prompt?.questions?.length
+    && (prompt.state || 'waiting') === 'waiting';
+  if (!waiting) {
+    revealedTermPrompts.delete(uid);
+    return false;
+  }
+  if (S.sel !== uid || S.agent) return false;
+  const pane = $('#termpane');
+  if (!pane || pane.classList.contains('hidden')) return false;
+  if (revealedTermPrompts.get(uid) === id) return false;
+  revealedTermPrompts.set(uid, id);
+  if (MOBILE.matches) {
+    closeTermPane(true);
+    return true;
+  }
+  if (T.mode !== 'full') return false;
+  T.mode = 'collapsed';
+  store.set('termmode', T.mode);
+  rememberTermLayout(T.name || takenOver(uid));
+  layoutTermPane();
+  renderTakeoverBtn();
+  return true;
 }
 
 function closeTermPane(preserveView = false) {
@@ -1319,8 +1403,9 @@ function layoutTermPane() {
   const pane = $('#termpane');
   const right = $('#right');
   const desktop = !MOBILE.matches;
-  right.classList.toggle('term-full', desktop && T.mode === 'full');
-  pane.classList.toggle('term-collapsed', desktop && T.mode === 'collapsed');
+  const paneOpen = !pane.classList.contains('hidden');
+  right.classList.toggle('term-full', desktop && paneOpen && T.mode === 'full');
+  pane.classList.toggle('term-collapsed', desktop && paneOpen && T.mode === 'collapsed');
   if (MOBILE.matches) {
     pane.style.removeProperty('height');
     const rightTop = right.getBoundingClientRect().top;
@@ -1878,7 +1963,31 @@ function syncComposerMode() {
   autoGrow(ta);
 }
 
-async function sendToSession(text, keys, uid = S.sel, media = []) {
+async function prepareCodexDraft(uid) {
+  const name = takenOver(uid);
+  const cli = sesmanCli(uid);
+  if (!name || cli?.source !== 'codex' || uid.startsWith('tmux:')) {
+    return { proceed: true, overwriteDraft: '' };
+  }
+  let d;
+  try {
+    d = await post('api/session/draft-status', { uid, name });
+  } catch (error) {
+    alert('发送失败: ' + (error.message || error));
+    return { proceed: false, overwriteDraft: '' };
+  }
+  if (d.error) {
+    alert('发送失败: ' + d.error);
+    return { proceed: false, overwriteDraft: '' };
+  }
+  if (!d.draft_conflict) return { proceed: true, overwriteDraft: '' };
+  if (!confirmTerminalDraftOverwrite()) {
+    return { proceed: false, overwriteDraft: '' };
+  }
+  return { proceed: true, overwriteDraft: d.draft_token || '' };
+}
+
+async function sendToSession(text, keys, uid = S.sel, media = [], options = {}) {
   const name = takenOver(uid);
   if (!name) return false;
   const cli = sesmanCli(uid);
@@ -1892,12 +2001,23 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
       const activity = entry?.activity || null;
       const requestId = globalThis.crypto?.randomUUID?.()
         || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      d = await post('api/session/send', {
-        uid, name, text, media, activity, request_id: requestId,
-        cursor: entry ? {
-          start: entry.end, head: entry.version?.head, anchor: entry.anchor,
-        } : null,
-      });
+      let overwriteDraft = String(options.overwriteDraft || '');
+      for (let attempt = 0; attempt < 3; attempt++) {
+        d = await post('api/session/send', {
+          uid, name, text, media, activity, request_id: requestId,
+          overwrite_draft: overwriteDraft,
+          cursor: entry ? {
+            start: entry.end, head: entry.version?.head, anchor: entry.anchor,
+          } : null,
+        });
+        if (!d.draft_conflict) break;
+        if (!confirmTerminalDraftOverwrite()) return false;
+        overwriteDraft = d.draft_token || '';
+      }
+      if (d?.draft_conflict) {
+        alert('终端草稿持续变化，消息未发送');
+        return false;
+      }
     } else {
       d = await post('api/term/send', keys ? { name, keys, uid } : { name, text });
     }
@@ -1912,7 +2032,7 @@ async function sendToSession(text, keys, uid = S.sel, media = []) {
     return false;
   }
   if (serverQueued && typeof syncServerOutbox === 'function') {
-    syncServerOutbox(uid, d.outbox || []);
+    syncServerOutbox(uid, d.outbox || [], d.outbox_version);
   }
   if (Object.prototype.hasOwnProperty.call(d, 'activity')) {
     const entry = cache.get(viewKey(uid));
@@ -2198,6 +2318,8 @@ async function submitComposer() {
   add.disabled = true;
   renderComposerItems();
   try {
+    const draftPolicy = await prepareCodexDraft(uid);
+    if (!draftPolicy.proceed) return;
     const uploaded = [];
     let attachmentId = attachments.find(x => x.uploaded?.uid === uid)?.uploaded?.attachment_id || null;
     for (let i = 0; i < attachments.length; i++) {
@@ -2209,7 +2331,9 @@ async function submitComposer() {
     button.textContent = '发送中…';
     const prompt = buildComposerPrompt(text, uploaded, quotes);
     const sentMedia = uploaded.flatMap(a => a.media ? [{ ...a.media, gallery: true }] : []);
-    const sent = await sendToSession(prompt, null, uid, sentMedia);
+    const sent = await sendToSession(
+      prompt, null, uid, sentMedia,
+      { overwriteDraft: draftPolicy.overwriteDraft });
     // 请求失败时保留草稿；等待响应期间若用户继续编辑，也不能抹掉新内容。
     if (sent) {
       if (draft.text === text || (composerUid === uid && ta.value === text)) draft.text = '';
@@ -2325,15 +2449,7 @@ async function revealNativeTerminal(uid = S.sel) {
   const name = takenOver(uid);
   if (!name || S.sel !== uid) return false;
   T.uid = uid;
-  await openTermPane(name);
-  if (!MOBILE.matches && T.mode === 'collapsed') {
-    T.mode = 'full';
-    store.set('termmode', T.mode);
-    rememberTermLayout(name);
-    layoutTermPane();
-    renderTakeoverBtn();
-    setTimeout(fitTerm, 0);
-  }
+  await openTermPane(name, true, MOBILE.matches ? null : 'full');
   return true;
 }
 
@@ -2577,6 +2693,9 @@ document.addEventListener('pointercancel', finishTermDrag);
 let termWasBackgrounded = false;
 function backgroundTerm() {
   termWasBackgrounded = true;
+  for (const view of T.views.values()) {
+    view.resumeFocus = !!document.activeElement && view.host.contains(document.activeElement);
+  }
   suspendTerm();
 }
 function foregroundTerm(force = false) {
@@ -2586,6 +2705,8 @@ function foregroundTerm(force = false) {
     if (view.webgl) {
       try { view.term.clearTextureAtlas(); } catch {}
     }
+    if (view.resumeFocus) requestTermFocus(view, document.body);
+    view.resumeFocus = false;
     reconnectTerm(view);
   }
 }

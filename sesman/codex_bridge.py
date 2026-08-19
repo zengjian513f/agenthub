@@ -46,14 +46,34 @@ def _styled_chars(text: str) -> list[tuple[str, bool]]:
         sgr = _SGR.fullmatch(ansi.group(0))
         if sgr:
             raw = sgr.group(1)
-            codes = [int(value or 0) for value in re.split(r"[;:]", raw)]
-            for code in codes:
+            # Do not flatten extended colour payloads.  In ``38;2;r;g;b`` the
+            # second value selects RGB colour; it is not SGR 2 (dim).  Treating
+            # it as dim can make an ordinary coloured draft look like Codex's
+            # empty placeholder and would let us append to user text.
+            fields = raw.split(";") if ";" in raw else [raw]
+            at = 0
+            while at < len(fields):
+                field = fields[at]
+                # Colon-form colour commands keep their payload in one field.
+                head = field.split(":", 1)[0]
+                try:
+                    code = int(head or 0)
+                except ValueError:
+                    at += 1
+                    continue
                 if code == 0:
                     dim = False
                 elif code == 2:
                     dim = True
                 elif code == 22:
                     dim = False
+                if code in {38, 48, 58} and ":" not in field and at + 1 < len(fields):
+                    try:
+                        mode = int(fields[at + 1] or 0)
+                    except ValueError:
+                        mode = 0
+                    at += 2 if mode == 5 else 4 if mode == 2 else 0
+                at += 1
         pos = ansi.end()
     return result
 
@@ -89,15 +109,26 @@ def composer_state(screen: str) -> str:
         if not nonblank or not _MODEL_FOOTER.match(clean_lines[nonblank[-1]]):
             return "unknown"
         footer = nonblank[-1]
-    prompts = [i for i in range(max(0, footer - 20), footer)
-               if clean_lines[i].lstrip()[:1] in _COMPOSER_MARKERS]
-    if not prompts:
+    # Only inspect the nonblank block immediately above the status bar.  The
+    # former 20-line search could reach into transcript history when a resize
+    # caught Codex between clearing and redrawing its composer.  A historic
+    # ``› user prompt`` was then reported as a live draft, permanently blocking
+    # the web outbox even though the visible composer was empty.
+    end = footer - 1
+    while end >= 0 and not clean_lines[end].strip():
+        end -= 1
+    if end < 0:
+        return "unknown"
+    start = end
+    while start > 0 and clean_lines[start - 1].strip():
+        start -= 1
+    if clean_lines[start].lstrip()[:1] not in _COMPOSER_MARKERS:
         return "unknown"
     if any(_BUSY_STATUS.search(clean_lines[i])
-           for i in range(max(0, prompts[-1] - 6), prompts[-1])):
+           for i in range(max(0, start - 6), start)):
         return "unknown"
 
-    styled = _styled_chars("\n".join(raw_lines[prompts[-1]:footer]))
+    styled = _styled_chars("\n".join(raw_lines[start:end + 1]))
     try:
         marker = next(i for i, (char, _) in enumerate(styled)
                       if char in _COMPOSER_MARKERS)

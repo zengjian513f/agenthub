@@ -144,6 +144,42 @@ def _resolve_activity(uid: str, result: dict) -> dict:
     return result
 
 
+def _codex_composer_probe(name: str) -> dict:
+    """Return a content-free fingerprint when Codex has an unsent draft."""
+    try:
+        screen = term.capture(name, 40)
+    except (OSError, RuntimeError):
+        return {"draft_state": "unknown"}
+    state = codex_bridge.composer_state(screen)
+    result = {"draft_state": state}
+    if state == "editing":
+        result.update(
+            draft_conflict=True,
+            draft_token=hashlib.sha256(
+                screen.encode("utf-8", "replace")).hexdigest(),
+        )
+    return result
+
+
+def _overwrite_codex_draft(name: str, expected_token: str) -> dict | None:
+    """Clear the exact draft the browser confirmed, then verify an empty editor."""
+    probe = _codex_composer_probe(name)
+    if probe.get("draft_state") != "editing":
+        return None
+    if not expected_token or expected_token != probe.get("draft_token"):
+        return probe
+
+    # Codex 0.147.0: Ctrl+C in an idle non-empty composer clears the draft and
+    # does not create a rollout record.  This was verified against the local TUI.
+    term.leave_copy_mode(name)
+    term.send_keys(name, "C-c")
+    for delay in (0.03, 0.05, 0.08, 0.13, 0.21):
+        time.sleep(delay)
+        if _codex_composer_probe(name).get("draft_state") == "empty":
+            return None
+    return {"error": "未能确认终端草稿已清空，消息未发送"}
+
+
 def _poll_outbox() -> None:
     """即使浏览器断开，也独立从 Codex rollout 追踪完成与接收事件。"""
     for item in send_queue.tracked():
@@ -200,20 +236,21 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
         composer = codex_bridge.composer_state(before)
         if composer == "editing":
             # 双 Esc 回退失败时 Codex 会把旧 prompt 留在编辑框里。绝不能
-            # 清空用户草稿，也不能把新消息粘到它后面形成一条拼接消息。
-            send_queue.mark_failed(
-                item["id"], "Codex 输入框已有内容，请在终端处理后重试")
+            # 清空用户草稿，也不能把新消息粘到它后面形成一条拼接消息。同时
+            # resize/重连会短暂留下历史 › 行；同一画面连续稳定数帧后才报错。
+            signature = hashlib.sha256(before.encode("utf-8", "replace")).hexdigest()
+            send_queue.defer_editing(item["id"], signature)
             return
         if composer == "unknown" and str(item.get("activity_state") or "") in {
                 "idle", "aborted", "failed"}:
             # Never mutate an unrecognised TUI with Ctrl+L: current Codex treats it as
-            # clear-screen, making an existing conversation look like a new one. Fail
-            # visibly and let the user expose a recognisable composer before retrying.
+            # clear-screen, making an existing conversation look like a new one.
+            # resize、切换会话和 TUI 重绘都会短暂产生这种帧；先退避重试，连续
+            # 多次仍无法识别才保留为可人工处理的失败项。
             if codex_bridge.busy_screen(before) or codex_bridge.approval_prompt(before):
                 send_queue.defer(item["id"])
                 return
-            send_queue.mark_failed(
-                item["id"], "Codex 输入框不可识别，请打开终端后重试")
+            send_queue.defer_unrecognized(item["id"])
             return
         if composer != "empty":
             # 审批、选择题及重绘中的画面都是瞬态状态，等待真正 Ready。
@@ -415,6 +452,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/api/session/send":
                 return self._queue_message(body)
+            if u.path == "/api/session/draft-status":
+                return self._draft_status(body)
             if u.path == "/api/session/outbox/retry":
                 return self._retry_message(body)
             if u.path == "/api/session/outbox/discard":
@@ -721,7 +760,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._new_session_status(q)
 
         if path == "/api/session/outbox":
-            return self._json({"outbox": send_queue.list_for(q.get("uid", [""])[0])})
+            return self._json(send_queue.snapshot(q.get("uid", [""])[0]))
 
         if path == "/api/session/input-history":
             uid = q.get("uid", [""])[0]
@@ -786,7 +825,7 @@ class Handler(BaseHTTPRequestHandler):
             if not agent:
                 if send_queue.observe(uid, result["messages"], result.get("activity")):
                     OUTBOX_WAKE.set()
-                result["outbox"] = send_queue.list_for(uid)
+                result.update(send_queue.snapshot(uid))
                 result["prompt"] = _session_prompt(session, result["messages"])
             result["meta"] = session_meta.enrich_one(result["meta"])
             return self._json(result)
@@ -884,8 +923,9 @@ class Handler(BaseHTTPRequestHandler):
                         activity_revision = session_meta.activity_revision(uid)
                         if send_queue.observe(uid, d["messages"], d.get("activity")):
                             OUTBOX_WAKE.set()
-                        d["outbox"] = send_queue.list_for(uid)
-                        outbox_revision = send_queue.revision()
+                        outbox = send_queue.snapshot(uid)
+                        d.update(outbox)
+                        outbox_revision = outbox["outbox_version"]["revision"]
                     if claude_sid:
                         d["prompt"] = _claude_prompt(claude_sid, d["messages"])
                         # _claude_prompt 可能在确认答案落盘后删掉状态文件。
@@ -937,9 +977,9 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                         beat = time.time()
                 elif not s.get("agent_id") and send_queue.revision() != outbox_revision:
-                    outbox_revision = send_queue.revision()
-                    payload = json.dumps({"outbox_only": True,
-                                          "outbox": send_queue.list_for(uid)},
+                    outbox = send_queue.snapshot(uid)
+                    outbox_revision = outbox["outbox_version"]["revision"]
+                    payload = json.dumps({"outbox_only": True, **outbox},
                                          ensure_ascii=False)
                     self.wfile.write(f"data: {payload}\n\n".encode())
                     self.wfile.flush()
@@ -1027,32 +1067,47 @@ class Handler(BaseHTTPRequestHandler):
             # 编辑框正文，并明确要求先处理真正的阻塞项。
             return self._json({
                 "error": "上一条消息发送失败，请先重试或移除",
-                "outbox": send_queue.list_for(uid),
+                **send_queue.snapshot(uid),
             }, 409)
-        try:
-            composer = codex_bridge.composer_state(term.capture(pane["name"], 40))
-        except (OSError, RuntimeError):
-            composer = "unknown"
-        if composer == "editing":
-            return self._json({
-                "error": "Codex 输入框已有内容，请先在终端处理",
-                "outbox": send_queue.list_for(uid),
-            }, 409)
+        conflict = _overwrite_codex_draft(
+            pane["name"], str(body.get("overwrite_draft") or ""))
+        if conflict:
+            return self._json({**conflict, **send_queue.snapshot(uid)}, 409)
         item = send_queue.enqueue(
             uid, pane["name"], str(body.get("text") or ""), body.get("media"),
             body.get("activity"), str(body.get("request_id") or ""),
             body.get("cursor"))
         OUTBOX_WAKE.set()
         return self._json({"ok": True, "item": item,
-                           "outbox": send_queue.list_for(uid)})
+                           **send_queue.snapshot(uid)})
+
+    def _draft_status(self, body: dict):
+        uid = str(body.get("uid") or "")
+        s = index.get(uid)
+        if not s or s.get("source") != "codex":
+            return self._json({"error": "草稿检测只适用于 Codex 会话"}, 400)
+        pane = _pane_for_session(s, term.list_sessions())
+        if not pane or pane["name"] != str(body.get("name") or ""):
+            return self._json({"error": "Codex tmux 会话未连接"}, 409)
+        return self._json({"ok": True, **_codex_composer_probe(pane["name"])})
 
     def _retry_message(self, body: dict):
         uid = str(body.get("uid") or "")
-        item = send_queue.retry(str(body.get("id") or ""), body.get("activity"), uid)
+        item_id = str(body.get("id") or "")
+        if not any(item.get("id") == item_id for item in send_queue.list_for(uid)):
+            return self._json({"error": "待发送消息不存在"}, 404)
+        s = index.get(uid)
+        pane = _pane_for_session(s, term.list_sessions()) if s else None
+        if pane:
+            conflict = _overwrite_codex_draft(
+                pane["name"], str(body.get("overwrite_draft") or ""))
+            if conflict:
+                return self._json({**conflict, **send_queue.snapshot(uid)}, 409)
+        item = send_queue.retry(item_id, body.get("activity"), uid)
         if not item:
             return self._json({"error": "待发送消息不存在"}, 404)
         OUTBOX_WAKE.set()
-        return self._json({"ok": True, "outbox": send_queue.list_for(item["uid"])})
+        return self._json({"ok": True, **send_queue.snapshot(item["uid"])})
 
     def _discard_message(self, body: dict):
         item_id = str(body.get("id") or "")
@@ -1060,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
         if not send_queue.discard(item_id, uid, {"queued", "failed"}):
             return self._json({"error": "消息不存在或已经开始发送"}, 409)
         return self._json({"ok": True, "uid": uid,
-                           "outbox": send_queue.list_for(uid)})
+                           **send_queue.snapshot(uid)})
 
     def _takeover(self, body: dict):
         """接管一个会话: 在 tmux 里把它 resume 起来, 之后网页就能直接输入。

@@ -475,6 +475,12 @@ def capture(name: str, lines: int = 200) -> str:
     return _session_tmux(name, "capture-pane", "-p", "-e", "-t", name, "-S", f"-{lines}")
 
 
+def capture_history(name: str, lines: int = 10000) -> str:
+    """Capture styled logical lines for replay into a differently sized xterm."""
+    return _session_tmux(name, "capture-pane", "-J", "-p", "-e", "-t", name,
+                         "-S", f"-{lines}")
+
+
 def capture_plain(name: str, lines: int = 80) -> str:
     """Capture screen text without ANSI escapes for native prompt detection."""
     # -J joins terminal soft-wraps, so resizing does not alter a long command's
@@ -637,8 +643,10 @@ class Attach:
         if self.server == MANAGED_SERVER:
             # tmux attach 只会重绘当前屏；先把已有 history 喂给 xterm 的正常缓冲区，
             # 随后的清屏/重绘会留下真正可由浏览器滚动的历史，不必进入 copy-mode。
+            # 先 -J 合并 tmux 按旧窗口宽度保存的软折行；否则手机/窄屏
+            # xterm 会对已折过的物理行再折一次，出现半截单词和错位短行。
             try:
-                history = capture(name, 10000)
+                history = capture_history(name, 10000)
                 if history:
                     self._initial = (history.replace("\n", "\r\n")
                                      + "\x1b[0m\r\n").encode("utf-8", "replace")

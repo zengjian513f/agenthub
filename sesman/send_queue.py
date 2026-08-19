@@ -21,8 +21,12 @@ QUEUE_FILE = DATA_DIR / "send-queue.json"
 VERSION = 1
 READY_DELAY = 0.30
 CONFIRM_TIMEOUT = 8.0
+COMPOSER_RETRY_DELAY = 0.50
+COMPOSER_RETRY_LIMIT = 12
+COMPOSER_EDITING_RETRY_LIMIT = 4
 _lock = threading.RLock()
 _revision = 0
+_epoch = uuid.uuid4().hex
 
 
 def _read() -> list[dict]:
@@ -63,6 +67,18 @@ def list_for(uid: str) -> list[dict]:
         rows = [x for x in _read() if x.get("uid") == uid]
     rows.sort(key=lambda x: (float(x.get("created") or 0), str(x.get("id") or "")))
     return [_public(x) for x in rows]
+
+
+def snapshot(uid: str) -> dict:
+    """Return one atomic public snapshot and its process-scoped ordering token."""
+    with _lock:
+        rows = [x for x in _read() if x.get("uid") == uid]
+        rows.sort(key=lambda x: (float(x.get("created") or 0),
+                                 str(x.get("id") or "")))
+        return {
+            "outbox": [_public(x) for x in rows],
+            "outbox_version": {"epoch": _epoch, "revision": _revision},
+        }
 
 
 def tracked() -> list[dict]:
@@ -175,6 +191,50 @@ def defer(item_id: str, delay: float = READY_DELAY) -> None:
     _update(item_id, lambda row: row.update(ready_at=time.time() + delay))
 
 
+def defer_unrecognized(item_id: str) -> bool:
+    """Retry a transiently unrecognisable Codex frame before failing visibly."""
+    def change(row):
+        row.pop("composer_editing_signature", None)
+        row.pop("composer_editing_attempts", None)
+        attempts = int(row.get("composer_attempts") or 0) + 1
+        row["composer_attempts"] = attempts
+        if attempts >= COMPOSER_RETRY_LIMIT:
+            row.update(state="failed",
+                       error="Codex 输入框不可识别，请打开终端后重试")
+            row.pop("ready_at", None)
+        else:
+            row["ready_at"] = time.time() + COMPOSER_RETRY_DELAY
+    result = _update(item_id, change)
+    return bool(result and result.get("state") == "queued")
+
+
+def defer_editing(item_id: str, signature: str) -> bool:
+    """Require several identical draft frames before declaring a real conflict.
+
+    A resize can leave a stable historic ``›`` block on screen briefly while
+    Codex redraws its composer.  Never paste into it, but do not permanently fail
+    the outbox from that single observation either.
+    """
+    signature = str(signature or "")[:64]
+
+    def change(row):
+        previous = str(row.get("composer_editing_signature") or "")
+        attempts = int(row.get("composer_editing_attempts") or 0) + 1 \
+            if previous == signature else 1
+        row["composer_editing_signature"] = signature
+        row["composer_editing_attempts"] = attempts
+        row.pop("composer_attempts", None)
+        if attempts >= COMPOSER_EDITING_RETRY_LIMIT:
+            row.update(state="failed",
+                       error="终端草稿中有内容，请重试并选择是否覆盖")
+            row.pop("ready_at", None)
+        else:
+            row["ready_at"] = time.time() + COMPOSER_RETRY_DELAY
+
+    result = _update(item_id, change)
+    return bool(result and result.get("state") == "queued")
+
+
 def mark_delivering(item_id: str, now: float | None = None) -> bool:
     now = time.time() if now is None else now
     def change(row):
@@ -183,6 +243,9 @@ def mark_delivering(item_id: str, now: float | None = None) -> bool:
         _snapshot_confirmation_cursor(row)
         row.pop("ready_at", None)
         row.pop("error", None)
+        row.pop("composer_attempts", None)
+        row.pop("composer_editing_signature", None)
+        row.pop("composer_editing_attempts", None)
     return _update(item_id, change) is not None
 
 
@@ -217,6 +280,9 @@ def retry(item_id: str, activity: dict | None = None, uid: str = "") -> dict | N
                    activity_ts=(activity or {}).get("ts"))
         row.pop("error", None)
         row.pop("delivered_at", None)
+        row.pop("composer_attempts", None)
+        row.pop("composer_editing_signature", None)
+        row.pop("composer_editing_attempts", None)
         row["after_ts"] = datetime.now(timezone.utc).isoformat()
         if state in {"idle", "aborted", "failed"}:
             row["ready_at"] = now + READY_DELAY

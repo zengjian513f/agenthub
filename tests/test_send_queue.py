@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -17,6 +18,19 @@ class SendQueueTests(unittest.TestCase):
     def tearDown(self):
         self.file_patch.stop()
         self.tmp.cleanup()
+
+    def test_snapshot_carries_atomic_process_epoch_and_revision(self):
+        before = send_queue.snapshot("codex:u")
+        self.assertEqual(before["outbox"], [])
+        self.assertTrue(before["outbox_version"]["epoch"])
+
+        send_queue.enqueue("codex:u", "pane", "消息", [], None, "snapshot")
+        after = send_queue.snapshot("codex:u")
+        self.assertEqual([x["id"] for x in after["outbox"]], ["snapshot"])
+        self.assertEqual(after["outbox_version"]["epoch"],
+                         before["outbox_version"]["epoch"])
+        self.assertGreater(after["outbox_version"]["revision"],
+                           before["outbox_version"]["revision"])
 
     def test_busy_codex_waits_for_native_turn_end_then_confirms(self):
         item = send_queue.enqueue(
@@ -177,13 +191,16 @@ class SendQueueTests(unittest.TestCase):
                 patch.object(server.term, "submit_text") as submit, \
                 patch.object(server.time, "sleep"):
             server._deliver_outbox_item(row, [pane])
+            self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "queued")
+            for _ in range(send_queue.COMPOSER_EDITING_RETRY_LIMIT - 1):
+                server._deliver_outbox_item(send_queue.tracked()[0], [pane])
 
         submit.assert_not_called()
         failed = send_queue.list_for("codex:u")[0]
         self.assertEqual(failed["state"], "failed")
-        self.assertIn("输入框已有内容", failed["error"])
+        self.assertIn("终端草稿中有内容", failed["error"])
 
-    def test_idle_unknown_screen_fails_without_mutating_terminal(self):
+    def test_idle_unknown_screen_retries_then_fails_without_mutating_terminal(self):
         send_queue.enqueue(
             "codex:u", "sesman-codex-u", "继续消息", [],
             {"state": "idle"}, "unknown")
@@ -200,6 +217,9 @@ class SendQueueTests(unittest.TestCase):
                 patch.object(server.term, "submit_text") as submit, \
                 patch.object(server.time, "sleep"):
             server._deliver_outbox_item(row, [pane])
+            self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "queued")
+            for _ in range(send_queue.COMPOSER_RETRY_LIMIT - 1):
+                server._deliver_outbox_item(send_queue.tracked()[0], [pane])
 
         leave.assert_not_called()
         keys.assert_not_called()
@@ -249,7 +269,7 @@ class SendQueueTests(unittest.TestCase):
         self.assertIn("先重试或移除", result["error"])
         self.assertEqual(len(send_queue.list_for("codex:u")), 1)
 
-    def test_web_send_rejects_nonempty_codex_composer_before_enqueue(self):
+    def test_web_send_requests_confirmation_for_nonempty_codex_composer(self):
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
         pane = {"name": "sesman-codex-u"}
         footer = "gpt-5.6-sol · Context 19% used · Ready"
@@ -266,7 +286,65 @@ class SendQueueTests(unittest.TestCase):
             })
 
         self.assertEqual(result["_status"], 409)
-        self.assertIn("输入框已有内容", result["error"])
+        self.assertTrue(result["draft_conflict"])
+        self.assertEqual(
+            result["draft_token"],
+            hashlib.sha256(screen.encode("utf-8")).hexdigest())
+        self.assertEqual(send_queue.list_for("codex:u"), [])
+
+    def test_confirmed_web_send_clears_exact_codex_draft_before_enqueue(self):
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        footer = "gpt-5.6-sol · Context 19% used · Ready"
+        screen = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
+        empty = "\x1b[2m› Ask Codex to do anything\x1b[0m\n\n" + footer
+        token = hashlib.sha256(screen.encode("utf-8")).hexdigest()
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture", side_effect=[screen, empty]), \
+                patch.object(server.term, "leave_copy_mode") as leave, \
+                patch.object(server.term, "send_keys") as keys, \
+                patch.object(server.time, "sleep"), \
+                patch.object(server.OUTBOX_WAKE, "set") as wake:
+            result = handler._queue_message({
+                "uid": "codex:u", "name": pane["name"], "text": "网页新消息",
+                "request_id": "confirmed", "overwrite_draft": token,
+            })
+
+        self.assertEqual(result["_status"], 200)
+        leave.assert_called_once_with(pane["name"])
+        keys.assert_called_once_with(pane["name"], "C-c")
+        wake.assert_called_once_with()
+        self.assertEqual(
+            [(item["id"], item["text"]) for item in send_queue.list_for("codex:u")],
+            [("confirmed", "网页新消息")])
+
+    def test_changed_codex_draft_is_never_cleared_by_stale_confirmation(self):
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        screen = ("\x1b[1;2m› \x1b[0m确认期间变化的新草稿\n\n"
+                  "gpt-5.6-sol · Context 19% used · Ready")
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture", return_value=screen), \
+                patch.object(server.term, "send_keys") as keys:
+            result = handler._queue_message({
+                "uid": "codex:u", "name": pane["name"], "text": "网页新消息",
+                "overwrite_draft": "stale-token",
+            })
+
+        self.assertEqual(result["_status"], 409)
+        self.assertTrue(result["draft_conflict"])
+        self.assertNotEqual(result["draft_token"], "stale-token")
+        keys.assert_not_called()
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
     def test_queued_item_can_be_cancelled_before_delivery_claim(self):

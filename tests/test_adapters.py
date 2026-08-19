@@ -343,6 +343,59 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertEqual(rewound_text,
                          ["共同开头", "共同回答", "已回到共同回答之后"])
 
+    def test_compaction_keeps_selected_precompact_branch_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "compacted-tree.jsonl"
+
+            def row(kind, uid, parent, text, **extra):
+                record = {
+                    "type": kind, "uuid": uid, "parentUuid": parent,
+                    "isSidechain": False, "timestamp": "2026-08-18T09:00:00Z",
+                    **extra,
+                }
+                if kind in {"user", "assistant"}:
+                    record["message"] = {"role": kind, "content": text}
+                elif text:
+                    record["content"] = text
+                return record
+
+            before = [
+                row("user", "u0", None, "共同开头"),
+                row("assistant", "a0", "u0", "压缩前保留的回答"),
+                row("user", "u-abandoned", "a0", "双 Esc 后放弃的输入"),
+                row("assistant", "a-abandoned", "u-abandoned", "放弃分支的回答"),
+                {"type": "last-prompt", "leafUuid": "a0"},
+            ]
+            after = [
+                row("system", "compact", None, "Conversation compacted",
+                    subtype="compact_boundary"),
+                row("user", "summary", "compact", "内部压缩摘要",
+                    isCompactSummary=True),
+                row("user", "u1", "summary", "压缩后的新问题"),
+                row("assistant", "a1", "u1", "压缩后的新回答"),
+            ]
+            lines = [json.dumps(item, ensure_ascii=False) + "\n"
+                     for item in [*before, *after]]
+            transcript.write_text("".join(lines))
+            boundary_start = len("".join(lines[:len(before)]).encode())
+            adapter = adapters.ClaudeAdapter()
+
+            messages, _ = adapter.read(str(transcript))
+            extends = adapter.append_extends(
+                str(transcript), boundary_start, "a0")
+
+        self.assertEqual(
+            [(m["role"], m["text"]) for m in messages
+             if m["role"] != "status"],
+            [
+                ("user", "共同开头"),
+                ("assistant", "压缩前保留的回答"),
+                ("event", "已压缩"),
+                ("user", "压缩后的新问题"),
+                ("assistant", "压缩后的新回答"),
+            ])
+        self.assertTrue(extends)
+
     def test_compact_protocol_becomes_one_event_for_full_and_incremental_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "session.jsonl"
@@ -992,6 +1045,31 @@ class ToolSummaryTests(unittest.TestCase):
                          ["enqueue", "remove", "dequeue"])
         self.assertTrue(all(m["silent"] for m in queue_events))
         self.assertTrue(all(not m["counted"] for m in queue_events))
+
+    def test_claude_human_queued_command_is_user_but_task_notification_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            rows = [
+                {"type": "queue-operation", "operation": "enqueue",
+                 "timestamp": "2026-08-18T04:27:00Z", "content": "排队的人类输入"},
+                {"type": "queue-operation", "operation": "remove",
+                 "timestamp": "2026-08-18T04:27:01Z", "content": "排队的人类输入"},
+                {"type": "attachment", "timestamp": "2026-08-18T04:27:00Z",
+                 "attachment": {"type": "queued_command", "commandMode": "prompt",
+                                "origin": {"kind": "human"},
+                                "prompt": "排队的人类输入"}},
+                {"type": "attachment", "timestamp": "2026-08-18T04:27:02Z",
+                 "attachment": {"type": "queued_command",
+                                "commandMode": "task-notification",
+                                "prompt": "后台任务完成通知"}},
+            ]
+            f.write_text("\n".join(json.dumps(x, ensure_ascii=False)
+                                     for x in rows) + "\n")
+            msgs, _ = adapters.ClaudeAdapter().read(str(f))
+
+        self.assertEqual([m["text"] for m in msgs if m["role"] == "user"],
+                         ["排队的人类输入"])
+        self.assertNotIn("后台任务完成通知", [m["text"] for m in msgs])
 
     def test_claude_notifications_recaps_and_duration_are_events(self):
         with tempfile.TemporaryDirectory() as tmp:

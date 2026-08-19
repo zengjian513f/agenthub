@@ -233,5 +233,15 @@ class TerminalSubmitTests(unittest.TestCase):
         kill_session.assert_called_once_with("sesman-test")
 
 
+class TermCaptureTests(unittest.TestCase):
+    def test_history_capture_joins_old_soft_wraps_before_browser_reflow(self):
+        with patch.object(term, "_session_tmux", return_value="history") as run:
+            self.assertEqual(term.capture_history("sesman-codex-u", 321), "history")
+
+        run.assert_called_once_with(
+            "sesman-codex-u", "capture-pane", "-J", "-p", "-e", "-t",
+            "sesman-codex-u", "-S", "-321")
+
+
 if __name__ == "__main__":
     unittest.main()

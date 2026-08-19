@@ -771,16 +771,28 @@ class ClaudeAdapter:
         """扫描一个读取区间，求其最后叶子的祖先链及实际 EOF。"""
         parents: dict[str, str | None] = {}
         tip = str(declared_tip) if declared_tip else None
+        scan_tip = None
         end = start
         for rec, off in _iter_records(path, start):
             end = off
             uid = cls._graph_uuid(rec, agent)
             if uid:
                 parent = rec.get("parentUuid")
+                # Claude 的 compact_boundary 会故意以 parentUuid=null 开一棵
+                # 新树，供模型从摘要继续；本地 JSONL 中的旧对话却仍然存在。
+                # 对“人看的时间线”，压缩是一个连续边界，应接回边界前由
+                # last-prompt/最后图节点声明的当前叶子。否则每次 compact 后
+                # sesman 都会把全部旧正文误判成已回退分支。
+                if (not parent and scan_tip
+                        and rec.get("type") == "system"
+                        and rec.get("subtype") == "compact_boundary"):
+                    parent = scan_tip
                 parents[uid] = str(parent) if parent else None
             signal = cls._lineage_signal(rec, agent)
-            if signal and not declared_tip:
-                tip = signal
+            if signal:
+                scan_tip = signal
+                if not declared_tip:
+                    tip = signal
         if not tip:
             return None, end
         active: set[str] = set()
@@ -902,14 +914,20 @@ class ClaudeAdapter:
         """
         parents: dict[str, str | None] = {}
         tip = None
+        scan_tip = old_tip
         for rec, _ in _iter_records(path, start):
             uid = cls._graph_uuid(rec, agent)
             if uid:
                 parent = rec.get("parentUuid")
+                if (not parent and scan_tip
+                        and rec.get("type") == "system"
+                        and rec.get("subtype") == "compact_boundary"):
+                    parent = scan_tip
                 parents[uid] = str(parent) if parent else None
             signal = cls._lineage_signal(rec, agent)
             if signal:
                 tip = signal
+                scan_tip = signal
         if not tip:
             return True
         node = tip
@@ -1138,6 +1156,18 @@ class ClaudeAdapter:
                                      event_id=f"compact:{event_id}"))
                 elif rec.get("content"):
                     msgs.append(_msg("system", _stringify(rec["content"]), ts))
+            elif t == "attachment" and not tag:
+                attachment = rec.get("attachment")
+                # Claude 在工具执行期间吸收排队输入时，不一定再写普通 user
+                # 记录，而会把真正参与本轮推理的输入保存成 queued_command。
+                # task-notification 也复用该附件类型，必须同时核对来源和模式。
+                if (isinstance(attachment, dict)
+                        and attachment.get("type") == "queued_command"
+                        and attachment.get("commandMode") == "prompt"
+                        and (attachment.get("origin") or {}).get("kind") == "human"
+                        and isinstance(attachment.get("prompt"), str)
+                        and attachment["prompt"].strip()):
+                    msgs.append(_msg("user", attachment["prompt"], ts))
             elif t == "queue-operation" and not tag:
                 # Claude 忙时会先把网页送入的 prompt 留在自己的内存队列。
                 # enqueue 证明 CLI 确实接收；dequeue/popAll 表示提升为正式 user，

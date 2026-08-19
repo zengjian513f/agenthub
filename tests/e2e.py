@@ -164,7 +164,7 @@ def make_fake_session():
     # 不能拿用户真实会话的文件大小推断命中消息数；大文件也可能只有一条超长消息。
     rows.extend({
         "type": "assistant",
-        "message": {"role": "assistant", "content": "限流样本 " + "a " * 100},
+        "message": {"role": "assistant", "content": "限流样本 " + "markprobe " * 100},
         "uuid": f"cap-{i}", "timestamp": f"2026-08-06T12:01:{i:02d}.000Z",
         "cwd": "/tmp/sesman-selftest", "sessionId": sid,
     } for i in range(45))
@@ -284,7 +284,7 @@ def run(pw):
         operation:'remove', text:'q'}),
       states:[SESMAN_CLIS.claude.createQueuedMessage({created:1000}).state,
         SESMAN_CLIS.codex.createQueuedMessage({created:1000}).state],
-      claudeExpires:SESMAN_CLIS.claude.queuedMessageExpired(
+      claudeSettled:SESMAN_CLIS.claude.settleQueuedMessage(
         SESMAN_CLIS.claude.createQueuedMessage({created:1000}), 9001, true),
       claudeMigration:SESMAN_CLIS.claude.migrateQueuedMessages(
         [{id:'old', created:1000}], 2, 3),
@@ -322,7 +322,9 @@ def run(pw):
           and cli_layers["claudePopAll"] == {"type": "promote-all"}
           and cli_layers["codexRemove"] is None
           and cli_layers["states"] == ["sending", "queued"]
-          and cli_layers["claudeExpires"] is True
+          and cli_layers["claudeSettled"] == {
+              "created": 1000, "state": "failed",
+              "error": "Claude 未在会话记录中确认接收"}
           and cli_layers["claudeMigration"] == [{"id": "old", "created": 1000,
                                                   "state": "sending", "expiresAt": 9000,
                                                   "legacy": True}]
@@ -342,36 +344,44 @@ def run(pw):
       if (!session) return {error:'no codex session'};
       const uid = session.uid, key = viewKey(uid), name = `sesman-codex-${session.sid.slice(0, 8)}`;
       const oldPost = post, oldList = T.list, oldEntry = cache.get(key);
-      const oldQueued = S.queued.get(uid);
+      const oldQueued = S.queued.get(uid), oldConfirm = window.confirm;
       const requests = [];
+      const confirmations = [];
       T.list = [...(T.list || []), {uid, name}];
       cache.set(key, {activity:{state:'working', ts:'2026-08-09T10:00:00Z'}, msgs:[],
         end:123, version:{head:'head-token'}, anchor:'anchor-token'});
       post = async (url, body) => {
         requests.push({url, body});
         if (url === 'api/session/send') {
+          if (!body.overwrite_draft) {
+            return {draft_conflict:true, draft_token:'confirmed-draft-v1', outbox:[]};
+          }
           return {ok:true, outbox:[{id:'server-1', uid, text:body.text,
             created:1000, state:'queued', server:true}]};
         }
         return {ok:true};
       };
+      window.confirm = text => { confirmations.push(text); return true; };
       try {
         await sendToSession('由服务端托管的 Codex 消息', null, uid);
         await sendToSession(null, ['Escape'], uid);
       }
       finally {
-        post = oldPost; T.list = oldList;
+        post = oldPost; T.list = oldList; window.confirm = oldConfirm;
         if (oldEntry) cache.set(key, oldEntry); else cache.delete(key);
       }
       const shown = queuedMessages(uid)[0];
       const persisted = store.get('queuedMessages', []).flatMap(x => x[1] || [])
         .some(x => x.text === '由服务端托管的 Codex 消息');
       if (oldQueued) S.queued.set(uid, oldQueued); else S.queued.delete(uid);
-      const queuedRequest = requests.find(x => x.url === 'api/session/send');
+      const queuedRequests = requests.filter(x => x.url === 'api/session/send');
+      const queuedRequest = queuedRequests.at(-1);
       const escapeRequest = requests.find(x => x.url === 'api/term/send');
       return {url:queuedRequest?.url, uid:queuedRequest?.body?.uid,
         activity:queuedRequest?.body?.activity?.state, shown:shown?.state,
         cursor:queuedRequest?.body?.cursor, server:shown?.server, persisted,
+        overwrite:queuedRequest?.body?.overwrite_draft,
+        attempts:queuedRequests.length, confirmations,
         escapeKeys:escapeRequest?.body?.keys};
     }""")
     check("Codex 网页消息先进入服务端队列且不再写浏览器乐观队列",
@@ -380,8 +390,55 @@ def run(pw):
                              "cursor": {"start": 123, "head": "head-token",
                                         "anchor": "anchor-token"},
                              "server": True, "persisted": False,
+                             "overwrite": "confirmed-draft-v1", "attempts": 2,
+                             "confirmations": ["终端草稿中有内容，是否覆盖？"],
                              "escapeKeys": ["Escape"]}
           and str(codex_delivery.get("uid", "")).startswith("codex:"), codex_delivery)
+    codex_draft_decline = p.evaluate("""async () => {
+      const session = S.sessions.find(x => x.source === 'codex');
+      if (!session) return {error:'no codex session'};
+      const uid = session.uid, name = `sesman-codex-${session.sid.slice(0, 8)}`;
+      const oldPost = post, oldFetch = window.fetch, oldConfirm = window.confirm;
+      const oldList = T.list, oldComposerUid = composerUid;
+      const oldDraft = composerDrafts.get(uid), oldInput = $('#cinput').value;
+      const postCalls = [], confirmations = [];
+      let uploads = 0;
+      T.list = [...(T.list || []), {uid, name}];
+      composerUid = uid;
+      composerDrafts.set(uid, {text:'不要丢失的网页草稿', quotes:[],
+        attachments:[{id:'decline-file', number:1,
+          file:new File(['x'], '不应上传.txt', {type:'text/plain'}), kind:'file'}],
+        nextAttachmentNumber:2});
+      $('#cinput').value = '不要丢失的网页草稿';
+      post = async (url, body) => {
+        postCalls.push({url, body});
+        if (url === 'api/session/draft-status') {
+          return {ok:true, draft_state:'editing', draft_conflict:true,
+            draft_token:'declined-draft-v1'};
+        }
+        return {ok:true};
+      };
+      window.fetch = async () => { uploads += 1; throw new Error('不应上传'); };
+      window.confirm = text => { confirmations.push(text); return false; };
+      try {
+        await submitComposer();
+        const draft = composerDrafts.get(uid);
+        return {postUrls:postCalls.map(x => x.url), confirmations, uploads,
+          input:$('#cinput').value, text:draft.text, files:draft.attachments.length};
+      } finally {
+        post = oldPost; window.fetch = oldFetch; window.confirm = oldConfirm;
+        T.list = oldList; composerUid = oldComposerUid; $('#cinput').value = oldInput;
+        if (oldDraft) composerDrafts.set(uid, oldDraft); else composerDrafts.delete(uid);
+        renderComposerItems();
+      }
+    }""")
+    check("拒绝覆盖终端草稿时不上传、不入队并保留网页输入",
+          codex_draft_decline == {
+              "postUrls": ["api/session/draft-status"],
+              "confirmations": ["终端草稿中有内容，是否覆盖？"],
+              "uploads": 0, "input": "不要丢失的网页草稿",
+              "text": "不要丢失的网页草稿", "files": 1,
+          }, codex_draft_decline)
     diff_race = p.evaluate("""async () => {
       const uid = 'codex:synthetic-diff-race', key = viewKey(uid);
       const oldEntry = cache.get(key), oldQueued = S.queued.get(uid);
@@ -423,6 +480,40 @@ def run(pw):
               "current": {"queued": 0, "messages": ["不能消失的消息"], "end": 120},
               "outboxOnly": {"queued": 1, "messages": 0, "end": 100},
           }, diff_race)
+    outbox_order = p.evaluate("""() => {
+      const uid = 'codex:synthetic-outbox-order';
+      const oldQueued = S.queued.get(uid), oldVersion = S.outboxVersions.get(uid);
+      const item = (id, text) => ({id, uid, text, created:1000,
+        state:'queued', server:true});
+      try {
+        syncServerOutbox(uid, [item('one', '第一条'), item('two', '第二条')],
+          {epoch:'e2e-old-process', revision:5});
+        syncServerOutbox(uid, [item('one', '第一条')],
+          {epoch:'e2e-old-process', revision:4});
+        const staleRevision = queuedMessages(uid).map(x => x.id);
+        syncServerOutbox(uid, [item('one', '第一条')],
+          {epoch:'e2e-new-process', revision:1});
+        const restarted = queuedMessages(uid).map(x => x.id);
+        syncServerOutbox(uid, [item('one', '第一条'), item('two', '第二条')],
+          {epoch:'e2e-old-process', revision:6});
+        return {staleRevision, restarted,
+          delayedOldProcess:queuedMessages(uid).map(x => x.id),
+          version:S.outboxVersions.get(uid)};
+      } finally {
+        if (oldQueued) S.queued.set(uid, oldQueued); else S.queued.delete(uid);
+        if (oldVersion) S.outboxVersions.set(uid, oldVersion);
+        else S.outboxVersions.delete(uid);
+        S.retiredOutboxEpochs.delete('e2e-old-process');
+        S.retiredOutboxEpochs.delete('e2e-new-process');
+      }
+    }""")
+    check("Codex 队列拒绝旧修订，并在服务重启后拒绝旧进程迟到快照",
+          outbox_order == {
+              "staleRevision": ["one", "two"],
+              "restarted": ["one"],
+              "delayedOldProcess": ["one"],
+              "version": {"epoch": "e2e-new-process", "revision": 1},
+          }, outbox_order)
     script_order = p.locator("script[src]").evaluate_all(
         "nodes => nodes.map(n => n.getAttribute('src').split('?')[0])")
     check("会话列表脚本不再被大型终端和公式库阻塞",
@@ -679,6 +770,13 @@ def run(pw):
     p.press("#q", "Enter")
     p.wait_for_function("document.querySelector('#stat').textContent.includes('命中')", timeout=120000)
     check("海量结果提示已截断", "截断" in p.locator("#stat").inner_text(), p.locator("#stat").inner_text())
+    seq = p.get_attribute("#stat", "data-seq") or ""
+    p.fill("#q", "markprobe")
+    p.press("#q", "Enter")
+    p.wait_for_function(
+        f"document.querySelector('#stat').dataset.seq !== '{seq}'"
+        " && !document.querySelector('#stat').textContent.includes('搜索中')",
+        timeout=120000)
     p.locator(".item").filter(has_text="SESMAN自测").first.click()
     p.wait_for_selector(".msg", timeout=60000)
     n_mark = p.locator("#msgs mark").count()
@@ -1978,9 +2076,12 @@ def run(pw):
     with open(extra, "a") as fh:
         fh.write(json.dumps({
             "type": "assistant", "message": {"role": "assistant", "content": "后台回复未读BBQ"},
-            "uuid": "n2", "timestamp": "2026-08-07T09:00:01.000Z",
+            "uuid": "n2", "parentUuid": "n1", "timestamp": "2026-08-07T09:00:01.000Z",
             "cwd": "/tmp/sesman-selftest", "sessionId": extra.stem,
         }, ensure_ascii=False) + "\n")
+    # 服务端会在 500ms 内复用刚发布的 inventory；这里明确跨过该去抖窗口，
+    # 测的是后台增量/未读，而不是同一瞬间重复刷新是否重扫磁盘。
+    p.wait_for_timeout(600)
     p.evaluate("pollSessions()")
     p.wait_for_timeout(3000)
     extra_badge = p.locator(f'.item[data-uid="{extra_uid}"] .item-status')
@@ -2111,9 +2212,15 @@ def run(pw):
     n_before = p.locator(".item").count()
     p.click("#reload")
     p.wait_for_function(
-        f"() => document.querySelectorAll('.item').length === {n_before}"
+        f"() => document.querySelector('.item[data-uid=\"{fake_uid}\"]')"
         " && !document.querySelector('#stat').textContent.includes('扫描')", timeout=30000)
-    check("刷新后列表数量不变", p.locator(".item").count() == n_before, p.locator(".item").count())
+    n_refreshed = p.locator(".item").count()
+    # 自动化与用户真实会话共用索引，刷新期间真实会话可能恰好增删；确定性
+    # 验证自测会话和非搜索态，不把全局总数当成刷新正确性的前提。
+    check("刷新后会话列表保持完整",
+          p.locator(f'.item[data-uid="{fake_uid}"]').count() == 1
+          and p.evaluate("S.results === null"),
+          {"before": n_before, "after": n_refreshed})
 
     # ---- 14c. 搜索态下切换来源筛选 ----
     p.fill("#q", "sesman")
@@ -2131,7 +2238,10 @@ def run(pw):
     check("恢复来源后搜索结果还在", p.locator(".item").count() == hit_all)
     p.fill("#q", "")
     p.wait_for_timeout(300)
-    check("清空输入退出搜索态", p.locator(".item").count() == n_before, p.locator(".item").count())
+    check("清空输入退出搜索态",
+          p.evaluate("S.results === null")
+          and p.locator(f'.item[data-uid="{fake_uid}"]').count() == 1,
+          p.locator(".item").count())
 
     # ---- 14d. 折叠预览不冒充 header ----
     p.locator(".item").first.click()
@@ -2450,8 +2560,11 @@ def run(pw):
         check("一键接管起了 tmux 会话", tname.startswith("sesman-claude-"), tname)
         check("新接管会话使用 sesman 专用 server", tserver == "sesman", tserver)
         check("接管未弹确认框(会话本来就没在跑)", not dialogs, dialogs[:1])
-        check("终端出现在会话底部", p.locator("#termpane").is_visible())
-        check("消息流还在上方", p.locator("#msgs .msg").count() > 0)
+        check("首次打开默认纯终端而不是分屏",
+              p.locator("#termpane").is_visible()
+              and p.evaluate("T.mode") == "full"
+              and p.locator("#msgs").evaluate("n => getComputedStyle(n).display") == "none"
+              and p.locator("#msgs .msg").count() > 0)
         ctrl_lock = p.evaluate("""() => {
           T.term.textarea.dispatchEvent(new KeyboardEvent('keydown', {
             key:'Control', code:'ControlRight', location:2, ctrlKey:true, bubbles:true
@@ -2470,7 +2583,9 @@ def run(pw):
                             "ctrlT": 20, "released": True},
               ctrl_lock)
         check("终端不再提供全屏模式", p.locator("#term-exclusive").count() == 0)
-        check("按钮变成收起终端", p.locator("#a-term").get_attribute("title") == "收起终端",
+        check("纯终端的切换键指向对话",
+              p.locator("#a-term").get_attribute("title") == "切换到对话"
+              and p.locator("#a-term use").get_attribute("href") == "#i-chat",
               p.locator("#a-term").get_attribute("title"))
         check("终端不再增加已接管状态栏",
               p.locator(".thead, #tstatus").count() == 0
@@ -2481,6 +2596,59 @@ def run(pw):
           return s.trim().length > 40;
         }""", timeout=30000)
         check("终端里 CLI 已经在跑", True)
+        prompt_reveal = p.evaluate("""async () => {
+          const prompt = {id:'terminal-live-question', state:'waiting', kind:'approval',
+            questions:[{header:'命令审批', question:'是否继续？', multiple:false,
+              options:[{label:'允许本次', key:'y'}, {label:'拒绝', key:'Escape'}]}]};
+          await applyDiff(S.sel, {prompt_only:true, prompt});
+          const first = {mode:T.mode, live:document.querySelectorAll('.live-question').length,
+            messages:getComputedStyle($('#msgs')).display, title:$('#a-term').title};
+          // 看过题卡后，用户仍有权主动回到原生终端；同一题目的后台轮询/恢复
+          // 不应再次抢走界面。
+          $('#a-term').click();
+          restoreTermPane(S.sel, S.agent);
+          const manual = T.mode;
+          await applyDiff(S.sel, {prompt_only:true, prompt:null});
+          return {first, manual};
+        }""")
+        check("纯终端收到实时选择题会自动切到对话且只切一次",
+              prompt_reveal["first"] == {
+                  "mode": "collapsed", "live": 1, "messages": "block",
+                  "title": "切换到终端",
+              } and prompt_reveal["manual"] == "full", prompt_reveal)
+        # 默认没有分屏。用户从纯终端的下边界向下拉到中间后才进入分屏；
+        # 分屏状态点顶栏键仍是“切到纯终端”，而不是关闭终端对象。
+        grip = p.locator("#tgrip").bounding_box()
+        right_box = p.locator("#right").bounding_box()
+        split_y = right_box["y"] + right_box["height"] * 0.55
+        p.mouse.move(grip["x"] + grip["width"] / 2,
+                     grip["y"] + grip["height"] / 2)
+        p.mouse.down()
+        p.mouse.move(grip["x"] + grip["width"] / 2, split_y, steps=8)
+        p.mouse.up()
+        p.wait_for_timeout(200)
+        split_layout = p.evaluate("""() => ({
+          mode:T.mode,
+          messages:getComputedStyle($('#msgs')).display,
+          pane:$('#termpane').getBoundingClientRect().height,
+          detail:$('#detail').getBoundingClientRect().height,
+          title:$('#a-term').title,
+          icon:$('#a-term use').getAttribute('href'),
+        })""")
+        check("只有拖动分界线才进入分屏",
+              split_layout["mode"] == "normal"
+              and split_layout["messages"] != "none"
+              and split_layout["pane"] > 100 and split_layout["detail"] > 100,
+              split_layout)
+        check("分屏中的切换键指向纯终端",
+              split_layout["title"] == "切换到终端"
+              and split_layout["icon"] == "#i-terminal", split_layout)
+        p.click("#a-term")
+        p.wait_for_timeout(200)
+        check("分屏点切换键进入纯终端而不是关闭面板",
+              p.evaluate("T.mode") == "full"
+              and p.locator("#termpane").is_visible()
+              and p.locator("#msgs").evaluate("n => getComputedStyle(n).display") == "none")
         terminal_backend = p.evaluate("""() => {
           const view = currentTermViewObject();
           return {renderer:view.renderer, unicode:view.term.unicode.activeVersion,
@@ -2594,20 +2762,31 @@ def run(pw):
         check("纯对话吸附态不会把隐藏终端尺寸发送给 tmux",
               collapsed_fit == 0, collapsed_fit)
 
-        # 收起只是断开, tmux 会话必须还在 —— 这是选 tmux 承载的意义
+        # 切到纯对话只隐藏终端视图；xterm、WebSocket 和 tmux 都必须原样保留。
+        p.evaluate("window.__keptSwitchSocket = T.ws")
         p.click("#a-term")
         p.wait_for_timeout(600)
-        check("收起后面板隐藏", p.locator("#termpane").is_hidden())
-        check("按钮变成展开终端", p.locator("#a-term").get_attribute("title") == "展开终端",
+        check("切换键进入纯对话而不是默认分屏",
+              p.evaluate("T.mode") == "collapsed"
+              and p.locator("#termpane").is_hidden()
+              and p.locator("#msgs").is_visible())
+        check("纯对话的切换键指向终端",
+              p.locator("#a-term").get_attribute("title") == "切换到终端"
+              and p.locator("#a-term use").get_attribute("href") == "#i-terminal",
               p.locator("#a-term").get_attribute("title"))
+        check("切到对话时终端连接和对象常驻",
+              p.evaluate("T.ws === window.__keptSwitchSocket"
+                         " && T.views.get(T.name)?.ws === window.__keptSwitchSocket"))
         after = json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())
-        check("收起后 tmux 会话仍存活", any(s["name"] == tname for s in after["sessions"]))
+        check("切到对话后 tmux 会话仍存活", any(s["name"] == tname for s in after["sessions"]))
 
-        # 再点一次: 已接管的会话直接展开终端, 不重复起
+        # 再点一次直接切回纯终端，不重复起、不重新连接。
         p.click("#a-term")
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=60000)
         n_now = len(json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())["sessions"])
-        check("再次打开复用同一会话", p.evaluate("T.name") == tname and n_now == len(after["sessions"]),
+        check("切回终端复用同一会话和连接",
+              p.evaluate("T.mode === 'full' && T.ws === window.__keptSwitchSocket")
+              and p.evaluate("T.name") == tname and n_now == len(after["sessions"]),
               f'{p.evaluate("T.name")} {n_now}')
 
         # 切会话只隐藏当前网页视图，xterm 和 WebSocket 都应继续存活；回来直接复用。
@@ -2668,6 +2847,16 @@ def run(pw):
               composer_single_line["esc"] == composer_single_line["send"], composer_single_line)
 
         # 空输入时用 ↑ 取回当前会话的历史输入；Enter 只回填，不直接发送。
+        # 接管目标由真实会话中动态挑选，可能本来只有一条输入；浏览器内补两条
+        # 确定性样本，测试结束即移除，不修改用户的 JSONL。
+        p.evaluate("""() => {
+          const entry = cache.get(viewKey(S.sel));
+          entry.msgs.push(
+            {role:'user', text:'输入历史自测甲', ts:'2026-08-18T00:00:00Z',
+             event_id:'e2e-input-history-a'},
+            {role:'user', text:'输入历史自测乙', ts:'2026-08-18T00:00:01Z',
+             event_id:'e2e-input-history-b'});
+        }""")
         p.fill("#cinput", "")
         p.press("#cinput", "ArrowUp")
         p.wait_for_selector("#input-history .input-history-item", timeout=10000)
@@ -2705,6 +2894,10 @@ def run(pw):
               p.locator("#input-history").is_hidden()
               and p.input_value("#cinput") == "已有草稿")
         p.fill("#cinput", "")
+        p.evaluate("""() => {
+          const entry = cache.get(viewKey(S.sel));
+          entry.msgs = entry.msgs.filter(x => !String(x.event_id || '').startsWith('e2e-input-history-'));
+        }""")
 
         p.click("#cadd")
         check("加号菜单提供图片视频音频文件和引用",
@@ -2898,7 +3091,17 @@ def run(pw):
           queuePendingUserMessage(u, '没有进入 Claude 的幽灵指令');
           expireQueuedMessages(Date.now() + 9000);
         }""", target)
-        check("未获得原生回执的 Claude 副本会自动撤掉", queued.count() == 0)
+        check("未获得原生回执的 Claude 消息保留为可处理的未确认状态",
+              queued.count() == 1
+              and "发送未确认" in queued.inner_text()
+              and queued.locator(".client-pending-actions button").all_inner_texts()
+                  == ["重试", "移除"])
+        p.evaluate("""u => {
+          reconcileQueuedMessages(u, [{role:'user', text:'没有进入 Claude 的幽灵指令',
+            ts:new Date().toISOString()}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+        }""", target)
+        check("迟到的 Claude 原生记录仍会清掉未确认副本", queued.count() == 0)
         p.evaluate("""({u, media}) => queuePendingUserMessage(
           u, '等待前一轮完成的指令', [{...media, gallery:true}])""",
                    {"u": target, "media": image_attachment_response["media"]})
@@ -2908,6 +3111,37 @@ def run(pw):
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
         }""", target)
         check("原生用户消息出现后移除乐观排队副本", queued.count() == 0)
+        cached_reconcile = p.evaluate("""u => {
+          const entry = cache.get(viewKey(u));
+          const original = entry.msgs;
+          const boundary = new Date(Date.now() + 86400000).toISOString();
+          entry.msgs = [...original,
+            {role:'user', text:'完全相同的上一条', ts:boundary}];
+          S.queued.set(u, [{id:'same-next', text:'完全相同的上一条',
+            state:'sending', created:Date.now(), afterTs:boundary, media:[]}]);
+          renderConversationTail(entry.activity, u);
+          const samePreviousKept = queuedMessages(u).length;
+          entry.msgs.push({role:'user', text:'完全相同的上一条',
+            ts:new Date(Date.parse(boundary) + 1000).toISOString()});
+          renderConversationTail(entry.activity, u);
+          const newerRemoved = queuedMessages(u).length;
+
+          const missedBoundary = new Date(Date.parse(boundary) + 2000).toISOString();
+          entry.msgs.push({role:'user', text:'已在缓存但错过增量对账',
+            ts:new Date(Date.parse(missedBoundary) + 1000).toISOString()});
+          S.queued.set(u, [{id:'missed-diff', text:'已在缓存但错过增量对账',
+            state:'sending', created:Date.now(), afterTs:missedBoundary, media:[]}]);
+          renderConversationTail(entry.activity, u);
+          const cachedRemoved = queuedMessages(u).length;
+          entry.msgs = original;
+          S.queued.delete(u); saveQueuedMessages();
+          renderConversationTail(entry.activity, u);
+          return {samePreviousKept, newerRemoved, cachedRemoved};
+        }""", target)
+        check("Claude 队尾重画会清掉已进缓存的假排队且不误删同文新消息",
+              cached_reconcile == {"samePreviousKept": 1,
+                                   "newerRemoved": 0, "cachedRemoved": 0},
+              cached_reconcile)
         p.evaluate("""u => {
           S.queued.set(u, [{id:'legacy-clock-skew', text:'旧版残留',
             created:Date.now() + 3600000, media:[]}]);
@@ -3136,6 +3370,9 @@ def run(pw):
 
         # 手机锁屏/切后台会冻结 WebSocket，但 tmux 本体仍在。模拟 pagehide/pageshow，
         # 恢复后必须换一条 socket，并且输入、输出都继续工作。
+        p.evaluate("T.term.focus()")
+        check("锁屏前终端确实持有输入焦点",
+              p.evaluate("T.views.get(T.name).host.contains(document.activeElement)"))
         p.evaluate("""() => {
           window.__termWsBeforeSleep = T.ws;
           window.dispatchEvent(new PageTransitionEvent('pagehide'));
@@ -3505,12 +3742,18 @@ def run(pw):
     p.locator(".item").first.click()
     p.wait_for_selector(".dhead h2", timeout=15000)
     title = p.locator(".dhead h2").inner_text()
-    p.locator(".ghead").first.click()          # 折叠一个分组
+    persisted_group = p.locator(".group").first
+    persisted_group_key = persisted_group.get_attribute("data-key")
+    group_was_closed = "closed" in (persisted_group.get_attribute("class") or "")
+    persisted_group.locator(".ghead").click()  # 翻转一个分组
     p.wait_for_timeout(200)
     p.reload(wait_until="networkidle")
-    # 第一个分组是折叠的, 等 .item 可见会超时 —— 等分组本身
+    # 只要求刷新后保持刚才的翻转结果；前面的交互可能已经折叠了第一组。
     p.wait_for_selector(".ghead", timeout=15000)
-    check("分组折叠状态已记住", "closed" in (p.locator(".group").first.get_attribute("class") or ""))
+    persisted_group = p.locator(f'.group[data-key="{persisted_group_key}"]')
+    group_is_closed = "closed" in (persisted_group.get_attribute("class") or "")
+    check("分组折叠状态已记住", group_is_closed != group_was_closed,
+          {"before": group_was_closed, "after": group_is_closed})
     check("视图模式已记住", "on" in (p.locator('#view button[data-v="date"]').get_attribute("class") or ""))
     check("时间轴的目录行随之恢复", p.locator(".item .cwd").count() > 0)
     check("来源筛选已记住", "off" in (p.locator(".chip").nth(2).get_attribute("class") or ""))
@@ -3519,7 +3762,8 @@ def run(pw):
     check("上次打开的会话已恢复", p.locator(".dhead h2").inner_text() == title,
           p.locator(".dhead h2").inner_text())
     # 复位, 不影响后续用例
-    p.locator(".ghead").first.click()
+    if group_is_closed:
+        persisted_group.locator(".ghead").click()
     p.locator('#view button[data-v="tree"]').click()
     p.locator(".chip").nth(2).click()
     p.locator('#opts button[data-o="case"]').click()
