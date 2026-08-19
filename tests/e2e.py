@@ -1231,18 +1231,20 @@ def run(pw):
     bundled_font = p.evaluate("""() => ({
       loaded: document.fonts.check('12px "Sesman Ubuntu Sans Mono"'),
       requested: performance.getEntriesByName(location.origin + '/fonts/UbuntuSansMono.ttf').length,
-      ratio: terminalFontGridRatio(configuredTermFont(), termFontSize()),
-      dashRatio: (() => {
+      metrics: (() => {
         const context = document.createElement('canvas').getContext('2d');
         context.font = `400 ${termFontSize()}px ${configuredTermFont()}`;
-        return context.measureText('—').width / context.measureText('0').width;
+        const zero = context.measureText('0').width;
+        return {zero, dashRatio:context.measureText('—').width / zero,
+                cjkRatio:context.measureText('中').width / zero};
       })(),
       resolved: termFont()
     })""")
-    check("Ubuntu Sans Mono 网页字体由项目自带且保持双宽网格",
+    check("Ubuntu Sans Mono 网页字体保持原始字号且不越终端网格",
           bundled_font["loaded"] and bundled_font["requested"] > 0
-          and abs(bundled_font["ratio"] - 2) <= .025
-          and abs(bundled_font["dashRatio"] - 1) <= .025
+          and 7.7 <= bundled_font["metrics"]["zero"] <= 8.0
+          and 1.7 <= bundled_font["metrics"]["cjkRatio"] <= 2.025
+          and abs(bundled_font["metrics"]["dashRatio"] - 1) <= .025
           and "Sesman Ubuntu Sans Mono" in bundled_font["resolved"]
           and "Sesman CJK Mono Grid" not in bundled_font["resolved"],
           bundled_font)

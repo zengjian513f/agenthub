@@ -95,8 +95,9 @@ function terminalFontGridRatio(family, size) {
 }
 
 /** Resolve one font face whose CJK glyph is exactly two Latin cells wide.
- * A configured font that already has a 1:2 grid wins; otherwise font
- * availability, not the browser/OS name, decides whether the CJK grid is used. */
+ * Ubuntu keeps its original glyph size: xterm reserves two cells for CJK and
+ * rescaleOverlappingGlyphs prevents wide outlines from crossing cell bounds.
+ * Other mixed stacks still prefer a locally available exact 1:2 font. */
 async function prepareTerminalFont() {
   const configured = configuredTermFont();
   const size = termFontSize();
@@ -112,7 +113,8 @@ async function prepareTerminalFont() {
   try {
     await document.fonts?.load(`${size}px ${configured}`, TERM_FONT_SAMPLE);
     const configuredRatio = terminalFontGridRatio(configured, size);
-    if (Math.abs(configuredRatio - 2) > .025) {
+    const keepUbuntuGlyphs = configured.includes('"Sesman Ubuntu Sans Mono"');
+    if (!keepUbuntuGlyphs && Math.abs(configuredRatio - 2) > .025) {
       const grid = '"Sesman CJK Mono Grid"';
       const faces = await document.fonts?.load(`${size}px ${grid}`, TERM_FONT_SAMPLE);
       const ratio = faces?.length ? terminalFontGridRatio(grid, size) : 0;
