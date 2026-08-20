@@ -1071,6 +1071,22 @@ class ToolSummaryTests(unittest.TestCase):
                          ["排队的人类输入"])
         self.assertNotIn("后台任务完成通知", [m["text"] for m in msgs])
 
+    def test_claude_custom_title_is_a_silent_rename_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            f.write_text(json.dumps({
+                "type": "custom-title", "customTitle": "新标题",
+                "sessionId": "session-1",
+            }, ensure_ascii=False) + "\n")
+
+            msgs, _ = adapters.ClaudeAdapter().read(str(f))
+
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["role"], "command")
+        self.assertEqual(msgs[0]["text"], "/rename 新标题")
+        self.assertTrue(msgs[0]["silent"])
+        self.assertFalse(msgs[0]["counted"])
+
     def test_claude_notifications_recaps_and_duration_are_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             f = Path(tmp) / "s.jsonl"

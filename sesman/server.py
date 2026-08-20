@@ -18,9 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import (claude_bridge, codex_bridge, index, live, media,
-               pending as pending_store, send_queue, session_meta, term,
-               term_ownership, wsock)
+from . import (claude_bridge, claude_queue, codex_bridge, index, live, media,
+               pending as pending_store, send_protocol, send_queue, session_meta,
+               term, term_ownership, wsock)
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
@@ -181,7 +181,31 @@ def _overwrite_codex_draft(name: str, expected_token: str) -> dict | None:
 
 
 def _poll_outbox() -> None:
-    """即使浏览器断开，也独立从 Codex rollout 追踪完成与接收事件。"""
+    """即使浏览器断开，也独立从原生记录追踪完成与接收事件。"""
+    for item in claude_queue.tracked():
+        uid = str(item.get("uid") or "")
+        s = index.get(uid)
+        if not s or s.get("source") != "claude":
+            continue
+        try:
+            start = int(item.get("watch_start") or 0)
+            head = str(item.get("watch_head") or "")
+            anchor = str(item.get("watch_anchor") or "")
+            if head and anchor:
+                result = index.messages_for(s, start=start, head=head, anchor=anchor)
+            else:
+                result = index.messages_for(s, append_only=True)
+            cursor = {
+                "start": result["end"],
+                "head": result["version"]["head"],
+                "anchor": result["anchor"],
+                "reset": result.get("reset", False),
+            }
+            claude_queue.observe(
+                uid, result["messages"], result.get("activity"), cursor)
+        except (OSError, ValueError, KeyError):
+            continue
+
     for item in send_queue.tracked():
         uid = str(item.get("uid") or "")
         s = index.get(uid)
@@ -266,13 +290,37 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
         send_queue.mark_failed(item["id"], str(e))
 
 
+def _deliver_claude_item(item: dict, panes: list[dict]) -> None:
+    """Resume only the state that proves no terminal write has begun yet."""
+    uid = str(item.get("uid") or "")
+    s = index.get(uid)
+    pane = _pane_for_session(s, panes) if s and s.get("source") == "claude" else None
+    if not pane or pane["name"] != str(item.get("name") or ""):
+        return
+    # Handler and background loop can see the same persisted row. Exactly one
+    # process path may change it to injecting; all others become status readers.
+    claimed = claude_queue.mark_injecting(str(item.get("id") or ""), uid)
+    if not claimed:
+        return
+    try:
+        term.leave_copy_mode(pane["name"])
+        term.submit_text(pane["name"], str(item.get("text") or ""))
+        claude_queue.mark_submitted(str(item.get("id") or ""), uid)
+    except Exception as error:
+        # Once the atomic claim is persisted, the exact crash point is unknown;
+        # never turn it back into a retryable row.
+        claude_queue.mark_ambiguous(
+            str(item.get("id") or ""), uid, str(error))
+
+
 def _outbox_loop() -> None:
-    """只交付服务端已经判定可发送的 Codex 队首消息。"""
+    """交付可证明安全的 Claude persisted 项和 Codex 队首消息。"""
     while True:
         _poll_outbox()
         send_queue.expire_deliveries()
-        ready = send_queue.ready()
-        if not ready:
+        claude_ready = claude_queue.ready()
+        codex_ready = send_queue.ready()
+        if not claude_ready and not codex_ready:
             OUTBOX_WAKE.wait(0.5)
             OUTBOX_WAKE.clear()
             continue
@@ -282,7 +330,9 @@ def _outbox_loop() -> None:
             OUTBOX_WAKE.wait(0.5)
             OUTBOX_WAKE.clear()
             continue
-        for item in ready:
+        for item in claude_ready:
+            _deliver_claude_item(item, panes)
+        for item in codex_ready:
             _deliver_outbox_item(item, panes)
 
 
@@ -449,6 +499,19 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._json({"error": "bad body"}, 400)
+        text_write = (u.path in {"/api/session/send", "/api/session/outbox/retry"}
+                      or (u.path == "/api/term/send" and not body.get("keys")
+                          and bool(body.get("text"))))
+        if text_write and str(body.get("_build") or "") != ASSET_VERSION:
+            # A tab can survive deployments for days.  Old code used a local
+            # eight-second guess and exposed a blind retry that duplicated prompts.
+            # Reject before touching tmux; even old clients will surface this error
+            # and keep their editor text intact.
+            return self._json({
+                "error": "页面版本已过期，请重新加载整个网页后再发送",
+                "reload": True,
+                "build": ASSET_VERSION,
+            }, 409)
         try:
             if u.path == "/api/session/send":
                 return self._queue_message(body)
@@ -690,9 +753,12 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass  # 会话已成功移入回收站，不能把元数据清理失败误报成删除失败
         send_queue.discard_uid(uid)
+        claude_queue.discard_uid(uid)
         self._json({"ok": True, "trash": dest})
 
     def _api_get(self, path: str, q: dict):
+        if path == "/api/meta":
+            return self._json({"build": ASSET_VERSION, "hostname": HOSTNAME})
         if path == "/api/sessions":
             force = q.get("force", ["0"])[0] == "1"
             known = q.get("sig", [""])[0]
@@ -760,7 +826,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._new_session_status(q)
 
         if path == "/api/session/outbox":
-            return self._json(send_queue.snapshot(q.get("uid", [""])[0]))
+            uid = q.get("uid", [""])[0]
+            session = index.get(uid)
+            return self._json(send_protocol.snapshot(
+                str((session or {}).get("source") or ""), uid))
 
         if path == "/api/session/input-history":
             uid = q.get("uid", [""])[0]
@@ -823,9 +892,16 @@ class Handler(BaseHTTPRequestHandler):
             )
             _resolve_activity(uid, result)
             if not agent:
-                if send_queue.observe(uid, result["messages"], result.get("activity")):
-                    OUTBOX_WAKE.set()
-                result.update(send_queue.snapshot(uid))
+                driver = send_protocol.driver_for(str(session.get("source") or ""))
+                if driver:
+                    cursor = {"start": result["end"],
+                              "head": result["version"]["head"],
+                              "anchor": result["anchor"],
+                              "reset": result.get("reset", False)}
+                    if driver.observe(uid, result["messages"], result.get("activity"),
+                                      cursor):
+                        OUTBOX_WAKE.set()
+                    result.update(driver.snapshot(uid))
                 result["prompt"] = _session_prompt(session, result["messages"])
             result["meta"] = session_meta.enrich_one(result["meta"])
             return self._json(result)
@@ -890,6 +966,8 @@ class Handler(BaseHTTPRequestHandler):
         head = q.get("head", [""])[0]
         anchor = q.get("anchor", [""])[0]
         last = None
+        outbox_driver = (send_protocol.driver_for(str(s.get("source") or ""))
+                         if not s.get("agent_id") else None)
         outbox_revision = -1
         claude_sid = (str(s.get("sid") or "")
                       if not s.get("agent_id") and s.get("source") == "claude" else "")
@@ -921,11 +999,17 @@ class Handler(BaseHTTPRequestHandler):
                         # 若文件追加和 Escape 同时发生，本批已经携带修正后的状态；
                         # 同步游标，避免下一轮再推一份完全相同的空状态增量。
                         activity_revision = session_meta.activity_revision(uid)
-                        if send_queue.observe(uid, d["messages"], d.get("activity")):
-                            OUTBOX_WAKE.set()
-                        outbox = send_queue.snapshot(uid)
-                        d.update(outbox)
-                        outbox_revision = outbox["outbox_version"]["revision"]
+                        if outbox_driver:
+                            cursor = {"start": d["end"],
+                                      "head": d["version"]["head"],
+                                      "anchor": d["anchor"],
+                                      "reset": d.get("reset", False)}
+                            if outbox_driver.observe(
+                                    uid, d["messages"], d.get("activity"), cursor):
+                                OUTBOX_WAKE.set()
+                            outbox = outbox_driver.snapshot(uid)
+                            d.update(outbox)
+                            outbox_revision = outbox["outbox_version"]["revision"]
                     if claude_sid:
                         d["prompt"] = _claude_prompt(claude_sid, d["messages"])
                         # _claude_prompt 可能在确认答案落盘后删掉状态文件。
@@ -976,8 +1060,9 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(f"data: {payload}\n\n".encode())
                         self.wfile.flush()
                         beat = time.time()
-                elif not s.get("agent_id") and send_queue.revision() != outbox_revision:
-                    outbox = send_queue.snapshot(uid)
+                elif (outbox_driver
+                      and outbox_driver.revision() != outbox_revision):
+                    outbox = outbox_driver.snapshot(uid)
                     outbox_revision = outbox["outbox_version"]["revision"]
                     payload = json.dumps({"outbox_only": True, **outbox},
                                          ensure_ascii=False)
@@ -1054,12 +1139,14 @@ class Handler(BaseHTTPRequestHandler):
     def _queue_message(self, body: dict):
         uid = str(body.get("uid") or "")
         s = index.get(uid)
-        if not s or s.get("source") != "codex":
-            return self._json({"error": "服务端发送队列目前只用于已有 Codex 会话"}, 400)
+        if not s or s.get("source") not in {"claude", "codex"}:
+            return self._json({"error": "服务端发送账本只用于已有 Claude/Codex 会话"}, 400)
         panes = term.list_sessions()
         pane = _pane_for_session(s, panes)
         if not pane or pane["name"] != str(body.get("name") or ""):
-            return self._json({"error": "Codex tmux 会话未连接"}, 409)
+            return self._json({"error": f"{s['source'].title()} tmux 会话未连接"}, 409)
+        if s.get("source") == "claude":
+            return self._queue_claude_message(body, s, pane)
         failed = next((item for item in send_queue.list_for(uid)
                        if item.get("state") == "failed"), None)
         if failed:
@@ -1081,6 +1168,46 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"ok": True, "item": item,
                            **send_queue.snapshot(uid)})
 
+    def _queue_claude_message(self, body: dict, session: dict, pane: dict):
+        uid = str(session.get("uid") or "")
+        # Establish the causal boundary on the server immediately before the
+        # ledger write. A background tab can send a cursor that predates an old
+        # same-text prompt or custom-title record and must not retire this row.
+        native_cursor = index.cursor(session)
+        causal_cursor = {
+            "start": native_cursor["end"],
+            "head": native_cursor["head"],
+            "anchor": native_cursor["anchor"],
+        }
+        item, created = claude_queue.enqueue(
+            uid, pane["name"], str(body.get("text") or ""), body.get("media"),
+            str(body.get("request_id") or ""), causal_cursor, {
+                "page": str(body.get("page_id") or "")[:128],
+                "build": str(body.get("_build") or "")[:32],
+                "ip": self._display_ip(),
+            })
+        if not created:
+            # A repeated HTTP request after a network loss is a status lookup,
+            # never permission to paste the same prompt into Claude again.
+            return self._json({"ok": True, "item": item,
+                               **claude_queue.snapshot(uid)})
+        claimed = claude_queue.mark_injecting(item["id"], uid)
+        if not claimed:
+            # The background restart-recovery loop won the atomic claim.
+            return self._json({"ok": True, "item": item,
+                               **claude_queue.snapshot(uid)})
+        try:
+            term.leave_copy_mode(pane["name"])
+            term.submit_text(pane["name"], str(body.get("text") or ""))
+            item = claude_queue.mark_submitted(item["id"], uid) or item
+        except Exception as error:
+            # Paste and Enter are separate operations.  Once injection begins an
+            # exception is ambiguous and must never expose a blind retry button.
+            item = claude_queue.mark_ambiguous(item["id"], uid, str(error)) or item
+        OUTBOX_WAKE.set()
+        return self._json({"ok": True, "item": item,
+                           **claude_queue.snapshot(uid)})
+
     def _draft_status(self, body: dict):
         uid = str(body.get("uid") or "")
         s = index.get(uid)
@@ -1094,9 +1221,16 @@ class Handler(BaseHTTPRequestHandler):
     def _retry_message(self, body: dict):
         uid = str(body.get("uid") or "")
         item_id = str(body.get("id") or "")
+        s = index.get(uid)
+        if s and s.get("source") == "claude":
+            if any(item.get("id") == item_id for item in claude_queue.list_for(uid)):
+                return self._json({
+                    "error": "消息已经提交到终端，禁止盲目重发；请等待原生记录或打开终端检查",
+                    **claude_queue.snapshot(uid),
+                }, 409)
+            return self._json({"error": "待核对消息不存在"}, 404)
         if not any(item.get("id") == item_id for item in send_queue.list_for(uid)):
             return self._json({"error": "待发送消息不存在"}, 404)
-        s = index.get(uid)
         pane = _pane_for_session(s, term.list_sessions()) if s else None
         if pane:
             conflict = _overwrite_codex_draft(
@@ -1112,6 +1246,12 @@ class Handler(BaseHTTPRequestHandler):
     def _discard_message(self, body: dict):
         item_id = str(body.get("id") or "")
         uid = str(body.get("uid") or "")
+        s = index.get(uid)
+        if s and s.get("source") == "claude":
+            if not claude_queue.discard(item_id, uid):
+                return self._json({"error": "待核对消息不存在"}, 404)
+            return self._json({"ok": True, "uid": uid,
+                               **claude_queue.snapshot(uid)})
         if not send_queue.discard(item_id, uid, {"queued", "failed"}):
             return self._json({"error": "消息不存在或已经开始发送"}, 409)
         return self._json({"ok": True, "uid": uid,
@@ -1169,6 +1309,9 @@ class Handler(BaseHTTPRequestHandler):
             killed = term.kill_pids(pids)
         live.snapshot(force=True)
         send_queue.discard_uid(s["uid"])
+        # Stop hides unresolved UI state but retains id-only tombstones, so a
+        # delayed HTTP replay cannot revive an old prompt after a later resume.
+        claude_queue.discard_uid(s["uid"], tombstone=True)
         return self._json({"ok": True, "stopped": bool(pane or killed),
                            "tmux": bool(pane)})
 

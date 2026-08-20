@@ -10,13 +10,14 @@ import subprocess
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
 import sys
 import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sesman import pending as pending_store, session_meta, term
+from sesman import pending as pending_store, server as server_module, session_meta, term
 
 BASE = os.environ.get("SESMAN_BASE", "http://127.0.0.1:8710")
 FAKE_PROJ = Path.home() / ".claude" / "projects" / "-tmp-sesman-selftest"
@@ -24,6 +25,7 @@ FAKE_IMG = Path("/tmp/sesman-selftest-image.png")
 FAKE_CWD = Path("/tmp/sesman-selftest")
 PENDING_TERM = "sesman-claude-e2epending"
 PENDING_EXIT_TERM = "sesman-claude-e2eexit"
+TERMINAL_TERM = "sesman-claude-00000000"
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 PASS, FAIL = [], []
 
@@ -220,9 +222,24 @@ def make_window_session():
     return f
 
 
+def make_cli_resumable(path: Path):
+    """Normalize synthetic assistant rows to the shape Claude Code can resume."""
+    rows = []
+    for line in path.read_text().splitlines():
+        row = json.loads(line)
+        message = row.get("message")
+        if (row.get("type") == "assistant" and isinstance(message, dict)
+                and isinstance(message.get("content"), str)):
+            message["content"] = [{"type": "text", "text": message["content"]}]
+        rows.append(row)
+    path.write_text("\n".join(json.dumps(row, ensure_ascii=False)
+                              for row in rows) + "\n")
+
+
 def cleanup():
     tmux_run("sesman", "kill-session", "-t", PENDING_TERM, capture_output=True)
     tmux_run("sesman", "kill-session", "-t", PENDING_EXIT_TERM, capture_output=True)
+    tmux_run("sesman", "kill-session", "-t", TERMINAL_TERM, capture_output=True)
     pending_store.discard(PENDING_TERM)
     pending_store.discard(PENDING_EXIT_TERM)
     fake_path = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
@@ -325,9 +342,7 @@ def run(pw):
           and cli_layers["claudeSettled"] == {
               "created": 1000, "state": "failed",
               "error": "Claude 未在会话记录中确认接收"}
-          and cli_layers["claudeMigration"] == [{"id": "old", "created": 1000,
-                                                  "state": "sending", "expiresAt": 9000,
-                                                  "legacy": True}]
+          and cli_layers["claudeMigration"] == []
           and cli_layers["migrations"] == [[], [1]]
           and cli_layers["rewind"] == [True, True, False]
           and cli_layers["rewindBusy"] == [False, False]
@@ -394,6 +409,44 @@ def run(pw):
                              "confirmations": ["终端草稿中有内容，是否覆盖？"],
                              "escapeKeys": ["Escape"]}
           and str(codex_delivery.get("uid", "")).startswith("codex:"), codex_delivery)
+    claude_delivery = p.evaluate("""async () => {
+      const session = S.sessions.find(x => x.source === 'claude' && x.uid !== S.sel);
+      if (!session) return {error:'no claude session'};
+      const uid = session.uid, key = viewKey(uid), name = `sesman-claude-${session.sid.slice(0, 8)}`;
+      const oldPost = post, oldList = T.list, oldEntry = cache.get(key);
+      const oldQueued = S.queued.get(uid), requests = [];
+      T.list = [...(T.list || []), {uid, name}];
+      cache.set(key, {activity:{state:'idle', ts:'2026-08-09T10:00:00Z'}, msgs:[],
+        end:456, version:{head:'claude-head'}, anchor:'claude-anchor'});
+      post = async (url, body) => {
+        requests.push({url, body});
+        return {ok:true, outbox:[{id:'claude-server-1', uid, text:body.text,
+          created:1000, state:'submitted', server:true}],
+          outbox_version:{epoch:'claude-e2e', revision:1}};
+      };
+      try { await sendToSession('由服务端账本托管的 Claude 消息', null, uid); }
+      finally {
+        post = oldPost; T.list = oldList;
+        if (oldEntry) cache.set(key, oldEntry); else cache.delete(key);
+      }
+      const shown = queuedMessages(uid)[0];
+      const persisted = store.get('queuedMessages', []).flatMap(x => x[1] || [])
+        .some(x => x.text === '由服务端账本托管的 Claude 消息');
+      if (oldQueued) S.queued.set(uid, oldQueued); else S.queued.delete(uid);
+      const request = requests.find(x => x.url === 'api/session/send');
+      return {url:request?.url, uid:request?.body?.uid, state:shown?.state,
+        server:shown?.server, cursor:request?.body?.cursor, persisted,
+        direct:requests.some(x => x.url === 'api/term/send')};
+    }""")
+    check("Claude 正式会话也由服务端幂等账本托管而不再直接写 tmux",
+          claude_delivery == {
+              "url": "api/session/send", "uid": claude_delivery.get("uid"),
+              "state": "submitted", "server": True,
+              "cursor": {"start": 456, "head": "claude-head",
+                         "anchor": "claude-anchor"},
+              "persisted": False, "direct": False,
+          } and str(claude_delivery.get("uid", "")).startswith("claude:"),
+          claude_delivery)
     codex_draft_decline = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex');
       if (!session) return {error:'no codex session'};
@@ -2530,24 +2583,17 @@ def run(pw):
             dialogs.append(d.message)
             d.dismiss()
         p.on("dialog", _dlg)
-        # 挑最老的一个既不在跑、也没被网页接管的 claude 会话。
-        # /api/live 与 tmux 列表是两套状态：用户在另一个浏览器里接管后，
-        # 会话本身未必仍被 live.py 识别为原进程。若只排除 live，会复用用户的
-        # tmux 会话，令下面的「首次接管」分支和最终 kill-session 产生干扰。
-        live_now = set(json.loads(urllib.request.urlopen(BASE + "/api/live", timeout=30).read())["uids"])
-        taken_now = {s["name"] for s in tl["sessions"] if s.get("owned")}
-        target = p.evaluate("""({liveList, takenList}) => {
-          const live = new Set(liveList);
-          const taken = new Set(takenList);
-          const c = S.sessions.filter(x => x.source === 'claude'
-            && !live.has(x.uid)
-            && !taken.has(`sesman-${x.source}-${String(x.sid).slice(0, 8)}`))
-                              .sort((a, b) => a.updated.localeCompare(b.updated));
-          return c.length ? c[0].uid : null;
-        }""", {"liveList": list(live_now), "takenList": list(taken_now)})
-        check("测试目标未占用用户已接管会话", target is not None, sorted(taken_now))
-        if target is None:
-            raise RuntimeError("没有可安全接管的 Claude 历史会话")
+        # 终端回归只能使用本次测试自己的会话。旧实现从真实历史里挑“最老的
+        # offline 会话”，既会污染用户 JSONL，也可能撞上无人占有但仍存活的
+        # tmux。合成记录在前端测试中允许 assistant 简写为字符串；接管前转成
+        # Claude Code 能 resume 的标准 content 数组即可，全程不调用模型。
+        fake_path = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
+        make_cli_resumable(fake_path)
+        urllib.request.urlopen(BASE + "/api/sessions?force=1", timeout=60).read()
+        target = fake_uid
+        existing_terms = {s["name"] for s in term_rows()}
+        check("终端回归使用隔离会话且不占用任何用户 tmux",
+              TERMINAL_TERM not in existing_terms, sorted(existing_terms))
         p.evaluate("u => openSession(u)", target)
         p.wait_for_selector("#a-term", timeout=60000)
         check("会话详情有接管按钮", p.locator("#a-term").get_attribute("title") == "接管会话",
@@ -3068,21 +3114,21 @@ def run(pw):
         }""", target)
         check("Claude 正式用户消息出现后撤掉队列副本", queued.count() == 0)
         p.evaluate("""u => {
-          S.queued.set(u, [{id:'server-cancel', uid:u, text:'可以主动撤销',
-            created:Date.now(), state:'queued', server:true, media:[]}]);
+          S.queued.set(u, [{id:'server-check', uid:u, text:'已提交待核对',
+            created:Date.now(), state:'submitted', server:true, media:[]}]);
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
         }""", target)
-        check("服务端排队项在失败前即可主动撤销",
+        check("Claude 服务端账本不提供危险重试而只允许检查终端",
               queued.count() == 1
               and queued.locator(".client-pending-actions button").all_inner_texts()
-                  == ["撤销"])
+                  == ["检查终端"])
         pending_footer = queued.locator(".client-pending-footer").evaluate("""n => {
           const state = n.querySelector('.client-pending-state').getBoundingClientRect();
           const action = n.querySelector('.client-pending-actions').getBoundingClientRect();
           return {display:getComputedStyle(n).display,
             centerGap:Math.abs((state.top + state.bottom) / 2 - (action.top + action.bottom) / 2)};
         }""")
-        check("排队状态和撤销按钮在同一条紧凑状态栏",
+        check("待确认状态和检查按钮在同一条紧凑状态栏",
               pending_footer["display"] == "flex" and pending_footer["centerGap"] < 1,
               pending_footer)
         p.evaluate("""u => {
@@ -3235,15 +3281,31 @@ def run(pw):
         p.wait_for_timeout(400)
         check("发送确认后才清空输入内容",
               p.input_value("#cinput") == "" and p.locator("#csend").is_enabled())
-        p.evaluate("post = async () => ({error: '模拟发送失败'})")
+        p.evaluate("""() => {
+          window.__failedRequestIds = [];
+          post = async (url, body) => {
+            if (url === 'api/session/send') window.__failedRequestIds.push(body.request_id);
+            return {error: '模拟发送失败'};
+          };
+        }""")
         p.fill("#cinput", "失败后保留草稿")
         # 本段已安装 _dlg；不要再给同一个 alert 注册第二个处理器。
         p.click("#csend")
         p.wait_for_timeout(100)
         check("发送失败时不丢草稿", p.input_value("#cinput") == "失败后保留草稿")
         p.wait_for_function("!composerSending", timeout=5000)
+        p.click("#csend")
+        p.wait_for_function("!composerSending", timeout=5000)
+        failed_ids = p.evaluate("window.__failedRequestIds")
+        check("相同草稿在响应丢失后复用 request id 而不会重复注入",
+              len(failed_ids) == 2 and bool(failed_ids[0])
+              and failed_ids[0] == failed_ids[1], failed_ids)
         p.fill("#cinput", "")
-        p.evaluate("post = window.__sesmanRealPost; delete window.__sesmanRealPost")
+        p.evaluate("""() => {
+          post = window.__sesmanRealPost;
+          delete window.__sesmanRealPost;
+          delete window.__failedRequestIds;
+        }""")
 
         rewind_bridge = p.evaluate("""async () => {
           const sent = [], opened = [], rewindPosts = [];
@@ -3336,9 +3398,29 @@ def run(pw):
         check("专用 tmux 已关闭 UI 与输入截获",
               transparent == {"status": "off", "mouse": "off", "prefix": "None",
                               "escape": "10", "focus": "on", "extended": "on"}, transparent)
+        stale_marker = "SESMAN_STALE_PAGE_MUST_NOT_RUN"
+        stale_status = 0
+        stale_error = ""
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                BASE + "/api/term/send",
+                json.dumps({"name": wname,
+                            "text": f"echo {stale_marker}"}).encode(),
+                {"Content-Type": "application/json"}), timeout=30).read()
+        except urllib.error.HTTPError as error:
+            stale_status = error.code
+            stale_error = json.loads(error.read()).get("error", "")
+        stale_screen = tmux_run(
+            wserver, "capture-pane", "-p", "-t", wname,
+            capture_output=True, text=True).stdout
+        check("旧页面的文字发送在触碰 tmux 前被版本握手拒绝",
+              stale_status == 409 and "版本已过期" in stale_error
+              and stale_marker not in stale_screen,
+              {"status": stale_status, "error": stale_error})
         urllib.request.urlopen(urllib.request.Request(
             BASE + "/api/term/send",
-            json.dumps({"name": wname, "text": "for i in $(seq 1 200); do echo 历史行$i; done"}).encode(),
+            json.dumps({"name": wname, "text": "for i in $(seq 1 200); do echo 历史行$i; done",
+                        "_build": server_module.ASSET_VERSION}).encode(),
             {"Content-Type": "application/json"}), timeout=30).read()
         time.sleep(1.2)
         p.evaluate("n => openTermPane(n)", wname)
@@ -3652,7 +3734,8 @@ def run(pw):
         # 全屏应用仍由 tmux 模拟 alternate screen，但外层 xterm 保持正常缓冲区。
         urllib.request.urlopen(urllib.request.Request(
             BASE + "/api/term/send",
-            json.dumps({"name": wname, "text": "less /etc/services"}).encode(),
+            json.dumps({"name": wname, "text": "less /etc/services",
+                        "_build": server_module.ASSET_VERSION}).encode(),
             {"Content-Type": "application/json"}), timeout=30).read()
         alt = "0"
         for _ in range(20):                     # less 起来要一会儿

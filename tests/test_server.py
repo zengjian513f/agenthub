@@ -62,6 +62,8 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertNotIn("__SESMAN_ASSET_VERSION__", page)
         self.assertIn(f"app.js?v={server.ASSET_VERSION}", page)
         self.assertIn(f"style.css?v={server.ASSET_VERSION}", page)
+        self.assertIn(
+            f'<meta name="sesman-build" content="{server.ASSET_VERSION}">', page)
         self.assertEqual(headers["Cache-Control"], "no-store")
 
 

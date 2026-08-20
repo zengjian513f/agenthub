@@ -155,6 +155,19 @@ html, body {
   text-rendering: optimizeLegibility;
 }
 
+.version-stale {
+  position: fixed; z-index: 10000; left: 50%; top: 10px;
+  transform: translateX(-50%); max-width: calc(100vw - 20px);
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px 8px 14px; border: 1px solid #d39a24;
+  border-radius: 10px; background: #fff5d7; color: #5b4212;
+  box-shadow: 0 5px 24px rgba(0, 0, 0, .2); font-size: 13px;
+}
+.version-stale .btn { white-space: nowrap; }
+:root[data-theme="dark"] .version-stale {
+  background: #33280f; color: #ffe29a; border-color: #8d6a1d;
+}
+
 #app { display: flex; flex-direction: column; height: 100%; }
 
 /* ---------- 顶栏 ---------- */

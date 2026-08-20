@@ -1181,6 +1181,13 @@ class ClaudeAdapter:
                     msgs.append(_msg("queue_operation",
                                      content if isinstance(content, str) else "", ts,
                                      operation=operation, counted=False, silent=True))
+            elif t == "custom-title" and not tag and rec.get("customTitle"):
+                # Claude 的 /rename 不写普通 user 记录，而是在命令之后追加
+                # custom-title。它没有 timestamp，但增量读取的文件偏移已经是
+                # 可靠的因果边界。仅作为静默协议确认透传；会话标题仍由扫描器
+                # 负责，避免每次重复的 custom-title 记录污染时间线。
+                msgs.append(_msg("command", f'/rename {rec["customTitle"]}', ts,
+                                 counted=False, silent=True, inferred=True))
         return msgs, end
 
 

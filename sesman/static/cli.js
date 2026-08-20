@@ -67,17 +67,9 @@ class ClaudeCli extends SesmanCli {
   }
 
   migrateQueuedMessages(items, fromVersion, _toVersion) {
-    // v2 只能证明 tmux 粘贴成功，无法区分真实排队和幽灵气泡。
-    // 先降级为“发送中”，等该会话的原生历史读入后再对账：真队列
-    // 会被 enqueue 重新确认，幽灵副本才会过期。
-    if (fromVersion < 3) {
-      return super.migrateQueuedMessages(items).map(item => ({
-        ...item,
-        state: 'sending',
-        expiresAt: (+item?.created || 0) + 8000,
-        legacy: true,
-      }));
-    }
+    // v5 起正式 Claude 会话由服务端发送账本管理。旧浏览器副本既没有
+    // request id 也没有交付凭据，保留只会再次制造“假失败/盲目重试”。
+    if (fromVersion < 5) return [];
     return super.migrateQueuedMessages(items);
   }
 
@@ -108,8 +100,8 @@ class ClaudeCli extends SesmanCli {
     return null;
   }
 
-  settleQueuedMessage(item, now, hasNativeHistory) {
-    if (item?.legacy && !hasNativeHistory) return item;
+  settleQueuedMessage(item, now, _hasNativeHistory) {
+    if (item?.server) return item;
     if (item?.state !== 'sending' || !Number.isFinite(+item.expiresAt)
         || now < +item.expiresAt) return item;
     const settled = {
@@ -118,8 +110,15 @@ class ClaudeCli extends SesmanCli {
       error: 'Claude 未在会话记录中确认接收',
     };
     delete settled.expiresAt;
-    delete settled.legacy;
     return settled;
+  }
+
+  queuedMessageLabel(item) {
+    if (!item?.server) return super.queuedMessageLabel(item);
+    if (item.state === 'native_queued') return 'Claude 已排队';
+    if (item.state === 'ambiguous' || item.state === 'injecting') return '状态待核对';
+    if (item.state === 'persisted') return '等待提交';
+    return '已送达终端，等待 Claude 确认';
   }
 
   questionAnswerKeys(prompt, optionIndex) {

@@ -341,9 +341,11 @@ async function takeover(uid, btn) {
 async function post(url, body) {
   const r = await fetch(appUrl(url), {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, _build: BUILD_ID }),
   });
-  return r.json();
+  const data = await r.json();
+  if (data?.reload) markStaleBuild(data.build);
+  return data;
 }
 
 // ---------------------------------------------------------------- 新建会话
@@ -1993,7 +1995,8 @@ async function sendToSession(text, keys, uid = S.sel, media = [], options = {}) 
   const name = takenOver(uid);
   if (!name) return false;
   const cli = sesmanCli(uid);
-  const serverQueued = !!text && cli?.source === 'codex' && !uid.startsWith('tmux:');
+  const serverQueued = !!text && ['claude', 'codex'].includes(cli?.source)
+    && !uid.startsWith('tmux:');
   const queuedId = text && !serverQueued && typeof queuePendingUserMessage === 'function'
     ? queuePendingUserMessage(uid, text, media) : null;
   let d;
@@ -2001,12 +2004,14 @@ async function sendToSession(text, keys, uid = S.sel, media = [], options = {}) 
     if (serverQueued) {
       const entry = cache.get(viewKey(uid));
       const activity = entry?.activity || null;
-      const requestId = globalThis.crypto?.randomUUID?.()
+      const requestId = String(options.requestId || '')
+        || globalThis.crypto?.randomUUID?.()
         || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       let overwriteDraft = String(options.overwriteDraft || '');
       for (let attempt = 0; attempt < 3; attempt++) {
         d = await post('api/session/send', {
           uid, name, text, media, activity, request_id: requestId,
+          page_id: TERM_PAGE_ID,
           overwrite_draft: overwriteDraft,
           cursor: entry ? {
             start: entry.end, head: entry.version?.head, anchor: entry.anchor,
@@ -2333,11 +2338,20 @@ async function submitComposer() {
     button.textContent = '发送中…';
     const prompt = buildComposerPrompt(text, uploaded, quotes);
     const sentMedia = uploaded.flatMap(a => a.media ? [{ ...a.media, gallery: true }] : []);
+    // Keep one idempotency key while retrying the exact same draft after a lost
+    // HTTP response.  Editing the prompt intentionally starts a new submission.
+    if (draft.requestText !== prompt || !draft.requestId) {
+      draft.requestText = prompt;
+      draft.requestId = globalThis.crypto?.randomUUID?.()
+        || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
     const sent = await sendToSession(
       prompt, null, uid, sentMedia,
-      { overwriteDraft: draftPolicy.overwriteDraft });
+      { overwriteDraft: draftPolicy.overwriteDraft, requestId: draft.requestId });
     // 请求失败时保留草稿；等待响应期间若用户继续编辑，也不能抹掉新内容。
     if (sent) {
+      delete draft.requestId;
+      delete draft.requestText;
       if (draft.text === text || (composerUid === uid && ta.value === text)) draft.text = '';
       const sentFiles = new Set(attachments.map(x => x.id));
       const sentQuotes = new Map(quotes.map(x => [x.id, x.text]));

@@ -237,6 +237,16 @@ pip install playwright && python3 -m playwright install chromium
 python3 tests/e2e.py
 ```
 
+`tests/claude_monkey.py` 是需要真实 Claude 账号、会产生费用的显式压力测试，不属于
+普通测试套件。它会创建至少 6 个隔离会话，交叉执行消息发送、原生忙时排队、丢失 HTTP
+响应后的同请求重放、切换会话、缩放窗口和终端/对话切换。脚本固定使用完整的
+`claude-haiku-4-5-20251001` 模型 ID，并从 JSONL 再次核对实际模型；不得用可能被配置重映射
+的 `haiku` 别名。只有明确接受真实模型费用时才运行：
+
+```bash
+python3 tests/claude_monkey.py --base http://127.0.0.1:8710
+```
+
 ## 结构
 
 ```
@@ -245,6 +255,9 @@ sesman/
   index.py      索引缓存、增量读取、全文搜索与删除
   media.py      内嵌/本地图片的校验、限额注册与安全读取
   pending.py    新会话首次落盘前的持久化元数据
+  claude_queue.py Claude 网页输入的服务端交付账本与原生记录确认
+  send_audit.py 消息交付事件审计（只存摘要和字节数，不存正文）
+  send_protocol.py Claude/Codex 交付状态的公共驱动接口
   send_queue.py Codex 网页输入的服务端持久队列与原生记录确认
   session_meta.py  星标等 sesman 自有会话元数据
   server.py     ThreadingHTTPServer 路由与 IP 白名单
@@ -260,12 +273,13 @@ sesman/
 - `GET /api/media/<token>` — 会话中已登记图片的不透明只读地址
 - `GET /api/search?q=&source=claude,codex` — 正文全文搜索
 - `GET /api/session/input-history?uid=` — 只返回当前会话的用户输入历史，供输入框按需回填
+- `GET /api/meta` — 当前服务端构建标识与主机名
 - `GET /api/term/complete-dir?path=` — 返回启动路径的子目录补全候选（需 `--terminal`）
 - `POST /api/term/create` / `GET /api/term/new-status?name=` — 创建并关联新 CLI 会话；目录不存在时先返回 `needs_create`，确认后以 `create_cwd: true` 重试（需 `--terminal`）
 - `POST /api/session/attachment?uid=&name=&id=` — 上传附件到会话 cwd 的受控批次子目录；首个文件省略 `id`，后续文件复用响应中的 `attachment_id`
 - `POST /api/session/star` — 设置会话星标（JSON：`{"uid":"…","starred":true}`）
-- `POST /api/session/send` — 把已有 Codex 会话的网页输入加入服务端持久队列
-- `POST /api/session/outbox/retry` / `POST /api/session/outbox/discard` — 重试或移除未确认的 Codex 输入
+- `POST /api/session/send` — 把已有 Claude/Codex 会话的网页输入交给服务端持久状态机
+- `POST /api/session/outbox/retry` / `POST /api/session/outbox/discard` — 重试可证明尚未触碰终端的输入，或移除页面里的未确认状态；Claude 一旦开始注入终端便拒绝盲目重试
 - `POST /api/session/stop` — 从内层 CLI 开始停止运行实例，保留对话记录
 - `DELETE /api/session/<uid>` — 移入回收站
 
@@ -279,8 +293,15 @@ Codex 忙时不会把尚未轮到的输入写进 rollout，tmux 接受粘贴也�
 已经接收。因此已有 Codex 会话的网页输入先持久化到权限为 `0600` 的
 `~/.local/share/sesman/send-queue.json`；观察到原生回合结束且终端画面稳定后才交付，
 服务端会独立续读 rollout，浏览器锁屏或断开也不影响队列推进；最终以其中出现对应的
-`user` 记录确认。超时未确认的消息会保留在时间线，供用户
-重试或移除。Claude 继续使用其原生 `queue-operation enqueue/remove` 对账，不经过这条队列。
+`user` 记录确认。
+
+Claude 输入同样先写入权限为 `0600` 的
+`~/.local/share/sesman/claude-send-queue.json`，然后才触碰终端。服务端以请求 ID 幂等，
+并用原生 `user`、`queue-operation` 和 `/rename` 记录确认结果。只有仍处于 `persisted`
+（可证明尚未触碰终端）的项目才允许恢复交付；从 `injecting` 开始，即使 HTTP 响应丢失或
+服务重启，也只等待原生证据或标记为待核对，绝不自动重发。页面与写请求还携带构建标识，
+旧标签页会被服务端在触碰终端前拒绝并提示整页刷新。交付审计只保存正文 SHA-256、字节数、
+状态和辅助连接信息，不保存正文。
 
 ## 开机自启（可选）
 

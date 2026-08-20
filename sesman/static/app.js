@@ -17,7 +17,7 @@ const store = {
 };
 
 // 存储结构的版本只由公共层调度；每种 CLI 自己决定怎样迁移旧队列。
-const QUEUED_MESSAGES_VERSION = 4;
+const QUEUED_MESSAGES_VERSION = 5;
 function loadQueuedMessages() {
   const saved = store.get('queuedMessages', []);
   const valid = Array.isArray(saved) ? saved : [];
@@ -85,7 +85,7 @@ const S = {
   unread: new Map(store.get('unread', [])),   // uid → {count, tmux}; 只计代理产生的新内容
   cursors: new Map(), // 主会话/子代理 EOF 游标；用于后台会话的精确未读增量
   queued: new Map(loadQueuedMessages()),       // uid → 尚未写入原生会话记录的已发送消息
-  outboxVersions: new Map(), // uid → 最近接受的 Codex 服务端队列快照版本
+  outboxVersions: new Map(), // uid → 最近接受的服务端发送账本快照版本
   retiredOutboxEpochs: new Set(), // 服务重启后拒收仍在网络中滞留的旧进程快照
   starBusy: new Set(), // 正在持久化星标的会话，避免多个网页请求在服务端乱序
   sig: null,          // 列表对应的磁盘签名
@@ -97,6 +97,7 @@ const MOBILE = matchMedia('(max-width: 720px)');
 // 页面既可挂在站点根目录，也可由反代放到 /sesman/ 之类的子路径。
 const APP_BASE = new URL('.', location.href);
 const appUrl = path => new URL(String(path).replace(/^\//, ''), APP_BASE).toString();
+const BUILD_ID = document.querySelector('meta[name="sesman-build"]')?.content || '';
 const el = (tag, cls, html) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -106,6 +107,37 @@ const el = (tag, cls, html) => {
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const icon = src => `<svg class="ico" style="color:${SOURCES[src].color}"><use href="#${SOURCES[src].icon}"/></svg>`;
 const uiIcon = name => `<svg class="ui-icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+
+let staleBuildShown = false;
+function markStaleBuild(serverBuild = '') {
+  if (staleBuildShown) return;
+  staleBuildShown = true;
+  document.body.classList.add('stale-build');
+  const notice = el('div', 'version-stale');
+  notice.setAttribute('role', 'alert');
+  notice.innerHTML = '<span>sesman 已更新。当前页面已停止发送，请重新加载。</span>';
+  const reload = el('button', 'btn', '重新加载');
+  reload.type = 'button';
+  reload.title = serverBuild ? `服务器版本 ${serverBuild}` : '加载新版本';
+  reload.onclick = () => location.reload();
+  notice.appendChild(reload);
+  document.body.appendChild(notice);
+  const send = $('#csend');
+  if (send) send.disabled = true;
+}
+
+async function checkServerBuild() {
+  try {
+    const response = await fetch(appUrl('api/meta'), {cache: 'no-store'});
+    const data = await response.json();
+    if (data.build && BUILD_ID && data.build !== BUILD_ID) markStaleBuild(data.build);
+  } catch { /* 网络恢复后再检查 */ }
+}
+setInterval(checkServerBuild, 30000);
+queueMicrotask(checkServerBuild);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) checkServerBuild();
+});
 
 // Android 默认只缩小 visual viewport；iOS 也不会让 100dvh 可靠地避开软键盘。
 // 把应用高度钉到真正可见区域，并在 Safari 产生 viewport 偏移时跟着移动。
@@ -291,7 +323,8 @@ function acceptServerOutboxVersion(uid, version) {
 }
 
 function syncServerOutbox(uid, items, version = null) {
-  if (sesmanCli(uid)?.source !== 'codex' || !Array.isArray(items)) return false;
+  if (!['claude', 'codex'].includes(sesmanCli(uid)?.source)
+      || !Array.isArray(items)) return false;
   if (staleServerOutbox(uid, version)) return false;
   acceptServerOutboxVersion(uid, version);
   const next = items.map(item => ({ ...item, server: true }));
@@ -423,7 +456,6 @@ function reconcileQueuedMessages(uid, messages) {
     if (action.type === 'confirm') {
       items[at] = { ...items[at], state: 'queued' };
       delete items[at].expiresAt;
-      delete items[at].legacy;
       delete items[at].error;
     } else {
       items.splice(at, 1);
@@ -2689,8 +2721,16 @@ function renderQueuedMessages(uid = S.sel) {
     const footer = el('div', 'client-pending-footer');
     footer.appendChild(el('small', 'client-pending-state',
       cli?.queuedMessageLabel(item) || '排队中'));
-    if ((item.server && ['queued', 'failed'].includes(item.state))
-        || (!item.server && item.state === 'failed')) {
+    if (item.server && cli?.source === 'claude') {
+      const actions = el('span', 'client-pending-actions');
+      const inspect = el('button', '', '检查终端');
+      inspect.type = 'button';
+      inspect.title = '消息可能已经被 Claude 接收；打开终端核对，不会重复发送';
+      inspect.onclick = () => globalThis.revealNativeTerminal?.(uid);
+      actions.append(inspect);
+      footer.appendChild(actions);
+    } else if ((item.server && ['queued', 'failed'].includes(item.state))
+               || (!item.server && item.state === 'failed')) {
       const actions = el('span', 'client-pending-actions');
       if (item.state === 'failed') {
         const retry = el('button', '', '重试');
