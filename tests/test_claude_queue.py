@@ -221,6 +221,19 @@ class ClaudeQueueTests(unittest.TestCase):
 
         self.assertEqual(len(claude_queue.list_for("claude:u")), 1)
 
+    def test_compact_completion_event_retires_slash_command(self):
+        self.enqueue("/compact")
+        claude_queue.mark_injecting("req-1", "claude:u")
+        claude_queue.mark_submitted("req-1", "claude:u")
+
+        claude_queue.observe("claude:u", [{
+            "role": "event", "text": "已压缩", "event_kind": "compact",
+            "ts": self.accepted_ts(),
+        }], None)
+
+        self.assertEqual(claude_queue.list_for("claude:u"), [])
+        self.assertNotIn("/compact", claude_queue.QUEUE_FILE.read_text())
+
     def test_ui_discard_hides_row_but_keeps_idempotency_tombstone(self):
         self.enqueue("不要复活")
 

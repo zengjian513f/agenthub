@@ -452,6 +452,55 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertEqual([m["state"] for m in incremental if m["role"] == "status"],
                          ["working"])
 
+    def test_current_compact_metadata_reconnects_lineage_and_emits_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "current-compact.jsonl"
+
+            def message(kind, uid, parent, text, **extra):
+                return {
+                    "type": kind, "uuid": uid, "parentUuid": parent,
+                    "timestamp": "2026-08-23T04:23:17Z", **extra,
+                    "message": {"role": kind, "content": text},
+                }
+
+            before = [
+                message("user", "u0", None, "压缩前问题"),
+                message("assistant", "a0", "u0", "压缩前回答"),
+                message("user", "cmd", "a0", "/compact"),
+            ]
+            after = [
+                {"type": "system", "uuid": "boundary", "parentUuid": None,
+                 "timestamp": "2026-08-23T04:25:43Z",
+                 "compactMetadata": {"trigger": "manual", "durationMs": 1200}},
+                message("user", "summary", "boundary", "内部摘要",
+                        isCompactSummary=True),
+                message("user", "u1", "summary", "压缩后问题"),
+                message("assistant", "a1", "u1", "压缩后回答"),
+            ]
+            lines = [json.dumps(row, ensure_ascii=False) + "\n"
+                     for row in [*before, *after]]
+            transcript.write_text("".join(lines))
+            start = len("".join(lines[:len(before)]).encode())
+            adapter = adapters.ClaudeAdapter()
+
+            full, _ = adapter.read(str(transcript))
+            incremental, _ = adapter.read(
+                str(transcript), start=start, declared_tip="a1")
+            extends = adapter.append_extends(str(transcript), start, "cmd")
+
+        self.assertEqual(
+            [(m["role"], m["text"]) for m in full if m["role"] != "status"],
+            [("user", "压缩前问题"), ("assistant", "压缩前回答"),
+             ("event", "已压缩"), ("user", "压缩后问题"),
+             ("assistant", "压缩后回答")])
+        self.assertEqual(
+            [(m["role"], m["text"]) for m in incremental
+             if m["role"] != "status"],
+            [("event", "已压缩"), ("user", "压缩后问题"),
+             ("assistant", "压缩后回答")])
+        self.assertIn("idle", [m["state"] for m in full if m["role"] == "status"])
+        self.assertTrue(extends)
+
     def test_escape_fork_replaces_parent_and_inherits_history_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"

@@ -211,6 +211,21 @@ def observe(uid: str, messages: list[dict] | None,
             role = str(message.get("role") or "")
             operation = str(message.get("operation") or "")
             text = str(message.get("text") or "")
+            if role == "event" and message.get("event_kind") == "compact":
+                # Current Claude Code rewrites /compact onto a new summary root.
+                # The original user command may leave the selected lineage, but
+                # the compact completion event is durable causal acknowledgement.
+                at = _matching_row(rows, uid, "/compact", message.get("ts"),
+                                   allow_timeless=allow_timeless)
+                if at is not None:
+                    matched = rows[at]
+                    send_audit.record(
+                        "claude", uid, str(matched.get("id") or ""),
+                        "native_compacted", matched.get("text"),
+                        native_ts=message.get("ts"))
+                    _confirm(rows[at])
+                    changed = True
+                continue
             if role in {"user", "command"}:
                 at = _matching_row(rows, uid, text, message.get("ts"),
                                    allow_timeless=allow_timeless)

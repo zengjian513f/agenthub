@@ -743,6 +743,13 @@ class ClaudeAdapter:
     source = "claude"
 
     @staticmethod
+    def _compact_boundary(rec: dict) -> bool:
+        """Recognize both legacy and current Claude Code compact records."""
+        return (rec.get("type") == "system"
+                and (rec.get("subtype") == "compact_boundary"
+                     or isinstance(rec.get("compactMetadata"), dict)))
+
+    @staticmethod
     def _graph_uuid(rec: dict, agent: str | None = None) -> str | None:
         """返回参与 Claude 当前时间线的记录 UUID。
 
@@ -778,14 +785,12 @@ class ClaudeAdapter:
             uid = cls._graph_uuid(rec, agent)
             if uid:
                 parent = rec.get("parentUuid")
-                # Claude 的 compact_boundary 会故意以 parentUuid=null 开一棵
+                # Claude 的 compact 边界会故意以 parentUuid=null 开一棵
                 # 新树，供模型从摘要继续；本地 JSONL 中的旧对话却仍然存在。
                 # 对“人看的时间线”，压缩是一个连续边界，应接回边界前由
                 # last-prompt/最后图节点声明的当前叶子。否则每次 compact 后
                 # sesman 都会把全部旧正文误判成已回退分支。
-                if (not parent and scan_tip
-                        and rec.get("type") == "system"
-                        and rec.get("subtype") == "compact_boundary"):
+                if not parent and scan_tip and cls._compact_boundary(rec):
                     parent = scan_tip
                 parents[uid] = str(parent) if parent else None
             signal = cls._lineage_signal(rec, agent)
@@ -919,9 +924,7 @@ class ClaudeAdapter:
             uid = cls._graph_uuid(rec, agent)
             if uid:
                 parent = rec.get("parentUuid")
-                if (not parent and scan_tip
-                        and rec.get("type") == "system"
-                        and rec.get("subtype") == "compact_boundary"):
+                if not parent and scan_tip and cls._compact_boundary(rec):
                     parent = scan_tip
                 parents[uid] = str(parent) if parent else None
             signal = cls._lineage_signal(rec, agent)
@@ -1146,7 +1149,7 @@ class ClaudeAdapter:
                 elif not tag and rec.get("subtype") == "away_summary" and rec.get("content"):
                     msgs.append(_msg("event", _stringify(rec["content"]), ts,
                                      counted=False, event_kind="recap"))
-                elif rec.get("subtype") == "compact_boundary":
+                elif self._compact_boundary(rec):
                     # /compact 没有 turn_duration；边界记录就是压缩完成点。
                     if not tag:
                         msgs.append(_status("idle", ts))
