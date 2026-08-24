@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from . import claude_queue, send_queue
+import hashlib
+import time
+
+from . import (claude_bridge, claude_queue, codex_bridge, send_queue, term)
 
 
 class SendDriver:
@@ -18,6 +21,46 @@ class SendDriver:
     def revision(self) -> int:
         raise NotImplementedError
 
+    def composer_snapshot(self, name: str) -> tuple[str, tuple[int, int] | None]:
+        raise NotImplementedError
+
+    def composer_state(self, screen: str, cursor: tuple[int, int] | None) -> str:
+        raise NotImplementedError
+
+    def composer_probe(self, name: str) -> dict:
+        """只返回草稿状态和不可逆指纹，不把终端正文暴露给浏览器。"""
+        try:
+            screen, cursor = self.composer_snapshot(name)
+        except (OSError, RuntimeError, ValueError, KeyError):
+            return {"draft_state": "unknown"}
+        state = self.composer_state(screen, cursor)
+        result = {"draft_state": state}
+        if state == "editing":
+            fingerprint = screen if cursor is None else (
+                f"{cursor[0]}\0{cursor[1]}\0{screen}")
+            result.update(
+                draft_conflict=True,
+                draft_token=hashlib.sha256(
+                    fingerprint.encode("utf-8", "replace")).hexdigest(),
+            )
+        return result
+
+    def overwrite_draft(self, name: str, expected_token: str) -> dict | None:
+        """只清空用户刚确认的那一版草稿，并等原生编辑器确实变空。"""
+        probe = self.composer_probe(name)
+        if probe.get("draft_state") != "editing":
+            return None
+        if not expected_token or expected_token != probe.get("draft_token"):
+            return probe
+
+        term.leave_copy_mode(name)
+        term.send_keys(name, "C-c")
+        for delay in (0.03, 0.05, 0.08, 0.13, 0.21):
+            time.sleep(delay)
+            if self.composer_probe(name).get("draft_state") == "empty":
+                return None
+        return {"error": "未能确认终端草稿已清空，消息未发送"}
+
 
 class ClaudeSendDriver(SendDriver):
     source = "claude"
@@ -32,6 +75,13 @@ class ClaudeSendDriver(SendDriver):
     def revision(self) -> int:
         return claude_queue.revision()
 
+    def composer_snapshot(self, name: str) -> tuple[str, tuple[int, int]]:
+        # 只取可见物理屏，使 cursor_y 与行号保持一致；历史里的旧 ❯ 不参与。
+        return term.capture_screen(name), term.cursor_position(name)
+
+    def composer_state(self, screen: str, cursor: tuple[int, int] | None) -> str:
+        return claude_bridge.composer_state(screen, cursor)
+
 
 class CodexSendDriver(SendDriver):
     source = "codex"
@@ -45,6 +95,13 @@ class CodexSendDriver(SendDriver):
 
     def revision(self) -> int:
         return send_queue.revision()
+
+    def composer_snapshot(self, name: str) -> tuple[str, None]:
+        # Codex 的占位符靠 ANSI dim 区分，现有解析器不依赖光标位置。
+        return term.capture(name, 40), None
+
+    def composer_state(self, screen: str, cursor: tuple[int, int] | None) -> str:
+        return codex_bridge.composer_state(screen)
 
 
 DRIVERS = {

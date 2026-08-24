@@ -87,6 +87,23 @@ def list_for(uid: str) -> list[dict]:
     return [_public(row) for row in rows]
 
 
+def lookup(request_id: str, uid: str, text: str) -> dict | None:
+    """把重复 HTTP 请求识别成状态查询，且不触碰当前终端草稿。"""
+    item_id = str(request_id or "")[:128]
+    if not item_id:
+        return None
+    uid, text = str(uid or ""), str(text or "")
+    with _lock:
+        row = next((item for item in _read() if item.get("id") == item_id), None)
+        if not row:
+            return None
+        same_text = (row.get("text") == text if row.get("text") is not None
+                     else row.get("text_sha256") == _text_hash(text))
+        if row.get("uid") != uid or not same_text:
+            raise ValueError("重复发送 ID 对应了不同消息")
+        return _public(row)
+
+
 def snapshot(uid: str) -> dict:
     with _lock:
         rows = [row for row in _read()

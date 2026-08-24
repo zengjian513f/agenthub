@@ -492,6 +492,41 @@ def run(pw):
               "uploads": 0, "input": "不要丢失的网页草稿",
               "text": "不要丢失的网页草稿", "files": 1,
           }, codex_draft_decline)
+    claude_draft_preflight = p.evaluate("""async () => {
+      const session = S.sessions.find(x => x.source === 'claude');
+      if (!session) return {error:'no claude session'};
+      const uid = session.uid, name = `sesman-claude-${session.sid.slice(0, 8)}`;
+      const oldPost = post, oldConfirm = window.confirm, oldList = T.list;
+      const calls = [], confirmations = [];
+      T.list = [...(T.list || []), {uid, name}];
+      post = async (url, body) => {
+        calls.push({url, body});
+        return {ok:true, draft_state:'editing', draft_conflict:true,
+          draft_token:'claude-restored-draft'};
+      };
+      window.confirm = text => { confirmations.push(text); return false; };
+      try {
+        const result = await prepareTerminalDraft(uid);
+        return {result, urls:calls.map(x => x.url),
+          body:calls[0]?.body, confirmations};
+      } finally {
+        post = oldPost; window.confirm = oldConfirm; T.list = oldList;
+      }
+    }""")
+    check("Claude 的 ESC 回填草稿也在网页发送前要求确认",
+          claude_draft_preflight == {
+              "result": {"proceed": False, "overwriteDraft": ""},
+              "urls": ["api/session/draft-status"],
+              "body": {
+                  "uid": claude_draft_preflight.get("body", {}).get("uid"),
+                  "name": claude_draft_preflight.get("body", {}).get("name"),
+              },
+              "confirmations": ["终端草稿中有内容，是否覆盖？"],
+          }
+          and str(claude_draft_preflight.get("body", {}).get("uid", ""))
+          .startswith("claude:")
+          and str(claude_draft_preflight.get("body", {}).get("name", ""))
+          .startswith("sesman-claude-"), claude_draft_preflight)
     diff_race = p.evaluate("""async () => {
       const uid = 'codex:synthetic-diff-race', key = viewKey(uid);
       const oldEntry = cache.get(key), oldQueued = S.queued.get(uid);
@@ -3272,7 +3307,9 @@ def run(pw):
         # 输入内容要等服务端确认后再清空；网络失败时必须保留草稿，不能假装发出。
         p.evaluate("""() => {
           window.__sesmanRealPost = post;
-          post = () => new Promise(resolve => setTimeout(() => resolve({ok: true}), 300));
+          post = url => url === 'api/session/draft-status'
+            ? Promise.resolve({ok:true, draft_state:'empty'})
+            : new Promise(resolve => setTimeout(() => resolve({ok: true}), 300));
         }""")
         p.fill("#cinput", "等待发送确认")
         p.click("#csend")
@@ -3284,6 +3321,9 @@ def run(pw):
         p.evaluate("""() => {
           window.__failedRequestIds = [];
           post = async (url, body) => {
+            if (url === 'api/session/draft-status') {
+              return {ok:true, draft_state:'empty'};
+            }
             if (url === 'api/session/send') window.__failedRequestIds.push(body.request_id);
             return {error: '模拟发送失败'};
           };
@@ -3354,7 +3394,39 @@ def run(pw):
         # 历史会话可能恢复在补全菜单或弹层里；先回到普通输入态再测斜杠命令。
         p.click("#cesc")
         p.wait_for_timeout(700)
-        p.fill("#cinput", "/help")                  # 本地命令, 不消耗额度但能证明 CLI 收到了
+        # 精确复现快速 Esc 的终态：Claude 把旧消息留在原生编辑器。网页发送
+        # 必须先弹确认、清掉这版草稿，再单独提交新消息，不能把两段文字拼接。
+        draft_driver = server_module.send_protocol.driver_for("claude")
+        if draft_driver.composer_probe(tname).get("draft_state") == "editing":
+            term.send_keys(tname, "C-c")
+            time.sleep(0.3)
+        # 先把网页新消息放进网页编辑器，再模拟 Claude 的 ESC 回填。若反过来，
+        # xterm 的 focus-out 会参与 TUI 重画，使测试不再等价于用户遇到的终态。
+        p.fill("#cinput", "/help")                  # 本地命令，不消耗模型额度
+        restored_draft = "SESMAN_ESC_RESTORED_DRAFT"
+        term.send_text(tname, restored_draft)
+        deadline = time.time() + 5
+        while (time.time() < deadline
+               and draft_driver.composer_probe(tname).get("draft_state") != "editing"):
+            time.sleep(0.05)
+        check("Claude 原生编辑器里的 ESC 回填正文可被识别为草稿",
+              draft_driver.composer_probe(tname).get("draft_state") == "editing")
+        draft_status = json.loads(urllib.request.urlopen(urllib.request.Request(
+            BASE + "/api/session/draft-status",
+            json.dumps({"uid": target, "name": tname}).encode(),
+            {"Content-Type": "application/json"}), timeout=30).read())
+        check("Claude 草稿检测接口在发送前返回不可逆版本指纹",
+              draft_status.get("draft_conflict") is True
+              and re.fullmatch(r"[0-9a-f]{64}", draft_status.get("draft_token", "")),
+              draft_status)
+        p.evaluate("""() => {
+          window.__draftRealConfirmTerminal = confirmTerminalDraftOverwrite;
+          window.__draftConfirmCalls = [];
+          confirmTerminalDraftOverwrite = () => {
+            window.__draftConfirmCalls.push('终端草稿中有内容，是否覆盖？');
+            return true;
+          };
+        }""")
         p.press("#cinput", "Enter")
         # Claude TUI 启动后还可能刷新插件/状态，固定 sleep 4 秒偶尔只截到主界面。
         # 轮询真实帮助页，仍然要求 CLI 确实处理了命令，而不只看发送接口 200。
@@ -3371,6 +3443,16 @@ def run(pw):
             p.wait_for_timeout(500)
         check("输入框内容送进了会话", sent and all(x == 200 for x in sent), sent)
         check("CLI 确实响应了输入", any(k in pane for k in help_words), pane.strip()[-90:])
+        draft_confirm_calls = p.evaluate("""() => {
+          const calls = window.__draftConfirmCalls || [];
+          confirmTerminalDraftOverwrite = window.__draftRealConfirmTerminal;
+          delete window.__draftRealConfirmTerminal;
+          delete window.__draftConfirmCalls;
+          return calls;
+        }""")
+        check("Claude 草稿覆盖确认只弹一次且旧正文没有拼进新命令",
+              draft_confirm_calls == ["终端草稿中有内容，是否覆盖？"]
+              and restored_draft not in pane, draft_confirm_calls)
         p.wait_for_function("!composerSending", timeout=5000)
         composer_after_send = p.input_value("#cinput")
         check("发送后输入框清空", composer_after_send == "", repr(composer_after_send))

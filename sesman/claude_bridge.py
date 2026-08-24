@@ -20,6 +20,100 @@ PROMPT_DIR = DATA_DIR / "claude-prompts"
 SETTINGS_FILE = DATA_DIR / "claude-bridge-settings.json"
 VERSION = 1
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+_COMPOSER_RULE = re.compile(r"^\s*─{12,}\s*$")
+
+
+def _styled_chars(text: str) -> list[tuple[str, bool]]:
+    """返回可见字符及其 dim 状态；Claude 用 dim 绘制输入建议。"""
+    result: list[tuple[str, bool]] = []
+    dim = False
+    pos = 0
+    while pos < len(text):
+        ansi = _ANSI.match(text, pos)
+        if not ansi:
+            result.append((text[pos], dim))
+            pos += 1
+            continue
+        sgr = _SGR.fullmatch(ansi.group(0))
+        if sgr:
+            fields = sgr.group(1).split(";") if ";" in sgr.group(1) else [sgr.group(1)]
+            at = 0
+            while at < len(fields):
+                field = fields[at]
+                head = field.split(":", 1)[0]
+                try:
+                    code = int(head or 0)
+                except ValueError:
+                    at += 1
+                    continue
+                if code == 0:
+                    dim = False
+                elif code == 2:
+                    dim = True
+                elif code == 22:
+                    dim = False
+                # RGB/256 色参数里的数字 2 不是 SGR dim。
+                if code in {38, 48, 58} and ":" not in field and at + 1 < len(fields):
+                    try:
+                        mode = int(fields[at + 1] or 0)
+                    except ValueError:
+                        mode = 0
+                    at += 2 if mode == 5 else 4 if mode == 2 else 0
+                at += 1
+        pos = ansi.end()
+    return result
+
+
+def composer_state(screen: str, cursor: tuple[int, int] | None) -> str:
+    """识别 Claude 当前编辑器是 ``empty``、``editing`` 还是 ``unknown``。
+
+    Claude 的建议文本和真实草稿都显示在两条横线之间，不能只看 ``❯`` 后
+    是否有字。建议文本是 dim 且真实光标仍停在起点；ESC 回填的草稿是正常
+    亮度，光标也会随正文移动。选择题虽然也使用 ``❯``，但没有编辑器横线，
+    因而不会被误清空。
+    """
+    if not cursor:
+        return "unknown"
+    raw_lines = str(screen or "").replace("\r", "").splitlines()
+    clean_lines = [_ANSI.sub("", line) for line in raw_lines]
+    cursor_x, cursor_y = cursor
+    if cursor_y < 0 or cursor_y >= len(clean_lines):
+        return "unknown"
+
+    upper = next((row for row in range(cursor_y, -1, -1)
+                  if _COMPOSER_RULE.match(clean_lines[row])), None)
+    lower = next((row for row in range(cursor_y + 1, len(clean_lines))
+                  if _COMPOSER_RULE.match(clean_lines[row])), None)
+    if upper is None or lower is None or lower <= upper + 1:
+        return "unknown"
+    prompt_y = upper + 1
+    prompt = clean_lines[prompt_y]
+    marker = prompt.find("❯")
+    if marker < 0 or prompt[:marker].strip() or not (prompt_y <= cursor_y < lower):
+        return "unknown"
+
+    block = "\n".join(raw_lines[prompt_y:lower])
+    styled = _styled_chars(block)
+    try:
+        marker_at = next(i for i, (char, _) in enumerate(styled) if char == "❯")
+    except StopIteration:
+        return "unknown"
+    content = [(char, dim) for char, dim in styled[marker_at + 1:]
+               if not char.isspace()]
+    if not content:
+        return "empty"
+
+    # 光标起点在 marker 后的一个空格/NBSP 后。无色终端会丢失 dim 信息，
+    # 此时光标位置仍能分辨静态建议和已经输入的正文。
+    at_start = cursor_y == prompt_y and cursor_x <= marker + 2
+    has_sgr = bool(_SGR.search(block))
+    if has_sgr and any(not dim for _, dim in content):
+        return "editing"
+    if at_start:
+        return "empty"
+    return "editing"
 
 
 def _atomic_json(path: Path, value: dict) -> None:

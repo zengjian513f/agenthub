@@ -1967,10 +1967,10 @@ function syncComposerMode() {
   autoGrow(ta);
 }
 
-async function prepareCodexDraft(uid) {
+async function prepareTerminalDraft(uid) {
   const name = takenOver(uid);
   const cli = sesmanCli(uid);
-  if (!name || cli?.source !== 'codex' || uid.startsWith('tmux:')) {
+  if (!name || !['claude', 'codex'].includes(cli?.source) || uid.startsWith('tmux:')) {
     return { proceed: true, overwriteDraft: '' };
   }
   let d;
@@ -2325,7 +2325,7 @@ async function submitComposer() {
   add.disabled = true;
   renderComposerItems();
   try {
-    const draftPolicy = await prepareCodexDraft(uid);
+    const draftPolicy = await prepareTerminalDraft(uid);
     if (!draftPolicy.proceed) return;
     const uploaded = [];
     let attachmentId = attachments.find(x => x.uploaded?.uid === uid)?.uploaded?.attachment_id || null;

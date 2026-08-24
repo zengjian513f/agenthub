@@ -494,6 +494,19 @@ def capture_screen_plain(name: str) -> str:
     return _session_tmux(name, "capture-pane", "-J", "-p", "-t", name)
 
 
+def capture_screen(name: str) -> str:
+    """取带样式的当前物理屏；编辑器检测需同时保留 ANSI 与软换行。"""
+    return _session_tmux(name, "capture-pane", "-p", "-e", "-t", name)
+
+
+def cursor_position(name: str) -> tuple[int, int]:
+    """返回 pane 内的光标列、行，用来区分可见占位提示与真实草稿。"""
+    value = _session_tmux(
+        name, "display-message", "-p", "-t", name, "#{cursor_x}\t#{cursor_y}")
+    left, right = value.strip().split("\t", 1)
+    return int(left), int(right)
+
+
 def set_window_size_policy(name: str, policy: str = "latest") -> bool:
     """Set the tmux window sizing policy without depending on the caller's tmux."""
     if policy not in {"latest", "largest", "smallest", "manual"}:

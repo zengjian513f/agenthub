@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -175,6 +176,96 @@ class ClaudeQueueTests(unittest.TestCase):
         self.assertEqual(repeated_after_ack["_status"], 200)
         late_submit.assert_not_called()
         self.assertEqual(claude_queue.list_for("claude:u"), [])
+
+    def test_server_rejects_claude_send_before_persisting_over_restored_draft(self):
+        session = {"uid": "claude:u", "source": "claude", "sid": "u"}
+        pane = {"name": "sesman-claude-u"}
+        rule = "─" * 60
+        screen = f"{rule}\n\x1b[39m❯\xa0被 ESC 回填的旧消息\n{rule}\n  ⏵⏵ auto mode on"
+        cursor = (24, 1)
+        expected = hashlib.sha256(
+            f"{cursor[0]}\0{cursor[1]}\0{screen}".encode()).hexdigest()
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture_screen", return_value=screen), \
+                patch.object(server.term, "cursor_position", return_value=cursor), \
+                patch.object(server.term, "submit_text") as submit:
+            result = handler._queue_message({
+                "uid": "claude:u", "name": pane["name"],
+                "text": "网页里的下一条", "request_id": "draft-conflict",
+            })
+
+        self.assertEqual(result["_status"], 409)
+        self.assertTrue(result["draft_conflict"])
+        self.assertEqual(result["draft_token"], expected)
+        submit.assert_not_called()
+        self.assertEqual(claude_queue.list_for("claude:u"), [])
+
+    def test_confirmed_claude_draft_is_cleared_and_verified_before_submit(self):
+        session = {"uid": "claude:u", "source": "claude", "sid": "u"}
+        pane = {"name": "sesman-claude-u"}
+        rule = "─" * 60
+        draft = f"{rule}\n\x1b[39m❯\xa0旧草稿\n{rule}\n  ⏵⏵ auto mode on"
+        empty = f"{rule}\n\x1b[39m❯\xa0\n{rule}\n  Press Ctrl-C again to exit"
+        cursor = (8, 1)
+        token = hashlib.sha256(
+            f"{cursor[0]}\0{cursor[1]}\0{draft}".encode()).hexdigest()
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.index, "cursor", return_value={
+                    "end": 10, "head": "head", "anchor": "anchor"}), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture_screen", side_effect=[draft, empty]), \
+                patch.object(server.term, "cursor_position",
+                             side_effect=[cursor, (2, 1)]), \
+                patch.object(server.term, "leave_copy_mode") as leave, \
+                patch.object(server.term, "send_keys") as keys, \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.send_protocol.time, "sleep"), \
+                patch.object(handler, "_display_ip", return_value="127.0.0.1"), \
+                patch.object(server.OUTBOX_WAKE, "set"):
+            result = handler._queue_message({
+                "uid": "claude:u", "name": pane["name"],
+                "text": "网页里的下一条", "request_id": "confirmed-draft",
+                "overwrite_draft": token,
+            })
+
+        self.assertEqual(result["_status"], 200)
+        keys.assert_called_once_with(pane["name"], "C-c")
+        self.assertEqual(leave.call_count, 2)
+        submit.assert_called_once_with(pane["name"], "网页里的下一条")
+        self.assertEqual(claude_queue.list_for("claude:u")[0]["state"], "submitted")
+
+    def test_repeated_claude_request_never_clears_a_later_terminal_draft(self):
+        self.enqueue("已经发送", "same-request")
+        claude_queue.mark_injecting("same-request", "claude:u")
+        claude_queue.mark_submitted("same-request", "claude:u")
+        session = {"uid": "claude:u", "source": "claude", "sid": "u"}
+        pane = {"name": "sesman-claude-u"}
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        driver = server.send_protocol.driver_for("claude")
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(driver, "overwrite_draft") as overwrite, \
+                patch.object(server.term, "submit_text") as submit:
+            result = handler._queue_message({
+                "uid": "claude:u", "name": pane["name"], "text": "已经发送",
+                "request_id": "same-request", "overwrite_draft": "stale-token",
+            })
+
+        self.assertEqual(result["_status"], 200)
+        overwrite.assert_not_called()
+        submit.assert_not_called()
 
     def test_server_poll_confirms_without_any_browser_connection(self):
         self.enqueue("离线确认")

@@ -136,42 +136,6 @@ def _resolve_activity(uid: str, result: dict) -> dict:
     return result
 
 
-def _codex_composer_probe(name: str) -> dict:
-    """Return a content-free fingerprint when Codex has an unsent draft."""
-    try:
-        screen = term.capture(name, 40)
-    except (OSError, RuntimeError):
-        return {"draft_state": "unknown"}
-    state = codex_bridge.composer_state(screen)
-    result = {"draft_state": state}
-    if state == "editing":
-        result.update(
-            draft_conflict=True,
-            draft_token=hashlib.sha256(
-                screen.encode("utf-8", "replace")).hexdigest(),
-        )
-    return result
-
-
-def _overwrite_codex_draft(name: str, expected_token: str) -> dict | None:
-    """Clear the exact draft the browser confirmed, then verify an empty editor."""
-    probe = _codex_composer_probe(name)
-    if probe.get("draft_state") != "editing":
-        return None
-    if not expected_token or expected_token != probe.get("draft_token"):
-        return probe
-
-    # Codex 0.147.0: Ctrl+C in an idle non-empty composer clears the draft and
-    # does not create a rollout record.  This was verified against the local TUI.
-    term.leave_copy_mode(name)
-    term.send_keys(name, "C-c")
-    for delay in (0.03, 0.05, 0.08, 0.13, 0.21):
-        time.sleep(delay)
-        if _codex_composer_probe(name).get("draft_state") == "empty":
-            return None
-    return {"error": "未能确认终端草稿已清空，消息未发送"}
-
-
 def _poll_outbox() -> None:
     """即使浏览器断开，也独立从原生记录追踪完成与接收事件。"""
     for item in claude_queue.tracked():
@@ -1137,6 +1101,9 @@ class Handler(BaseHTTPRequestHandler):
         pane = _pane_for_session(s, panes)
         if not pane or pane["name"] != str(body.get("name") or ""):
             return self._json({"error": f"{s['source'].title()} tmux 会话未连接"}, 409)
+        driver = send_protocol.driver_for(str(s.get("source") or ""))
+        if not driver:
+            return self._json({"error": "会话发送协议不可用"}, 400)
         if s.get("source") == "claude":
             return self._queue_claude_message(body, s, pane)
         failed = next((item for item in send_queue.list_for(uid)
@@ -1148,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "上一条消息发送失败，请先重试或移除",
                 **send_queue.snapshot(uid),
             }, 409)
-        conflict = _overwrite_codex_draft(
+        conflict = driver.overwrite_draft(
             pane["name"], str(body.get("overwrite_draft") or ""))
         if conflict:
             return self._json({**conflict, **send_queue.snapshot(uid)}, 409)
@@ -1162,6 +1129,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _queue_claude_message(self, body: dict, session: dict, pane: dict):
         uid = str(session.get("uid") or "")
+        text = str(body.get("text") or "")
+        request_id = str(body.get("request_id") or "")
+        existing = claude_queue.lookup(request_id, uid, text)
+        if existing:
+            # 网络丢包后的同 ID 重放只是查询状态，绝不能清掉用户后来写的草稿。
+            return self._json({"ok": True, "item": existing,
+                               **claude_queue.snapshot(uid)})
+
+        driver = send_protocol.driver_for("claude")
+        conflict = driver.overwrite_draft(
+            pane["name"], str(body.get("overwrite_draft") or ""))
+        if conflict:
+            return self._json({**conflict, **claude_queue.snapshot(uid)}, 409)
+
         # Establish the causal boundary on the server immediately before the
         # ledger write. A background tab can send a cursor that predates an old
         # same-text prompt or custom-title record and must not retire this row.
@@ -1172,8 +1153,7 @@ class Handler(BaseHTTPRequestHandler):
             "anchor": native_cursor["anchor"],
         }
         item, created = claude_queue.enqueue(
-            uid, pane["name"], str(body.get("text") or ""), body.get("media"),
-            str(body.get("request_id") or ""), causal_cursor, {
+            uid, pane["name"], text, body.get("media"), request_id, causal_cursor, {
                 "page": str(body.get("page_id") or "")[:128],
                 "build": str(body.get("_build") or "")[:32],
                 "ip": self._display_ip(),
@@ -1190,7 +1170,7 @@ class Handler(BaseHTTPRequestHandler):
                                **claude_queue.snapshot(uid)})
         try:
             term.leave_copy_mode(pane["name"])
-            term.submit_text(pane["name"], str(body.get("text") or ""))
+            term.submit_text(pane["name"], text)
             item = claude_queue.mark_submitted(item["id"], uid) or item
         except Exception as error:
             # Paste and Enter are separate operations.  Once injection begins an
@@ -1203,12 +1183,13 @@ class Handler(BaseHTTPRequestHandler):
     def _draft_status(self, body: dict):
         uid = str(body.get("uid") or "")
         s = index.get(uid)
-        if not s or s.get("source") != "codex":
-            return self._json({"error": "草稿检测只适用于 Codex 会话"}, 400)
+        driver = send_protocol.driver_for(str(s.get("source") or "")) if s else None
+        if not s or not driver:
+            return self._json({"error": "草稿检测只适用于 Claude/Codex 会话"}, 400)
         pane = _pane_for_session(s, term.list_sessions())
         if not pane or pane["name"] != str(body.get("name") or ""):
-            return self._json({"error": "Codex tmux 会话未连接"}, 409)
-        return self._json({"ok": True, **_codex_composer_probe(pane["name"])})
+            return self._json({"error": f"{s['source'].title()} tmux 会话未连接"}, 409)
+        return self._json({"ok": True, **driver.composer_probe(pane["name"])})
 
     def _retry_message(self, body: dict):
         uid = str(body.get("uid") or "")
@@ -1225,7 +1206,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "待发送消息不存在"}, 404)
         pane = _pane_for_session(s, term.list_sessions()) if s else None
         if pane:
-            conflict = _overwrite_codex_draft(
+            driver = send_protocol.driver_for("codex")
+            conflict = driver.overwrite_draft(
                 pane["name"], str(body.get("overwrite_draft") or ""))
             if conflict:
                 return self._json({**conflict, **send_queue.snapshot(uid)}, 409)

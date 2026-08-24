@@ -78,6 +78,39 @@ class ClaudeBridgeTests(unittest.TestCase):
         self.assertEqual(command["type"], "command")
         self.assertNotIn("permissionDecision", json.dumps(settings))
 
+    def test_composer_distinguishes_empty_suggestion_and_restored_draft(self):
+        rule = "─" * 80
+        footer = "  ⏵⏵ bypass permissions on · ← 4 agents"
+        empty = f"old output\n{rule}\n\x1b[39m❯\xa0\n{rule}\n{footer}"
+        suggestion = (f"old output\n{rule}\n\x1b[39m❯\xa0"
+                      f"\x1b[2mTry fixing the tests\x1b[0m\n{rule}\n{footer}")
+        restored = (f"old output\n{rule}\n\x1b[39m❯\xa0"
+                    f"被 ESC 回填的消息\n{rule}\n{footer}")
+
+        self.assertEqual(claude_bridge.composer_state(empty, (2, 2)), "empty")
+        self.assertEqual(claude_bridge.composer_state(suggestion, (2, 2)), "empty")
+        self.assertEqual(claude_bridge.composer_state(restored, (19, 2)), "editing")
+        # 即使用户把光标移回开头，正常亮度的正文仍然是草稿。
+        self.assertEqual(claude_bridge.composer_state(restored, (2, 2)), "editing")
+
+    def test_composer_handles_wrapping_but_rejects_choice_pointer(self):
+        rule = "─" * 50
+        wrapped = (f"{rule}\n\x1b[39m❯\xa0第一行很长\n"
+                   f"第二行草稿\n{rule}\n  ⏵⏵ auto mode on")
+        choice = ("  Resume this session?\n\n"
+                  "  \x1b[38;5;153m❯\x1b[39m 1. Resume from summary\n"
+                  "    2. Resume full session\n\n"
+                  "  Enter to confirm · Esc to cancel")
+
+        self.assertEqual(claude_bridge.composer_state(wrapped, (12, 2)), "editing")
+        self.assertEqual(claude_bridge.composer_state(choice, (2, 2)), "unknown")
+
+    def test_colourless_placeholder_uses_real_cursor_position(self):
+        rule = "─" * 50
+        screen = f"{rule}\n❯\xa0Try fixing tests\n{rule}\n  manual mode on"
+        self.assertEqual(claude_bridge.composer_state(screen, (2, 1)), "empty")
+        self.assertEqual(claude_bridge.composer_state(screen, (18, 1)), "editing")
+
 
 if __name__ == "__main__":
     unittest.main()
