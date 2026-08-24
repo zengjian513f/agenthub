@@ -39,6 +39,7 @@ ATTACHMENT_DIR = "sesman_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
 OUTBOX_WAKE = threading.Event()
 TERM_OWNERS = term_ownership.Registry()
+_CLAUDE_CONFIRM_REPLAY_AT: dict[str, float] = {}
 
 
 def _add_allowed(value: str) -> None:
@@ -140,13 +141,29 @@ def _poll_outbox() -> None:
     """即使浏览器断开，也独立从原生记录追踪完成与接收事件。"""
     for item in claude_queue.tracked():
         uid = str(item.get("uid") or "")
+        item_id = str(item.get("id") or "")
         s = index.get(uid)
         if not s or s.get("source") != "claude":
             continue
         try:
-            start = int(item.get("watch_start") or 0)
-            head = str(item.get("watch_head") or "")
-            anchor = str(item.get("watch_anchor") or "")
+            # watch 游标会持续前移。提交超过确认期限后，定期从实际注入前的
+            # 固定游标复核，避免一次解析/匹配遗漏永久制造“等待 Claude 确认”。
+            now = time.time()
+            submitted_at = float(item.get("submitted_at")
+                                 or item.get("injecting_at") or now)
+            overdue = (
+                item.get("state") in {"injecting", "submitted", "ambiguous"}
+                and now - submitted_at >= claude_queue.CONFIRM_TIMEOUT
+                and item.get("confirm_start") is not None)
+            last_replay = _CLAUDE_CONFIRM_REPLAY_AT.get(item_id, 0.0)
+            replay = (overdue
+                      and now - last_replay >= claude_queue.CONFIRM_TIMEOUT)
+            if replay:
+                _CLAUDE_CONFIRM_REPLAY_AT[item_id] = now
+            prefix = "confirm" if replay else "watch"
+            start = int(item.get(f"{prefix}_start") or 0)
+            head = str(item.get(f"{prefix}_head") or "")
+            anchor = str(item.get(f"{prefix}_anchor") or "")
             if head and anchor:
                 result = index.messages_for(s, start=start, head=head, anchor=anchor)
             else:
@@ -159,6 +176,8 @@ def _poll_outbox() -> None:
             }
             claude_queue.observe(
                 uid, result["messages"], result.get("activity"), cursor)
+            if not any(row.get("id") == item_id for row in claude_queue.tracked()):
+                _CLAUDE_CONFIRM_REPLAY_AT.pop(item_id, None)
         except (OSError, ValueError, KeyError):
             continue
 

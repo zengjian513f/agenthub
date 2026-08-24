@@ -24,6 +24,8 @@ DATA_DIR = Path.home() / ".local" / "share" / "sesman"
 QUEUE_FILE = DATA_DIR / "claude-send-queue.json"
 VERSION = 1
 TOMBSTONE_SECONDS = 7 * 24 * 60 * 60
+CONFIRM_TIMEOUT = 8.0
+APPENDED_DRAFT_MAX_DELAY = 2.0
 _lock = threading.RLock()
 _revision = 0
 _epoch = uuid.uuid4().hex
@@ -167,6 +169,7 @@ def enqueue(uid: str, name: str, text: str, media: list | None,
             "client": dict(client or {}),
         }
         _put_cursor(row, cursor)
+        _snapshot_confirmation_cursor(row)
         rows.append(row)
         _write(rows)
         send_audit.record("claude", uid, item_id, "persisted", text,
@@ -246,11 +249,21 @@ def observe(uid: str, messages: list[dict] | None,
             if role in {"user", "command"}:
                 at = _matching_row(rows, uid, text, message.get("ts"),
                                    allow_timeless=allow_timeless)
+                appended_prefix_bytes = None
+                if at is None and role == "user":
+                    appended = _matching_appended_draft_row(
+                        rows, uid, text, message.get("ts"))
+                    if appended is not None:
+                        at, appended_prefix_bytes = appended
                 if at is not None:
                     matched = rows[at]
-                    send_audit.record("claude", uid, str(matched.get("id") or ""),
-                                      "native_committed", matched.get("text"),
-                                      native_ts=message.get("ts"))
+                    event = ("native_committed_appended_draft"
+                             if appended_prefix_bytes is not None
+                             else "native_committed")
+                    send_audit.record(
+                        "claude", uid, str(matched.get("id") or ""), event,
+                        matched.get("text"), native_ts=message.get("ts"),
+                        appended_prefix_bytes=appended_prefix_bytes)
                     _confirm(rows[at])
                     changed = True
                 continue
@@ -369,6 +382,40 @@ def _matching_row(rows: list[dict], uid: str, text: str, recorded,
     return None
 
 
+def _matching_appended_draft_row(rows: list[dict], uid: str, text: str,
+                                 recorded) -> tuple[int, int] | None:
+    """Match a web prompt appended by Claude to a pre-existing composer draft.
+
+    This is deliberately narrower than ordinary prompt matching: only an exact
+    suffix, only terminal-submitted rows, and only a native record written within
+    two seconds of the server's pre-injection boundary.  It repairs the historical
+    ESC-draft failure without allowing a coincidentally similar later prompt to
+    acknowledge an old ledger row.
+    """
+    native_key = _prompt_key(text)
+    if not native_key or not recorded:
+        return None
+    candidates: list[tuple[float, int, int]] = []
+    for i, row in enumerate(rows):
+        row_key = _prompt_key(row.get("text"))
+        if (row.get("uid") != uid
+                or row.get("state") not in {"injecting", "submitted", "ambiguous"}
+                or not row_key or native_key == row_key
+                or not native_key.endswith(row_key)):
+            continue
+        delay = _timestamp_delta(recorded, row.get("after_ts"))
+        if delay is None or not 0 <= delay <= APPENDED_DRAFT_MAX_DELAY:
+            continue
+        prefix = native_key[:-len(row_key)]
+        if not prefix:
+            continue
+        candidates.append((delay, i, len(prefix.encode("utf-8", "replace"))))
+    if not candidates:
+        return None
+    _, index, prefix_bytes = min(candidates)
+    return index, prefix_bytes
+
+
 def _prompt_key(value) -> str:
     # Claude records the submitted prompt without the editor's outer whitespace.
     return str(value or "").strip()
@@ -396,6 +443,18 @@ def _causal(recorded, boundary) -> bool:
         return True
 
 
+def _timestamp_delta(recorded, boundary) -> float | None:
+    """Return a strict native-minus-boundary delta for narrow causal matches."""
+    if not recorded or not boundary:
+        return None
+    try:
+        left = datetime.fromisoformat(str(recorded).replace("Z", "+00:00"))
+        right = datetime.fromisoformat(str(boundary).replace("Z", "+00:00"))
+        return left.timestamp() - right.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def _put_cursor(row: dict, cursor: dict | None) -> bool:
     if not isinstance(cursor, dict):
         return False
@@ -412,3 +471,16 @@ def _put_cursor(row: dict, cursor: dict | None) -> bool:
         return False
     row.update(values)
     return True
+
+
+def _snapshot_confirmation_cursor(row: dict) -> None:
+    """Keep the pre-injection cursor even after the live watch cursor advances."""
+    for source, target in (
+        ("watch_start", "confirm_start"),
+        ("watch_head", "confirm_head"),
+        ("watch_anchor", "confirm_anchor"),
+    ):
+        if row.get(source) is not None:
+            row[target] = row[source]
+        else:
+            row.pop(target, None)

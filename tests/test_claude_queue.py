@@ -46,6 +46,9 @@ class ClaudeQueueTests(unittest.TestCase):
         self.assertEqual(
             (row["watch_start"], row["watch_head"], row["watch_anchor"]),
             (100, "head", "anchor"))
+        self.assertEqual(
+            (row["confirm_start"], row["confirm_head"], row["confirm_anchor"]),
+            (100, "head", "anchor"))
         audit = send_audit.LOG_FILE.read_text()
         self.assertIn('"event":"persisted"', audit)
         self.assertIn('"text_sha256"', audit)
@@ -66,6 +69,54 @@ class ClaudeQueueTests(unittest.TestCase):
         claude_queue.observe("claude:u", [
             {"role": "user", "text": "同文", "ts": self.accepted_ts(row)}], None)
         self.assertEqual(claude_queue.list_for("claude:u"), [])
+
+    def test_immediate_native_prompt_with_old_draft_prefix_retires_suffix_row(self):
+        self.enqueue("网页新消息")
+        claude_queue.mark_injecting("req-1", "claude:u")
+        claude_queue.mark_submitted("req-1", "claude:u")
+
+        claude_queue.observe("claude:u", [{
+            "role": "user", "text": "ESC 回填的旧草稿。网页新消息",
+            "ts": self.accepted_ts(),
+        }], None)
+
+        self.assertEqual(claude_queue.list_for("claude:u"), [])
+        audit = send_audit.LOG_FILE.read_text()
+        self.assertIn('"event":"native_committed_appended_draft"', audit)
+        self.assertIn('"appended_prefix_bytes":', audit)
+
+    def test_late_or_middle_occurrence_does_not_fake_appended_draft_ack(self):
+        self.enqueue("网页新消息")
+        claude_queue.mark_injecting("req-1", "claude:u")
+        claude_queue.mark_submitted("req-1", "claude:u")
+        row = claude_queue.tracked()[0]
+        late = (datetime.fromisoformat(row["after_ts"])
+                + timedelta(seconds=3)).isoformat()
+
+        claude_queue.observe("claude:u", [{
+            "role": "user", "text": "旧草稿 网页新消息 后续文字",
+            "ts": self.accepted_ts(row),
+        }, {
+            "role": "user", "text": "另一条消息以网页新消息结尾",
+            "ts": late,
+        }], None)
+
+        self.assertEqual(len(claude_queue.list_for("claude:u")), 1)
+
+    def test_live_cursor_advances_without_losing_confirmation_cursor(self):
+        self.enqueue("保留确认边界")
+
+        claude_queue.observe("claude:u", [], None, {
+            "start": 240, "head": "new-head", "anchor": "new-anchor",
+        })
+
+        row = claude_queue.tracked()[0]
+        self.assertEqual(
+            (row["watch_start"], row["watch_head"], row["watch_anchor"]),
+            (240, "new-head", "new-anchor"))
+        self.assertEqual(
+            (row["confirm_start"], row["confirm_head"], row["confirm_anchor"]),
+            (100, "head", "anchor"))
 
     def test_native_enqueue_is_ack_not_failure_and_user_finally_retires(self):
         self.enqueue("忙时消息")
@@ -281,6 +332,33 @@ class ClaudeQueueTests(unittest.TestCase):
         }
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.index, "messages_for", return_value=result) as read:
+            server._poll_outbox()
+
+        read.assert_called_once_with(
+            session, start=100, head="head", anchor="anchor")
+        self.assertEqual(claude_queue.list_for("claude:u"), [])
+
+    def test_timeout_rechecks_claude_from_immutable_confirmation_cursor(self):
+        self.enqueue("已经收到")
+        claude_queue.mark_injecting("req-1", "claude:u")
+        claude_queue.mark_submitted("req-1", "claude:u")
+        row = claude_queue.tracked()[0]
+        claude_queue.observe("claude:u", [], None, {
+            "start": 240, "head": "new-head", "anchor": "new-anchor",
+        })
+        session = {"uid": "claude:u", "source": "claude", "path": "/tmp/fake"}
+        result = {
+            "messages": [{"role": "user", "text": "已经收到",
+                          "ts": self.accepted_ts(row)}],
+            "activity": {"state": "working"},
+            "end": 260, "version": {"head": "latest-head"},
+            "anchor": "latest-anchor",
+        }
+        server._CLAUDE_CONFIRM_REPLAY_AT.clear()
+        replay_at = float(row["submitted_at"]) + claude_queue.CONFIRM_TIMEOUT + .01
+        with patch.object(server.time, "time", return_value=replay_at), patch.object(
+                server.index, "get", return_value=session), patch.object(
+                server.index, "messages_for", return_value=result) as read:
             server._poll_outbox()
 
         read.assert_called_once_with(
