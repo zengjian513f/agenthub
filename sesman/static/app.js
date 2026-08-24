@@ -322,13 +322,25 @@ function acceptServerOutboxVersion(uid, version) {
   });
 }
 
-function syncServerOutbox(uid, items, version = null) {
+function syncServerOutbox(uid, items, version = null, { retireMissing = false } = {}) {
   if (!['claude', 'codex'].includes(sesmanCli(uid)?.source)
       || !Array.isArray(items)) return false;
   if (staleServerOutbox(uid, version)) return false;
   acceptServerOutboxVersion(uid, version);
   const next = items.map(item => ({ ...item, server: true }));
-  const before = JSON.stringify(queuedMessages(uid));
+  const current = queuedMessages(uid);
+  if (!retireMissing) {
+    const ids = new Set(next.map(item => item?.id).filter(Boolean));
+    // 服务端账本消失只证明原生记录已经被服务端看见，不证明这个标签页也
+    // 收到了正文 diff。占位必须等匹配的 user/command 被本页接受后，再由
+    // reconcileQueuedMessages 原子替换；否则空账本包先到就会让消息消失。
+    for (const item of current) {
+      if (item?.server && item.id && !ids.has(item.id)) next.push(item);
+    }
+  }
+  next.sort((a, b) => (+a?.created || 0) - (+b?.created || 0)
+    || String(a?.id || '').localeCompare(String(b?.id || '')));
+  const before = JSON.stringify(current);
   if (next.length) S.queued.set(uid, next); else S.queued.delete(uid);
   const changed = before !== JSON.stringify(next);
   if (changed && S.sel === uid && !S.agent) {
@@ -364,7 +376,8 @@ async function retryServerQueuedMessage(uid, id) {
 async function discardServerQueuedMessage(uid, id) {
   const d = await post('api/session/outbox/discard', { uid, id });
   if (d.error) return alert('移除失败: ' + d.error);
-  syncServerOutbox(uid, d.outbox || [], d.outbox_version);
+  // 用户明确点了撤销/移除，不需要等待一条永远不会出现的原生正文。
+  syncServerOutbox(uid, d.outbox || [], d.outbox_version, {retireMissing: true});
 }
 
 function updateClientQueuedMessage(uid, id, update) {
@@ -625,8 +638,8 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
       // 短暂消失。先从当前浏览器游标补一次正文，再原子完成替换。
       const removesPending = queuedMessages(uid).some(
         item => item.server && item.id && !ids.has(item.id));
+      syncServerOutbox(uid, data.outbox, data.outbox_version);
       if (removesPending) scheduleDiffRecovery(uid, agent);
-      else syncServerOutbox(uid, data.outbox, data.outbox_version);
     }
     return 0;
   }
@@ -641,10 +654,20 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     e.prompt = data.prompt || null;
     globalThis.revealConversationForPrompt?.(uid, e.prompt);
   }
+  let missingOutboxIds = null;
   if (!agent && Array.isArray(data.outbox)) {
+    const ids = new Set(data.outbox.map(item => item?.id).filter(Boolean));
+    missingOutboxIds = new Set(queuedMessages(uid)
+      .filter(item => item.server && item.id && !ids.has(item.id))
+      .map(item => item.id));
     syncServerOutbox(uid, data.outbox, data.outbox_version);
   }
   if (!agent) reconcileQueuedMessages(uid, data.messages);
+  if (missingOutboxIds?.size && queuedMessages(uid).some(
+      item => missingOutboxIds.has(item.id))) {
+    // 本批没有带来匹配正文；主动补读，但补读期间仍保留占位。
+    scheduleDiffRecovery(uid, agent);
+  }
   const questionCalls = new Set([...e.msgs, ...(data.messages || [])]
     .filter(m => m.role === 'question' && m.call_id).map(m => m.call_id));
   data.messages = (data.messages || []).map(m => {

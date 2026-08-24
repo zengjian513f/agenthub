@@ -556,7 +556,26 @@ def run(pw):
         await applyDiff(uid, {outbox_only:true, outbox:[]});
         const outboxOnly = {queued:queuedMessages(uid).length,
           messages:cache.get(key).msgs.length, end:cache.get(key).end};
-        return {stale, current, outboxOnly};
+
+        cache.set(key, entry()); S.queued.set(uid, [pending()]);
+        await applyDiff(uid, {reset:false, start:100, end:110,
+          version:{head:'head-a'}, anchor:'anchor-b', messages:[{
+            role:'assistant', text:'账本先确认，但本批还没有用户正文',
+            ts:'2026-08-13T00:00:01Z'}],
+          outbox:[], activity_changed:false, activity:null});
+        const bodyLag = {queued:queuedMessages(uid).length,
+          messages:cache.get(key).msgs.map(x => x.text), end:cache.get(key).end};
+        await applyDiff(uid, {reset:false, start:110, end:120,
+          version:{head:'head-a'}, anchor:'anchor-c', messages:[{
+            role:'user', text:'不能消失的消息', ts:'2026-08-13T00:00:02Z'}],
+          outbox:[], activity_changed:false, activity:null});
+        const bodyArrived = {queued:queuedMessages(uid).length,
+          messages:cache.get(key).msgs.map(x => x.text), end:cache.get(key).end};
+
+        cache.set(key, entry()); S.queued.set(uid, [pending()]);
+        syncServerOutbox(uid, [], null, {retireMissing:true});
+        const explicitDiscard = queuedMessages(uid).length;
+        return {stale, current, outboxOnly, bodyLag, bodyArrived, explicitDiscard};
       } finally {
         if (oldEntry) cache.set(key, oldEntry); else cache.delete(key);
         if (oldQueued) S.queued.set(uid, oldQueued); else S.queued.delete(uid);
@@ -567,6 +586,12 @@ def run(pw):
               "stale": {"queued": 1, "messages": 0, "end": 100},
               "current": {"queued": 0, "messages": ["不能消失的消息"], "end": 120},
               "outboxOnly": {"queued": 1, "messages": 0, "end": 100},
+              "bodyLag": {"queued": 1,
+                           "messages": ["账本先确认，但本批还没有用户正文"], "end": 110},
+              "bodyArrived": {"queued": 0,
+                               "messages": ["账本先确认，但本批还没有用户正文", "不能消失的消息"],
+                               "end": 120},
+              "explicitDiscard": 0,
           }, diff_race)
     outbox_order = p.evaluate("""() => {
       const uid = 'codex:synthetic-outbox-order';
@@ -595,11 +620,11 @@ def run(pw):
         S.retiredOutboxEpochs.delete('e2e-new-process');
       }
     }""")
-    check("Codex 队列拒绝旧修订，并在服务重启后拒绝旧进程迟到快照",
+    check("Codex 队列拒绝旧修订，服务重启也不抢在原生正文前删占位",
           outbox_order == {
               "staleRevision": ["one", "two"],
-              "restarted": ["one"],
-              "delayedOldProcess": ["one"],
+              "restarted": ["one", "two"],
+              "delayedOldProcess": ["one", "two"],
               "version": {"epoch": "e2e-new-process", "revision": 1},
           }, outbox_order)
     script_order = p.locator("script[src]").evaluate_all(
