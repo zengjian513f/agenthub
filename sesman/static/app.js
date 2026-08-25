@@ -223,6 +223,7 @@ const FAST_MAX = 3000;
 const TICK_MS = 200;
 const BACKUP_MS = 20000;    // SSE 正常时的兜底对账间隔
 const LIST_MS = 8000;       // 会话列表跟进磁盘变化的间隔
+const PENDING_RECONCILE_MS = 5000; // 只在有服务端 pending 时巡检小账本
 const cache = new Map();          // viewKey → {meta, msgs, version, end, bytes}
 // 多题题卡会被 SSE、兜底对账和完整重绘反复替换 DOM。未提交选择必须独立于
 // 节点保存，否则下一次后台刷新就会让用户刚点的答案消失。
@@ -788,6 +789,78 @@ function syncSession(uid, agent = S.agent) {
   syncingViews.set(key, task);
   return task;
 }
+
+// SSE 负责低延迟更新，但标签页休眠、网络切换和浏览会话切换都可能让某次
+// 账本/正文更新错过。只要本页仍有服务端 pending，就定期读取很小的 outbox
+// 快照；若服务端项已消失，再用缓存和一次增量正文读取判断它是正式落盘、
+// Claude 分支取代，还是仍应保留为“未确认”。
+const pendingReconciliations = new Map();
+
+function reconcilePendingSnapshot(uid, data) {
+  if (!data || !Array.isArray(data.outbox)) return false;
+  const ids = new Set(data.outbox.map(item => item?.id).filter(Boolean));
+  const missing = new Set(queuedMessages(uid)
+    .filter(item => item?.server && item.id && !ids.has(item.id))
+    .map(item => item.id));
+  let changed = syncServerOutbox(uid, data.outbox, data.outbox_version);
+  const entry = cache.get(viewKey(uid));
+  if (entry?.msgs?.length) {
+    changed = reconcileQueuedMessages(uid, entry.msgs) || changed;
+    changed = retireSupersededClaudeMessages(uid, missing, entry.msgs) || changed;
+  }
+  if (changed && S.sel === uid && !S.agent) {
+    renderConversationTail(entry?.activity || null, uid);
+  }
+  return changed;
+}
+
+function reconcilePendingUid(uid) {
+  uid = String(uid || '');
+  if (!queuedMessages(uid).some(item => item?.server)) return Promise.resolve(false);
+  const current = pendingReconciliations.get(uid);
+  if (current) return current;
+  const task = (async () => {
+    try {
+      const query = new URLSearchParams({uid});
+      const response = await fetch(appUrl(`api/session/outbox?${query}`), {
+        cache: 'no-store',
+      });
+      if (!response.ok) return false;
+      const data = await response.json();
+      let changed = reconcilePendingSnapshot(uid, data);
+      // 账本状态只能说明服务端是否还在追踪。正文决定 pending 是被同文
+      // 正式消息取代，还是 Claude Esc 后被新分支取代；缓存存在时补一次
+      // 小型增量读取，未打开的会话则等打开时读取，绝不拉几十 MB 全量。
+      const serverIds = new Set(data.outbox.map(item => item?.id).filter(Boolean));
+      if (queuedMessages(uid).some(
+          item => item?.server && item.id && !serverIds.has(item.id))
+          && cache.has(viewKey(uid))) {
+        changed = !!(await syncSession(uid, null)) || changed;
+      }
+      return changed;
+    } catch {
+      return false;
+    }
+  })().finally(() => {
+    if (pendingReconciliations.get(uid) === task) pendingReconciliations.delete(uid);
+  });
+  pendingReconciliations.set(uid, task);
+  return task;
+}
+
+async function reconcileAllPendingMessages() {
+  expireQueuedMessages();
+  if (document.hidden) return [];
+  const uids = [...S.queued]
+    .filter(([, items]) => items?.some(item => item?.server))
+    .map(([uid]) => uid);
+  return Promise.all(uids.map(reconcilePendingUid));
+}
+
+setInterval(reconcileAllPendingMessages, PENDING_RECONCILE_MS);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) reconcileAllPendingMessages();
+});
 
 // ---- 服务端推送 ----
 // 服务端盯着会话文件, 一变就把 diff 推过来, 不用客户端反复问。
@@ -1824,6 +1897,7 @@ async function renderSession(meta, msgs, activity = null) {
   if (seq === renderSeq && S.sel === uid && S.agent === agent) {
     watchSession(meta.uid, agent); // 之后的更新由服务端推过来
     if (typeof restoreTermPane === 'function') restoreTermPane(uid, agent);
+    if (!agent) queueMicrotask(reconcileAllPendingMessages);
   }
 }
 

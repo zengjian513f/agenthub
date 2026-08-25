@@ -43,6 +43,7 @@ class ClaudeQueueTests(unittest.TestCase):
         self.assertEqual(first, again)
         self.assertEqual(len(claude_queue.list_for("claude:u")), 1)
         row = claude_queue.tracked()[0]
+        self.assertEqual(first["afterTs"], row["after_ts"])
         self.assertEqual(
             (row["watch_start"], row["watch_head"], row["watch_anchor"]),
             (100, "head", "anchor"))

@@ -635,6 +635,64 @@ def run(pw):
               "assistantOnly": 1, "superseded": 0,
               "active": ["xsec 截面排序损失 ic(M1-E21)\n\n入主线"],
           }, claude_rewind_replace)
+    pending_sweep = p.evaluate("""async () => {
+      const claudeUid='claude:synthetic-pending-sweep';
+      const codexUid='codex:synthetic-pending-sweep';
+      const claudeKey=viewKey(claudeUid), codexKey=viewKey(codexUid);
+      const oldClaudeEntry=cache.get(claudeKey), oldCodexEntry=cache.get(codexKey);
+      const oldClaudeQueued=S.queued.get(claudeUid), oldCodexQueued=S.queued.get(codexUid);
+      const oldClaudeVersion=S.outboxVersions.get(claudeUid);
+      const oldCodexVersion=S.outboxVersions.get(codexUid);
+      const oldFetch=globalThis.fetch;
+      let calls=0;
+      try {
+        cache.set(claudeKey,{meta:{uid:claudeUid,source:'claude'},msgs:[{
+          role:'user',text:'编辑后的活动分支',ts:'2026-08-25T18:21:35.616Z'}],
+          version:{head:'head'},end:120,anchor:'anchor',activity:null,bytes:0,total:1});
+        S.queued.set(claudeUid,[{id:'old-branch',uid:claudeUid,text:'旧分支',
+          created:Date.parse('2026-08-25T18:21:14.960Z'),
+          afterTs:'2026-08-25T18:21:14.000Z',state:'submitted',server:true}]);
+        S.queued.set(codexUid,[{id:'failed-send',uid:codexUid,text:'未确认消息',
+          created:Date.parse('2026-08-25T18:22:00.000Z'),
+          afterTs:'2026-08-25T18:21:59.000Z',state:'delivering',server:true}]);
+        globalThis.fetch=async (input, init) => {
+          const url=new URL(String(input),location.href);
+          if (!url.pathname.endsWith('/api/session/outbox')) return oldFetch(input, init);
+          calls++;
+          const uid=url.searchParams.get('uid');
+          const data=uid===claudeUid
+            ? {outbox:[],outbox_version:{epoch:'e2e-sweep-claude',revision:1}}
+            : {outbox:[{id:'failed-send',uid:codexUid,text:'未确认消息',
+                created:Date.parse('2026-08-25T18:22:00.000Z'),
+                afterTs:'2026-08-25T18:21:59.000Z',state:'failed',
+                error:'未在会话记录中确认',server:true}],
+              outbox_version:{epoch:'e2e-sweep-codex',revision:1}};
+          return {ok:true,json:async()=>data};
+        };
+        await Promise.all([reconcilePendingUid(claudeUid),reconcilePendingUid(codexUid)]);
+        return {calls,claude:queuedMessages(claudeUid).length,
+          codex:queuedMessages(codexUid).map(item=>({state:item.state,error:item.error})),
+          running:pendingReconciliations.size};
+      } finally {
+        globalThis.fetch=oldFetch;
+        if (oldClaudeEntry) cache.set(claudeKey,oldClaudeEntry); else cache.delete(claudeKey);
+        if (oldCodexEntry) cache.set(codexKey,oldCodexEntry); else cache.delete(codexKey);
+        if (oldClaudeQueued) S.queued.set(claudeUid,oldClaudeQueued); else S.queued.delete(claudeUid);
+        if (oldCodexQueued) S.queued.set(codexUid,oldCodexQueued); else S.queued.delete(codexUid);
+        if (oldClaudeVersion) S.outboxVersions.set(claudeUid,oldClaudeVersion);
+        else S.outboxVersions.delete(claudeUid);
+        if (oldCodexVersion) S.outboxVersions.set(codexUid,oldCodexVersion);
+        else S.outboxVersions.delete(codexUid);
+        S.retiredOutboxEpochs.delete('e2e-sweep-claude');
+        S.retiredOutboxEpochs.delete('e2e-sweep-codex');
+      }
+    }""")
+    check("所有服务端 pending 会定期修补 Claude 分支和 Codex 失败状态",
+          pending_sweep == {
+              "calls": 2, "claude": 0,
+              "codex": [{"state": "failed", "error": "未在会话记录中确认"}],
+              "running": 0,
+          }, pending_sweep)
     outbox_order = p.evaluate("""() => {
       const uid = 'codex:synthetic-outbox-order';
       const oldQueued = S.queued.get(uid), oldVersion = S.outboxVersions.get(uid);

@@ -75,9 +75,12 @@ def revision() -> int:
 
 
 def _public(row: dict) -> dict:
-    return {key: row.get(key) for key in (
+    public = {key: row.get(key) for key in (
         "id", "uid", "text", "media", "created", "state", "error", "attempts"
     ) if row.get(key) is not None} | {"server": True}
+    if row.get("after_ts") is not None:
+        public["afterTs"] = row["after_ts"]
+    return public
 
 
 def list_for(uid: str) -> list[dict]:

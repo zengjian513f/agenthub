@@ -27,6 +27,8 @@ class SendQueueTests(unittest.TestCase):
         send_queue.enqueue("codex:u", "pane", "消息", [], None, "snapshot")
         after = send_queue.snapshot("codex:u")
         self.assertEqual([x["id"] for x in after["outbox"]], ["snapshot"])
+        self.assertEqual(after["outbox"][0]["afterTs"],
+                         send_queue.tracked()[0]["after_ts"])
         self.assertEqual(after["outbox_version"]["epoch"],
                          before["outbox_version"]["epoch"])
         self.assertGreater(after["outbox_version"]["revision"],
