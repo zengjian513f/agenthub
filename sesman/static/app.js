@@ -96,7 +96,16 @@ const $ = s => document.querySelector(s);
 const MOBILE = matchMedia('(max-width: 720px)');
 // 页面既可挂在站点根目录，也可由反代放到 /sesman/ 之类的子路径。
 const APP_BASE = new URL('.', location.href);
-const appUrl = path => new URL(String(path).replace(/^\//, ''), APP_BASE).toString();
+const DEBUG_RUN = /^[A-Za-z0-9_-]{1,64}$/.test(
+  new URLSearchParams(location.search).get('debug_run') || '')
+  ? new URLSearchParams(location.search).get('debug_run') : '';
+const appUrl = path => {
+  const url = new URL(String(path).replace(/^\//, ''), APP_BASE);
+  if (DEBUG_RUN && url.pathname.includes('/api/')) {
+    url.searchParams.set('debug_run', DEBUG_RUN);
+  }
+  return url.toString();
+};
 const BUILD_ID = document.querySelector('meta[name="sesman-build"]')?.content || '';
 const el = (tag, cls, html) => {
   const n = document.createElement(tag);

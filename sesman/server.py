@@ -18,9 +18,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import (claude_bridge, claude_queue, codex_bridge, index, live, media,
-               pending as pending_store, send_protocol, send_queue, session_meta,
-               term, term_ownership, wsock)
+from . import (claude_bridge, claude_queue, codex_bridge, debug_runs, index, live,
+               media, pending as pending_store, send_protocol, send_queue,
+               session_meta, term, term_ownership, wsock)
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
@@ -314,6 +314,17 @@ def _outbox_loop() -> None:
 def _sessions_signature(index_sig: str | None = None) -> str:
     """原生会话与 sesman 自有元数据共同决定列表版本。"""
     return f"{index.signature() if index_sig is None else index_sig}:{session_meta.signature()}"
+
+
+def _debug_run(q: dict) -> str:
+    return str(q.get("debug_run", [""])[0] or "")[:64]
+
+
+def _view_signature(rows: list[dict], run_id: str) -> str:
+    """Hidden monkey writes must not make the user's ordinary list churn."""
+    payload = json.dumps({"debug_run": run_id, "sessions": rows},
+                         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
 def _pane_for_session(session: dict, panes: list[dict],
@@ -740,16 +751,18 @@ class Handler(BaseHTTPRequestHandler):
             # load 是唯一会扫 inventory 的入口；签名必须与这批 rows 属于同一
             # 已发布快照，不能 signature → load → signature 制造 TOCTOU。
             sessions, index_sig, built_at = index.load_snapshot(force=force)
-            current_sig = _sessions_signature(index_sig)
+            run_id = _debug_run(q)
+            sessions = debug_runs.filter_rows(sessions, run_id)
+            rows = session_meta.enrich(index.with_cursors(sessions))
+            current_sig = _view_signature(rows, run_id)
             if known and not force and known == current_sig:
                 return self._json({"unchanged": True, "sig": known})
-            rows = session_meta.enrich(index.with_cursors(sessions))
             return self._json({"sessions": rows, "sig": current_sig,
                                "built_at": built_at})
 
         if path == "/api/live":
             force = q.get("force", ["0"])[0] == "1"
-            sessions = index.cached()
+            sessions = debug_runs.filter_rows(index.cached(), _debug_run(q))
             uids = live.live_uids(sessions, force=force)
             live_set = set(uids)
             tmux_uids = [s["uid"] for s in sessions
@@ -766,11 +779,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/term/list":
             tmux_sessions = term.list_sessions() if TERMINAL else []
+            run_id = _debug_run(q)
+            tmux_sessions = debug_runs.filter_rows(tmux_sessions, run_id)
             if tmux_sessions:
                 # 把 tmux pane 映射回当前列表 uid。前端不能只从 pane 名猜 UUID，
                 # 因为 Codex 回退分支会沿用父会话启动时的旧名字。
                 linked: dict[str, dict] = {}
-                for session in index.cached():
+                for session in debug_runs.filter_rows(index.cached(), run_id):
                     pane = _pane_for_session(session, tmux_sessions)
                     if pane and (pane["name"] not in linked
                                  or session["updated"] > linked[pane["name"]]["updated"]):
@@ -779,6 +794,7 @@ class Handler(BaseHTTPRequestHandler):
                     if pane["name"] in linked:
                         pane["uid"] = linked[pane["name"]]["uid"]
             pending = pending_store.active({x["name"] for x in tmux_sessions}) if TERMINAL else []
+            pending = debug_runs.filter_rows(pending, run_id)
             public_pending = [{k: row.get(k) for k in
                                ("name", "source", "sid", "cwd", "started", "cols", "rows")}
                               for row in pending]
@@ -841,12 +857,15 @@ class Handler(BaseHTTPRequestHandler):
             srcs = [s for s in q.get("source", [""])[0].split(",") if s] or None
             on = lambda k: q.get(k, ["0"])[0] == "1"
             if on("progress"):
-                return self._search_stream(query, srcs, word=on("word"),
+                return self._search_stream(query, srcs, _debug_run(q), word=on("word"),
                                            case=on("case"), regex=on("regex"))
             try:
                 result = index.search(
                     query, srcs, word=on("word"), case=on("case"), regex=on("regex"))
-                result["results"] = session_meta.enrich(result["results"])
+                run_id = _debug_run(q)
+                result["results"] = session_meta.enrich(
+                    debug_runs.filter_rows(result["results"], run_id))
+                result["total_pool"] = len(debug_runs.filter_rows(index.cached(), run_id))
                 return self._json(result)
             except re.error as e:
                 return self._json({"error": f"正则无效: {e}"}, 400)
@@ -883,7 +902,7 @@ class Handler(BaseHTTPRequestHandler):
 
         raise KeyError(path)
 
-    def _search_stream(self, query: str, sources, **opts):
+    def _search_stream(self, query: str, sources, run_id: str = "", **opts):
         """以 NDJSON 推送扫描进度，最后一行给出完整搜索结果。"""
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -904,7 +923,9 @@ class Handler(BaseHTTPRequestHandler):
                 progress=lambda done, total: emit(
                     {"type": "progress", "done": done, "total": total}),
             )
-            result["results"] = session_meta.enrich(result["results"])
+            result["results"] = session_meta.enrich(
+                debug_runs.filter_rows(result["results"], run_id))
+            result["total_pool"] = len(debug_runs.filter_rows(index.cached(), run_id))
             emit({"type": "result", "data": result})
         except re.error as e:
             emit({"type": "error", "error": f"正则无效: {e}"})
