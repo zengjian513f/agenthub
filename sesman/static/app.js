@@ -481,6 +481,28 @@ function reconcileQueuedMessages(uid, messages) {
   return true;
 }
 
+/** Claude 的 Esc 编辑会把原输入留在 JSONL 的旧分支，再从同一父节点提交
+ *  新输入。服务端已经确认旧输入后 outbox 会消失；若当前活动时间线出现了
+ *  因果更晚的另一条 user/command，它不是“仍待确认”，而是已被新分支取代。 */
+function retireSupersededClaudeMessages(uid, ids, messages) {
+  if (sesmanCli(uid)?.source !== 'claude' || !ids?.size) return false;
+  const laterInputs = (messages || []).filter(message =>
+    ['user', 'command'].includes(message?.role)
+    && Number.isFinite(Date.parse(message.ts || '')));
+  if (!laterInputs.length) return false;
+  const current = queuedMessages(uid);
+  const next = current.filter(item => {
+    if (!item?.server || !ids.has(item.id)) return true;
+    const submitted = +item.created;
+    if (!Number.isFinite(submitted)) return true;
+    return !laterInputs.some(message => Date.parse(message.ts) > submitted);
+  });
+  if (next.length === current.length) return false;
+  if (next.length) S.queued.set(uid, next); else S.queued.delete(uid);
+  saveQueuedMessages();
+  return true;
+}
+
 /** 超时未获 CLI 原生回执时保留消息，并明确标成“发送未确认”。 */
 function expireQueuedMessages(now = Date.now()) {
   let changed = false;
@@ -663,6 +685,12 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     syncServerOutbox(uid, data.outbox, data.outbox_version);
   }
   if (!agent) reconcileQueuedMessages(uid, data.messages);
+  if (missingOutboxIds?.size) {
+    // reset 时旧缓存属于被回退的分支，不能拿来判断；普通追加则当前缓存和
+    // 本批共同构成活动时间线。只有更晚的用户输入才能证明旧项已被取代。
+    const activeMessages = data.reset ? data.messages : [...e.msgs, ...data.messages];
+    retireSupersededClaudeMessages(uid, missingOutboxIds, activeMessages);
+  }
   if (missingOutboxIds?.size && queuedMessages(uid).some(
       item => missingOutboxIds.has(item.id))) {
     // 本批没有带来匹配正文；主动补读，但补读期间仍保留占位。

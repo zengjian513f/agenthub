@@ -593,6 +593,48 @@ def run(pw):
                                "end": 120},
               "explicitDiscard": 0,
           }, diff_race)
+    claude_rewind_replace = p.evaluate("""async () => {
+      const uid='claude:synthetic-rewind-replace', key=viewKey(uid);
+      const oldEntry=cache.get(key), oldQueued=S.queued.get(uid);
+      const oldVersion=S.outboxVersions.get(uid);
+      const pending=()=>({id:'claude-old-branch',uid,
+        text:'xsec 截面排序损失 ic(M1-E21)\\n\\n入dev',
+        created:Date.parse('2026-08-25T18:21:14.960Z'),
+        state:'submitted',server:true});
+      const entry=()=>({meta:{uid,source:'claude'},msgs:[],
+        version:{head:'head-a'},end:100,anchor:'anchor-a',activity:null,
+        bytes:0,total:0,prompt:null});
+      try {
+        cache.set(key,entry()); S.queued.set(uid,[pending()]);
+        await applyDiff(uid,{reset:true,start:0,end:110,
+          version:{head:'head-a'},anchor:'anchor-b',messages:[{
+            role:'assistant',text:'只有更晚回复不能证明用户改了分支',
+            ts:'2026-08-25T18:21:30.000Z'}],outbox:[],
+          outbox_version:{epoch:'claude-rewind',revision:1},
+          activity_changed:false,activity:null,meta:{uid,source:'claude'}});
+        const assistantOnly=queuedMessages(uid).length;
+
+        cache.set(key,entry()); S.queued.set(uid,[pending()]);
+        await applyDiff(uid,{reset:true,start:0,end:120,
+          version:{head:'head-a'},anchor:'anchor-c',messages:[{
+            role:'user',text:'xsec 截面排序损失 ic(M1-E21)\\n\\n入主线',
+            ts:'2026-08-25T18:21:35.616Z'}],outbox:[],
+          outbox_version:{epoch:'claude-rewind',revision:2},
+          activity_changed:false,activity:null,meta:{uid,source:'claude'}});
+        return {assistantOnly,superseded:queuedMessages(uid).length,
+          active:cache.get(key).msgs.map(message=>message.text)};
+      } finally {
+        if (oldEntry) cache.set(key,oldEntry); else cache.delete(key);
+        if (oldQueued) S.queued.set(uid,oldQueued); else S.queued.delete(uid);
+        if (oldVersion) S.outboxVersions.set(uid,oldVersion);
+        else S.outboxVersions.delete(uid);
+      }
+    }""")
+    check("Claude Esc 编辑成新分支后退掉已被取代的旧发送占位",
+          claude_rewind_replace == {
+              "assistantOnly": 1, "superseded": 0,
+              "active": ["xsec 截面排序损失 ic(M1-E21)\n\n入主线"],
+          }, claude_rewind_replace)
     outbox_order = p.evaluate("""() => {
       const uid = 'codex:synthetic-outbox-order';
       const oldQueued = S.queued.get(uid), oldVersion = S.outboxVersions.get(uid);
