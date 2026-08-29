@@ -227,17 +227,20 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
     try:
         # task_complete 写盘到 TUI 真正回到输入框仍有一个很短的重绘窗口。
         # 连续两帧终端文本一致才注入，避开本次事故中的 15ms 状态切换。
-        before = term.capture(name, 40)
+        before = term.capture_screen_state(name)
         time.sleep(0.08)
-        if before != term.capture(name, 40):
+        if before != term.capture_screen_state(name):
             send_queue.defer(item["id"])
             return
-        composer = codex_bridge.composer_state(before)
+        screen, cursor = before
+        composer = codex_bridge.composer_state(screen, cursor)
         if composer == "editing":
             # 双 Esc 回退失败时 Codex 会把旧 prompt 留在编辑框里。绝不能
             # 清空用户草稿，也不能把新消息粘到它后面形成一条拼接消息。同时
             # resize/重连会短暂留下历史 › 行；同一画面连续稳定数帧后才报错。
-            signature = hashlib.sha256(before.encode("utf-8", "replace")).hexdigest()
+            signature = hashlib.sha256(
+                f"{cursor[0]}\0{cursor[1]}\0{screen}".encode("utf-8", "replace")
+            ).hexdigest()
             send_queue.defer_editing(item["id"], signature)
             return
         if composer == "unknown" and str(item.get("activity_state") or "") in {
@@ -246,7 +249,7 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
             # clear-screen, making an existing conversation look like a new one.
             # resize、切换会话和 TUI 重绘都会短暂产生这种帧；先退避重试，连续
             # 多次仍无法识别才保留为可人工处理的失败项。
-            if codex_bridge.busy_screen(before) or codex_bridge.approval_prompt(before):
+            if codex_bridge.busy_screen(screen) or codex_bridge.approval_prompt(screen):
                 send_queue.defer(item["id"])
                 return
             send_queue.defer_unrecognized(item["id"])

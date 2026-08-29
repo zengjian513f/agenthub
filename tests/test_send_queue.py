@@ -189,7 +189,8 @@ class SendQueueTests(unittest.TestCase):
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture", return_value=screen), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=(screen, (2, 0))), \
                 patch.object(server.term, "submit_text") as submit, \
                 patch.object(server.time, "sleep"):
             server._deliver_outbox_item(row, [pane])
@@ -213,7 +214,8 @@ class SendQueueTests(unittest.TestCase):
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture", return_value=stale_screen), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=(stale_screen, (0, 0))), \
                 patch.object(server.term, "leave_copy_mode") as leave, \
                 patch.object(server.term, "send_keys") as keys, \
                 patch.object(server.term, "submit_text") as submit, \
@@ -230,6 +232,38 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual(failed["state"], "failed")
         self.assertIn("输入框不可识别", failed["error"])
 
+    def test_short_footerless_codex_composer_is_delivered_from_live_cursor(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "短窗口继续", [],
+            {"state": "idle"}, "short-footerless")
+        row = send_queue.tracked()[0]
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        lines = [
+            "• 已完成上一回合。", "", "  这是最后一条回答。", "",
+            "─ Worked for 1m 01s " + "─" * 24, "", "", "", "", "", "",
+            "", "", "", "", "",
+            "\x1b[1m\x1b[38;5;215m›\x1b[0m "
+            "\x1b[2mAsk Codex to do anything\x1b[0m",
+        ]
+        screen = "\n".join(lines)
+        snapshot = (screen, (2, 16))
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=snapshot), \
+                patch.object(server.term, "leave_copy_mode") as leave, \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.time, "sleep"):
+            server._deliver_outbox_item(row, [pane])
+
+        leave.assert_called_once_with(pane["name"])
+        submit.assert_called_once_with(pane["name"], "短窗口继续")
+        delivered = send_queue.list_for("codex:u")[0]
+        self.assertEqual((delivered["state"], delivered["attempts"]),
+                         ("delivering", 1))
+
     def test_unknown_busy_screen_is_deferred_from_stale_idle(self):
         send_queue.enqueue(
             "codex:u", "sesman-codex-u", "下一条", [],
@@ -241,7 +275,8 @@ class SendQueueTests(unittest.TestCase):
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture", return_value=screen), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=(screen, (2, 1))), \
                 patch.object(server.term, "send_keys") as keys, \
                 patch.object(server.term, "submit_text") as submit, \
                 patch.object(server.time, "sleep"):
@@ -276,13 +311,15 @@ class SendQueueTests(unittest.TestCase):
         pane = {"name": "sesman-codex-u"}
         footer = "gpt-5.6-sol · Context 19% used · Ready"
         screen = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
+        cursor = (2, 0)
         handler = object.__new__(server.Handler)
         handler._json = lambda payload, status=200: {**payload, "_status": status}
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture", return_value=screen):
+                patch.object(server.term, "capture_screen_state",
+                             return_value=(screen, cursor)):
             result = handler._queue_message({
                 "uid": "codex:u", "name": pane["name"], "text": "网页新消息",
             })
@@ -291,7 +328,9 @@ class SendQueueTests(unittest.TestCase):
         self.assertTrue(result["draft_conflict"])
         self.assertEqual(
             result["draft_token"],
-            hashlib.sha256(screen.encode("utf-8")).hexdigest())
+            hashlib.sha256(
+                f"{cursor[0]}\0{cursor[1]}\0{screen}".encode("utf-8")
+            ).hexdigest())
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
     def test_confirmed_web_send_clears_exact_codex_draft_before_enqueue(self):
@@ -300,14 +339,18 @@ class SendQueueTests(unittest.TestCase):
         footer = "gpt-5.6-sol · Context 19% used · Ready"
         screen = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
         empty = "\x1b[2m› Ask Codex to do anything\x1b[0m\n\n" + footer
-        token = hashlib.sha256(screen.encode("utf-8")).hexdigest()
+        cursor = (2, 0)
+        token = hashlib.sha256(
+            f"{cursor[0]}\0{cursor[1]}\0{screen}".encode("utf-8")
+        ).hexdigest()
         handler = object.__new__(server.Handler)
         handler._json = lambda payload, status=200: {**payload, "_status": status}
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture", side_effect=[screen, empty]), \
+                patch.object(server.term, "capture_screen_state",
+                             side_effect=[(screen, cursor), (empty, cursor)]), \
                 patch.object(server.term, "leave_copy_mode") as leave, \
                 patch.object(server.term, "send_keys") as keys, \
                 patch.object(server.time, "sleep"), \
@@ -336,7 +379,8 @@ class SendQueueTests(unittest.TestCase):
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture", return_value=screen), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=(screen, (2, 0))), \
                 patch.object(server.term, "send_keys") as keys:
             result = handler._queue_message({
                 "uid": "codex:u", "name": pane["name"], "text": "网页新消息",

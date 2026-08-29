@@ -78,14 +78,16 @@ def _styled_chars(text: str) -> list[tuple[str, bool]]:
     return result
 
 
-def composer_state(screen: str) -> str:
+def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
     """Classify the live Codex composer as ``empty``, ``editing`` or ``unknown``.
 
     Codex renders its empty rotating placeholder with SGR dim, while restored
-    rewind text and normal drafts are not dim.  A live model/status footer is
-    required so transcript output containing a composer marker cannot be mistaken for
-    the composer.  Recent Codex builds no longer print the old Context/Ready
-    labels, so their final ``model · cwd`` status line is also accepted.
+    rewind text and normal drafts are not dim.  Normally a live model/status
+    footer proves that a nearby marker belongs to the composer.  At short pane
+    heights Codex suppresses that footer entirely, so a cursor inside the
+    bottom composer block is accepted as the equivalent live-screen proof.
+    Recent Codex builds no longer print the old Context/Ready labels, so their
+    final ``model · cwd`` status line is also accepted.
     """
     raw_lines = str(screen or "").replace("\r", "").splitlines()
     clean_lines = [_ANSI.sub("", line) for line in raw_lines]
@@ -97,6 +99,7 @@ def composer_state(screen: str) -> str:
                     if _CONTEXT_FOOTER.search(clean_lines[i])]
         if contexts:
             status.append((ready, contexts[-1]))
+    footer: int | None = None
     if status:
         ready, context = status[-1]
         footer = min(ready, context)
@@ -106,22 +109,46 @@ def composer_state(screen: str) -> str:
             footer -= 1
     else:
         nonblank = [i for i, line in enumerate(clean_lines) if line.strip()]
-        if not nonblank or not _MODEL_FOOTER.match(clean_lines[nonblank[-1]]):
+        candidate = nonblank[-1] if nonblank else None
+        if candidate is not None and _MODEL_FOOTER.match(clean_lines[candidate]):
+            footer = candidate
+
+    if footer is not None:
+        # Only inspect the nonblank block immediately above the status bar.  The
+        # former 20-line search could reach into transcript history when a resize
+        # caught Codex between clearing and redrawing its composer.  A historic
+        # ``› user prompt`` was then reported as a live draft, permanently blocking
+        # the web outbox even though the visible composer was empty.
+        end = footer - 1
+        while end >= 0 and not clean_lines[end].strip():
+            end -= 1
+        if end < 0:
             return "unknown"
-        footer = nonblank[-1]
-    # Only inspect the nonblank block immediately above the status bar.  The
-    # former 20-line search could reach into transcript history when a resize
-    # caught Codex between clearing and redrawing its composer.  A historic
-    # ``› user prompt`` was then reported as a live draft, permanently blocking
-    # the web outbox even though the visible composer was empty.
-    end = footer - 1
-    while end >= 0 and not clean_lines[end].strip():
-        end -= 1
-    if end < 0:
-        return "unknown"
-    start = end
-    while start > 0 and clean_lines[start - 1].strip():
-        start -= 1
+        start = end
+        while start > 0 and clean_lines[start - 1].strip():
+            start -= 1
+    else:
+        # The 46x17 frame in BUG-20260829-164614-566cac ended at the live
+        # ``› Ask Codex to do anything`` row and omitted the status bar.  Use
+        # tmux's visible-screen cursor to identify that exact block; without a
+        # cursor, transcript text remains untrusted.
+        try:
+            cursor_x, cursor_y = (int(value) for value in cursor)  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            return "unknown"
+        if not (0 <= cursor_y < len(clean_lines)) or not clean_lines[cursor_y].strip():
+            return "unknown"
+        start = end = cursor_y
+        while start > 0 and clean_lines[start - 1].strip():
+            start -= 1
+        while end + 1 < len(clean_lines) and clean_lines[end + 1].strip():
+            end += 1
+        marker_col = len(clean_lines[start]) - len(clean_lines[start].lstrip())
+        if cursor_y == start and cursor_x <= marker_col:
+            return "unknown"
+        if any(_BUSY_STATUS.search(clean_lines[i])
+               for i in range(max(0, start - 6), end + 1)):
+            return "unknown"
     if clean_lines[start].lstrip()[:1] not in _COMPOSER_MARKERS:
         return "unknown"
     if any(_BUSY_STATUS.search(clean_lines[i])

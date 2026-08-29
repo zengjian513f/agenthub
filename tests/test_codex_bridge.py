@@ -53,6 +53,38 @@ class CodexBridgeTests(unittest.TestCase):
         transcript = "输出里引用了 › Implement {feature}\n仍在工作"
         self.assertEqual(codex_bridge.composer_state(transcript), "unknown")
 
+    def test_short_live_screen_uses_cursor_when_codex_hides_footer(self):
+        lines = [
+            "─" * 46,
+            "",
+            "• 因为窗口太短，底部状态行不会显示。",
+            "",
+            "  已完成。",
+            "",
+            "─ Worked for 1m 01s " + "─" * 24,
+            "",
+            "",
+            "\x1b[1m\x1b[38;5;215m›\x1b[0m "
+            "\x1b[2mAsk Codex to do anything\x1b[0m",
+        ]
+        screen = "\n".join(lines)
+        cursor = (2, len(lines) - 1)
+
+        self.assertEqual(codex_bridge.composer_state(screen), "unknown")
+        self.assertEqual(codex_bridge.composer_state(screen, cursor), "empty")
+
+        lines[-1] = "\x1b[1m\x1b[38;5;215m›\x1b[0m 真实草稿"
+        draft = "\n".join(lines)
+        self.assertEqual(
+            codex_bridge.composer_state(draft, (6, len(lines) - 1)), "editing")
+
+    def test_cursor_elsewhere_does_not_authorize_footerless_history(self):
+        screen = ("\x1b[1m›\x1b[0m "
+                  "\x1b[2mAsk Codex to do anything\x1b[0m\n\n"
+                  "• 当前只是历史输出")
+        self.assertEqual(
+            codex_bridge.composer_state(screen, (0, 2)), "unknown")
+
     def test_wrapped_ready_footer_does_not_become_editor_text(self):
         screen = ("\x1b[1m›\x1b[0m \x1b[2mImplement {feature}\x1b[0m\n\n"
                   "  gpt-5.6-sol max · weekly 87% left\n"

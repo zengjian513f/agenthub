@@ -96,12 +96,14 @@ class CodexSendDriver(SendDriver):
     def revision(self) -> int:
         return send_queue.revision()
 
-    def composer_snapshot(self, name: str) -> tuple[str, None]:
-        # Codex 的占位符靠 ANSI dim 区分，现有解析器不依赖光标位置。
-        return term.capture(name, 40), None
+    def composer_snapshot(self, name: str) -> tuple[str, tuple[int, int]]:
+        # 只取可见物理屏，让光标行与输入块对齐。短窗口中 Codex
+        # 会完全隐藏 model/status footer，此时光标是区分实时 composer
+        # 与历史 ``›`` 文本的必要证据。
+        return term.capture_screen_state(name)
 
     def composer_state(self, screen: str, cursor: tuple[int, int] | None) -> str:
-        return codex_bridge.composer_state(screen)
+        return codex_bridge.composer_state(screen, cursor)
 
 
 DRIVERS = {

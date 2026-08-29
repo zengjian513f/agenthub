@@ -499,6 +499,11 @@ def capture_screen(name: str) -> str:
     return _session_tmux(name, "capture-pane", "-p", "-e", "-t", name)
 
 
+def capture_screen_state(name: str) -> tuple[str, tuple[int, int]]:
+    """Return the visible styled screen and its aligned tmux cursor."""
+    return capture_screen(name), cursor_position(name)
+
+
 def cursor_position(name: str) -> tuple[int, int]:
     """返回 pane 内的光标列、行，用来区分可见占位提示与真实草稿。"""
     value = _session_tmux(
