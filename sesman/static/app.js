@@ -2368,13 +2368,9 @@ function head(m, total) {
   }
   const tb = h.querySelector('#a-term');
   if (tb) {
-    tb.onclick = () => {
-      const name = takenOver(m.uid);
-      if (name) {
-        T.uid = m.uid;
-        toggleTermPane(name);
-      }
-      else takeover(m.uid, tb);
+    tb.onclick = async () => {
+      if (takenOver(m.uid)) await toggleLinkedTermSession(m.uid);
+      else await takeover(m.uid, tb);
     };
     setTimeout(renderTakeoverBtn, 0);
   }

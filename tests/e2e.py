@@ -359,6 +359,51 @@ def run(pw):
               ["Left"] * 3 + ["Up"] * 5 + ["Down", "Enter"]
               + ["Up"] * 6 + ["Down", "Down", "Enter", "Enter"])
           and cli_layers["codexApproval"] == ["p"], cli_layers)
+    codex_branch_rebind = p.evaluate("""async () => {
+      const fromUid = 'codex:e2e-old-branch', toUid = 'codex:e2e-current-branch';
+      const rootSid = '01234567-89ab-cdef-0123-456789abcdef';
+      const name = 'sesman-codex-01234567', key = viewKey(fromUid);
+      const saved = {sel:S.sel, agent:S.agent, sessions:S.sessions,
+        termUid:T.uid, termName:T.name, list:T.list, composerUid};
+      const oldOpen = openSession, oldAudit = browserAuditEvent;
+      const opened = [];
+      try {
+        // 与真实回退一致：旧叶子已从列表消失，缓存详情仍在；
+        // 同一根 pane 现在由 term/list 标成新分支 uid。
+        S.sessions = S.sessions.filter(row => ![fromUid, toUid].includes(row.uid));
+        S.sel = fromUid; S.agent = null;
+        T.uid = fromUid; T.name = null;
+        T.list = [...(T.list || []), {name, uid:toUid}];
+        cache.set(key, {meta:{uid:fromUid, source:'codex',
+          sid:'fedcba98-7654-3210-fedc-ba9876543210', root_sid:rootSid}, msgs:[]});
+        composerDrafts.set(fromUid, {text:'跟随分支的草稿', attachments:[], quotes:[]});
+        openSession = async uid => { opened.push(uid); S.sel = uid; };
+        browserAuditEvent = () => {};
+        const linked = linkedTermSession(fromUid);
+        const changed = await rebindSelectedTermSession();
+        return {linked, taken:takenOver(fromUid), changed, opened,
+          selected:S.sel, termUid:T.uid,
+          oldDraft:composerDrafts.has(fromUid),
+          newDraft:composerDrafts.get(toUid)?.text || ''};
+      } finally {
+        openSession = oldOpen; browserAuditEvent = oldAudit;
+        cache.delete(key); composerDrafts.delete(fromUid); composerDrafts.delete(toUid);
+        S.queued.delete(fromUid); S.queued.delete(toUid);
+        S.sel = saved.sel; S.agent = saved.agent; S.sessions = saved.sessions;
+        T.uid = saved.termUid; T.name = saved.termName; T.list = saved.list;
+        composerUid = saved.composerUid;
+      }
+    }""")
+    check("Codex 回退后按根 pane 跟进新分支 uid 并迁移草稿",
+          codex_branch_rebind == {
+              "linked": {"name": "sesman-codex-01234567",
+                         "uid": "codex:e2e-current-branch"},
+              "taken": "sesman-codex-01234567", "changed": True,
+              "opened": ["codex:e2e-current-branch"],
+              "selected": "codex:e2e-current-branch",
+              "termUid": "codex:e2e-current-branch",
+              "oldDraft": False, "newDraft": "跟随分支的草稿",
+          }, codex_branch_rebind)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
       if (!session) return {error:'no codex session'};

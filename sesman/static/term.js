@@ -264,6 +264,10 @@ async function loadTermList() {
     }
     // tmux 结束后，对应的消息缓存才重新回到普通 LRU 容量池。
     if (typeof trimCache === 'function') trimCache();
+    // Codex 回退会创建新分支 UUID，但原生进程与 tmux pane 都不变。
+    // term/list 已经把 pane 映射到当前叶子；若本页还选中旧叶子，
+    // 必须连同草稿和终端归属一起跟进，不能继续向已消失的 uid 请求接管。
+    await rebindSelectedTermSession();
   }
   $('#new-session')?.classList.toggle('hidden', !T.enabled);
   // app.js 先于体积较大的终端库执行。若详情已在终端库就绪前打开，
@@ -287,17 +291,85 @@ async function loadTermList() {
   restoreTermPane(S.sel, S.agent);
 }
 
-/** 某个会话是否已经被接管 (存在对应的 tmux 会话)。 */
-function takenOver(uid) {
+function sessionTermMeta(uid) {
+  return S.sessions.find(x => x.uid === uid)
+    || (typeof cache !== 'undefined' ? cache.get(viewKey(uid))?.meta : null)
+    || null;
+}
+
+/** 返回会话所在的稳定 tmux pane 以及 pane 当前对应的 uid。 */
+function linkedTermSession(uid) {
+  const panes = [...(T.list || []), ...(T.pending || [])];
   if (String(uid || '').startsWith('tmux:')) {
     const name = String(uid).slice(5);
-    return [...(T.list || []), ...(T.pending || [])].some(x => x.name === name) ? name : null;
+    const pane = panes.find(x => x.name === name);
+    return pane ? { name, uid: pane.uid || uid } : null;
   }
-  const s = S.sessions.find(x => x.uid === uid);
-  if (!s || !T.list) return null;
-  const name = `sesman-${s.source}-${String(s.sid).slice(0, 8)}`;
-  return T.list.find(x => x.uid === uid)?.name
-    || (T.list.some(x => x.name === name) ? name : null);
+  const direct = panes.find(x => x.uid === uid);
+  if (direct) return { name: direct.name, uid: direct.uid || uid };
+
+  // 终端已经在本页打开时，pane 名是跨分支的稳定身份。
+  // 服务端映射出的 pane.uid 才是当前原生叶子。
+  if (T.uid === uid && T.name) {
+    const active = panes.find(x => x.name === T.name);
+    if (active) return { name: active.name, uid: active.uid || uid };
+  }
+
+  const session = sessionTermMeta(uid);
+  if (!session) return null;
+  // Codex 分支的 sid 会变，而接管时的 tmux 名由根会话 sid 生成。
+  // 优先保留普通会话的叶子名，再用 root_sid 追溯回同一 pane。
+  const ids = [...new Set([session.sid, session.root_sid].filter(Boolean))];
+  for (const sid of ids) {
+    const name = `sesman-${session.source}-${String(sid).slice(0, 8)}`;
+    const pane = panes.find(x => x.name === name);
+    if (pane) return { name, uid: pane.uid || uid };
+  }
+  return null;
+}
+
+/** 某个会话是否已经被接管 (存在对应的 tmux 会话)。 */
+function takenOver(uid) {
+  return linkedTermSession(uid)?.name || null;
+}
+
+function adoptLinkedTermSession(fromUid, linked, reason) {
+  const toUid = linked?.uid;
+  if (!toUid || toUid === fromUid || String(toUid).startsWith('tmux:')) return fromUid;
+  browserAuditEvent?.('terminal.session_rebound', {
+    name: linked.name, from_uid: fromUid, to_uid: toUid, reason,
+  }, null, { uid: toUid });
+  migrateComposerDraft(fromUid, toUid);
+  T.uid = toUid;
+  return toUid;
+}
+
+/** tmux 列表已指向新分支时，原子跟进当前详情与输入状态。 */
+async function rebindSelectedTermSession() {
+  const fromUid = T.uid;
+  if (!fromUid || S.sel !== fromUid || S.agent
+      || String(fromUid).startsWith('tmux:')) return false;
+  const linked = linkedTermSession(fromUid);
+  if (!linked?.uid || linked.uid === fromUid) return false;
+  const toUid = adoptLinkedTermSession(fromUid, linked, 'term-list');
+  await openSession(toUid);
+  return true;
+}
+
+/** 顶栏切换前先跟进 pane 的当前分支，然后再执行原本的对话/终端切换。 */
+async function toggleLinkedTermSession(uid) {
+  const linked = linkedTermSession(uid);
+  if (!linked) return false;
+  const toUid = adoptLinkedTermSession(uid, linked, 'user-toggle');
+  if (toUid !== uid && S.sel === uid && !S.agent) {
+    await openSession(toUid);
+    // 读取新分支期间用户可能已经切到别处，不再抢回终端。
+    if (S.sel !== toUid || S.agent) return true;
+  } else {
+    T.uid = toUid;
+  }
+  toggleTermPane(linked.name);
+  return true;
 }
 
 // ---------------------------------------------------------------- 接管
