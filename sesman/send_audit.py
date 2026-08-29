@@ -9,6 +9,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import audit
+
 
 DATA_DIR = Path.home() / ".local" / "share" / "sesman"
 LOG_FILE = DATA_DIR / "send-events.jsonl"
@@ -32,6 +34,15 @@ def record(source: str, uid: str, request_id: str, event: str,
                    text_bytes=len(encoded))
     row.update({key: value for key, value in details.items()
                 if value is not None and value != ""})
+    audit.record(
+        f"delivery.{event}", category="delivery",
+        severity="error" if any(word in str(event).casefold()
+                                for word in ("failed", "ambiguous", "error")) else "info",
+        source=source, uid=uid, trace_id=request_id, request_id=request_id,
+        page_id=str(details.get("page") or details.get("page_id") or ""),
+        build=str(details.get("build") or ""), data=row,
+        content={"text": text} if text is not None else None,
+    )
     try:
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
     except (TypeError, ValueError):

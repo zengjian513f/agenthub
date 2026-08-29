@@ -93,6 +93,34 @@ class ClaudeBridgeTests(unittest.TestCase):
         # 即使用户把光标移回开头，正常亮度的正文仍然是草稿。
         self.assertEqual(claude_bridge.composer_state(restored, (2, 2)), "editing")
 
+    def test_renamed_session_border_is_still_a_composer_rule(self):
+        upper = "─" * 28 + " renamed session " + "─" * 18
+        lower = "─" * 64
+        empty = f"{upper}\n❯\u00a0\n{lower}\n  plan mode on"
+        draft = f"{upper}\n❯\u00a0继续工作\n{lower}\n  plan mode on"
+        self.assertEqual(claude_bridge.composer_state(empty, (2, 1)), "empty")
+        self.assertEqual(claude_bridge.composer_state(draft, (6, 1)), "editing")
+
+    def test_narrow_renamed_title_can_consume_leading_rule(self):
+        screen = (" monkey-monkey-20260828-claude ─\n"
+                  "❯\u00a0\n"
+                  + "─" * 46 + "\n"
+                  "  manual mode on · ? for shortcuts")
+        self.assertEqual(claude_bridge.composer_state(screen, (2, 1)), "empty")
+
+    def test_busy_footer(self):
+        self.assertTrue(claude_bridge.busy_screen(
+            "plan mode on · \x1b[2mesc to interrupt\x1b[0m"))
+        self.assertTrue(claude_bridge.busy_screen(
+            "\x1b[38;5;174m✢\x1b[39m Unfurling… "
+            "\x1b[38;5;246m(1m 1s · ↓ 1.9k tokens)\x1b[39m"))
+        self.assertTrue(claude_bridge.busy_screen(
+            "* Ionizing… (12s · ↓ 800 tokens)"))
+        self.assertTrue(claude_bridge.busy_screen(
+            "✻ Sautéed for 1m 5s · 1 shell still running"))
+        self.assertFalse(claude_bridge.busy_screen("plan mode on"))
+        self.assertFalse(claude_bridge.busy_screen("* 普通 Markdown 项…"))
+
     def test_composer_handles_wrapping_but_rejects_choice_pointer(self):
         rule = "─" * 50
         wrapped = (f"{rule}\n\x1b[39m❯\xa0第一行很长\n"

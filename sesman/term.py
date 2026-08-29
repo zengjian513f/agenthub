@@ -27,7 +27,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import claude_bridge
+from . import audit, claude_bridge
 
 PREFIX = "sesman-"          # sesman 起的会话用这个前缀, 便于识别
 MANAGED_SERVER = "sesman"   # 独立 socket，不继承用户默认 tmux server 的交互配置
@@ -324,6 +324,11 @@ def new_session(name: str, cmd: str, cwd: str | None = None,
     args += [cmd]
     _tmux(*args, server=MANAGED_SERVER)
     _managed_configured = True          # 新 server 已经由 -f 加载；旧 server 先前也 source 过
+    audit.record(
+        "tmux.session.created", category="terminal",
+        data={"tmux": full, "cwd": cwd or "", "cols": cols, "rows": rows},
+        content={"command": cmd},
+    )
     return full
 
 
@@ -339,6 +344,8 @@ def kill_session(name: str) -> bool:
         return False
     try:
         _tmux("kill-session", "-t", name, server=row["server"], no_start=True)
+        audit.record("tmux.session.killed", category="terminal",
+                     data={"tmux": name, "server": row["server"]})
         return True
     except RuntimeError:
         if session_info(name) is None:
@@ -351,6 +358,8 @@ def rename_session(old: str, new: str) -> str:
     if full != old and has_session(full):
         raise RuntimeError(f"tmux 会话已存在: {full}")
     _session_tmux(old, "rename-session", "-t", old, full)
+    audit.record("tmux.session.renamed", category="terminal",
+                 data={"from": old, "to": full})
     return full
 
 
@@ -374,6 +383,8 @@ def process_belongs_to(pid: int, root_pid: int) -> bool:
 def send_text(name: str, text: str) -> None:
     """把一段文本当作键盘输入送进去 (不自动回车)。"""
     _session_tmux(name, "send-keys", "-t", name, "-l", "--", text)
+    audit.record("tmux.text.sent", category="terminal",
+                 data={"tmux": name, "chars": len(text)}, content=text)
 
 
 def submit_text(name: str, text: str) -> None:
@@ -386,6 +397,8 @@ def submit_text(name: str, text: str) -> None:
     with _submit_locks_guard:
         lock = _submit_locks.setdefault(name, threading.Lock())
     with lock:
+        audit.record("tmux.submit.started", category="terminal",
+                     data={"tmux": name, "chars": len(text)}, content=text)
         row = session_info(name)
         if not row:
             raise RuntimeError(f"tmux 会话不存在: {name}")
@@ -407,11 +420,15 @@ def submit_text(name: str, text: str) -> None:
         time.sleep(0.04)
         _tmux("send-keys", "-t", name, "--", "Enter",
               server=row["server"], no_start=True)
+        audit.record("tmux.submit.completed", category="terminal",
+                     data={"tmux": name, "chars": len(text)}, content=text)
 
 
 def send_keys(name: str, *keys: str) -> None:
     """送 tmux 键名, 例如 Enter / Escape / C-c / Up。"""
     _session_tmux(name, "send-keys", "-t", name, "--", *keys)
+    audit.record("tmux.keys.sent", category="terminal",
+                 data={"tmux": name, "keys": list(keys)})
 
 
 def in_copy_mode(name: str) -> bool:

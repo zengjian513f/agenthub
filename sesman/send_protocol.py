@@ -27,6 +27,22 @@ class SendDriver:
     def composer_state(self, screen: str, cursor: tuple[int, int] | None) -> str:
         raise NotImplementedError
 
+    def clear_composer(self, name: str) -> None:
+        raise NotImplementedError
+
+    def busy_screen(self, screen: str) -> bool:
+        raise NotImplementedError
+
+    def terminal_probe(self, name: str) -> dict:
+        screen, cursor = self.composer_snapshot(name)
+        return {
+            "draft_state": self.composer_state(screen, cursor),
+            "busy": self.busy_screen(screen),
+        }
+
+    def mark_interrupted(self, uid: str, restored: bool = False) -> bool:
+        raise NotImplementedError
+
     def composer_probe(self, name: str) -> dict:
         """只返回草稿状态和不可逆指纹，不把终端正文暴露给浏览器。"""
         try:
@@ -54,7 +70,7 @@ class SendDriver:
             return probe
 
         term.leave_copy_mode(name)
-        term.send_keys(name, "C-c")
+        self.clear_composer(name)
         for delay in (0.03, 0.05, 0.08, 0.13, 0.21):
             time.sleep(delay)
             if self.composer_probe(name).get("draft_state") == "empty":
@@ -82,6 +98,18 @@ class ClaudeSendDriver(SendDriver):
     def composer_state(self, screen: str, cursor: tuple[int, int] | None) -> str:
         return claude_bridge.composer_state(screen, cursor)
 
+    def clear_composer(self, name: str) -> None:
+        # Ctrl-C exits Claude when it is already idle.  Clear both sides of the
+        # cursor with line-editor keys instead, then let overwrite_draft verify
+        # the actual empty frame before any new prompt is persisted.
+        term.send_keys(name, "C-u", "C-k")
+
+    def busy_screen(self, screen: str) -> bool:
+        return claude_bridge.busy_screen(screen)
+
+    def mark_interrupted(self, uid: str, restored: bool = False) -> bool:
+        return claude_queue.mark_interrupted(uid, restored)
+
 
 class CodexSendDriver(SendDriver):
     source = "codex"
@@ -104,6 +132,15 @@ class CodexSendDriver(SendDriver):
 
     def composer_state(self, screen: str, cursor: tuple[int, int] | None) -> str:
         return codex_bridge.composer_state(screen, cursor)
+
+    def clear_composer(self, name: str) -> None:
+        term.send_keys(name, "C-u", "C-k")
+
+    def busy_screen(self, screen: str) -> bool:
+        return codex_bridge.busy_screen(screen)
+
+    def mark_interrupted(self, uid: str, restored: bool = False) -> bool:
+        return send_queue.mark_interrupted(uid)
 
 
 DRIVERS = {

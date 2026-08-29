@@ -15,6 +15,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import audit
+
 
 DATA_DIR = Path.home() / ".local" / "share" / "sesman"
 QUEUE_FILE = DATA_DIR / "send-queue.json"
@@ -42,6 +44,7 @@ def _read() -> list[dict]:
 
 def _write(rows: list[dict]) -> None:
     global _revision
+    before = _read()
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = QUEUE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(
@@ -49,6 +52,7 @@ def _write(rows: list[dict]) -> None:
     os.chmod(tmp, 0o600)
     tmp.replace(QUEUE_FILE)
     _revision += 1
+    audit.record_ledger_changes("codex", before, rows)
 
 
 def revision() -> int:
@@ -87,7 +91,9 @@ def snapshot(uid: str) -> dict:
 def tracked() -> list[dict]:
     """返回每个会话的队首，供后台独立追踪原生 rollout。"""
     with _lock:
-        rows = sorted(_read(), key=lambda x: float(x.get("created") or 0))
+        rows = sorted((row for row in _read()
+                       if row.get("state") != "aborted"),
+                      key=lambda x: float(x.get("created") or 0))
     first: dict[str, dict] = {}
     for row in rows:
         first.setdefault(str(row.get("uid") or ""), row)
@@ -154,7 +160,8 @@ def observe(uid: str, messages: list[dict] | None,
         mine = [x for x in rows if x.get("uid") == uid]
         if activity and mine:
             state = str(activity.get("state") or "")
-            for row in mine:
+            active = [row for row in mine if row.get("state") != "aborted"]
+            for row in active:
                 if row.get("activity_state") != state or row.get("activity_ts") != activity.get("ts"):
                     row["activity_state"] = state
                     row["activity_ts"] = activity.get("ts")
@@ -164,8 +171,21 @@ def observe(uid: str, messages: list[dict] | None,
                 if state in {"working", "waiting"} and row.get("state") == "queued":
                     if row.pop("ready_at", None) is not None:
                         changed = True
-            if state in {"idle", "aborted", "failed"}:
-                first = mine[0]
+            if state in {"aborted", "failed"}:
+                delivering = next((row for row in active
+                                   if row.get("state") in {
+                                       "delivering", "confirming"}), None)
+                if (delivering is not None
+                        and _causal(activity.get("ts"), delivering.get("after_ts"))):
+                    delivering.update(
+                        state="aborted", interrupted_at=now,
+                        error="回合在 Codex 写入原生用户记录前被中断")
+                    delivering.pop("ready_at", None)
+                    delivering.pop("delivered_at", None)
+                    changed = True
+                active = [row for row in mine if row.get("state") != "aborted"]
+            if state in {"idle", "aborted", "failed"} and active:
+                first = active[0]
                 if (first.get("state") == "queued" and not first.get("ready_at")
                         and _causal(activity.get("ts"), first.get("after_ts"))):
                     first["ready_at"] = now + READY_DELAY
@@ -183,7 +203,8 @@ def ready(now: float | None = None) -> list[dict]:
     with _lock:
         rows = _read()
     first: dict[str, dict] = {}
-    for row in sorted(rows, key=lambda x: float(x.get("created") or 0)):
+    for row in sorted((row for row in rows if row.get("state") != "aborted"),
+                      key=lambda x: float(x.get("created") or 0)):
         first.setdefault(str(row.get("uid") or ""), row)
     return [dict(row) for row in first.values()
             if row.get("state") == "queued"
@@ -259,7 +280,59 @@ def mark_failed(item_id: str, error: str) -> None:
     _update(item_id, change)
 
 
+def mark_confirming(item_id: str, error: str = "") -> None:
+    """Keep tracking a terminal write whose native record has not appeared yet.
+
+    Once ``mark_delivering`` has claimed a row, paste/Enter may already have
+    reached Codex.  A slow compact or an exception after that point is
+    ambiguous, never a retryable failure: exposing Retry can submit the same
+    prompt twice.
+    """
+    def change(row):
+        row.update(
+            state="confirming",
+            error=str(error or "已送达终端，等待 Codex 写入会话记录"),
+        )
+        row.pop("ready_at", None)
+    _update(item_id, change)
+
+
+def mark_interrupted(uid: str, now: float | None = None) -> bool:
+    """Settle an injected prompt that returned to an idle TUI without a record.
+
+    It must remain visible as an interrupted user action, but it is no longer a
+    queued delivery and must not block the next row in the FIFO.
+    """
+    now = time.time() if now is None else now
+    with _lock:
+        rows = _read()
+        target = next((row for row in rows if row.get("uid") == uid
+                       and row.get("state") in {
+                           "delivering", "confirming"}), None)
+        if target is None:
+            return False
+        target.update(
+            state="aborted", interrupted_at=now,
+            error="回合在 Codex 写入原生用户记录前被中断")
+        target.pop("ready_at", None)
+        target.pop("delivered_at", None)
+        following = next((row for row in rows if row.get("uid") == uid
+                          and row.get("state") == "queued"), None)
+        if following is not None and not following.get("ready_at"):
+            following["ready_at"] = now + READY_DELAY
+        _write(rows)
+        return True
+
+
 def expire_deliveries(now: float | None = None) -> int:
+    """Move overdue terminal writes into a non-retryable confirmation state.
+
+    Codex can emit ``task_started`` and then spend tens of seconds compacting
+    before persisting the corresponding user message.  The old eight-second
+    timeout changed the row to ``failed`` and offered Retry while the original
+    request was already running.  Keep polling from the fixed delivery cursor
+    instead; native confirmation or a real interrupt will retire the row.
+    """
     now = time.time() if now is None else now
     with _lock:
         rows = _read()
@@ -267,8 +340,8 @@ def expire_deliveries(now: float | None = None) -> int:
         for row in rows:
             if (row.get("state") == "delivering"
                     and now - float(row.get("delivered_at") or now) >= CONFIRM_TIMEOUT):
-                row["state"] = "failed"
-                row["error"] = "Codex 未在会话记录中确认接收"
+                row["state"] = "confirming"
+                row["error"] = "已送达终端，等待 Codex 写入会话记录"
                 changed += 1
         if changed:
             _write(rows)
@@ -278,7 +351,16 @@ def expire_deliveries(now: float | None = None) -> int:
 def retry(item_id: str, activity: dict | None = None, uid: str = "") -> dict | None:
     now = time.time()
     state = str((activity or {}).get("state") or "")
-    def change(row):
+    with _lock:
+        rows = _read()
+        row = next((x for x in rows if x.get("id") == item_id
+                    and (not uid or x.get("uid") == uid)), None)
+        # Only failures proven to have happened before the terminal write are
+        # safe to retry.  attempts > 0 means mark_delivering already won the
+        # atomic claim; a stale tab or direct API call must not duplicate it.
+        if (not row or row.get("state") != "failed"
+                or int(row.get("attempts") or 0) > 0):
+            return None
         row.update(state="queued", activity_state=state,
                    activity_ts=(activity or {}).get("ts"))
         row.pop("error", None)
@@ -291,7 +373,8 @@ def retry(item_id: str, activity: dict | None = None, uid: str = "") -> dict | N
             row["ready_at"] = now + READY_DELAY
         else:
             row.pop("ready_at", None)
-    return _update(item_id, change, uid)
+        _write(rows)
+        return _public(row)
 
 
 def discard(item_id: str, uid: str = "",

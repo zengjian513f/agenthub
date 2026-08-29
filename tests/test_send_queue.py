@@ -154,7 +154,7 @@ class SendQueueTests(unittest.TestCase):
 
         self.assertEqual(len(send_queue.list_for("codex:u")), 1)
 
-    def test_idle_message_is_durable_idempotent_and_failure_is_visible(self):
+    def test_slow_native_confirmation_never_becomes_retryable(self):
         first = send_queue.enqueue("codex:u", "pane", "消息", [{"src": "token"}],
                                    {"state": "idle"}, "same-id")
         again = send_queue.enqueue("codex:u", "pane", "消息", [{"src": "token"}],
@@ -165,9 +165,36 @@ class SendQueueTests(unittest.TestCase):
 
         send_queue.mark_delivering("same-id", now=10)
         self.assertEqual(send_queue.expire_deliveries(now=18.01), 1)
-        failed = send_queue.list_for("codex:u")[0]
-        self.assertEqual(failed["state"], "failed")
-        self.assertIn("未在会话记录中确认", failed["error"])
+        confirming = send_queue.list_for("codex:u")[0]
+        self.assertEqual(confirming["state"], "confirming")
+        self.assertIn("等待 Codex 写入", confirming["error"])
+        self.assertIsNone(send_queue.retry("same-id", {"state": "working"}, "codex:u"))
+
+        # Auto-compact may persist the user record tens of seconds after
+        # task_started.  The late native record still retires the placeholder.
+        send_queue.observe("codex:u", [{"role": "user", "text": "消息"}],
+                           {"state": "working"}, now=40)
+        self.assertEqual(send_queue.list_for("codex:u"), [])
+
+    def test_interrupt_before_native_user_record_becomes_aborted_not_pending(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "立刻中断的消息", [],
+            {"state": "idle"}, "interrupted")
+        send_queue.mark_delivering("interrupted", now=10)
+        send_queue.enqueue(
+            "codex:u", "pane", "中断后继续", [],
+            {"state": "working"}, "next")
+
+        send_queue.observe(
+            "codex:u", [],
+            {"state": "aborted", "ts": "2099-01-01T00:00:00Z"}, now=11)
+
+        rows = send_queue.list_for("codex:u")
+        self.assertEqual([(row["id"], row["state"]) for row in rows],
+                         [("interrupted", "aborted"), ("next", "queued")])
+        self.assertNotIn("interrupted", [row["id"] for row in send_queue.tracked()])
+        self.assertEqual(send_queue.ready(11.31)[0]["id"], "next")
+        self.assertEqual(send_queue.expire_deliveries(now=100), 0)
 
     def test_failed_item_blocks_fifo_until_retry_or_discard(self):
         send_queue.enqueue("codex:u", "pane", "一", [], {"state": "idle"}, "one")
@@ -263,6 +290,36 @@ class SendQueueTests(unittest.TestCase):
         delivered = send_queue.list_for("codex:u")[0]
         self.assertEqual((delivered["state"], delivered["attempts"]),
                          ("delivering", 1))
+
+    def test_retry_delivers_from_codex_interrupt_rewind_composer(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "中断后重试", [],
+            {"state": "aborted"}, "retry-after-abort")
+        send_queue.mark_failed("retry-after-abort", "Codex 输入框不可识别")
+        send_queue.retry(
+            "retry-after-abort",
+            {"state": "aborted", "ts": "2099-01-01T00:00:00Z"}, "codex:u")
+        row = send_queue.ready(10**12)[0]
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        screen = (
+            "\x1b[38;5;1m■ Conversation interrupted - tell the model\x1b[0m\n\n"
+            "\x1b[1m\x1b[38;5;215m›\x1b[0m "
+            "\x1b[2mUse /skills to list available skills\x1b[0m\n\n"
+            "\x1b[2m  esc again to edit previous message\x1b[0m")
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=(screen, (2, 2))), \
+                patch.object(server.term, "leave_copy_mode") as leave, \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.time, "sleep"):
+            server._deliver_outbox_item(row, [pane])
+
+        leave.assert_called_once_with(pane["name"])
+        submit.assert_called_once_with(pane["name"], "中断后重试")
+        self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "delivering")
 
     def test_unknown_busy_screen_is_deferred_from_stale_idle(self):
         send_queue.enqueue(
@@ -362,7 +419,7 @@ class SendQueueTests(unittest.TestCase):
 
         self.assertEqual(result["_status"], 200)
         leave.assert_called_once_with(pane["name"])
-        keys.assert_called_once_with(pane["name"], "C-c")
+        keys.assert_called_once_with(pane["name"], "C-u", "C-k")
         wake.assert_called_once_with()
         self.assertEqual(
             [(item["id"], item["text"]) for item in send_queue.list_for("codex:u")],
@@ -399,6 +456,53 @@ class SendQueueTests(unittest.TestCase):
             "cancel", "codex:u", {"queued", "failed"}))
         self.assertFalse(send_queue.mark_delivering("cancel"))
         self.assertEqual(send_queue.list_for("codex:u"), [])
+
+    def test_aborted_item_can_be_removed_from_the_timeline(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "中断项", [], {"state": "idle"}, "aborted")
+        send_queue.mark_delivering("aborted", now=10)
+        send_queue.mark_interrupted("codex:u", now=11)
+
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        with patch.object(server.index, "get", return_value=session):
+            result = handler._discard_message({"uid": "codex:u", "id": "aborted"})
+
+        self.assertEqual(result["_status"], 200)
+        self.assertEqual(result["outbox"], [])
+
+        # A second browser can still hold the same in-memory bubble after the
+        # first browser removed the durable row. Its dismiss is a successful
+        # no-op carrying the authoritative empty snapshot.
+        with patch.object(server.index, "get", return_value=session):
+            again = handler._discard_message({"uid": "codex:u", "id": "aborted"})
+        self.assertEqual(again["_status"], 200)
+        self.assertEqual(again["outbox"], [])
+
+    def test_exception_after_delivery_claim_is_not_retryable(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "只发一次", [],
+            {"state": "idle"}, "ambiguous")
+        row = send_queue.tracked()[0]
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        screen = ("\x1b[2m› Use /skills to list available skills\x1b[0m\n\n"
+                  "gpt-5.6-sol · ~/Projects/sesman")
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=(screen, (2, 0))), \
+                patch.object(server.term, "leave_copy_mode"), \
+                patch.object(server.term, "submit_text", side_effect=OSError("lost ack")), \
+                patch.object(server.time, "sleep"):
+            server._deliver_outbox_item(row, [pane])
+
+        item = send_queue.list_for("codex:u")[0]
+        self.assertEqual(item["state"], "confirming")
+        self.assertEqual(item["attempts"], 1)
+        self.assertIsNone(send_queue.retry(
+            "ambiguous", {"state": "idle"}, "codex:u"))
 
     def test_codex_escape_keeps_queue_and_abort_releases_only_head(self):
         activity = {"state": "working", "ts": "2026-08-09T10:00:00Z"}

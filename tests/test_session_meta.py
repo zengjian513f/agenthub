@@ -53,9 +53,13 @@ class SessionMetaTests(unittest.TestCase):
                 patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
             session_meta.set_starred("claude:a", True)
             before = session_meta.activity_revision("claude:a")
-            stopped = session_meta.stop_activity("claude:a", now=100)
+            stopped = session_meta.stop_activity(
+                "claude:a", now=100, reason="终端已结束或中断")
 
             self.assertEqual(stopped["state"], "aborted")
+            self.assertEqual(stopped["reason"], "终端已结束或中断")
+            self.assertEqual(session_meta.stopped_activity("claude:a")["reason"],
+                             "终端已结束或中断")
             self.assertGreater(session_meta.activity_revision("claude:a"), before)
             self.assertEqual(session_meta.activity_revision("claude:b"), 0)
             self.assertEqual(session_meta.resolve_activity("claude:a", {
@@ -66,6 +70,31 @@ class SessionMetaTests(unittest.TestCase):
             idle = {"state": "idle", "ts": "1970-01-01T00:01:39+00:00"}
             self.assertEqual(session_meta.resolve_activity("claude:a", idle), idle)
             self.assertTrue(session_meta.enrich_one({"uid": "claude:a"})["starred"])
+
+    def test_inferred_idle_can_be_revoked_by_visible_busy_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
+            session_meta.set_starred("claude:a", True)
+            stopped = session_meta.stop_activity(
+                "claude:a", now=100, reason="终端已回到输入状态",
+                state="idle", inferred=True)
+            before = session_meta.activity_revision("claude:a")
+
+            self.assertEqual(stopped["state"], "idle")
+            self.assertEqual(session_meta.stopped_activity("claude:a")["state"],
+                             "idle")
+            self.assertTrue(session_meta.clear_inferred_activity_stop("claude:a"))
+            self.assertIsNone(session_meta.stopped_activity("claude:a"))
+            self.assertGreater(session_meta.activity_revision("claude:a"), before)
+            self.assertTrue(session_meta.enrich_one({"uid": "claude:a"})["starred"])
+            self.assertFalse(session_meta.clear_inferred_activity_stop("claude:a"))
+
+            session_meta.stop_activity("claude:a", now=101,
+                                       reason="网页发送 Escape")
+            self.assertFalse(session_meta.clear_inferred_activity_stop("claude:a"))
+            self.assertEqual(session_meta.stopped_activity("claude:a")["state"],
+                             "aborted")
 
     def test_claude_timeline_changes_only_after_native_rewind_is_confirmed(self):
         with tempfile.TemporaryDirectory() as tmp, \

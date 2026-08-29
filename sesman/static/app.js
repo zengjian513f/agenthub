@@ -107,6 +107,152 @@ const appUrl = path => {
   return url.toString();
 };
 const BUILD_ID = document.querySelector('meta[name="sesman-build"]')?.content || '';
+// One ephemeral page identity joins HTTP, SSE, terminal and final DOM receipts.
+// It intentionally is not persisted: duplicated/restored tabs must remain distinct.
+const AUDIT_PAGE_ID = globalThis.crypto?.randomUUID?.()
+  || [...globalThis.crypto.getRandomValues(new Uint8Array(16))]
+    .map(value => value.toString(16).padStart(2, '0')).join('');
+window.__sesmanPageId = AUDIT_PAGE_ID;
+
+let browserAuditQueue = [];
+let browserAuditTimer = 0;
+let browserAuditSending = false;
+
+function browserAuditEvent(event, data = {}, content = null, fields = {}) {
+  try {
+    browserAuditQueue.push({
+      event, ts: new Date().toISOString(), uid: fields.uid ?? S.sel ?? '',
+      trace_id: fields.traceId || '', request_id: fields.requestId || '',
+      connection_id: fields.connectionId || '', severity: fields.severity || 'info',
+      data, content,
+    });
+    if (browserAuditQueue.length > 500) browserAuditQueue.splice(0, browserAuditQueue.length - 500);
+    if (!browserAuditTimer) browserAuditTimer = setTimeout(flushBrowserAudit, 750);
+  } catch { /* diagnostics never change UI behavior */ }
+}
+
+async function flushBrowserAudit(useBeacon = false) {
+  clearTimeout(browserAuditTimer);
+  browserAuditTimer = 0;
+  if ((!useBeacon && browserAuditSending) || !browserAuditQueue.length) return;
+  const events = browserAuditQueue.splice(0, 20);
+  const payload = JSON.stringify({
+    page_id: AUDIT_PAGE_ID, uid: S.sel || '', _build: BUILD_ID, events,
+  });
+  if (useBeacon && navigator.sendBeacon) {
+    navigator.sendBeacon(appUrl('api/audit/browser'),
+      new Blob([payload], {type: 'application/json'}));
+    return;
+  }
+  browserAuditSending = true;
+  try {
+    const response = await fetch(appUrl('api/audit/browser'), {
+      method: 'POST', keepalive: true,
+      headers: {
+        'Content-Type': 'application/json', 'X-Sesman-Page': AUDIT_PAGE_ID,
+        'X-Sesman-Build': BUILD_ID,
+      },
+      body: payload,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch {
+    browserAuditQueue.unshift(...events);
+    if (browserAuditQueue.length > 500) browserAuditQueue.length = 500;
+  } finally {
+    browserAuditSending = false;
+    if (browserAuditQueue.length && !browserAuditTimer) {
+      browserAuditTimer = setTimeout(flushBrowserAudit, 1500);
+    }
+  }
+}
+
+function browserStateSnapshot(reason = '') {
+  const box = $('#msgs');
+  const nodes = box ? [...box.querySelectorAll('.msg, #activity, .client-outbox')].slice(-40) : [];
+  const entry = S.sel ? cache.get(viewKey(S.sel, S.agent)) : null;
+  const termState = typeof T === 'undefined' ? null : {
+    name: T.name, uid: T.uid, mode: T.mode,
+    visible: !$('#termpane')?.classList.contains('hidden'),
+    connected: T.ws?.readyState ?? null,
+  };
+  return {
+    data: {
+      reason, selected: S.sel, agent: S.agent, mobile: MOBILE.matches,
+      mobile_detail: document.body.classList.contains('mobile-detail'),
+      visibility: document.visibilityState, online: navigator.onLine,
+      viewport: {width: innerWidth, height: innerHeight,
+        visual_width: window.visualViewport?.width,
+        visual_height: window.visualViewport?.height},
+      cache: entry ? {messages: entry.msgs?.length || 0, end: entry.end,
+        anchor: entry.anchor, activity: entry.activity?.state || '',
+        outbox: queuedMessages(S.sel).map(item => ({id: item.id, state: item.state}))} : null,
+      dom_messages: nodes.length, terminal: termState,
+    },
+    content: {
+      composer: $('#cinput')?.value || '',
+      messages: nodes.map(node => ({
+        id: node.id || '', role: node.dataset?.role || '',
+        call_id: node.dataset?.callId || '', classes: node.className,
+        text: (node.textContent || '').slice(0, 4000),
+      })),
+    },
+  };
+}
+
+let browserSnapshotTimer = 0;
+let lastBrowserSnapshot = '';
+function scheduleBrowserSnapshot(reason = 'render') {
+  clearTimeout(browserSnapshotTimer);
+  browserSnapshotTimer = setTimeout(() => {
+    try {
+      const snapshot = browserStateSnapshot(reason);
+      const signature = JSON.stringify(snapshot);
+      if (signature === lastBrowserSnapshot) return;
+      lastBrowserSnapshot = signature;
+      browserAuditEvent('dom.snapshot', snapshot.data, snapshot.content);
+    } catch { /* page can be between detail teardown and rebuild */ }
+  }, 100);
+}
+
+queueMicrotask(() => browserAuditEvent('page.loaded', {
+  url: location.pathname + location.search, referrer: document.referrer,
+  user_agent: navigator.userAgent, language: navigator.language,
+  viewport: {width: innerWidth, height: innerHeight}, theme: document.documentElement.dataset.theme,
+}));
+window.addEventListener('error', event => browserAuditEvent('error', {
+  message: event.message, filename: event.filename, line: event.lineno, column: event.colno,
+}, null, {severity: 'error'}));
+window.addEventListener('unhandledrejection', event => browserAuditEvent('unhandledrejection', {
+  reason: String(event.reason?.stack || event.reason || 'unknown'),
+}, null, {severity: 'error'}));
+window.addEventListener('online', () => browserAuditEvent('network.online'));
+window.addEventListener('offline', () => browserAuditEvent('network.offline', {}, null,
+  {severity: 'warning'}));
+window.addEventListener('pagehide', () => {
+  const snapshot = browserStateSnapshot('pagehide');
+  browserAuditEvent('page.hidden', snapshot.data, snapshot.content);
+  flushBrowserAudit(true);
+});
+document.addEventListener('visibilitychange', () => browserAuditEvent(
+  'visibility.changed', {visibility: document.visibilityState}));
+document.addEventListener('click', event => {
+  const target = event.target?.closest?.('button, .item, .ghead, a, [role="button"]');
+  if (!target) return;
+  browserAuditEvent('ui.clicked', {
+    tag: target.tagName, id: target.id || '', classes: target.className || '',
+    title: target.getAttribute('title') || '', uid: target.dataset?.uid || '',
+    action: target.dataset?.v || target.dataset?.termKey || target.dataset?.attach || '',
+  });
+}, true);
+let auditResizeTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(auditResizeTimer);
+  auditResizeTimer = setTimeout(() => browserAuditEvent('viewport.resized', {
+    width: innerWidth, height: innerHeight,
+    visual_width: window.visualViewport?.width,
+    visual_height: window.visualViewport?.height,
+  }), 200);
+});
 const el = (tag, cls, html) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -233,6 +379,10 @@ const TICK_MS = 200;
 const BACKUP_MS = 20000;    // SSE 正常时的兜底对账间隔
 const LIST_MS = 8000;       // 会话列表跟进磁盘变化的间隔
 const PENDING_RECONCILE_MS = 5000; // 只在有服务端 pending 时巡检小账本
+// 主动增量读取可能因浏览器连接池、网络切换或代理半开而既不成功也不失败。
+// 只要响应头或正文仍有进展就续期；真正静止到这个时长才中止，让下一次
+// SSE/对账从同一游标重试。用 let 是为了浏览器 E2E 能把分钟级故障压缩到毫秒。
+let SYNC_STALL_MS = 12000;
 const cache = new Map();          // viewKey → {meta, msgs, version, end, bytes}
 // 多题题卡会被 SSE、兜底对账和完整重绘反复替换 DOM。未提交选择必须独立于
 // 节点保存，否则下一次后台刷新就会让用户刚点的答案消失。
@@ -293,6 +443,8 @@ function queuePendingUserMessage(uid, text, media = []) {
   const items = queuedMessages(uid).slice();
   items.push(item);
   S.queued.set(uid, items);
+  browserAuditEvent('outbox.local_queued', {id: item.id, state: item.state},
+    {text: item.text, media: item.media}, {uid, requestId: item.id});
   saveQueuedMessages();
   if (S.sel === uid && !S.agent) renderConversationTail(
     cache.get(viewKey(uid))?.activity, uid);
@@ -302,6 +454,8 @@ function queuePendingUserMessage(uid, text, media = []) {
 function discardQueuedUserMessage(uid, id) {
   const items = queuedMessages(uid).filter(item => item.id !== id);
   if (items.length) S.queued.set(uid, items); else S.queued.delete(uid);
+  browserAuditEvent('outbox.local_discarded', {id, remaining: items.length}, null,
+    {uid, requestId: id});
   saveQueuedMessages();
   if (S.sel === uid && !S.agent) renderConversationTail(
     cache.get(viewKey(uid))?.activity, uid);
@@ -335,7 +489,10 @@ function acceptServerOutboxVersion(uid, version) {
 function syncServerOutbox(uid, items, version = null, { retireMissing = false } = {}) {
   if (!['claude', 'codex'].includes(sesmanCli(uid)?.source)
       || !Array.isArray(items)) return false;
-  if (staleServerOutbox(uid, version)) return false;
+  if (staleServerOutbox(uid, version)) {
+    browserAuditEvent('outbox.snapshot_rejected', {version, reason: 'stale'}, items, {uid});
+    return false;
+  }
   acceptServerOutboxVersion(uid, version);
   const next = items.map(item => ({ ...item, server: true }));
   const current = queuedMessages(uid);
@@ -353,6 +510,9 @@ function syncServerOutbox(uid, items, version = null, { retireMissing = false } 
   const before = JSON.stringify(current);
   if (next.length) S.queued.set(uid, next); else S.queued.delete(uid);
   const changed = before !== JSON.stringify(next);
+  browserAuditEvent('outbox.snapshot_applied', {
+    version, changed, retire_missing: retireMissing, before: current.length, after: next.length,
+  }, next, {uid});
   if (changed && S.sel === uid && !S.agent) {
     renderConversationTail(cache.get(viewKey(uid))?.activity, uid);
   }
@@ -464,7 +624,7 @@ function reconcileQueuedMessages(uid, messages) {
       continue;
     }
     const at = items.findIndex(item => {
-      if (item.text !== action.text) return false;
+      if (!cli.queuedTextMatches(item.text, action.text)) return false;
       // 同文指令可能连续排队；enqueue 应依次确认尚未确认的副本，
       // 不能反复命中第一条已确认项。
       if (action.type === 'confirm' && item.state === 'queued') return false;
@@ -558,7 +718,10 @@ function cacheEntryUid(key, entry) {
 
 function cacheEntryPinned(key, entry) {
   const uid = cacheEntryUid(key, entry);
-  return S.liveTmux.has(uid)
+  // 详情 DOM 直接由当前缓存生成。若容量整理把正在看的这一份删掉，页面仍
+  // 看似正常，却再也没有游标可供 SSE/outbox 补读，最终会留下永久 pending。
+  return key === viewKey(S.sel, S.agent)
+    || S.liveTmux.has(uid)
     || (typeof T !== 'undefined' && T.list?.some(x => x.uid === uid));
 }
 
@@ -593,9 +756,40 @@ async function fetchMessages(uid, opts = {}) {
   if (opts.agent) p.set('agent', opts.agent);
   if (opts.appendOnly) p.set('append', '1');
   if (opts.windowed) p.set('window', '1');
-  const r = await fetch(appUrl(`api/messages/${encodeURIComponent(uid)}?${p}`), { signal: opts.signal });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  const total = +r.headers.get('Content-Length') || 0;
+  const traceId = globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const url = `api/messages/${encodeURIComponent(uid)}?${p}`;
+  const started = performance.now();
+  browserAuditEvent('http.request.started', {
+    url, method: 'GET', start: opts.start || 0, agent: opts.agent || '',
+  }, null, {uid, traceId});
+  let r;
+  try {
+    r = await fetch(appUrl(url), {
+      signal: opts.signal,
+      headers: {'X-Sesman-Trace': traceId, 'X-Sesman-Page': AUDIT_PAGE_ID,
+        'X-Sesman-Build': BUILD_ID},
+    });
+  } catch (error) {
+    browserAuditEvent('http.request.failed', {
+      url, error: String(error?.name || error),
+      duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
+    }, null, {uid, traceId, severity: error?.name === 'AbortError' ? 'warning' : 'error'});
+    throw error;
+  }
+  opts.onActivity?.();
+  if (!r.ok) {
+    browserAuditEvent('http.response.received', {url, status: r.status, ok: false},
+      null, {uid, traceId, severity: 'warning'});
+    throw new Error('HTTP ' + r.status);
+  }
+  // Fetch 自动解压 gzip：reader.read() 统计的是解压后字节，而标准
+  // Content-Length 仍可能是压缩后大小。优先用服务端给出的同口径长度；
+  // 连到旧服务端时，压缩响应改显示不定进度，也不伪造一个较小的分母。
+  const contentTotal = +r.headers.get('Content-Length') || 0;
+  const decodedTotal = +r.headers.get('X-Sesman-Decoded-Length') || 0;
+  const encoded = !!r.headers.get('Content-Encoding');
+  const total = decodedTotal || (encoded ? 0 : contentTotal);
   const reader = r.body.getReader();
   const chunks = [];
   let got = 0;
@@ -604,23 +798,44 @@ async function fetchMessages(uid, opts = {}) {
     if (done) break;
     chunks.push(value);
     got += value.length;
-    opts.onProgress?.(got, total);
+    opts.onActivity?.();
+    if (encoded && contentTotal && decodedTotal) {
+      // Fetch 不暴露实时压缩字节数。用解压进度映射到已知的
+      // 压缩总量：中途值明确标为估算，最后一帧则精确等于响应体流量。
+      const transferred = Math.min(contentTotal,
+        Math.round(got / decodedTotal * contentTotal));
+      opts.onProgress?.(transferred, contentTotal, {
+        compressed: true, estimated: got < decodedTotal,
+      });
+    } else {
+      opts.onProgress?.(got, total);
+    }
   }
   const buf = new Uint8Array(got);
   let at = 0;
   for (const c of chunks) { buf.set(c, at); at += c.length; }
-  return { data: JSON.parse(new TextDecoder().decode(buf)), bytes: got };
+  const data = JSON.parse(new TextDecoder().decode(buf));
+  browserAuditEvent('http.response.parsed', {
+    url, status: r.status, bytes: got, reset: !!data.reset,
+    start: data.start, end: data.end, messages: data.messages?.length || 0,
+    duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
+  }, null, {uid, traceId});
+  return { data, bytes: got,
+    networkBytes: encoded && contentTotal ? contentTotal : got };
 }
 
 // ---- 进度条 ----
-function progress(done, total, label) {
+function progress(done, total, label, detail = {}) {
   const bar = $('#prog');
   bar.classList.add('on');
   const pct = total ? Math.min(100, done / total * 100) : 0;
   bar.querySelector('.bar').style.width = (total ? pct : 12) + '%';
   bar.querySelector('.bar').classList.toggle('idle', !total);
+  const estimate = detail.estimated ? '≈' : '';
+  const compressed = detail.compressed ? '（压缩）' : '';
   bar.querySelector('.txt').textContent = total
-    ? `${label} ${label === '渲染' ? `${done}/${total}` : fmtSize(done) + ' / ' + fmtSize(total)}`
+    ? `${label} ${label === '渲染' ? `${done}/${total}`
+      : estimate + fmtSize(done) + ' / ' + fmtSize(total) + compressed}`
     : `${label}…`;
 }
 
@@ -647,6 +862,32 @@ function normalizedQuestionAnswer(text) {
     }).filter(Boolean);
     return rows.join('\n') || raw;
   } catch { return raw; }
+}
+
+/** 正文游标可能已经由并行 fetch 推进，但后到的 SSE 仍可能携带更新的活动态。
+ *  活动态有自己的时间线：接收较新的状态，绝不让旧 Working 覆盖已中断。 */
+function activityFollows(current, incoming) {
+  if (!current) return true;
+  if (!incoming) return ['working', 'waiting'].includes(current.state);
+  const currentAt = Date.parse(current.ts || '');
+  const incomingAt = Date.parse(incoming.ts || '');
+  if (Number.isFinite(currentAt) && Number.isFinite(incomingAt)) {
+    return incomingAt >= currentAt;
+  }
+  const currentBusy = ['working', 'waiting'].includes(current.state);
+  const incomingBusy = ['working', 'waiting'].includes(incoming.state);
+  if (currentBusy !== incomingBusy) return currentBusy && !incomingBusy;
+  return true;
+}
+
+function applyCoveredActivity(uid, agent, entry, data) {
+  if (!data.activity_changed || !activityFollows(entry.activity, data.activity)) return;
+  entry.activity = data.activity;
+  if (S.sel !== uid || S.agent !== agent) return;
+  const box = $('#msgs');
+  $('#activity')?.remove();
+  if (box && entry.activity?.state !== 'working') sealToolTail(box);
+  renderConversationTail(entry.activity, uid);
 }
 
 async function applyDiff(uid, data, bytes = 0, agent = null) {
@@ -679,6 +920,17 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   // 乱序包必须在修改 outbox、prompt 或乐观消息之前丢弃，否则正文没被
   // 接收，发送占位却已先清掉。
   if (!data.reset && data.start !== e.end) {
+    const packetStart = Number(data.start), packetEnd = Number(data.end);
+    const currentEnd = Number(e.end);
+    if (Number.isFinite(packetStart) && Number.isFinite(packetEnd)
+        && Number.isFinite(currentEnd)
+        && packetStart < currentEnd && packetEnd <= currentEnd) {
+      // SSE 与主动 fetch 从同一旧游标出发时，后到者可能是一份已被前者
+      // 完整覆盖的重复正文。活动态使用独立修订，仍须接收其中较新的
+      // aborted/failed；否则页面要等兜底拉取才会清掉 Working。
+      applyCoveredActivity(uid, agent, e, data);
+      return 0;
+    }
     scheduleDiffRecovery(uid, agent);
     return 0;
   }
@@ -742,7 +994,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     if (S.sel === uid && S.agent === agent) {
       const box = $('#msgs');
       $('#activity')?.remove();
-      box?.querySelectorAll('.client-pending').forEach(node => node.remove());
+      box?.querySelectorAll('.client-outbox').forEach(node => node.remove());
       if (box && e.activity?.state !== 'working') sealToolTail(box);
       renderConversationTail(e.activity, uid);
     }
@@ -758,7 +1010,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   const box = $('#msgs');
   if (!box) return data.messages.length;
   $('#activity')?.remove();
-  box.querySelectorAll('.client-pending').forEach(node => node.remove());
+  box.querySelectorAll('.client-outbox').forEach(node => node.remove());
   const built = appendMessages(box, data.messages, null,
     {openTail: e.activity?.state === 'working'});
   built.forEach(markMatches);
@@ -785,12 +1037,22 @@ function syncSession(uid, agent = S.agent) {
   const current = syncingViews.get(key);
   if (current) return current;
   const task = (async () => {
+    const ac = new AbortController();
+    let stallTimer = null;
+    const keepAlive = () => {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => ac.abort(), SYNC_STALL_MS);
+    };
     try {
+      keepAlive();
       const { data, bytes } = await fetchMessages(uid, {
-        agent, start: e.end, head: e.version.head, anchor: e.anchor });
+        agent, start: e.end, head: e.version.head, anchor: e.anchor,
+        signal: ac.signal, onActivity: keepAlive });
       return await applyDiff(uid, data, bytes, agent);
     } catch {
       return 0;
+    } finally {
+      clearTimeout(stallTimer);
     }
   })().finally(() => {
     if (syncingViews.get(key) === task) syncingViews.delete(key);
@@ -804,6 +1066,8 @@ function syncSession(uid, agent = S.agent) {
 // 快照；若服务端项已消失，再用缓存和一次增量正文读取判断它是正式落盘、
 // Claude 分支取代，还是仍应保留为“未确认”。
 const pendingReconciliations = new Map();
+const pendingWindowRecoveries = new Map();
+const recoveredPendingWindows = new Map();
 
 function reconcilePendingSnapshot(uid, data) {
   if (!data || !Array.isArray(data.outbox)) return false;
@@ -821,6 +1085,64 @@ function reconcilePendingSnapshot(uid, data) {
     renderConversationTail(entry?.activity || null, uid);
   }
   return changed;
+}
+
+/**
+ * 服务端已经从 outbox 移除一项，说明原生记录曾被确认；但浏览器可能在
+ * SSE/主动补读竞争或移动端休眠期间把游标推进到了正文之后，同时漏掉正文。
+ * 从当前 EOF 继续补读永远找不回来，因此只对同一组缺失 id 做一次有界窗口
+ * 重载（最早 100 + 最新 500），而不是反复下载完整长会话。
+ */
+function recoverPendingWindow(uid, ids) {
+  const key = viewKey(uid);
+  const fingerprint = [...ids].sort().join('\0');
+  if (!fingerprint || recoveredPendingWindows.get(uid) === fingerprint) {
+    return Promise.resolve(false);
+  }
+  const current = pendingWindowRecoveries.get(uid);
+  if (current) return current;
+  const task = (async () => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), SYNC_STALL_MS);
+    try {
+      const {data, bytes} = await fetchMessages(uid, {
+        windowed: true, signal: ac.signal,
+      });
+      if (!data?.reset) return false;
+      recoveredPendingWindows.set(uid, fingerprint);
+      if (Array.isArray(data.outbox)) {
+        syncServerOutbox(uid, data.outbox, data.outbox_version);
+      }
+      reconcileQueuedMessages(uid, data.messages);
+      retireSupersededClaudeMessages(uid, ids, data.messages);
+      cachePut(key, {
+        meta: data.meta, msgs: data.messages, version: data.version,
+        end: data.end, anchor: data.anchor, activity: data.activity, bytes,
+        prompt: data.prompt || null, total: data.message_total,
+        partial: data.partial || null,
+      });
+      S.cursors.set(key, {
+        end: data.end, head: data.version.head, anchor: data.anchor,
+      });
+      if (!queuedMessages(uid).some(item => item?.server)) {
+        recoveredPendingWindows.delete(uid);
+      }
+      if (S.sel === uid && !S.agent) {
+        await renderSession(data.meta, data.messages, data.activity);
+      }
+      return true;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  })().finally(() => {
+    if (pendingWindowRecoveries.get(uid) === task) {
+      pendingWindowRecoveries.delete(uid);
+    }
+  });
+  pendingWindowRecoveries.set(uid, task);
+  return task;
 }
 
 function reconcilePendingUid(uid) {
@@ -841,10 +1163,20 @@ function reconcilePendingUid(uid) {
       // 正式消息取代，还是 Claude Esc 后被新分支取代；缓存存在时补一次
       // 小型增量读取，未打开的会话则等打开时读取，绝不拉几十 MB 全量。
       const serverIds = new Set(data.outbox.map(item => item?.id).filter(Boolean));
-      if (queuedMessages(uid).some(
-          item => item?.server && item.id && !serverIds.has(item.id))
-          && cache.has(viewKey(uid))) {
+      let missing = new Set(queuedMessages(uid)
+        .filter(item => item?.server && item.id && !serverIds.has(item.id))
+        .map(item => item.id));
+      if (missing.size && cache.has(viewKey(uid))) {
         changed = !!(await syncSession(uid, null)) || changed;
+        missing = new Set(queuedMessages(uid)
+          .filter(item => item?.server && item.id && !serverIds.has(item.id))
+          .map(item => item.id));
+      }
+      // 当前详情的缓存可能被旧版本 LRU 清掉；DOM 还在并不代表仍有可续读
+      // 游标。窗口恢复同时覆盖“有缓存但游标已经越过正文”和“详情缓存丢失”。
+      if (missing.size && (cache.has(viewKey(uid))
+                           || (S.sel === uid && !S.agent))) {
+        changed = !!(await recoverPendingWindow(uid, missing)) || changed;
       }
       return changed;
     } catch {
@@ -900,21 +1232,56 @@ function watchSession(uid, agent = S.agent) {
   closeWatch();
   const e = cache.get(viewKey(uid, agent));
   if (!e || !window.EventSource) return;
-  const p = new URLSearchParams({ uid, start: e.end, head: e.version.head, anchor: e.anchor || '' });
+  // watch 从当前缓存游标开始，建立过程中不需要 tickSync 立刻再发一条相同
+  // 增量请求。否则 CONNECTING 尚未变 OPEN 的几百毫秒会产生一次竞争包。
+  if (S.sel === uid && S.agent === agent) S.lastSync = Date.now();
+  const connectionId = globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const p = new URLSearchParams({ uid, start: e.end, head: e.version.head,
+    anchor: e.anchor || '', page: AUDIT_PAGE_ID, connection: connectionId });
   if (agent) p.set('agent', agent);
   const es = new EventSource(appUrl('api/watch?' + p));
   _es = es;
   _esUid = uid;
+  es.__sesmanConnectionId = connectionId;
+  let received = 0;
+  browserAuditEvent('sse.connecting', {start: e.end, agent: agent || ''}, null,
+    {uid, connectionId});
+  es.onopen = () => browserAuditEvent('sse.opened', {ready_state: es.readyState}, null,
+    {uid, connectionId});
   es.onmessage = ev => {
     // close() 后浏览器仍可能派发已经排队的旧事件，不能让旧 watch 改新视图。
     if (_es !== es || _esUid !== uid || S.agent !== agent) return;
     let data;
-    try { data = JSON.parse(ev.data); } catch { return; }
-    applyDiff(uid, data, 0, agent);
+    try { data = JSON.parse(ev.data); }
+    catch (error) {
+      browserAuditEvent('sse.parse_failed', {error: String(error), bytes: ev.data.length},
+        ev.data.slice(0, 4000), {uid, connectionId, severity: 'error'});
+      return;
+    }
+    received++;
+    const packetId = data._audit?.packet_id || `${connectionId}:client-${received}`;
+    browserAuditEvent('sse.received', {
+      packet_id: packetId, kind: data._audit?.kind || '', bytes: ev.data.length,
+      reset: !!data.reset, start: data.start, end: data.end,
+      messages: data.messages?.length || 0, outbox: data.outbox?.length || 0,
+    }, null, {uid, traceId: packetId, connectionId});
+    Promise.resolve(applyDiff(uid, data, 0, agent)).then(applied => {
+      const snapshot = browserStateSnapshot('sse-applied');
+      browserAuditEvent('sse.applied', {
+        packet_id: packetId, applied_messages: applied,
+        cache_end: cache.get(viewKey(uid, agent))?.end,
+      }, snapshot.content, {uid, traceId: packetId, connectionId});
+      scheduleBrowserSnapshot('sse-applied');
+    }).catch(error => browserAuditEvent('sse.apply_failed', {
+      packet_id: packetId, error: String(error?.stack || error),
+    }, null, {uid, traceId: packetId, connectionId, severity: 'error'}));
   };
   es.onerror = () => {
     // EventSource 自带的重连会沿用旧 URL(旧偏移), 所以自己关掉重开, 带上新偏移
     es.close();
+    browserAuditEvent('sse.error', {ready_state: es.readyState, received}, null,
+      {uid, connectionId, severity: 'warning'});
     if (_es !== es) return;
     _es = null;
     clearTimeout(_esRetry);
@@ -926,7 +1293,11 @@ function watchSession(uid, agent = S.agent) {
 
 function closeWatch() {
   clearTimeout(_esRetry);
-  if (_es) { _es.close(); _es = null; _esUid = null; }
+  if (_es) {
+    browserAuditEvent('sse.closed_by_page', {ready_state: _es.readyState}, null,
+      {uid: _esUid, connectionId: _es.__sesmanConnectionId || ''});
+    _es.close(); _es = null; _esUid = null;
+  }
 }
 
 function unreadRow(uid) {
@@ -1114,7 +1485,8 @@ function pendingTmuxSessions() {
     const source = t.source;
     return [{
       uid: pendingUid(t.name), pending: true, name: t.name, tmuxName: t.name, source,
-      title: `新建 ${SOURCES[source].name} 会话`, cwd: t.cwd || '(未知)',
+      title: t.title || `新建 ${SOURCES[source].name} 会话`,
+      kind: t.kind || '', report_id: t.report_id || '', cwd: t.cwd || '(未知)',
       created: new Date((t.started || Date.now() / 1000) * 1000).toISOString(),
       updated: new Date((t.started || Date.now() / 1000) * 1000).toISOString(),
       size: 0,
@@ -1643,6 +2015,8 @@ let inflight = null;
 
 async function openSession(uid, agent = null) {
   const selectedAgent = agent || null;
+  browserAuditEvent('session.opened', {agent: selectedAgent || '', cached: cache.has(viewKey(uid, selectedAgent))},
+    null, {uid});
   showMobileDetail();
   inflight?.abort();            // 连点列表时, 放弃上一个还没回来的请求
   const ac = inflight = new AbortController();
@@ -1661,19 +2035,24 @@ async function openSession(uid, agent = null) {
   const key = viewKey(uid, selectedAgent);
   const hit = cacheGet(key);
   if (hit) {
-    await renderSession(hit.meta, hit.msgs, hit.activity);
-    if (S.sel === uid && S.agent === selectedAgent) syncSession(uid, selectedAgent);
+    // 先把缓存立即画出来，但暂不占一个长期 SSE 连接。补齐缓存游标之后再
+    // 建 watch，避免 HTTP/1 连接池紧张时增量 fetch 永远排在 EventSource 后。
+    await renderSession(hit.meta, hit.msgs, hit.activity, { startWatch: false });
+    if (S.sel === uid && S.agent === selectedAgent) {
+      await syncSession(uid, selectedAgent);
+      if (S.sel === uid && S.agent === selectedAgent) watchSession(uid, selectedAgent);
+    }
     return;
   }
 
   $('#detail').innerHTML = '<div class="spin">正在读取会话…</div>';
-  progress(0, 0, '读取');
+  progress(0, 0, '下载');
   let res;
   try {
     res = await fetchMessages(uid, {
       agent: selectedAgent, signal: ac.signal,
       windowed: true,
-      onProgress: (a, b) => progress(a, b, '读取'),
+      onProgress: (a, b, detail) => progress(a, b, '下载', detail),
     });
   } catch (e) {
     if (e.name === 'AbortError') return;      // 已经切到别的会话了
@@ -1818,11 +2197,11 @@ async function loadFullHistory(uid, agent, button) {
   closeWatch();
   button.disabled = true;
   button.textContent = '正在载入完整历史…';
-  progress(0, 0, '读取完整历史');
+  progress(0, 0, '下载完整历史');
   try {
     const {data, bytes} = await fetchMessages(uid, {
       agent, signal: ac.signal,
-      onProgress: (a, b) => progress(a, b, '读取完整历史'),
+      onProgress: (a, b, detail) => progress(a, b, '下载完整历史', detail),
     });
     cachePut(key, {meta: data.meta, msgs: data.messages, version: data.version,
                    end: data.end, anchor: data.anchor, activity: data.activity, bytes,
@@ -1846,7 +2225,7 @@ async function loadFullHistory(uid, agent, button) {
   }
 }
 
-async function renderSession(meta, msgs, activity = null) {
+async function renderSession(meta, msgs, activity = null, { startWatch = true } = {}) {
   const seq = ++renderSeq;
   const uid = meta.uid;
   const agent = meta.agent_id || null;
@@ -1904,7 +2283,7 @@ async function renderSession(meta, msgs, activity = null) {
     else renderComposer();
   }
   if (seq === renderSeq && S.sel === uid && S.agent === agent) {
-    watchSession(meta.uid, agent); // 之后的更新由服务端推过来
+    if (startWatch) watchSession(meta.uid, agent); // 之后的更新由服务端推过来
     if (typeof restoreTermPane === 'function') restoreTermPane(uid, agent);
     if (!agent) queueMicrotask(reconcileAllPendingMessages);
   }
@@ -1944,6 +2323,8 @@ function head(m, total) {
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
           (!m.agent_id && typeof T !== 'undefined' && T.enabled)
             ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
+        <button class="iconbtn" data-report-bug title="报告当前会话问题"
+          aria-label="报告当前会话问题">${uiIcon('bug')}</button>
         ${S.term ? `<span class="mnav"><b id="mcount">…</b>
           <button class="iconbtn" id="m-prev" title="上一处" aria-label="上一处">↑</button>
           <button class="iconbtn" id="m-next" title="下一处" aria-label="下一处">↓</button></span>` : ''}
@@ -2052,6 +2433,8 @@ const TOOL_ROLES = new Set(['tool', 'tool_result']);
 const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent',
                               'thinking', 'question', 'answer', 'command']);
 const GROUP_MIN = 2;
+const MESSAGE_TIME_GAP_MS = 5 * 60 * 1000;
+const MESSAGE_TIME_CADENCE_MS = 20 * 60 * 1000;
 
 const isGroupableTool = m => TOOL_ROLES.has(m?.role) && !m.changes?.length;
 
@@ -2105,10 +2488,84 @@ function planMessages(msgs, { openTail = false } = {}) {
   return plan;
 }
 
+/** 一个工具卡可能同时包含调用和结果，工具组又包含多张卡。
+ *  分隔线用这个视觉单元的最早/最晚时间，不会把一次长时间工具调用
+ *  误判成与下一条消息的空档。 */
+function messageTimeRange(messages) {
+  const values = [];
+  for (const message of messages || []) {
+    for (const item of [message, message?.result]) {
+      const value = Date.parse(item?.ts || '');
+      if (Number.isFinite(value)) values.push(value);
+    }
+  }
+  return values.length ? {start: Math.min(...values), end: Math.max(...values)} : null;
+}
+
+function stampMessageTime(node, messages) {
+  if (!node?.matches('.msg')) return node;
+  const range = messageTimeRange(messages);
+  if (range) {
+    node.dataset.timeStart = range.start;
+    node.dataset.timeEnd = range.end;
+  }
+  return node;
+}
+
+function formatMessageDateTime(value) {
+  const date = new Date(value);
+  const pad = number => String(number).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    + ` ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function messageTimeDivider(value) {
+  const node = el('div', 'message-time-divider');
+  const time = document.createElement('time');
+  time.dateTime = new Date(value).toISOString();
+  time.textContent = formatMessageDateTime(value);
+  node.appendChild(time);
+  return node;
+}
+
+/** 相邻气泡空档超过 5 分钟时显示时间；对连续的密集对话，也每超过
+ *  20 分钟补一条。历史缺口会重新起算；任务事件和 Working 状态行只中断
+ *  “相邻”判断，不中断 20 分钟周期；隐藏的协议消息不参与。 */
+function refreshMessageTimeDividers(box = $('#msgs')) {
+  if (!box) return;
+  box.querySelectorAll(':scope > .message-time-divider').forEach(node => node.remove());
+  let previousEnd = null;
+  let lastShownAt = null;
+  for (const node of [...box.children]) {
+    if (node.matches('.silent-tool-result, .question-live-shadowed') || node.hidden) continue;
+    if (!node.matches('.msg')) {
+      previousEnd = null;
+      if (node.matches('.history-gap')) lastShownAt = null;
+      continue;
+    }
+    const start = Number(node.dataset.timeStart);
+    const end = Number(node.dataset.timeEnd);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      previousEnd = null;
+      lastShownAt = null;
+      continue;
+    }
+    if (lastShownAt === null) lastShownAt = start;
+    const afterGap = previousEnd !== null && start - previousEnd > MESSAGE_TIME_GAP_MS;
+    const afterCadence = start - lastShownAt > MESSAGE_TIME_CADENCE_MS;
+    if (afterGap || afterCadence) {
+      box.insertBefore(messageTimeDivider(start), node);
+      lastShownAt = start;
+    }
+    previousEnd = Math.max(start, end);
+  }
+}
+
 function buildPlan(box, plan, before) {
   const built = [];
   for (const p of plan) {
     const n = p.gap ? historyGapNode(p.gap) : (p.g ? groupNode(p.g, p.open) : msgNode(p.m));
+    stampMessageTime(n, p.g || (p.m ? [p.m] : []));
     before ? box.insertBefore(n, before) : box.appendChild(n);
     built.push(n);
   }
@@ -2667,6 +3124,12 @@ function msgNode(m) {
     setAction(`展开全文 (${m.text.length.toLocaleString()} 字符)`, full, false);
   };
   if (long) hit ? full() : clipped();
+  if (m.interrupted) {
+    n.classList.add('native-interrupted');
+    const state = el('small', 'native-message-state', '已中断');
+    if (m.interrupt_reason) state.title = m.interrupt_reason;
+    n.appendChild(state);
+  }
   return n;
 }
 
@@ -2848,22 +3311,37 @@ function renderQueuedMessages(uid = S.sel) {
   if (!box || S.agent || uid !== S.sel) return;
   for (const item of queuedMessages(uid)) {
     const cli = sesmanCli(uid);
-    const node = msgNode({role: 'user', text: item.text, media: item.media, counted: false});
-    node.classList.add('client-pending');
+    const queuedMessage = {role: 'user', text: item.text, media: item.media,
+      counted: false, ts: item.created_iso || item.created_at || item.ts};
+    const node = stampMessageTime(msgNode(queuedMessage), [queuedMessage]);
+    const interrupted = ['aborted', 'restored'].includes(item.state);
+    node.classList.add('client-outbox',
+      interrupted ? 'client-aborted' : 'client-pending');
     node.classList.toggle('failed', item.state === 'failed');
     node.dataset.queuedId = item.id;
     const footer = el('div', 'client-pending-footer');
     footer.appendChild(el('small', 'client-pending-state',
       cli?.queuedMessageLabel(item) || '排队中'));
-    if (item.server && cli?.source === 'claude') {
+    const codexNeedsInspection = item.server && cli?.source === 'codex'
+      && (item.state === 'confirming'
+          || (item.state === 'failed' && +item.attempts > 0));
+    if (item.server && !interrupted
+        && (cli?.source === 'claude' || codexNeedsInspection)) {
       const actions = el('span', 'client-pending-actions');
       const inspect = el('button', '', '检查终端');
       inspect.type = 'button';
-      inspect.title = '消息可能已经被 Claude 接收；打开终端核对，不会重复发送';
+      inspect.title = `消息可能已经被 ${cli.name} 接收；打开终端核对，不会重复发送`;
       inspect.onclick = () => globalThis.revealNativeTerminal?.(uid);
       actions.append(inspect);
+      if (item.state === 'failed') {
+        const discard = el('button', '', '移除');
+        discard.type = 'button';
+        discard.onclick = () => discardServerQueuedMessage(uid, item.id);
+        actions.append(discard);
+      }
       footer.appendChild(actions);
-    } else if ((item.server && ['queued', 'failed'].includes(item.state))
+    } else if ((item.server
+                && ['queued', 'failed', 'aborted', 'restored'].includes(item.state))
                || (!item.server && item.state === 'failed')) {
       const actions = el('span', 'client-pending-actions');
       if (item.state === 'failed') {
@@ -2916,14 +3394,14 @@ function renderConversationTail(activity, uid = S.sel) {
   // 增量，乐观副本便会永久残留。Claude 有本地副本时，每次画队尾都用
   // 已接受的完整缓存兜底对账一次。通常只有一条、几千项，且仅发送期间执行。
   if (sesmanCli(uid)?.source === 'claude'
-      && queuedMessages(uid).some(item => !item.server) && entry?.msgs?.length) {
+      && queuedMessages(uid).length && entry?.msgs?.length) {
     reconcileQueuedMessages(uid, entry.msgs);
   }
   $('#activity')?.remove();
   box.querySelectorAll('.live-question').forEach(node => node.remove());
   box.querySelectorAll('.question-live-shadowed').forEach(
     node => node.classList.remove('question-live-shadowed'));
-  box.querySelectorAll('.client-pending').forEach(node => node.remove());
+  box.querySelectorAll('.client-outbox').forEach(node => node.remove());
   const prompt = entry?.prompt;
   const nativeQuestion = prompt?.questions?.length ? null : pendingHistoryQuestion(entry);
   const activeQuestion = prompt?.questions?.length ? prompt : nativeQuestion;
@@ -2937,20 +3415,24 @@ function renderConversationTail(activity, uid = S.sel) {
         .find(node => node.dataset.callId === prompt.id)
         ?.classList.add('question-live-shadowed');
     }
-    box.appendChild(questionNode({
+    const liveQuestion = {
       role: 'question', call_id: prompt.id, questions: prompt.questions,
       text: prompt.questions.map(q => q.question).join('\n\n'), live: true,
-      state: prompt.state, uid,
-    }));
+      state: prompt.state, uid, ts: prompt.ts || prompt.created_at,
+    };
+    box.appendChild(stampMessageTime(questionNode(liveQuestion), [liveQuestion]));
   } else if (nativeQuestion) {
     [...box.querySelectorAll('.msg[data-role="question"][data-call-id]')]
       .find(node => node.dataset.callId === nativeQuestion.call_id)
       ?.classList.add('question-live-shadowed');
-    box.appendChild(questionNode({ ...nativeQuestion, live: true, uid }));
+    const liveQuestion = { ...nativeQuestion, live: true, uid };
+    box.appendChild(stampMessageTime(questionNode(liveQuestion), [liveQuestion]));
   } else {
     renderActivity(activity);
   }
   renderQueuedMessages(uid);
+  refreshMessageTimeDividers(box);
+  scheduleBrowserSnapshot('conversation-tail');
 }
 
 const CLIP = 4000;

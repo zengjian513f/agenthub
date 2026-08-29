@@ -52,6 +52,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 - **状态与询问**：直接解析 Codex `task_started/task_complete/turn_aborted` 和 Claude 回合事件，在消息流底部显示临时 `Working…`、「等待回答」、「已中断」或失败状态，完成后自动移除，不计入消息数或历史正文。`Working…` 还会与当前 CLI 进程的启动时间交叉校验，resume 后停在输入提示符的新进程不会继承旧回合状态。Claude `AskUserQuestion` 和 Codex `request_user_input` 按问题、选项和说明排成专用气泡，回答按用户消息显示；全程读取结构化 JSONL，不做 OCR。
 - **手机适配**：720px 以下改为“会话列表 → 会话详情”的单栏导航，不再硬挤左右栏，并记住当前在列表还是详情，刷新后原页恢复。详情使用紧凑返回键，消息数放在标题栏右侧，运行状态改为终端图标左上角的绿/蓝点；标题栏不设三点菜单，只保留直接操作图标，次要元信息默认省略。状态、来源、视图与刷新压在同一行，极窄屏只省略来源数量；输入框使用短提示词，手机 Enter 只换行、点击发送按钮才提交，并兼容安全区域；展开终端时直接覆盖消息区和输入框，提供 Ctrl（下一键生效）、Tab、方向、翻页和 Esc 触控键。
 - **管理操作**：Claude 子代理可在会话标题处下拉切换，各自保留独立时间线；运行中的会话显示停止按钮，停止后原位变为删除按钮。
+- **问题报告**：顶栏虫形按钮会冻结当前页面、发送账本、tmux scrollback 和最近 15 分钟跨层事件，随后在 sesman 项目目录自动新建一条 Codex 会话处理。原页面不会被切走，右下角可随时打开处理会话。该操作会使用当前 Codex 配置并产生模型用量。
 
 ## 界面状态
 
@@ -247,6 +248,30 @@ python3 tests/e2e.py
 python3 tests/claude_monkey.py --base http://127.0.0.1:8710
 ```
 
+`tests/dual_cli_monkey.py` 是 Claude/Codex 双端的一小时状态机 monkey，也属于显式
+付费测试，不能被普通测试套件调用。它固定使用完整的
+`claude-haiku-4-5-20251001` 和 `gpt-5.6-luna` 模型 ID，每端创建 10 个隐藏 debug
+会话。调度器按当前 tmux 状态和尚未覆盖的转移选择动作，不再按固定阶段顺序重复脚本；
+动作包括网页与 tmux 双向输入、首尾空白、服务端已接收但 HTTP 响应丢失后的同 ID 重试、
+忙时排队、快/慢 ESC、终端草稿覆盖、选择题、斜杠命令，以及工作期间切会话、切终端、
+横纵 resize、刷新、断网恢复和双页面接管。
+
+正确性由独立模型持续核对 tmux 实际画面、每个浏览器页的缓存/DOM、服务端发送账本；
+不使用产品自身的 `busy_screen()`/`composer_state()` 给产品判对。每一步均写入带 seed 的
+轨迹；失败证据包包含 tmux 画面与 scrollback、浏览器状态/HTML/截图、outbox 和
+`replay.json`。调度和不变量可以完全免费地先检查：
+
+```bash
+python3 tests/dual_cli_monkey.py --simulate --steps 900 --seed 4815
+```
+
+只有明确接受真实模型费用后才能运行或重放：
+
+```bash
+python3 tests/dual_cli_monkey.py --duration 3600 --sessions 10 --max-paid-turns 14
+python3 tests/dual_cli_monkey.py --replay /path/to/failure-001/replay.json
+```
+
 ## 结构
 
 ```
@@ -256,7 +281,9 @@ sesman/
   media.py      内嵌/本地图片的校验、限额注册与安全读取
   pending.py    新会话首次落盘前的持久化元数据
   claude_queue.py Claude 网页输入的服务端交付账本与原生记录确认
-  send_audit.py 消息交付事件审计（只存摘要和字节数，不存正文）
+  audit.py      SQLite 跨层事件审计、压缩正文去重与报告导出
+  bug_report.py 私有诊断包与自动 Codex 处理会话
+  send_audit.py 兼容旧版的紧凑消息交付日志
   send_protocol.py Claude/Codex 交付状态的公共驱动接口
   send_queue.py Codex 网页输入的服务端持久队列与原生记录确认
   session_meta.py  星标等 sesman 自有会话元数据
@@ -281,6 +308,8 @@ sesman/
 - `POST /api/session/send` — 把已有 Claude/Codex 会话的网页输入交给服务端持久状态机
 - `POST /api/session/outbox/retry` / `POST /api/session/outbox/discard` — 重试可证明尚未触碰终端的输入，或移除页面里的未确认状态；Claude 一旦开始注入终端便拒绝盲目重试
 - `POST /api/session/stop` — 从内层 CLI 开始停止运行实例，保留对话记录
+- `POST /api/audit/browser` — 浏览器批量回传 SSE 应用、DOM 和交互回执
+- `POST /api/bug-report` — 冻结诊断上下文并启动一条 Codex 处理会话
 - `DELETE /api/session/<uid>` — 移入回收站
 
 新建 CLI 在产生第一条正式记录前，会写入权限为 `0600` 的
@@ -300,8 +329,26 @@ Claude 输入同样先写入权限为 `0600` 的
 并用原生 `user`、`queue-operation` 和 `/rename` 记录确认结果。只有仍处于 `persisted`
 （可证明尚未触碰终端）的项目才允许恢复交付；从 `injecting` 开始，即使 HTTP 响应丢失或
 服务重启，也只等待原生证据或标记为待核对，绝不自动重发。页面与写请求还携带构建标识，
-旧标签页会被服务端在触碰终端前拒绝并提示整页刷新。交付审计只保存正文 SHA-256、字节数、
-状态和辅助连接信息，不保存正文。
+旧标签页会被服务端在触碰终端前拒绝并提示整页刷新。
+
+### 跨层审计与问题报告
+
+服务端把浏览器 → HTTP → 发送账本 → tmux/PTY → JSONL 解析 → SSE → 浏览器 DOM
+记录为同一条可关联时间线。事件存于 `~/.local/share/sesman/audit.sqlite3`（SQLite
+WAL，文件权限 `0600`），顺序由数据库自增序号确定；较大的请求正文、终端片段、规范化
+消息批和 DOM 快照以 SHA-256 寻址、zlib 压缩并去重。默认保留 14 天。诊断写入在后台执行，
+队列、磁盘或数据库失败不会改变消息发送结果。
+
+审计会保存诊断所需的对话正文、终端输入输出和页面可见文字，因此该数据库本身属于敏感
+本机数据，不应上传或随仓库发布。结构化字段会递归移除 Cookie、Authorization、密码、
+API key 与 access/refresh token；附件只记录既有引用和元数据，不另复制正文附件。
+
+点「报告问题」后，私有包写到
+`~/.local/share/sesman/bug-reports/<BUG-id>/`，包含 `manifest.json`、用户描述、浏览器状态、
+相关事件、tmux scrollback 和 Git 状态。随后新建 Codex tmux，会话提示词要求先按
+`AGENTS.md` 用 Playwright 重现，再找出链路中第一个偏差并修复；它不会自动 commit 或 push。
+如果 Codex 启动失败，诊断包仍会保留。报告按钮会实际调用当前账号配置的 Codex 模型，
+并产生相应模型用量。
 
 ## 开机自启（可选）
 

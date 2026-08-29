@@ -22,7 +22,24 @@ VERSION = 1
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _SGR = re.compile(r"\x1b\[([0-9;:]*)m")
-_COMPOSER_RULE = re.compile(r"^\s*─{12,}\s*$")
+_COMPOSER_RULE = re.compile(r"^\s*─{12,}(?:\s+.+?\s+─+)?\s*$")
+_BUSY_STATUS = re.compile(
+    r"(?:\besc\s+to\s+(?:interrupt|stop|cancel)\b"
+    r"|^\s*[✻✽✢✶✳✣✤]\s+\S[^\n]*…(?:\s+\([^\n)]*\))?\s*$"
+    r"|^\s*[✻✽✢✶✳✣✤]\s+[^\n]*\b\d+\s+shells?\s+still\s+running\b[^\n]*$"
+    r"|^\s*\*\s+\S[^\n]*…\s+\([^\n)]*\btokens?\b[^\n)]*\)\s*$)",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def busy_screen(screen: str) -> bool:
+    """Whether Claude visibly has a turn in progress.
+
+    Wide panes expose ``esc to interrupt`` in the footer.  Claude drops that
+    footer text in narrow panes but keeps its animated ``✢ Unfurling…`` row;
+    both are positive busy evidence.  The ASCII ``*`` frame is accepted only
+    with Claude's token counter so ordinary Markdown bullets cannot match.
+    """
+    return bool(_BUSY_STATUS.search(_ANSI.sub("", str(screen or ""))))
 
 
 def _styled_chars(text: str) -> list[tuple[str, bool]]:
@@ -66,6 +83,19 @@ def _styled_chars(text: str) -> list[tuple[str, bool]]:
     return result
 
 
+def _composer_upper(line: str) -> bool:
+    """Accept Claude's titled upper border even when a narrow pane clips it.
+
+    With a long renamed-session title Claude can consume every leading rule
+    glyph and leave only ``title ─``.  The caller still requires a real lower
+    rule plus a ``❯`` editor row, so this relaxed upper-only check does not
+    turn question menus or transcript prompts into a live composer.
+    """
+    clean = str(line or "").rstrip()
+    return bool(_COMPOSER_RULE.match(clean)
+                or (clean.endswith("─") and "─" in clean))
+
+
 def composer_state(screen: str, cursor: tuple[int, int] | None) -> str:
     """识别 Claude 当前编辑器是 ``empty``、``editing`` 还是 ``unknown``。
 
@@ -83,7 +113,7 @@ def composer_state(screen: str, cursor: tuple[int, int] | None) -> str:
         return "unknown"
 
     upper = next((row for row in range(cursor_y, -1, -1)
-                  if _COMPOSER_RULE.match(clean_lines[row])), None)
+                  if _composer_upper(clean_lines[row])), None)
     lower = next((row for row in range(cursor_y + 1, len(clean_lines))
                   if _COMPOSER_RULE.match(clean_lines[row])), None)
     if upper is None or lower is None or lower <= upper + 1:

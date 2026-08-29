@@ -14,12 +14,14 @@ import re
 import socket
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import (claude_bridge, claude_queue, codex_bridge, debug_runs, index, live,
-               media, pending as pending_store, send_protocol, send_queue,
+from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
+               debug_runs, index, live, media, pending as pending_store,
+               send_protocol, send_queue,
                session_meta, term, term_ownership, wsock)
 
 STATIC = Path(__file__).parent / "static"
@@ -187,10 +189,10 @@ def _poll_outbox() -> None:
         if not s or s.get("source") != "codex":
             continue
         try:
-            # 正常情况下从持续前移的 watch 游标读。到确认期限时，先从实际
-            # 注入前的固定游标复核一次，再决定失败；这样即使某次解析或匹配
-            # 漏掉了已经扫过的 user 记录，也不会留下假的“发送未确认”。
-            replay = (item.get("state") == "delivering"
+            # 正常情况下从持续前移的 watch 游标读。到确认期限时，改从实际
+            # 注入前的固定游标持续复核；即使 compact 延迟 user 记录或某次
+            # 解析遗漏，也不能把已经写入终端的消息重新暴露为可重试。
+            replay = (item.get("state") in {"delivering", "confirming"}
                       and time.time() - float(item.get("delivered_at") or 0)
                       >= send_queue.CONFIRM_TIMEOUT)
             prefix = ("confirm" if replay and item.get("confirm_start") is not None
@@ -224,6 +226,7 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
         send_queue.mark_failed(item["id"], "Codex tmux 会话已断开")
         return
     name = pane["name"]
+    claimed = False
     try:
         # task_complete 写盘到 TUI 真正回到输入框仍有一个很短的重绘窗口。
         # 连续两帧终端文本一致才注入，避开本次事故中的 15ms 状态切换。
@@ -249,7 +252,8 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
             # clear-screen, making an existing conversation look like a new one.
             # resize、切换会话和 TUI 重绘都会短暂产生这种帧；先退避重试，连续
             # 多次仍无法识别才保留为可人工处理的失败项。
-            if codex_bridge.busy_screen(screen) or codex_bridge.approval_prompt(screen):
+            if (codex_bridge.busy_screen(screen)
+                    or codex_bridge.approval_prompt(screen)):
                 send_queue.defer(item["id"])
                 return
             send_queue.defer_unrecognized(item["id"])
@@ -262,10 +266,15 @@ def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
         # 绝不能继续向 tmux 注入已经撤掉的正文。
         if not send_queue.mark_delivering(item["id"]):
             return
+        claimed = True
         term.leave_copy_mode(name)
         term.submit_text(name, str(item.get("text") or ""))
     except Exception as e:
-        send_queue.mark_failed(item["id"], str(e))
+        if claimed:
+            send_queue.mark_confirming(
+                item["id"], f"终端写入状态待核对: {e}")
+        else:
+            send_queue.mark_failed(item["id"], str(e))
 
 
 def _deliver_claude_item(item: dict, panes: list[dict]) -> None:
@@ -437,6 +446,68 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         return self._client_ip()
 
+    def _audit_begin(self, method: str, path: str) -> None:
+        """Start one HTTP trace without allowing diagnostics to affect routing."""
+        self._audit_started = time.monotonic()
+        self._audit_method = str(method or "")
+        self._audit_path = str(path or "")
+        self._audit_trace_id = str(
+            self.headers.get("X-Sesman-Trace", "") if self.headers else "")[:128]
+        self._audit_page_id = str(
+            self.headers.get("X-Sesman-Page", "") if self.headers else "")[:128]
+        self._audit_build = str(
+            self.headers.get("X-Sesman-Build", "") if self.headers else "")[:128]
+        inferred_uid = (unquote(path[len("/api/messages/"):])
+                        if path.startswith("/api/messages/") else
+                        unquote(path[len("/api/session/"):])
+                        if method == "DELETE" and path.startswith("/api/session/") else "")
+        self._audit_uid = inferred_uid[:512]
+        self._audit_source = self._audit_uid.partition(":")[0]
+        self._audit_request_id = ""
+        self._audit_response_done = False
+        self._audit_json_response = None
+        audit.record(
+            "http.request.received", category="http",
+            uid=self._audit_uid, source=self._audit_source,
+            trace_id=self._audit_trace_id, page_id=self._audit_page_id,
+            build=self._audit_build,
+            data={
+                "method": self._audit_method, "path": self._audit_path,
+                "content_length": self.headers.get("Content-Length", "")
+                if self.headers else "",
+                "content_type": self.headers.get("Content-Type", "")
+                if self.headers else "",
+                "peer_ip": self._client_ip(), "display_ip": self._display_ip(),
+            },
+        )
+
+    def _audit_body(self, body: dict) -> None:
+        if not isinstance(body, dict):
+            return
+        self._audit_trace_id = str(body.get("_trace_id")
+                                   or getattr(self, "_audit_trace_id", ""))[:128]
+        self._audit_page_id = str(body.get("page_id") or body.get("_page_id")
+                                  or getattr(self, "_audit_page_id", ""))[:128]
+        self._audit_build = str(body.get("_build")
+                                or getattr(self, "_audit_build", ""))[:128]
+        self._audit_uid = str(body.get("uid") or "")[:512]
+        self._audit_source = self._audit_uid.partition(":")[0]
+        self._audit_request_id = str(body.get("request_id")
+                                     or body.get("_request_id") or "")[:128]
+        audit.record(
+            "http.request.body", category="http", uid=self._audit_uid,
+            source=self._audit_source, trace_id=self._audit_trace_id,
+            request_id=self._audit_request_id, page_id=self._audit_page_id,
+            build=self._audit_build,
+            data={"method": getattr(self, "_audit_method", ""),
+                  "path": getattr(self, "_audit_path", ""),
+                  "keys": sorted(str(key) for key in body)},
+            # The telemetry endpoint expands its bounded event batch below; do
+            # not store the same browser snapshot a second time as an HTTP body.
+            content=None if getattr(self, "_audit_path", "") == "/api/audit/browser"
+            else body,
+        )
+
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -444,14 +515,50 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
+        delivered = True
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            delivered = False
+        if (hasattr(self, "_audit_started")
+                and not getattr(self, "_audit_response_done", False)):
+            self._audit_response_done = True
+            response_content = getattr(self, "_audit_json_response", None)
+            audit.record(
+                "http.response.sent" if delivered else "http.response.write_failed",
+                category="http",
+                severity="error" if code >= 500 else "warning" if code >= 400 else "info",
+                uid=getattr(self, "_audit_uid", ""),
+                source=getattr(self, "_audit_source", ""),
+                trace_id=getattr(self, "_audit_trace_id", ""),
+                request_id=getattr(self, "_audit_request_id", ""),
+                page_id=getattr(self, "_audit_page_id", ""),
+                build=getattr(self, "_audit_build", ""),
+                data={
+                    "method": getattr(self, "_audit_method", ""),
+                    "path": getattr(self, "_audit_path", ""), "status": code,
+                    "bytes": len(body), "content_type": ctype,
+                    "delivered": delivered,
+                    "content_encoding": (extra or {}).get("Content-Encoding", ""),
+                    "duration_ms": round(
+                        (time.monotonic() - self._audit_started) * 1000, 3),
+                },
+                content=response_content,
+            )
 
     def _json(self, obj, code: int = 200):
         body = json.dumps(obj, ensure_ascii=False).encode()
-        headers = {"Vary": "Accept-Encoding"}
+        decoded_length = len(body)
+        # Full small responses are invaluable for distinguishing a server reply
+        # from what the browser later rendered. Large history windows keep only
+        # their byte/count metadata and are represented by parser/SSE events.
+        self._audit_json_response = obj if len(body) <= 512 * 1024 else None
+        # Fetch 会把 gzip 解压后的字节交给 ReadableStream，但保留压缩后
+        # Content-Length。单独传递解压长度，让前端进度的分子分母同口径。
+        headers = {
+            "Vary": "Accept-Encoding",
+            "X-Sesman-Decoded-Length": str(decoded_length),
+        }
         if len(body) >= JSON_GZIP_MIN and _accepts_gzip(
                 self.headers.get("Accept-Encoding", "")):
             packed = gzip.compress(body, compresslevel=JSON_GZIP_LEVEL, mtime=0)
@@ -462,19 +569,35 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 路由 --------------------------------------------------------
     def do_POST(self):
+        u = urlparse(self.path)
+        self._audit_begin("POST", u.path)
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
-        u = urlparse(self.path)
-        if u.path == "/api/session/star":
+        if u.path in {"/api/session/star", "/api/audit/browser",
+                      "/api/bug-report"}:
             try:
                 n = int(self.headers.get("Content-Length", 0))
+                if n > 4 * 1024 * 1024:
+                    return self._json({"error": "request too large"}, 413)
                 body = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 return self._json({"error": "bad body"}, 400)
-            return self._star_session(body)
+            self._audit_body(body)
+            if u.path == "/api/session/star":
+                return self._star_session(body)
+            if u.path == "/api/audit/browser":
+                return self._browser_audit(body)
+            return self._bug_report(body)
         if not TERMINAL:
             return self._json({"error": "终端未启用, 服务端需加 --terminal"}, 403)
         if u.path == "/api/session/attachment":
+            audit.record(
+                "attachment.upload.started", category="attachment",
+                trace_id=getattr(self, "_audit_trace_id", ""),
+                page_id=getattr(self, "_audit_page_id", ""),
+                data={"query": parse_qs(u.query),
+                      "bytes": self.headers.get("Content-Length", "")},
+            )
             try:
                 return self._upload_attachment(parse_qs(u.query))
             except (KeyError, ValueError) as e:
@@ -488,6 +611,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._json({"error": "bad body"}, 400)
+        self._audit_body(body)
         text_write = (u.path in {"/api/session/send", "/api/session/outbox/retry"}
                       or (u.path == "/api/term/send" and not body.get("keys")
                           and bool(body.get("text"))))
@@ -701,9 +825,10 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def do_GET(self):
+        u = urlparse(self.path)
+        self._audit_begin("GET", u.path)
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
-        u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/api/term/attach":
             return self._attach(q)
@@ -719,9 +844,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
     def do_DELETE(self):
+        u = urlparse(self.path)
+        self._audit_begin("DELETE", u.path)
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
-        u = urlparse(self.path)
         if not u.path.startswith("/api/session/"):
             return self._json({"error": "not found"}, 404)
         uid = unquote(u.path[len("/api/session/"):])
@@ -799,7 +925,8 @@ class Handler(BaseHTTPRequestHandler):
             pending = pending_store.active({x["name"] for x in tmux_sessions}) if TERMINAL else []
             pending = debug_runs.filter_rows(pending, run_id)
             public_pending = [{k: row.get(k) for k in
-                               ("name", "source", "sid", "cwd", "started", "cols", "rows")}
+                               ("name", "source", "sid", "cwd", "started",
+                                "cols", "rows", "title", "kind", "report_id")}
                               for row in pending]
             return self._json({"enabled": TERMINAL and term.available(),
                                "sources": term.available_sources() if TERMINAL else {},
@@ -961,6 +1088,51 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
+        connection_id = str(q.get("connection", [""])[0])[:128] or uuid.uuid4().hex
+        page_id = str(q.get("page", [""])[0])[:128]
+        self._audit_uid = uid
+        self._audit_source = str(s.get("source") or "")
+        self._audit_page_id = page_id
+        self._audit_response_done = True
+        packet_seq = 0
+        opened_at = time.monotonic()
+
+        def emit(obj: dict, kind: str) -> None:
+            nonlocal packet_seq
+            packet_seq += 1
+            packet_id = f"{connection_id}:{packet_seq}"
+            packet = {**obj, "_audit": {
+                "connection_id": connection_id, "packet_id": packet_id,
+                "kind": kind,
+            }}
+            payload = json.dumps(packet, ensure_ascii=False)
+            self.wfile.write(f"data: {payload}\n\n".encode())
+            self.wfile.flush()
+            audit.record(
+                "sse.packet.sent", category="stream", uid=uid,
+                source=str(s.get("source") or ""), page_id=page_id,
+                connection_id=connection_id,
+                trace_id=packet_id, build=getattr(self, "_audit_build", ""),
+                data={
+                    "packet_id": packet_id, "kind": kind,
+                    "reset": bool(obj.get("reset")),
+                    "start": obj.get("start"), "end": obj.get("end"),
+                    "messages": len(obj.get("messages") or []),
+                    "outbox": len(obj.get("outbox") or []),
+                    "prompt_only": bool(obj.get("prompt_only")),
+                    "outbox_only": bool(obj.get("outbox_only")),
+                    "bytes": len(payload.encode()),
+                }, content=packet,
+            )
+
+        audit.record(
+            "sse.connection.opened", category="stream", uid=uid,
+            source=str(s.get("source") or ""), page_id=page_id,
+            connection_id=connection_id, build=getattr(self, "_audit_build", ""),
+            data={"start": q.get("start", ["0"])[0],
+                  "agent": q.get("agent", [""])[0]},
+        )
+
         start = int(q.get("start", ["0"])[0])
         head = q.get("head", [""])[0]
         anchor = q.get("anchor", [""])[0]
@@ -972,12 +1144,24 @@ class Handler(BaseHTTPRequestHandler):
                       if not s.get("agent_id") and s.get("source") == "claude" else "")
         prompt_revision = claude_bridge.revision(claude_sid) if claude_sid else None
         codex_session = bool(not s.get("agent_id") and s.get("source") == "codex")
-        codex_pane = ""
-        if codex_session:
+        terminal_session = bool(not s.get("agent_id")
+                                and s.get("source") in {"claude", "codex"})
+        terminal_name = ""
+        if terminal_session:
             pane = _pane_for_session(s, term.list_sessions())
-            codex_pane = str(pane.get("name") or "") if pane else ""
+            terminal_name = str(pane.get("name") or "") if pane else ""
+        codex_pane = terminal_name if codex_session else ""
         codex_prompt = None
         next_codex_prompt_check = 0.0
+        next_terminal_check = 0.0
+        next_terminal_lookup = 0.0
+        terminal_idle_since = 0.0
+        terminal_idle_token = None
+        handled_terminal_activity = None
+        visible_activity = None
+        native_activity = None
+        terminal_activity_token = None
+        terminal_busy_seen = False
         activity_revision = session_meta.activity_revision(uid)
         beat = time.time()
         try:
@@ -993,7 +1177,9 @@ class Handler(BaseHTTPRequestHandler):
                     # 用 messages_for 而不是 messages: 后者要过一遍索引,
                     # 而文件刚变过, 签名对不上就会重建整个索引(百毫秒级)
                     d = index.messages_for(s, start=start, head=head, anchor=anchor)
+                    native_activity = d.get("activity")
                     _resolve_activity(uid, d)
+                    visible_activity = d.get("activity")
                     if not s.get("agent_id"):
                         # 若文件追加和 Escape 同时发生，本批已经携带修正后的状态；
                         # 同步游标，避免下一轮再推一份完全相同的空状态增量。
@@ -1021,61 +1207,142 @@ class Handler(BaseHTTPRequestHandler):
                             or outbox_revision != previous_outbox_revision
                             or prompt_revision != previous_prompt_revision
                             or codex_prompt != previous_codex_prompt):
-                        payload = json.dumps(d, ensure_ascii=False)
-                        self.wfile.write(f"data: {payload}\n\n".encode())
-                        self.wfile.flush()
+                        emit(d, "messages")
                     start, head, anchor = d["end"], d["version"]["head"], d["anchor"]
                     beat = time.time()
                 elif (not s.get("agent_id")
                       and session_meta.activity_revision(uid) != activity_revision):
                     activity_revision = session_meta.activity_revision(uid)
+                    visible_activity = session_meta.resolve_activity(
+                        uid, native_activity)
                     # 使用普通的空增量格式，已打开、尚未刷新到新版 JS 的页面
                     # 也能立即清掉 Working，不需要认识额外的事件协议。
-                    payload = json.dumps({
+                    packet = {
                         "reset": False, "start": start, "end": start,
                         "version": ver, "anchor": anchor, "messages": [],
                         "activity_changed": True,
-                        "activity": session_meta.stopped_activity(uid),
-                    }, ensure_ascii=False)
-                    self.wfile.write(f"data: {payload}\n\n".encode())
-                    self.wfile.flush()
+                        "activity": visible_activity,
+                    }
+                    emit(packet, "activity")
                     beat = time.time()
                 elif claude_sid and current_prompt_revision != prompt_revision:
                     prompt_revision = current_prompt_revision
-                    payload = json.dumps({"prompt_only": True,
-                                          "prompt": claude_bridge.prompt(claude_sid)},
-                                         ensure_ascii=False)
-                    self.wfile.write(f"data: {payload}\n\n".encode())
-                    self.wfile.flush()
+                    emit({"prompt_only": True,
+                          "prompt": claude_bridge.prompt(claude_sid)}, "prompt")
                     beat = time.time()
                 elif codex_session and time.time() >= next_codex_prompt_check:
                     next_codex_prompt_check = time.time() + 0.4
                     current_codex_prompt = _codex_prompt(s, codex_pane)
                     if current_codex_prompt != codex_prompt:
                         codex_prompt = current_codex_prompt
-                        payload = json.dumps({"prompt_only": True,
-                                              "prompt": codex_prompt},
-                                             ensure_ascii=False)
-                        self.wfile.write(f"data: {payload}\n\n".encode())
-                        self.wfile.flush()
+                        emit({"prompt_only": True,
+                              "prompt": codex_prompt}, "prompt")
                         beat = time.time()
                 elif (outbox_driver
                       and outbox_driver.revision() != outbox_revision):
                     outbox = outbox_driver.snapshot(uid)
                     outbox_revision = outbox["outbox_version"]["revision"]
-                    payload = json.dumps({"outbox_only": True, **outbox},
-                                         ensure_ascii=False)
-                    self.wfile.write(f"data: {payload}\n\n".encode())
-                    self.wfile.flush()
+                    emit({"outbox_only": True, **outbox}, "outbox")
                     beat = time.time()
                 elif time.time() - beat > 20:     # 心跳, 让中间的代理别掐连接
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                     beat = time.time()
+
+                # Native tmux input bypasses /api/term/send, so an immediate
+                # Escape can return the real TUI to its composer without adding
+                # a durable abort record.  Reconcile only a stable, recognised
+                # idle composer; question/approval overlays remain unknown and
+                # can never be mistaken for completion.
+                now = time.time()
+                if terminal_session and now >= next_terminal_lookup and not terminal_name:
+                    next_terminal_lookup = now + 1.0
+                    pane = _pane_for_session(s, term.list_sessions())
+                    terminal_name = str(pane.get("name") or "") if pane else ""
+                    if codex_session:
+                        codex_pane = terminal_name
+                if (terminal_name and outbox_driver
+                        and now >= next_terminal_check):
+                    next_terminal_check = now + 0.15
+                    try:
+                        terminal_state = outbox_driver.terminal_probe(terminal_name)
+                    except (OSError, RuntimeError, ValueError, KeyError):
+                        terminal_name = ""
+                        terminal_idle_since = 0.0
+                        terminal_idle_token = None
+                    else:
+                        state = str((visible_activity or {}).get("state") or "")
+                        token = (state, str((visible_activity or {}).get("ts") or ""))
+                        if token != terminal_activity_token:
+                            terminal_activity_token = token
+                            terminal_busy_seen = False
+                            terminal_idle_since = 0.0
+                            terminal_idle_token = None
+                        if terminal_state["busy"]:
+                            terminal_busy_seen = True
+                            terminal_idle_since = 0.0
+                            terminal_idle_token = None
+                            # 窄屏 Claude 曾因隐藏 interrupt 页脚被误判为空闲。
+                            # 一旦 TUI 本身重新给出明确运行证据，撤销那次启发式
+                            # stop；显式网页 Escape 不属于 inferred，不会被清理。
+                            if ((visible_activity or {}).get("reason") in {
+                                    "终端已结束或中断", "终端已回到输入状态"}):
+                                session_meta.clear_inferred_activity_stop(uid)
+                            time.sleep(WATCH_POLL)
+                            continue
+                        settled = (not terminal_state["busy"]
+                                   and terminal_state["draft_state"] in {
+                                       "empty", "editing"})
+                        if (state in {"working", "waiting", "aborted", "failed"}
+                                and settled and token != handled_terminal_activity):
+                            if terminal_idle_token != token:
+                                terminal_idle_token = token
+                                terminal_idle_since = now
+                            elif now - terminal_idle_since >= 0.45:
+                                interrupted = outbox_driver.mark_interrupted(
+                                    uid, terminal_state["draft_state"] == "editing")
+                                if interrupted:
+                                    OUTBOX_WAKE.set()
+                                if state in {"working", "waiting"}:
+                                    if interrupted:
+                                        visible_activity = session_meta.stop_activity(
+                                            uid, reason="终端在原生消息落盘前中断")
+                                    elif terminal_busy_seen:
+                                        # 空输入框只证明回合已经结束，不能证明用户
+                                        # 按过 Esc。原生 transcript 若稍后补上 idle，
+                                        # 它会自然覆盖这条启发式停止点。
+                                        visible_activity = session_meta.stop_activity(
+                                            uid, reason="终端已回到输入状态",
+                                            state="idle", inferred=True)
+                                    else:
+                                        # Enter 后 Claude 可能先短暂画出空输入框，
+                                        # 再出现 spinner。没有见过忙态、也没有退役
+                                        # 待确认发送项时，不得据此宣称回合结束。
+                                        terminal_idle_since = 0.0
+                                        terminal_idle_token = None
+                                        time.sleep(WATCH_POLL)
+                                        continue
+                                handled_terminal_activity = token
+                        else:
+                            terminal_idle_since = 0.0
+                            terminal_idle_token = None
                 time.sleep(WATCH_POLL)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass                                  # 客户端走了
+        except (BrokenPipeError, ConnectionResetError, OSError) as error:
+            audit.record(
+                "sse.connection.error", category="stream", severity="warning",
+                uid=uid, source=str(s.get("source") or ""), page_id=page_id,
+                connection_id=connection_id,
+                data={"error": f"{type(error).__name__}: {error}"},
+            )
         finally:
+            audit.record(
+                "sse.connection.closed", category="stream", uid=uid,
+                source=str(s.get("source") or ""), page_id=page_id,
+                connection_id=connection_id,
+                data={"packets": packet_seq,
+                      "duration_ms": round((time.monotonic() - opened_at) * 1000, 3),
+                      "end": start},
+            )
             self.close_connection = True
 
     def _star_session(self, body: dict):
@@ -1090,6 +1357,106 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             return self._json({"error": str(e)}, 500)
         return self._json({"ok": True, "uid": uid, **meta})
+
+    def _browser_audit(self, body: dict):
+        """Accept a bounded browser-side receipt batch.
+
+        These records are the final hop of the trace. They describe what the
+        isolated page actually received and rendered, not what the server hoped
+        it rendered.
+        """
+        events = body.get("events")
+        if not isinstance(events, list):
+            return self._json({"error": "events must be a list"}, 400)
+        if len(events) > 100:
+            return self._json({"error": "too many events"}, 413)
+        page_id = str(body.get("page_id") or body.get("_page_id") or "")[:128]
+        accepted = 0
+        for item in events:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("event") or "")[:160]
+            if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,160}", name):
+                continue
+            uid = str(item.get("uid") or body.get("uid") or "")[:512]
+            trace_id = str(item.get("trace_id") or body.get("_trace_id") or "")[:128]
+            connection_id = str(item.get("connection_id") or "")[:128]
+            request_id = str(item.get("request_id") or "")[:128]
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            content = item.get("content")
+            # Keep individual browser events bounded even within the request cap.
+            try:
+                if len(json.dumps(content, ensure_ascii=False)) > 512 * 1024:
+                    content = {"truncated": True}
+            except (TypeError, ValueError):
+                content = None
+            audit.record(
+                f"browser.{name}", category="browser",
+                severity=str(item.get("severity") or "info")[:24],
+                uid=uid, source=uid.partition(":")[0], trace_id=trace_id,
+                request_id=request_id, page_id=page_id,
+                connection_id=connection_id,
+                build=str(body.get("_build") or item.get("build") or "")[:128],
+                data={"client_ts": item.get("ts"), **data}, content=content,
+            )
+            accepted += 1
+        return self._json({"ok": True, "accepted": accepted}, 202)
+
+    def _bug_report(self, body: dict):
+        """Capture the current cross-layer state and start a Codex investigator."""
+        if not TERMINAL:
+            return self._json({"error": "终端未启用，无法启动处理会话"}, 403)
+        if not term.available_sources().get("codex"):
+            return self._json({"error": "本机找不到 codex 命令"}, 503)
+        description = str(body.get("description") or "").strip()
+        uid = str(body.get("uid") or "")[:512]
+        session = index.get(uid) if uid and not uid.startswith("tmux:") else None
+        snapshot = body.get("snapshot") if isinstance(body.get("snapshot"), dict) else {}
+        terminal_name = str(body.get("terminal_name") or "")[:256]
+        terminal_capture = ""
+        if terminal_name and any(row.get("name") == terminal_name
+                                 for row in term.list_sessions()):
+            try:
+                terminal_capture = term.capture_history(terminal_name, 8000)
+            except (OSError, RuntimeError, ValueError):
+                try:
+                    terminal_capture = term.capture_screen(terminal_name)
+                except (OSError, RuntimeError, ValueError):
+                    terminal_capture = ""
+        source = str((session or {}).get("source") or uid.partition(":")[0])
+        outbox = send_protocol.snapshot(source, uid) if uid else {}
+        try:
+            report = bug_report.create(
+                description, uid=uid,
+                page_id=str(body.get("page_id") or body.get("_page_id") or "")[:128],
+                trace_id=str(body.get("_trace_id") or "")[:128],
+                build=str(body.get("_build") or "")[:128], hostname=HOSTNAME,
+                client_ip=self._display_ip(), snapshot=snapshot,
+                terminal_capture=terminal_capture, session=session, outbox=outbox,
+            )
+        except (OSError, ValueError) as error:
+            return self._json({"error": str(error)}, 400)
+        try:
+            worker = bug_report.launch(
+                report, cols=max(40, min(int(body.get("cols") or 120), 300)),
+                rows=max(12, min(int(body.get("rows") or 36), 120)))
+        except Exception as error:
+            message = f"诊断已保存，但 Codex 会话启动失败：{error}"
+            bug_report.update_manifest(
+                Path(report["path"]), status="failed", error=message)
+            audit.record(
+                "bug_report.worker_launch_failed", category="bug-report",
+                severity="error", uid=uid, trace_id=report["report_id"],
+                data={"report_id": report["report_id"], "error": str(error)},
+            )
+            return self._json({"error": message, "report_id": report["report_id"],
+                               "path": report["path"]}, 500)
+        return self._json({
+            "ok": True, "report_id": report["report_id"], "path": report["path"],
+            "worker": {key: worker.get(key) for key in
+                       ("name", "source", "sid", "cwd", "token", "title",
+                        "kind", "report_id")},
+        }, 202)
 
     def _claude_rewind(self, body: dict):
         """把 Claude 只存在进程内的双-Esc 回滚同步到对话时间线。"""
@@ -1154,8 +1521,10 @@ class Handler(BaseHTTPRequestHandler):
         if failed:
             # 新消息排在失败项后面永远不会投递。拒绝本次请求，让浏览器保留
             # 编辑框正文，并明确要求先处理真正的阻塞项。
+            retryable = int(failed.get("attempts") or 0) == 0
             return self._json({
-                "error": "上一条消息发送失败，请先重试或移除",
+                "error": ("上一条消息发送失败，请先重试或移除" if retryable
+                          else "上一条消息状态待核对，请检查终端或移除"),
                 **send_queue.snapshot(uid),
             }, 409)
         conflict = driver.overwrite_draft(
@@ -1245,8 +1614,16 @@ class Handler(BaseHTTPRequestHandler):
                     **claude_queue.snapshot(uid),
                 }, 409)
             return self._json({"error": "待核对消息不存在"}, 404)
-        if not any(item.get("id") == item_id for item in send_queue.list_for(uid)):
+        existing = next((item for item in send_queue.list_for(uid)
+                         if item.get("id") == item_id), None)
+        if not existing:
             return self._json({"error": "待发送消息不存在"}, 404)
+        if (existing.get("state") != "failed"
+                or int(existing.get("attempts") or 0) > 0):
+            return self._json({
+                "error": "消息已经写入终端或仍在确认，禁止重复发送",
+                **send_queue.snapshot(uid),
+            }, 409)
         pane = _pane_for_session(s, term.list_sessions()) if s else None
         if pane:
             driver = send_protocol.driver_for("codex")
@@ -1269,7 +1646,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "待核对消息不存在"}, 404)
             return self._json({"ok": True, "uid": uid,
                                **claude_queue.snapshot(uid)})
-        if not send_queue.discard(item_id, uid, {"queued", "failed"}):
+        existing = next((item for item in send_queue.list_for(uid)
+                         if item.get("id") == item_id), None)
+        # Dismiss is idempotent. Another tab may already have removed the
+        # durable row while this tab still retains its in-memory placeholder;
+        # the authoritative snapshot lets that tab clear it too.
+        if not existing:
+            return self._json({"ok": True, "uid": uid,
+                               **send_queue.snapshot(uid)})
+        if not send_queue.discard(
+                item_id, uid, {"queued", "failed", "aborted", "restored"}):
             return self._json({"error": "消息不存在或已经开始发送"}, 409)
         return self._json({"ok": True, "uid": uid,
                            **send_queue.snapshot(uid)})
@@ -1366,7 +1752,11 @@ class Handler(BaseHTTPRequestHandler):
         if pending and pending.get("resolved"):
             return self._json(pending["resolved"])
         if not pending:
-            return self._json({"error": "新会话记录不存在或已过期", "gone": True}, 404)
+            # This is a polling state, not an exceptional resource lookup.  A
+            # kill can race with an already-dispatched poll; return a normal
+            # terminal state so browsers and reverse proxies do not report a
+            # spurious HTTP error after a successful shutdown.
+            return self._json({"gone": True})
 
         # 签名包含路径、mtime 和大小；新文件/首条消息会自然触发重建。
         # 不能在 750ms 状态轮询里强制全量解析所有会话。
@@ -1430,6 +1820,15 @@ class Handler(BaseHTTPRequestHandler):
         name = q.get("name", [""])[0]
         page = q.get("page", [""])[0]
         token = q.get("token", [""])[0]
+        connection_id = str(q.get("connection", [""])[0])[:128] or uuid.uuid4().hex
+        self._audit_page_id = str(page)[:128]
+        self._audit_connection_id = connection_id
+        audit.record(
+            "terminal.connection.requested", category="terminal",
+            page_id=page, connection_id=connection_id,
+            data={"tmux": name, "cols": q.get("cols", [""])[0],
+                  "rows": q.get("rows", [""])[0]},
+        )
         if not name or not any(s["name"] == name for s in term.list_sessions()):
             return self._send(404, b"no such tmux session", "text/plain")
         # The claim endpoint issues this opaque token.  Binding is repeated
@@ -1438,11 +1837,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, b"terminal ownership required", "text/plain")
         if not wsock.handshake(self):
             return self._send(400, b"expected websocket", "text/plain")
+        self._audit_response_done = True
 
         sock = self.connection
         stop = threading.Event()
         connection = _TerminalConnection(sock, stop)
         if not TERM_OWNERS.bind(name, page, token, connection):
+            audit.record(
+                "terminal.connection.rejected", category="terminal",
+                severity="warning", page_id=page, connection_id=connection_id,
+                data={"tmux": name, "reason": "ownership"},
+            )
             connection.revoke("", notify=False)
             connection.closed.set()
             self.close_connection = True
@@ -1458,16 +1863,46 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
+        opened_at = time.monotonic()
+        audit.record(
+            "terminal.connection.opened", category="terminal",
+            page_id=page, connection_id=connection_id,
+            data={"tmux": name, "cols": q.get("cols", ["120"])[0],
+                  "rows": q.get("rows", ["32"])[0]},
+        )
+
         def pump():                      # tmux → 浏览器
+            buffered = bytearray()
+            last_record = time.monotonic()
+
+            def record_output(force: bool = False):
+                nonlocal last_record
+                if not buffered or (not force and len(buffered) < 32 * 1024
+                                    and time.monotonic() - last_record < 0.25):
+                    return
+                payload = bytes(buffered)
+                buffered.clear()
+                last_record = time.monotonic()
+                audit.record(
+                    "terminal.output", category="terminal",
+                    page_id=page, connection_id=connection_id,
+                    data={"tmux": name, "bytes": len(payload)}, content=payload,
+                )
+
             while not stop.is_set():
                 data = att.read(0.05)
                 if data:
+                    buffered.extend(data)
                     try:
                         connection.send(data, wsock.OP_BIN)
                     except OSError:
                         break
+                    record_output()
                 elif not att.alive():
                     break
+                else:
+                    record_output()
+            record_output(True)
             stop.set()
 
         t = threading.Thread(target=pump, daemon=True)
@@ -1485,9 +1920,21 @@ class Handler(BaseHTTPRequestHandler):
                         m = json.loads(payload)
                         if m.get("t") == "resize":
                             att.resize(int(m["cols"]), int(m["rows"]))
+                            audit.record(
+                                "terminal.resized", category="terminal",
+                                page_id=page, connection_id=connection_id,
+                                data={"tmux": name, "cols": int(m["cols"]),
+                                      "rows": int(m["rows"])},
+                            )
                             continue
                     except Exception:
                         pass
+                audit.record(
+                    "terminal.input", category="terminal",
+                    page_id=page, connection_id=connection_id,
+                    data={"tmux": name, "bytes": len(payload), "opcode": op},
+                    content=payload,
+                )
                 att.write(payload)
         except (ConnectionError, OSError):
             pass
@@ -1498,6 +1945,12 @@ class Handler(BaseHTTPRequestHandler):
             connection.closed.set()
             with connection.send_lock:
                 wsock.close(sock)
+            audit.record(
+                "terminal.connection.closed", category="terminal",
+                page_id=page, connection_id=connection_id,
+                data={"tmux": name, "replaced": connection.replaced,
+                      "duration_ms": round((time.monotonic() - opened_at) * 1000, 3)},
+            )
             self.close_connection = True
 
     def _static(self, path: str):

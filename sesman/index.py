@@ -17,14 +17,14 @@ from datetime import datetime
 from pathlib import Path
 
 from .adapters import ADAPTERS, ClaudeAdapter
-from . import media, session_meta
+from . import audit, media, session_meta
 
 CACHE_DIR = Path.home() / ".cache" / "sesman"
 CACHE_FILE = CACHE_DIR / "index.json"
 CACHE_VERSION = 5
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
-WINDOW_CACHE_VERSION = 5
-MESSAGE_CURSOR_VERSION = 5
+WINDOW_CACHE_VERSION = 7
+MESSAGE_CURSOR_VERSION = 7
 WINDOW_CACHE_MIN_BYTES = 8 * 1024 * 1024
 WINDOW_CACHE_MEMORY_ITEMS = 16
 TRASH_DIR = Path.home() / ".local" / "share" / "sesman" / "trash"
@@ -205,6 +205,32 @@ def _refresh_raw(raw: dict[str, dict[str, dict]], old_files: dict,
     return updated
 
 
+def _audit_inventory_changes(old_files: dict, new_files: dict) -> None:
+    """Record file-level evidence even before a changed owner is parsed."""
+    if not old_files:
+        return
+    owner_uids = {
+        (str(row.get("source") or ""), str(row.get("path") or "")):
+            str(row.get("uid") or "")
+        for row in _state.get("sessions", [])
+    }
+    for path in sorted(old_files.keys() | new_files.keys()):
+        previous, current = old_files.get(path), new_files.get(path)
+        if previous == current:
+            continue
+        entry = current or previous
+        kind, owner = entry[0], entry[1]
+        source = _KIND_SOURCE.get(kind, "codex" if kind == "codex-index" else "")
+        uid = owner_uids.get((source, str(owner)), "")
+        audit.record(
+            "jsonl.file.changed", category="filesystem", uid=uid, source=source,
+            data={"path": path, "kind": kind, "owner": owner,
+                  "change": "created" if previous is None else
+                            "deleted" if current is None else "modified",
+                  "before": previous, "after": current},
+        )
+
+
 def _cache_raw(value) -> dict[str, dict[str, dict]]:
     """严格恢复 v3 raw schema；任何异常都让调用方安全回退全量扫描。"""
     if not isinstance(value, dict):
@@ -300,6 +326,8 @@ def load(force: bool = False) -> list[dict]:
             return _state["sessions"]
 
         files = _inventory()
+        if _state["initialized"]:
+            _audit_inventory_changes(_state["files"], files)
         sig = _signature(files)
         if (not force and _state["initialized"] and not _state["dirty"]
                 and _state["sig"] == sig):
@@ -768,9 +796,12 @@ def _read_message_batch(s: dict, ad, start: int, ver: dict,
                         initial_window: bool) -> dict:
     """解析一批消息，并在富媒体展开前生成可安全缓存的纯 JSON 结果。"""
     if isinstance(ad, ClaudeAdapter):
+        timeline = (session_meta.timeline(str(s.get("uid") or ""))
+                    if not s.get("agent_id") else None)
         msgs, end = ad.read(
             s["path"], start=start, agent=s.get("agent_id"),
-            declared_tip=_claude_effective_tip(s, pos=ver["size"]))
+            declared_tip=_claude_effective_tip(s, pos=ver["size"]),
+            abandoned_after=int((timeline or {}).get("stale_end") or 0))
     else:
         msgs, end = ad.read(s["path"], start=start)
     activity_events = [m for m in msgs if m.get("role") == "status"]
@@ -788,6 +819,51 @@ def _read_message_batch(s: dict, ad, start: int, ver: dict,
             "activity": activity_events[-1] if activity_events else None}
 
 
+_audit_parse_seen: OrderedDict[tuple, None] = OrderedDict()
+_audit_parse_lock = threading.Lock()
+
+
+def _audit_message_batch(s: dict, result: dict, requested: dict) -> None:
+    """Describe the parser boundary without making parsing depend on audit I/O."""
+    messages = result.get("messages") or []
+    if not (messages or result.get("activity_changed") or result.get("reset")):
+        return
+    version_value = result.get("version") or {}
+    activity_value = result.get("activity") or {}
+    fingerprint = (
+        str(data_file(s)), str(s.get("agent_id") or ""),
+        version_value.get("size"), version_value.get("mtime"),
+        version_value.get("head"), bool(result.get("reset")),
+        result.get("start"), result.get("end"), len(messages),
+        activity_value.get("state"), activity_value.get("ts"),
+    )
+    with _audit_parse_lock:
+        if fingerprint in _audit_parse_seen:
+            _audit_parse_seen.move_to_end(fingerprint)
+            return
+        _audit_parse_seen[fingerprint] = None
+        while len(_audit_parse_seen) > 4096:
+            _audit_parse_seen.popitem(last=False)
+    roles: dict[str, int] = {}
+    for message in messages:
+        role = str(message.get("role") or "unknown")
+        roles[role] = roles.get(role, 0) + 1
+    audit.record(
+        "jsonl.batch.parsed", category="parser",
+        uid=str(s.get("uid") or ""), source=str(s.get("source") or ""),
+        data={
+            "path": str(data_file(s)), "agent": str(s.get("agent_id") or ""),
+            "requested": requested, "reset": bool(result.get("reset")),
+            "start": result.get("start"), "end": result.get("end"),
+            "version": result.get("version"), "anchor": result.get("anchor"),
+            "message_count": len(messages), "message_total": result.get("message_total"),
+            "roles": roles, "partial": result.get("partial"),
+            "activity_changed": bool(result.get("activity_changed")),
+        },
+        content={"messages": messages, "activity": result.get("activity")},
+    )
+
+
 def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
                  append_only: bool = False, windowed: bool = False) -> dict:
     """整份或增量读取。直接持有会话快照，SSE 每 50ms 只检查目标文件。
@@ -796,6 +872,8 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
     最后一条是必需的 —— 有些会话会截断后重写。Claude 双 Esc 则更特殊：
     文件只追加、字节锚点完全不变，但树的当前叶子会退回祖先，也必须整份重建。
     """
+    requested = {"start": start, "head": head, "anchor": anchor,
+                 "append_only": append_only, "windowed": windowed}
     ver = version(s)
     # 小于 4 KiB 的新会话追加后，当前 head 会自然变长、哈希也会变化；应当
     # 用旧 EOF 所确定的同长度前缀校验，而不是把正常追加误判成历史改写。
@@ -824,10 +902,13 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
         # 后台未读探测绝不能因回滚/重写退化成几十 MB 的整份下载；让调用方
         # 丢弃旧缓存并以当前 EOF 重新建立基线即可。
         end = ver["size"]
-        return {"meta": s, "version": ver, "reset": True, "start": end, "end": end,
-                "anchor": _cursor_anchor(s, end), "messages": [],
-                "message_total": 0, "partial": None,
-                "activity_changed": False, "activity": None}
+        result = {"meta": s, "version": ver, "reset": True,
+                  "start": end, "end": end,
+                  "anchor": _cursor_anchor(s, end), "messages": [],
+                  "message_total": 0, "partial": None,
+                  "activity_changed": False, "activity": None}
+        _audit_message_batch(s, result, requested)
+        return result
     if reset:
         start = 0
 
@@ -839,12 +920,14 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
     msgs = batch["messages"]
     for msg in msgs:
         media.enrich_message(msg, s.get("cwd"))
-    return {"meta": s, "version": ver, "reset": reset, "start": start,
-            "end": batch["end"],
-            "anchor": _cursor_anchor(s, batch["end"]), "messages": msgs,
-            "message_total": batch["message_total"], "partial": batch["partial"],
-            "activity_changed": batch["activity_changed"],
-            "activity": batch["activity"]}
+    result = {"meta": s, "version": ver, "reset": reset, "start": start,
+              "end": batch["end"],
+              "anchor": _cursor_anchor(s, batch["end"]), "messages": msgs,
+              "message_total": batch["message_total"], "partial": batch["partial"],
+              "activity_changed": batch["activity_changed"],
+              "activity": batch["activity"]}
+    _audit_message_batch(s, result, requested)
+    return result
 
 
 def delete(uid: str) -> str:
@@ -914,8 +997,12 @@ def _search_text(s: dict) -> str:
     try:
         ad = ADAPTERS[s["source"]]
         if isinstance(ad, ClaudeAdapter):
+            timeline = (session_meta.timeline(str(s.get("uid") or ""))
+                        if not s.get("agent_id") else None)
             msgs, _ = ad.read(s["path"], agent=s.get("agent_id"),
-                              declared_tip=_claude_effective_tip(s))
+                              declared_tip=_claude_effective_tip(s),
+                              abandoned_after=int(
+                                  (timeline or {}).get("stale_end") or 0))
         else:
             msgs, _ = ad.read(s["path"])
     except Exception:

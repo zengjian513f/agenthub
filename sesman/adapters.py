@@ -508,6 +508,10 @@ _CODEX_ABORT_PREFIX = re.compile(
 _GROK_USER_QUERY = re.compile(
     r"^\s*(?:<image_files>.*?</image_files>\s*)*"
     r"<user_query>(.*?)</user_query>\s*$", re.I | re.S)
+_CLAUDE_BASH_INPUT = re.compile(
+    r"^\s*<bash-input>(.*?)</bash-input>\s*$", re.I | re.S)
+_CLAUDE_BASH_STREAM = re.compile(
+    r"<(bash-(?:stdout|stderr))>(.*?)</\1>", re.I | re.S)
 
 
 def _is_injected(text: str) -> bool:
@@ -556,6 +560,55 @@ def _notification_tag(text: str, name: str) -> str:
     match = re.search(fr"<{re.escape(name)}>(.*?)</{re.escape(name)}>", text,
                       re.I | re.S)
     return html.unescape(match.group(1).strip()) if match else ""
+
+
+def _claude_local_command(text: str) -> str | None:
+    """Extract the user-facing command from Claude's local-command envelope.
+
+    Recent Claude Code versions write these envelopes as system records rather
+    than user records. Letting the generic system renderer see the XML creates
+    protocol bubbles; dropping every envelope also loses real slash commands.
+    """
+    name = _notification_tag(str(text or ""), "command-name")
+    if not name.startswith("/"):
+        return None
+    args = _notification_tag(str(text or ""), "command-args")
+    return f"{name} {args}".rstrip()
+
+
+def _claude_bash_input(text: str) -> str | None:
+    """Decode Claude's native ``!`` local-shell input envelope."""
+    match = _CLAUDE_BASH_INPUT.fullmatch(str(text or ""))
+    if not match:
+        return None
+    command = html.unescape(match.group(1)).strip()
+    if not command:
+        return None
+    return command if command.startswith("!") else f"! {command}"
+
+
+def _claude_bash_output(text: str) -> dict | None:
+    """Decode the stdout/stderr envelope paired with a local-shell input.
+
+    Claude writes both streams inside a ``user`` record because their contents
+    are fed back into the model.  They are terminal output in the UI, not a
+    second user prompt.  Only accept an exact sequence of known tags so text in
+    which the user merely discusses these tags remains ordinary conversation.
+    """
+    raw = str(text or "")
+    matches = list(_CLAUDE_BASH_STREAM.finditer(raw))
+    if not matches or _CLAUDE_BASH_STREAM.sub("", raw).strip():
+        return None
+    streams: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    for match in matches:
+        name = match.group(1).lower().removeprefix("bash-")
+        streams[name].append(html.unescape(match.group(2)).strip("\n"))
+    stdout = "\n".join(x for x in streams["stdout"] if x)
+    stderr = "\n".join(x for x in streams["stderr"] if x)
+    blocks = [stdout] if stdout else []
+    if stderr:
+        blocks.append(f"stderr:\n{stderr}" if stdout else stderr)
+    return {"text": "\n\n".join(blocks), "stderr": bool(stderr)}
 
 
 def _task_notification_summary(summary: str, status: str) -> str:
@@ -774,9 +827,14 @@ class ClaudeAdapter:
     @classmethod
     def _active_lineage(cls, path: str, start: int = 0,
                         agent: str | None = None,
-                        declared_tip: str | None = None) -> tuple[set[str] | None, int]:
-        """扫描一个读取区间，求其最后叶子的祖先链及实际 EOF。"""
+                        declared_tip: str | None = None,
+                        abandoned_after: int = 0,
+                        ) -> tuple[set[str] | None, set[str], int]:
+        """扫描读取区间，求活动祖先链、无回答的废弃输入及实际 EOF。"""
         parents: dict[str, str | None] = {}
+        user_parents: dict[str, str | None] = {}
+        user_offsets: dict[str, int] = {}
+        response_nodes: list[str] = []
         tip = str(declared_tip) if declared_tip else None
         scan_tip = None
         end = start
@@ -793,13 +851,22 @@ class ClaudeAdapter:
                 if not parent and scan_tip and cls._compact_boundary(rec):
                     parent = scan_tip
                 parents[uid] = str(parent) if parent else None
+                if not agent and rec.get("type") == "user":
+                    user_parents[uid] = parents[uid]
+                    user_offsets[uid] = off
+                elif (rec.get("type") == "assistant"
+                      and (rec.get("message") or {}).get("content")):
+                    response_nodes.append(uid)
+                elif (rec.get("type") == "system"
+                      and rec.get("subtype") == "turn_duration"):
+                    response_nodes.append(uid)
             signal = cls._lineage_signal(rec, agent)
             if signal:
                 scan_tip = signal
                 if not declared_tip:
                     tip = signal
         if not tip:
-            return None, end
+            return None, set(), end
         active: set[str] = set()
         node = tip
         while node and node not in active:
@@ -807,7 +874,30 @@ class ClaudeAdapter:
             if node not in parents:
                 break
             node = parents[node]
-        return active, end
+        # A fast Esc can commit a native user row and then make the next input
+        # a sibling of it.  The old row leaves the selected lineage despite
+        # never receiving an assistant response.  Preserve only that narrow
+        # abandoned-leaf case as an interrupted user message; completed old
+        # branches (the normal double-Esc rewind case) remain hidden.
+        responded: set[str] = set()
+        for response in response_nodes:
+            node = parents.get(response)
+            while node and node not in responded:
+                responded.add(node)
+                node = parents.get(node)
+        active_user_parents = {
+            parent for uid, parent in user_parents.items() if uid in active
+        }
+        abandoned = {
+            uid for uid, parent in user_parents.items()
+            if uid not in active and uid not in responded
+            and parent in active and parent in active_user_parents
+            # A confirmed double-Esc rewind records the old EOF.  Inputs at or
+            # before that boundary were deliberately removed from the display
+            # lineage and must stay hidden after a later replacement arrives.
+            and user_offsets.get(uid, 0) > max(0, int(abandoned_after or 0))
+        }
+        return active, abandoned, end
 
     @classmethod
     def latest_tip_after(cls, path: str, start: int, end: int | None = None,
@@ -909,6 +999,50 @@ class ClaudeAdapter:
             pass
         return None
 
+    @staticmethod
+    def _custom_title_before(path: str, pos: int) -> str | None:
+        """Find the latest title before an incremental-read boundary.
+
+        /compact re-emits the current custom-title without a timestamp or UUID.
+        A full read can suppress that replay while walking forward; an
+        incremental read must seed the same state from the prefix or it would
+        append a second /rename bubble. Search backwards only when the new
+        interval actually contains a title record, so normal polling pays no
+        extra I/O.
+        """
+        if pos <= 0:
+            return None
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                cursor = min(pos, fh.tell())
+                suffix = b""
+                while cursor > 0:
+                    lo = max(0, cursor - 64 * 1024)
+                    fh.seek(lo)
+                    data = fh.read(cursor - lo) + suffix
+                    lines = data.split(b"\n")
+                    if lo:
+                        suffix = lines[0]
+                        lines = lines[1:]
+                    else:
+                        suffix = b""
+                    for raw in reversed(lines):
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                        except Exception:
+                            continue
+                        if (rec.get("type") == "custom-title"
+                                and rec.get("customTitle")):
+                            return str(rec["customTitle"])
+                    cursor = lo
+        except OSError:
+            pass
+        return None
+
     @classmethod
     def append_extends(cls, path: str, start: int, old_tip: str,
                        agent: str | None = None) -> bool:
@@ -992,7 +1126,11 @@ class ClaudeAdapter:
             if t == "user" and first_user is None and not rec.get("isSidechain"):
                 parts = _flatten_content((rec.get("message") or {}).get("content"))
                 txt = "\n".join(p["text"] for p in parts if p["kind"] == "text")
-                if txt.strip() and not _is_injected(txt):
+                local_command = _claude_bash_input(txt)
+                if local_command:
+                    first_user = local_command
+                elif (_claude_bash_output(txt) is None
+                      and txt.strip() and not _is_injected(txt)):
                     first_user = txt
         custom_title = latest_ai_title = None
         tail_cwds = {}
@@ -1051,21 +1189,28 @@ class ClaudeAdapter:
         }
 
     def read(self, path: str, start: int = 0, agent: str | None = None,
-             declared_tip: str | None = None):
+             declared_tip: str | None = None, abandoned_after: int = 0):
         return self._read_one(path, start=start, agent=agent[:8] if agent else None,
-                              declared_tip=declared_tip)
+                              declared_tip=declared_tip,
+                              abandoned_after=abandoned_after)
 
     def _read_one(self, path: str, agent: str | None = None, start: int = 0,
-                  declared_tip: str | None = None):
+                  declared_tip: str | None = None,
+                  abandoned_after: int = 0):
         # 先用轻量父指针表确定当前分支，再做原有消息解析。这样双 Esc 后留在
         # append-only 文件里的旧输入/回答不会继续混入当前时间线。
-        active, end = self._active_lineage(path, start=start, agent=agent,
-                                           declared_tip=declared_tip)
+        active, abandoned, end = self._active_lineage(
+            path, start=start, agent=agent, declared_tip=declared_tip,
+            abandoned_after=abandoned_after)
         msgs, calls = [], {}
+        previous_custom_title = None
+        custom_title_seeded = start == 0
         for rec, off in _iter_records(path, start):
             end = off
             uid = self._graph_uuid(rec, agent)
-            if active is not None and uid and uid not in active:
+            interrupted_branch = bool(uid and uid in abandoned)
+            if (active is not None and uid and uid not in active
+                    and not interrupted_branch):
                 continue
             t = rec.get("type")
             ts = _norm_ts(rec.get("timestamp"))
@@ -1077,6 +1222,10 @@ class ClaudeAdapter:
                 # Claude 没有 task_started；真实用户输入就是新回合的结构化起点。
                 text_parts = [p["text"] for p in parts if p["kind"] == "text"]
                 notifications = [_claude_task_notification(x) for x in text_parts]
+                bash_inputs = [(_claude_bash_input(x) if t == "user" and not tag
+                                else None) for x in text_parts]
+                bash_outputs = [(_claude_bash_output(x) if t == "user" and not tag
+                                 else None) for x in text_parts]
                 if hidden_record:
                     continue
                 if t == "user" and not tag and (
@@ -1084,17 +1233,44 @@ class ClaudeAdapter:
                         or any(_is_claude_interrupt(x) for x in text_parts)):
                     msgs.append(_status("aborted", ts))
                     continue
-                if t == "user" and not tag and any(
-                        x.strip() and x.strip() != "/compact" and notice is None
-                        and not _is_timeline_protocol(x)
-                        for x, notice in zip(text_parts, notifications)):
+                if t == "user" and not tag and not interrupted_branch and any(
+                        command is not None or (
+                            output is None and x.strip()
+                            and x.strip() != "/compact" and notice is None
+                            and not _is_timeline_protocol(x))
+                        for x, notice, command, output in zip(
+                            text_parts, notifications, bash_inputs, bash_outputs)):
                     msgs.append(_status("working", ts))
+                emitted_interrupted_user = False
+                interrupted_meta = ({
+                    "interrupted": True,
+                    "interrupt_reason": "输入已中断，未进入当前 Claude 分支",
+                } if interrupted_branch else {})
                 for p in parts:
                     if not str(p.get("text", "")).strip() and not p.get("media"):
                         continue
                     if p["kind"] == "text":
                         notice = _claude_task_notification(p["text"])
-                        if notice and not tag:
+                        bash_input = (_claude_bash_input(p["text"])
+                                      if role == "user" and not tag else None)
+                        bash_output = (_claude_bash_output(p["text"])
+                                       if role == "user" and not tag else None)
+                        if bash_input is not None:
+                            event_id = rec.get("uuid") or off
+                            call_id = f"local-shell:{event_id}"
+                            msgs.append(_msg(
+                                "command", bash_input, ts, call_id=call_id,
+                                local_shell=True, event_id=call_id,
+                                **interrupted_meta))
+                            emitted_interrupted_user |= interrupted_branch
+                        elif bash_output is not None:
+                            parent = rec.get("parentUuid") or rec.get("uuid") or off
+                            msgs.append(_msg(
+                                "tool_result", bash_output["text"], ts,
+                                name="Shell", call_id=f"local-shell:{parent}",
+                                counted=False,
+                                has_stderr=bash_output["stderr"]))
+                        elif notice and not tag:
                             notice["ts"] = ts
                             msgs.append(notice)
                         elif role.startswith("user") and (
@@ -1102,10 +1278,14 @@ class ClaudeAdapter:
                                 or (not tag and p["text"].strip() == "/compact")):
                             continue
                         else:
-                            msgs.append(_msg(role, p["text"], ts, name=tag))
+                            msgs.append(_msg(role, p["text"], ts, name=tag,
+                                             **interrupted_meta))
+                            emitted_interrupted_user |= interrupted_branch
                     elif p["kind"] == "image":
                         msgs.append(_msg(role, p["text"], ts, name=tag,
-                                         media_parts=[p.get("media")]))
+                                         media_parts=[p.get("media")],
+                                         **interrupted_meta))
+                        emitted_interrupted_user |= interrupted_branch
                     elif p["kind"] == "thinking":
                         msgs.append(_msg("thinking", p["text"], ts, name=tag))
                     elif p["kind"] == "tool":
@@ -1139,6 +1319,9 @@ class ClaudeAdapter:
                                          media_parts=p.get("media"), **output_meta))
                         if is_answer and not tag:
                             msgs.append(_status("working", ts))
+                if emitted_interrupted_user:
+                    msgs.append(_status("aborted", ts,
+                                        reason="输入已中断，未进入当前 Claude 分支"))
             elif t == "system":
                 if not tag and rec.get("subtype") == "turn_duration":
                     duration = rec.get("durationMs")
@@ -1149,6 +1332,19 @@ class ClaudeAdapter:
                 elif not tag and rec.get("subtype") == "away_summary" and rec.get("content"):
                     msgs.append(_msg("event", _stringify(rec["content"]), ts,
                                      counted=False, event_kind="recap"))
+                elif rec.get("subtype") == "local_command":
+                    # Claude 2.x writes slash-command protocol as system XML.
+                    # /rename already has the earlier custom-title record and
+                    # /compact is represented by its completion event. Other
+                    # commands remain visible as one semantic command bubble;
+                    # local-command-stdout stays out of the timeline.
+                    command = _claude_local_command(rec.get("content"))
+                    verb = command.split(maxsplit=1)[0] if command else ""
+                    if not tag and command and verb not in {"/rename", "/compact"}:
+                        event_id = rec.get("uuid") or off
+                        msgs.append(_msg("command", command, ts, counted=False,
+                                         inferred=True,
+                                         event_id=f"command:{event_id}"))
                 elif self._compact_boundary(rec):
                     # /compact 没有 turn_duration；边界记录就是压缩完成点。
                     if not tag:
@@ -1187,10 +1383,18 @@ class ClaudeAdapter:
             elif t == "custom-title" and not tag and rec.get("customTitle"):
                 # Claude 的 /rename 不写普通 user 记录，而是在命令之后追加
                 # custom-title。它没有 timestamp，但增量读取的文件偏移已经是
-                # 可靠的因果边界。仅作为静默协议确认透传；会话标题仍由扫描器
-                # 负责，避免每次重复的 custom-title 记录污染时间线。
-                msgs.append(_msg("command", f'/rename {rec["customTitle"]}', ts,
-                                 counted=False, silent=True, inferred=True))
+                # 可靠的因果边界。用户确实在 TUI 输入过这条斜杠命令；显示为
+                # 不计数的 command，同时由扫描器负责更新会话标题。
+                title = str(rec["customTitle"])
+                if not custom_title_seeded:
+                    previous_custom_title = self._custom_title_before(path, start)
+                    custom_title_seeded = True
+                if title == previous_custom_title:
+                    continue
+                previous_custom_title = title
+                msgs.append(_msg("command", f"/rename {title}", ts,
+                                 counted=False, inferred=True,
+                                 event_id=f"rename:{rec.get('sessionId') or ''}:{off}"))
         return msgs, end
 
 

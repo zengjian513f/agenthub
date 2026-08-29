@@ -17,7 +17,8 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sesman import pending as pending_store, server as server_module, session_meta, term
+from sesman import (claude_queue, pending as pending_store,
+                    server as server_module, session_meta, term)
 
 BASE = os.environ.get("SESMAN_BASE", "http://127.0.0.1:8710")
 FAKE_PROJ = Path.home() / ".claude" / "projects" / "-tmp-sesman-selftest"
@@ -243,7 +244,11 @@ def cleanup():
     pending_store.discard(PENDING_TERM)
     pending_store.discard(PENDING_EXIT_TERM)
     fake_path = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
-    session_meta.discard("claude:" + hashlib.sha1(str(fake_path).encode()).hexdigest()[:16])
+    fake_uid = "claude:" + hashlib.sha1(str(fake_path).encode()).hexdigest()[:16]
+    # 前一轮若因断言异常退出，合成会话可能还留有服务端发送账本；只删 JSONL
+    # 会让下一轮同一路径/UID 把旧 pending 混进新夹具。
+    claude_queue.discard_uid(fake_uid)
+    session_meta.discard(fake_uid)
     shutil.rmtree(FAKE_PROJ, ignore_errors=True)
     shutil.rmtree(FAKE_CWD, ignore_errors=True)
     FAKE_IMG.unlink(missing_ok=True)
@@ -530,7 +535,9 @@ def run(pw):
     diff_race = p.evaluate("""async () => {
       const uid = 'codex:synthetic-diff-race', key = viewKey(uid);
       const oldEntry = cache.get(key), oldQueued = S.queued.get(uid);
-      const pending = () => ({id:'server-race', uid, text:'不能消失的消息',
+      // 手机 Enter 很容易在提交正文后留下末尾换行；Codex 写 rollout 时会
+      // strip。两个气泡视觉相同，前端对账也必须采用相同的 CLI 语义。
+      const pending = () => ({id:'server-race', uid, text:'不能消失的消息\\n',
         created:1000, state:'delivering', server:true});
       const entry = () => ({meta:{uid, source:'codex'}, msgs:[],
         version:{head:'head-a'}, end:100, anchor:'anchor-a', activity:null,
@@ -593,6 +600,42 @@ def run(pw):
                                "end": 120},
               "explicitDiscard": 0,
           }, diff_race)
+    covered_duplicate = p.evaluate("""async () => {
+      const uid = 'codex:synthetic-covered-duplicate', key = viewKey(uid);
+      const oldEntry = cache.get(key);
+      cache.set(key, {meta:{uid, source:'codex'}, msgs:[{
+        role:'user', text:'已经接收的内容', ts:'2026-08-13T00:00:00Z'}],
+        version:{head:'head-a'}, end:120, anchor:'anchor-b', activity:{
+          role:'status', state:'working', text:'working',
+          ts:'2026-08-13T00:00:01Z'},
+        bytes:0, total:1, prompt:null});
+      try {
+        const result = await applyDiff(uid, {reset:false, start:100, end:120,
+          version:{head:'head-a'}, anchor:'anchor-b', messages:[{
+            role:'user', text:'已经接收的内容', ts:'2026-08-13T00:00:00Z'}],
+          outbox:[], activity_changed:false, activity:null});
+        await applyDiff(uid, {reset:false, start:100, end:120,
+          version:{head:'head-a'}, anchor:'anchor-b', messages:[],
+          activity_changed:true, activity:{role:'status', state:'aborted',
+            text:'aborted', ts:'2026-08-13T00:00:02Z'}});
+        const afterAbort = cache.get(key).activity.state;
+        await applyDiff(uid, {reset:false, start:100, end:120,
+          version:{head:'head-a'}, anchor:'anchor-b', messages:[],
+          activity_changed:true, activity:{role:'status', state:'working',
+            text:'working', ts:'2026-08-13T00:00:01Z'}});
+        return {result, messages:cache.get(key).msgs.map(x => x.text),
+          end:cache.get(key).end, afterAbort,
+          finalActivity:cache.get(key).activity.state,
+          recovering:diffRecoveries.has(key)};
+      } finally {
+        if (oldEntry) cache.set(key, oldEntry); else cache.delete(key);
+      }
+    }""")
+    check("SSE 与主动读取的完整重复包不会触发第三次恢复",
+          covered_duplicate == {"result": 0, "messages": ["已经接收的内容"],
+                                "end": 120, "afterAbort": "aborted",
+                                "finalActivity": "aborted", "recovering": False},
+          covered_duplicate)
     claude_rewind_replace = p.evaluate("""async () => {
       const uid='claude:synthetic-rewind-replace', key=viewKey(uid);
       const oldEntry=cache.get(key), oldQueued=S.queued.get(uid);
@@ -1103,6 +1146,8 @@ def run(pw):
     check("大会话 JSON 使用 gzip 降低传输流量",
           gzip_res.headers.get("Content-Encoding") == "gzip"
           and "Accept-Encoding" in gzip_res.headers.get("Vary", "")
+          and int(gzip_res.headers.get("X-Sesman-Decoded-Length", 0))
+              == len(gzip.decompress(gzip_body))
           and gzip_data["meta"]["uid"] == p.evaluate("S.sel")
           and len(gzip_body) < len(plain_body) * .7,
           f"{len(plain_body)} -> {len(gzip_body)}")
@@ -1111,10 +1156,68 @@ def run(pw):
     no_gzip_body = no_gzip_res.read()
     check("客户端拒绝 gzip 时仍返回原始 JSON",
           no_gzip_res.headers.get("Content-Encoding") is None
+          and int(no_gzip_res.headers.get("X-Sesman-Decoded-Length", 0)) == len(no_gzip_body)
           and json.loads(no_gzip_body)["meta"]["uid"] == p.evaluate("S.sel"))
+    progress_sizes = p.evaluate("""async uid => {
+      const samples = [];
+      const result = await fetchMessages(uid, {
+        onProgress:(done, total) => samples.push([done, total]),
+      });
+      return {samples, bytes:result.bytes, networkBytes:result.networkBytes};
+    }""", p.evaluate("S.sel"))
+    check("浏览器进度显示压缩传输量而缓存仍记解压后字节",
+          progress_sizes["samples"]
+          and all(total > 0 and done <= total
+                  for done, total in progress_sizes["samples"])
+          and progress_sizes["samples"][-1]
+              == [progress_sizes["networkBytes"], progress_sizes["networkBytes"]]
+          and progress_sizes["networkBytes"] < progress_sizes["bytes"], progress_sizes)
     roles = p.locator("#msgs [data-role]").evaluate_all("ns => ns.map(n => n.dataset.role)")
     check("消息角色齐全", {"user", "assistant", "thinking", "tool", "tool_result"} <= set(roles), roles)
     check("CLI 注入上下文不进入时间线", "context" not in roles, roles)
+    time_dividers = p.evaluate("""() => {
+      const box = el('section', 'msgs');
+      box.style.position = 'fixed'; box.style.left = '0'; box.style.top = '0';
+      box.style.width = '360px'; box.style.zIndex = '-1';
+      document.body.appendChild(box);
+      buildPlan(box, planMessages([
+        {role:'assistant', text:'时间样本 A', ts:'2026-08-06T00:00:00.000Z'},
+        {role:'user', text:'时间样本 B', ts:'2026-08-06T00:05:00.000Z'},
+        {role:'assistant', text:'时间样本 C', ts:'2026-08-06T00:10:00.000Z'},
+        {role:'user', text:'时间样本 D', ts:'2026-08-06T00:15:00.000Z'},
+        {role:'assistant', text:'时间样本 E', ts:'2026-08-06T00:20:00.000Z'},
+        {role:'user', text:'时间样本 F', ts:'2026-08-06T00:20:00.001Z'},
+        {role:'assistant', text:'时间样本 G', ts:'2026-08-06T00:25:00.002Z'},
+      ]), null);
+      refreshMessageTimeDividers(box);
+      const dividers = [...box.querySelectorAll(':scope > .message-time-divider')];
+      const result = {count:dividers.length, text:dividers.map(x => x.textContent),
+        dateTime:dividers.map(x => x.querySelector('time')?.dateTime),
+        color:dividers.map(x => getComputedStyle(x).color),
+        messageColor:getComputedStyle(box.querySelector('.msg')).color};
+      box.remove();
+      return result;
+    }""")
+    check("气泡间隔超过五分钟或距上次时间标记超过二十分钟时显示时间",
+          time_dividers["count"] == 2
+          and all(re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", value)
+                  for value in time_dividers["text"])
+          and time_dividers["dateTime"] == [
+              "2026-08-06T00:20:00.001Z", "2026-08-06T00:25:00.002Z"]
+          and all(color != time_dividers["messageColor"]
+                  for color in time_dividers["color"]), time_dividers)
+    interrupted_message = p.evaluate("""() => {
+      const node=msgNode({role:'user', text:'快速中断的输入', interrupted:true,
+        interrupt_reason:'输入已中断，未进入当前 Claude 分支'});
+      return {className:node.className, text:node.innerText,
+        title:node.querySelector('.native-message-state')?.title || ''};
+    }""")
+    check("Claude 快速 Esc 的原生输入保留并明确标为已中断",
+          "native-interrupted" in interrupted_message["className"]
+          and "快速中断的输入" in interrupted_message["text"]
+          and "已中断" in interrupted_message["text"]
+          and "未进入当前 Claude 分支" in interrupted_message["title"],
+          interrupted_message)
     check("结构化询问显示为对话气泡", "question" in roles)
     question = p.locator('.msg[data-role="question"]')
     check("询问气泡显示问题和选项",
@@ -1492,6 +1595,39 @@ def run(pw):
     p.select_option("#setting-theme", "system")
     p.select_option("#setting-cache", "256")
     p.locator("#settings-dialog .modal-actions button").click()
+    report_requests = []
+    def fake_bug_report(route):
+        report_requests.append(route.request.post_data_json)
+        route.fulfill(status=202, content_type="application/json", body=json.dumps({
+            "ok": True, "report_id": "BUG-E2E", "path": "/tmp/BUG-E2E",
+            "worker": {"name": "sesman-codex-new-e2e", "source": "codex",
+                       "sid": None, "cwd": str(Path(__file__).resolve().parents[1]),
+                       "token": "e2e", "title": "处理 BUG-E2E",
+                       "kind": "bug-report", "report_id": "BUG-E2E"},
+        }))
+    p.route("**/api/bug-report*", fake_bug_report)
+    check("会话标题栏提供问题报告入口",
+          p.locator(".dhead [data-report-bug]").count() == 1)
+    p.click(".dhead [data-report-bug]")
+    check("会话标题栏的问题报告入口可以打开弹窗",
+          p.locator("#bug-report-dialog").is_visible())
+    p.locator("#bug-report-dialog .modal-close").click()
+    p.click("#report-bug")
+    check("问题报告弹窗说明自动诊断范围与模型用量",
+          p.locator("#bug-report-dialog").is_visible()
+          and "最近 15 分钟" in p.locator(".report-capture-note").inner_text()
+          and "模型用量" in p.locator(".report-capture-note").inner_text())
+    p.fill("#bug-report-description", "E2E 隔离验证，不启动真实 Codex")
+    p.click("#bug-report-go")
+    p.wait_for_selector("#bug-report-toast:not(.hidden)", timeout=10000)
+    check("报告提交包含最终页面快照且不强制切走当前会话",
+          len(report_requests) == 1
+          and report_requests[0].get("uid") == fake_uid
+          and report_requests[0].get("snapshot", {}).get("data", {}).get("selected") == fake_uid
+          and not p.locator("#bug-report-dialog").is_visible()
+          and "BUG-E2E" in p.locator("#bug-report-toast").inner_text(), report_requests)
+    p.unroute("**/api/bug-report*", fake_bug_report)
+    p.locator("#bug-report-toast").evaluate("node => node.classList.add('hidden')")
     check("滚动条使用细圆角低对比样式且轨道不是纯黑",
           single_tool_skin["scrollbarWidth"] == "thin"
           and "rgba(0, 0, 0, 0)" not in single_tool_skin["scrollbarColor"]
@@ -1925,16 +2061,21 @@ def run(pw):
     pinned_cache = p.evaluate("""() => {
       const oldLiveTmux = S.liveTmux;
       const oldTermList = T.list;
+      const oldSelected = S.sel, oldAgent = S.agent;
       const oldCache = [...cache];
       const oldLimit = CACHE_MAX_BYTES;
       try {
         cache.clear();
         CACHE_MAX_BYTES = 64 * 1024 * 1024;
+        S.sel = 'plain-selected'; S.agent = null;
         S.liveTmux = new Set(['tmux-live']);
         T.list = [{ name: 'tmux-mapped', uid: 'tmux-by-list' }];
         const mb = 1024 * 1024;
         cachePut('tmux-live', {
           meta: { uid: 'tmux-live' }, msgs: [], bytes: 80 * mb,
+        });
+        cachePut('plain-selected', {
+          meta: { uid: 'plain-selected' }, msgs: [], bytes: 40 * mb,
         });
         cachePut('plain-old', {
           meta: { uid: 'plain-old' }, msgs: [], bytes: 40 * mb,
@@ -1954,6 +2095,7 @@ def run(pw):
       } finally {
         S.liveTmux = oldLiveTmux;
         T.list = oldTermList;
+        S.sel = oldSelected; S.agent = oldAgent;
         CACHE_MAX_BYTES = oldLimit;
         cache.clear();
         for (const [key, entry] of oldCache) cache.set(key, entry);
@@ -1961,9 +2103,13 @@ def run(pw):
     }""")
     check("tmux 会话缓存不受 LRU 容量淘汰",
           pinned_cache["whileRunning"] ==
-          ["tmux-live", "tmux-by-list::child", "plain-new"], pinned_cache)
+          ["tmux-live", "plain-selected", "tmux-by-list::child", "plain-new"],
+          pinned_cache)
+    check("当前可见会话缓存不受 LRU 容量淘汰",
+          "plain-selected" in pinned_cache["whileRunning"]
+          and "plain-selected" in pinned_cache["afterStop"], pinned_cache)
     check("tmux 结束后缓存重新参与 LRU",
-          pinned_cache["afterStop"] == ["plain-new"], pinned_cache)
+          pinned_cache["afterStop"] == ["plain-selected", "plain-new"], pinned_cache)
 
     p.fill("#q", "")
     p.wait_for_timeout(200)
@@ -2076,6 +2222,81 @@ def run(pw):
     check("缓存命中后内容照常渲染", back > 0 and p.locator("#msgs .msg").count() > 0,
           f"meta={back} dom={p.locator('#msgs .msg').count()} 首次={total}")
 
+    # 缓存命中必须先用短连接补齐游标，再建立长期 EventSource。反过来在
+    # HTTP/1 连接池紧张时会让 fetch 永远排队，表现为原标签页不再增量上屏。
+    watch_order = p.evaluate("""async () => {
+      const originalSync = syncSession, originalWatch = watchSession;
+      const events = [];
+      let error = '';
+      syncSession = async () => {
+        events.push('sync-start');
+        await new Promise(resolve => setTimeout(resolve, 40));
+        events.push('sync-end');
+        return 0;
+      };
+      watchSession = () => events.push('watch');
+      try {
+        await openSession(S.sel, S.agent);
+      } catch (e) {
+        error = String(e);
+      } finally {
+        syncSession = originalSync;
+        watchSession = originalWatch;
+        originalWatch(S.sel, S.agent);
+      }
+      return {events, error};
+    }""")
+    check("缓存命中先增量补齐再建立实时监听",
+          not watch_order["error"]
+          and watch_order["events"] == ["sync-start", "sync-end", "watch"],
+          watch_order)
+
+    # 模拟一条连响应头都收不到的增量请求。它必须自行 abort，并从
+    # syncingViews 删除；否则后续 SSE/outbox 修复只会反复等同一个死 Promise。
+    p.evaluate("syncSession(S.sel, S.agent)")
+    stalled_sync = p.evaluate("""async () => {
+      const originalFetch = globalThis.fetch;
+      const originalTimeout = SYNC_STALL_MS;
+      const key = viewKey(S.sel, S.agent);
+      let calls = 0, aborted = 0;
+      closeWatch();
+      SYNC_STALL_MS = 80;
+      globalThis.fetch = (url, options = {}) => {
+        if (String(url).includes('/api/messages/') && String(url).includes('start=')) {
+          calls++;
+          return new Promise((resolve, reject) => {
+            const abort = () => {
+              aborted++;
+              reject(new DOMException('stalled test request', 'AbortError'));
+            };
+            if (options.signal?.aborted) abort();
+            else options.signal?.addEventListener('abort', abort, {once: true});
+          });
+        }
+        return originalFetch(url, options);
+      };
+      const started = performance.now();
+      let result = null, error = '';
+      try {
+        result = await syncSession(S.sel, S.agent);
+      } catch (e) {
+        error = String(e);
+      } finally {
+        globalThis.fetch = originalFetch;
+        SYNC_STALL_MS = originalTimeout;
+      }
+      const state = {calls, aborted, result, error,
+        elapsed: performance.now() - started,
+        stillSyncing: syncingViews.has(key)};
+      watchSession(S.sel, S.agent);
+      return state;
+    }""")
+    check("悬住的增量读取会超时并释放同步槽",
+          stalled_sync["calls"] == 1 and stalled_sync["aborted"] == 1
+          and stalled_sync["result"] == 0 and not stalled_sync["error"]
+          and stalled_sync["elapsed"] < 1000 and not stalled_sync["stillSyncing"],
+          stalled_sync)
+
     # ---- 14a. 增量同步: 会话被 CLI 追加内容后应自动接上 ----
     p.fill("#q", "SESMAN自测")
     p.wait_for_timeout(250)
@@ -2138,6 +2359,34 @@ def run(pw):
     # 更新靠服务端推送(SSE), 不是客户端轮询
     p.wait_for_function("_es && _es.readyState === 1", timeout=20000)
     check("已建立服务端推送连接", p.evaluate("_es.readyState") == 1)
+    # 上一段刻意让主动读取与 SSE 竞争，可能留下一个正在收尾的恢复任务。
+    # 先建立干净边界，后面的断言才真正只测 SSE，而不是把上一段的尾声
+    # 误算成“定时轮询”。若恢复自身悬死，这里会明确超时失败。
+    p.wait_for_function("diffRecoveries.size === 0 && syncingViews.size === 0",
+                        timeout=20000)
+    p.evaluate("""() => {
+      window.__e2eOriginalSyncSession = syncSession;
+      window.__e2eOriginalScheduleDiffRecovery = scheduleDiffRecovery;
+      window.__e2eSyncCalls = [];
+      window.__e2eRecoveryCalls = [];
+      syncSession = (...args) => {
+        window.__e2eSyncCalls.push({at:Date.now(), args,
+          selected:[S.sel, S.agent], lastSync:S.lastSync,
+          eventSource:{uid:_esUid, state:_es?.readyState ?? -1},
+          recoveries:[...diffRecoveries.keys()],
+          stack:String(new Error().stack || '').split('\\n').slice(1, 7)});
+        return window.__e2eOriginalSyncSession(...args);
+      };
+      scheduleDiffRecovery = (...args) => {
+        const entry = cache.get(viewKey(args[0], args[1]));
+        window.__e2eRecoveryCalls.push({at:Date.now(), args,
+          cursor:entry ? {end:entry.end, head:entry.version?.head,
+            messages:entry.msgs?.length} : null,
+          queued:queuedMessages(args[0]).map(x => ({id:x.id, state:x.state})),
+          stack:String(new Error().stack || '').split('\\n').slice(1, 7)});
+        return window.__e2eOriginalScheduleDiffRecovery(...args);
+      };
+    }""")
     pulls = []
     p.on("request", lambda r: pulls.append(r.url) if "/api/messages/" in r.url else None)
     lat = []
@@ -2151,8 +2400,24 @@ def run(pw):
         p.wait_for_function("document.querySelector('#msgs').textContent.includes('推送消息RT%d')" % i,
                             timeout=20000)
         lat.append(time.time() - t0)
+    sync_calls = p.evaluate("""() => {
+      const calls = {sync:window.__e2eSyncCalls || [],
+        recovery:window.__e2eRecoveryCalls || []};
+      if (window.__e2eOriginalSyncSession) {
+        syncSession = window.__e2eOriginalSyncSession;
+        delete window.__e2eOriginalSyncSession;
+      }
+      if (window.__e2eOriginalScheduleDiffRecovery) {
+        scheduleDiffRecovery = window.__e2eOriginalScheduleDiffRecovery;
+        delete window.__e2eOriginalScheduleDiffRecovery;
+      }
+      delete window.__e2eSyncCalls;
+      delete window.__e2eRecoveryCalls;
+      return calls;
+    }""")
     check("新消息被推送上屏(亚秒级)", max(lat) < 1.0, [round(x, 3) for x in lat])
-    check("期间没有客户端主动拉取", not pulls, pulls[:2])
+    check("期间没有客户端主动拉取", not pulls,
+          {"pulls": pulls[:2], "sync_calls": sync_calls})
 
     # 回滚也走推送
     lines = fake.read_text().splitlines()
@@ -2713,7 +2978,7 @@ def run(pw):
                  "bash --noprofile --norc", check=True)
         pending_store.put({
             "name": PENDING_EXIT_TERM, "source": "claude",
-            "sid": "00000000-dead-beef-0000-000000000003", "cwd": str(FAKE_CWD),
+            "sid": "00000000-dead-beef-0000-000000000099", "cwd": str(FAKE_CWD),
             "token": "e2e-exit", "before": [], "started": time.time(),
             "cols": 100, "rows": 30,
         })
@@ -2797,7 +3062,7 @@ def run(pw):
               p.locator("#a-term").get_attribute("title"))
         check("终端不再增加已接管状态栏",
               p.locator(".thead, #tstatus").count() == 0
-              and p.locator(".dhead-actions #tmouse").is_visible())
+              and p.locator("#tmouse").count() == 0)
         p.wait_for_function("""() => {
           const b = T.term.buffer.active; let s = '';
           for (let i = 0; i < b.length; i++) s += (b.getLine(i)?.translateToString(true) || '');
@@ -3291,6 +3556,25 @@ def run(pw):
         check("待确认状态和检查按钮在同一条紧凑状态栏",
               pending_footer["display"] == "flex" and pending_footer["centerGap"] < 1,
               pending_footer)
+        interrupted = p.evaluate("""u => {
+          S.queued.set(u, [{id:'server-aborted', uid:u,
+            text:'已经送进终端但立即中断的指令', created:Date.now(),
+            state:'aborted', server:true, media:[]}]);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+          renderConversationTail(cache.get(viewKey(u))?.activity, u);
+          const nodes=[...document.querySelectorAll(
+            '#msgs .client-aborted[data-queued-id="server-aborted"]')];
+          return {count:nodes.length,
+            pending:nodes.filter(node=>node.classList.contains('client-pending')).length,
+            text:nodes[0]?.innerText || '',
+            actions:[...(nodes[0]?.querySelectorAll(
+              '.client-pending-actions button') || [])].map(node=>node.innerText)};
+        }""", target)
+        check("被中断但未写入原生记录的输入保留一条正式动作且不伪装成排队",
+              interrupted["count"] == 1 and interrupted["pending"] == 0
+              and "已经送进终端但立即中断的指令" in interrupted["text"]
+              and "已中断" in interrupted["text"]
+              and interrupted["actions"] == ["移除"], interrupted)
         p.evaluate("""u => {
           S.queued.delete(u); saveQueuedMessages();
           renderConversationTail(cache.get(viewKey(u))?.activity, u);
@@ -3350,6 +3634,39 @@ def run(pw):
               cached_reconcile == {"samePreviousKept": 1,
                                    "newerRemoved": 0, "cachedRemoved": 0},
               cached_reconcile)
+        pending_recovery_requests = []
+        p.on("request", lambda r: pending_recovery_requests.append(r.url)
+             if "/api/messages/" in r.url else None)
+        skipped_native = p.evaluate("""async u => {
+          const key = viewKey(u), entry = cache.get(key);
+          // 前面的回滚用例在文件尾留下四条同文 user；用它模拟浏览器游标
+          // 已经越过这些正文，且边界之后没有别的 user 可被误判成分支取代。
+          const text = '回滚后的新内容QQZ';
+          const saved = {...entry, msgs:entry.msgs};
+          entry.msgs = entry.msgs.filter(m => !(m.role === 'user' && m.text === text));
+          S.queued.set(u, [{id:'server-past-eof', uid:u, text,
+            created:Date.parse('2026-08-07T11:59:59Z'),
+            afterTs:'2026-08-07T11:59:59Z', state:'submitted',
+            server:true, media:[]}]);
+          renderConversationTail(entry.activity, u);
+          const before = {pending:document.querySelectorAll('.client-pending').length,
+            native:entry.msgs.filter(m => m.role === 'user' && m.text === text).length};
+          await reconcilePendingUid(u);
+          const recovered = cache.get(key);
+          const after = {pending:document.querySelectorAll('.client-pending').length,
+            queued:queuedMessages(u).length,
+            native:recovered.msgs.filter(m => m.role === 'user' && m.text === text).length};
+          cachePut(key, saved);
+          await renderSession(saved.meta, saved.msgs, saved.activity);
+          return {before, after};
+        }""", target)
+        check("游标越过正文后用一次有界窗口恢复已确认消息",
+              skipped_native["before"] == {"pending": 1, "native": 0}
+              and skipped_native["after"] == {
+                  "pending": 0, "queued": 0, "native": 4}
+              and any("window=1" in url for url in pending_recovery_requests),
+              {"state": skipped_native,
+               "requests": pending_recovery_requests[-6:]})
         p.evaluate("""u => {
           S.queued.set(u, [{id:'legacy-clock-skew', text:'旧版残留',
             created:Date.now() + 3600000, media:[]}]);
@@ -3552,7 +3869,32 @@ def run(pw):
             return true;
           };
         }""")
+        draft_requests = []
+        draft_dialog_at = len(dialogs)
+        def _draft_request(request):
+            path = urllib.parse.urlparse(request.url).path
+            if path not in {"/api/session/draft-status", "/api/session/send",
+                            "/api/term/send"}:
+                return
+            try:
+                body = request.post_data_json
+            except Exception:
+                body = request.post_data
+            draft_requests.append({"path": path, "body": body})
+        p.on("request", _draft_request)
         p.press("#cinput", "Enter")
+        # Do not use an old /help frame as proof that this submission finished.
+        # The draft-status request is asynchronous; restoring the confirm stub
+        # before it resolves makes the real native dialog cancel the send and
+        # turns the test itself into the apparent product failure.
+        deadline = time.time() + 10
+        while (time.time() < deadline
+               and p.evaluate("composerSending && !(window.__draftConfirmCalls?.length)")):
+            p.wait_for_timeout(100)
+        deadline = time.time() + 15
+        while time.time() < deadline and p.evaluate("composerSending"):
+            p.wait_for_timeout(100)
+        draft_settled = not p.evaluate("composerSending")
         # Claude TUI 启动后还可能刷新插件/状态，固定 sleep 4 秒偶尔只截到主界面。
         # 轮询真实帮助页，仍然要求 CLI 确实处理了命令，而不只看发送接口 200。
         help_words = ("code.claude.com", "keybindings", "resets in", "CLAUDE.md",
@@ -3575,12 +3917,21 @@ def run(pw):
           delete window.__draftConfirmCalls;
           return calls;
         }""")
+        p.remove_listener("request", _draft_request)
+        draft_diagnostics = {
+            "confirm": draft_confirm_calls,
+            "requests": draft_requests,
+            "dialogs": dialogs[draft_dialog_at:],
+            "probe": draft_driver.composer_probe(tname),
+            "settled": draft_settled,
+        }
         check("Claude 草稿覆盖确认只弹一次且旧正文没有拼进新命令",
-              draft_confirm_calls == ["终端草稿中有内容，是否覆盖？"]
-              and restored_draft not in pane, draft_confirm_calls)
-        p.wait_for_function("!composerSending", timeout=5000)
+              draft_settled
+              and draft_confirm_calls == ["终端草稿中有内容，是否覆盖？"]
+              and restored_draft not in pane, draft_diagnostics)
         composer_after_send = p.input_value("#cinput")
-        check("发送后输入框清空", composer_after_send == "", repr(composer_after_send))
+        check("发送后输入框清空", composer_after_send == "",
+              {**draft_diagnostics, "composer": composer_after_send})
 
         # 专用 server 只做托管：无状态栏/前缀/鼠标接管，滚动留给 xterm。
         for server in ("sesman", "default"):
@@ -3675,7 +4026,7 @@ def run(pw):
             "T.ws && T.ws !== window.__termWsBeforeSleep && T.ws.readyState === 1", timeout=30000)
         check("锁屏恢复后自动重建终端连接",
               p.locator(".thead, #tstatus").count() == 0
-              and p.locator(".dhead-actions #tmouse").is_visible())
+              and p.locator("#tmouse").count() == 0)
         p.keyboard.type("echo SESMAN_LOCK_RESUME_OK")
         p.keyboard.press("Enter")
         p.wait_for_function("""() => { const b = T.term.buffer.active; let s = '';
@@ -3912,18 +4263,24 @@ def run(pw):
                   and x["paneOverflow"] == "hidden"
                   for x in page_overflow_frames), page_overflow_frames)
 
-        was = p.evaluate("T.localMouse")
-        p.click("#tmouse")
-        p.wait_for_timeout(500)
-        check("框选开关可切换", p.evaluate("T.localMouse") != was)
-        p.mouse.move(box["x"] + 30, box["y"] + 40)
-        p.mouse.down()
-        p.mouse.move(box["x"] + 240, box["y"] + 40, steps=8)
-        p.mouse.up()
-        p.wait_for_timeout(400)
-        check("鼠标能框选文本", len(p.evaluate("T.term.getSelection()").strip()) > 0,
-              repr(p.evaluate("T.term.getSelection()")[:30]))
-        selected_text = p.evaluate("T.term.getSelection()")
+        check("终端不再提供框选模式开关", p.locator("#tmouse").count() == 0)
+        # live TUI 可能在 Playwright 拖拽的同一帧重绘；这里直接从当前
+        # buffer 建立真实 xterm 选区，稳定验证保留与复制路径。
+        selected_text = p.evaluate("""() => {
+          const view = currentTermViewObject(), term = view.term;
+          const buffer = term.buffer.active, needle = 'SESMAN_LOCK_RESUME_OK';
+          let lineIndex = -1;
+          for (let i = buffer.length - 1; i >= 0; i--) {
+            const text = buffer.getLine(i)?.translateToString(true) || '';
+            const found = text.indexOf(needle);
+            if (found >= 0) { lineIndex = i; break; }
+          }
+          if (lineIndex < 0) throw new Error('selection probe text is absent');
+          view.selectionLocked = true;
+          term.focus(); term.select(0, lineIndex, term.cols);
+          return term.getSelection();
+        }""")
+        check("终端仍能建立文本选区", bool(selected_text), repr(selected_text[:30]))
         p.evaluate("T.term.clearSelection()")       # 模拟 Claude 一次 TUI 重绘清掉选区
         p.wait_for_timeout(100)
         check("Claude 重绘清除选区后会自动恢复",
@@ -3935,9 +4292,6 @@ def run(pw):
         check("终端有选区时 Ctrl+Shift+C 复制而不是发送中断",
               bool(selected_text) and copied_text == selected_text,
               {"selected": selected_text[:30], "copied": copied_text[:30]})
-        if p.evaluate("T.localMouse") != was:
-            p.click("#tmouse")
-            p.wait_for_timeout(300)
         # 全屏应用仍由 tmux 模拟 alternate screen，但外层 xterm 保持正常缓冲区。
         urllib.request.urlopen(urllib.request.Request(
             BASE + "/api/term/send",

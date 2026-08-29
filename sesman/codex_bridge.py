@@ -22,6 +22,8 @@ _CONTEXT_FOOTER = re.compile(r"\bContext\s+\d+%\s+used\b", re.IGNORECASE)
 _READY_FOOTER = re.compile(r"\bReady\b", re.IGNORECASE)
 _MODEL_FOOTER = re.compile(
     r"^\s*(?:gpt|codex|o\d)[\w.-]*(?:\s+\S+)*\s+·\s+\S.*$", re.IGNORECASE)
+_REWIND_FOOTER = re.compile(
+    r"^\s*esc again to edit previous message\s*$", re.IGNORECASE)
 _BUSY_STATUS = re.compile(r"\bWorking\b.*\besc to interrupt\b", re.IGNORECASE)
 _SGR = re.compile(r"\x1b\[([0-9;:]*)m")
 _COMPOSER_MARKERS = {"›", "»"}
@@ -112,6 +114,18 @@ def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
         candidate = nonblank[-1] if nonblank else None
         if candidate is not None and _MODEL_FOOTER.match(clean_lines[candidate]):
             footer = candidate
+        elif candidate is not None:
+            # Immediately after Esc, Codex temporarily replaces its normal
+            # model/cwd footer with a dim "esc again to edit previous message"
+            # hint.  The composer above it is already live and accepts a new
+            # prompt.  Require both the exact hint and its native dim styling;
+            # quoted terminal output with the same English sentence must not
+            # turn an arbitrary historic › line into a writable composer.
+            rewind_style = [dim for char, dim in _styled_chars(raw_lines[candidate])
+                            if not char.isspace()]
+            if (_REWIND_FOOTER.match(clean_lines[candidate])
+                    and rewind_style and all(rewind_style)):
+                footer = candidate
 
     if footer is not None:
         # Only inspect the nonblank block immediately above the status bar.  The
@@ -146,6 +160,9 @@ def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
         marker_col = len(clean_lines[start]) - len(clean_lines[start].lstrip())
         if cursor_y == start and cursor_x <= marker_col:
             return "unknown"
+        # A working frame can also be too short to show the footer.  Prefer a
+        # conservative retry over injecting while any nearby live busy marker
+        # is visible.
         if any(_BUSY_STATUS.search(clean_lines[i])
                for i in range(max(0, start - 6), end + 1)):
             return "unknown"

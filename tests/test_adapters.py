@@ -343,6 +343,44 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertEqual(rewound_text,
                          ["共同开头", "共同回答", "已回到共同回答之后"])
 
+    def test_unanswered_sibling_branch_remains_visible_as_aborted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "fast-escape.jsonl"
+
+            def row(kind, uid, parent, text):
+                return {
+                    "type": kind, "uuid": uid, "parentUuid": parent,
+                    "isSidechain": False, "timestamp": "2026-08-27T17:26:23Z",
+                    "message": {"role": kind, "content": text},
+                }
+
+            rows = [
+                row("user", "u0", None, "共同开头"),
+                row("assistant", "a0", "u0", "共同回答"),
+                row("user", "cancelled", "a0", "快速 Esc 的输入"),
+                {"type": "attachment", "uuid": "reminder",
+                 "parentUuid": "cancelled", "isSidechain": False,
+                 "attachment": {"type": "total_tokens_reminder"}},
+                row("user", "replacement", "a0", "之后的新输入"),
+                row("assistant", "answer", "replacement", "新回答"),
+            ]
+            transcript.write_text("\n".join(
+                json.dumps(item, ensure_ascii=False) for item in rows) + "\n")
+
+            messages, _ = adapters.ClaudeAdapter().read(str(transcript))
+
+        interrupted = next(item for item in messages
+                           if item.get("text") == "快速 Esc 的输入")
+        self.assertTrue(interrupted["interrupted"])
+        self.assertIn("已中断", interrupted["interrupt_reason"])
+        self.assertEqual(
+            [(item["role"], item["text"]) for item in messages],
+            [("status", "working"), ("user", "共同开头"),
+             ("assistant", "共同回答"),
+             ("user", "快速 Esc 的输入"), ("status", "aborted"),
+             ("status", "working"), ("user", "之后的新输入"),
+             ("assistant", "新回答")])
+
     def test_compaction_keeps_selected_precompact_branch_visible(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "compacted-tree.jsonl"
@@ -670,6 +708,13 @@ class IncrementalCursorTests(unittest.TestCase):
             self.assertFalse(appended["reset"])
             self.assertEqual([m["text"] for m in appended["messages"]], ["改写后的输入"])
             self.assertTrue(appended["anchor"].endswith("@replacement"), appended["anchor"])
+
+            # A browser refresh must keep honoring the explicit double-Esc
+            # boundary.  The discarded sibling is not a fast-Esc leaf and
+            # must not come back merely because a replacement now exists.
+            reloaded = session_index.messages_for(session)
+            self.assertEqual([m["text"] for m in reloaded["messages"]],
+                             ["共同开头", "共同回答", "改写后的输入"])
 
     def test_claude_append_only_rewind_forces_full_timeline_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1120,7 +1165,7 @@ class ToolSummaryTests(unittest.TestCase):
                          ["排队的人类输入"])
         self.assertNotIn("后台任务完成通知", [m["text"] for m in msgs])
 
-    def test_claude_custom_title_is_a_silent_rename_ack(self):
+    def test_claude_custom_title_is_a_visible_rename_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             f = Path(tmp) / "s.jsonl"
             f.write_text(json.dumps({
@@ -1133,8 +1178,106 @@ class ToolSummaryTests(unittest.TestCase):
         self.assertEqual(len(msgs), 1)
         self.assertEqual(msgs[0]["role"], "command")
         self.assertEqual(msgs[0]["text"], "/rename 新标题")
-        self.assertTrue(msgs[0]["silent"])
+        self.assertFalse(msgs[0].get("silent", False))
         self.assertFalse(msgs[0]["counted"])
+        self.assertTrue(msgs[0]["event_id"].startswith("rename:session-1:"))
+
+    def test_claude_compact_title_replay_does_not_duplicate_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            rows = [
+                {"type": "custom-title", "customTitle": "同一标题",
+                 "sessionId": "session-1"},
+                {"type": "user", "timestamp": "2026-08-25T10:00:00Z",
+                 "message": {"role": "user", "content": "/compact"}},
+                {"type": "custom-title", "customTitle": "同一标题",
+                 "sessionId": "session-1"},
+                {"type": "system", "subtype": "compact_boundary",
+                 "uuid": "compact-1", "timestamp": "2026-08-25T10:00:01Z",
+                 "content": "Conversation compacted"},
+            ]
+            lines = [json.dumps(row, ensure_ascii=False) + "\n" for row in rows]
+            f.write_text("".join(lines))
+            duplicate_start = len("".join(lines[:2]).encode())
+            adapter = adapters.ClaudeAdapter()
+
+            full, _ = adapter.read(str(f))
+            incremental, _ = adapter.read(str(f), start=duplicate_start)
+
+        self.assertEqual([m["text"] for m in full if m["role"] == "command"],
+                         ["/rename 同一标题"])
+        self.assertEqual([m["text"] for m in incremental
+                          if m["role"] == "command"], [])
+        self.assertEqual([m["text"] for m in incremental
+                          if m["role"] == "event"], ["已压缩"])
+
+    def test_claude_system_local_command_is_semantic_not_xml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            rows = [
+                {"type": "system", "subtype": "local_command",
+                 "uuid": "help-1", "timestamp": "2026-08-25T10:00:00Z",
+                 "content": "<command-name>/help</command-name>\n"
+                            "<command-message>help</command-message>\n"
+                            "<command-args></command-args>"},
+                {"type": "system", "subtype": "local_command",
+                 "uuid": "help-2", "timestamp": "2026-08-25T10:00:01Z",
+                 "content": "<local-command-stdout>Help dialog dismissed"
+                            "</local-command-stdout>"},
+                {"type": "system", "subtype": "local_command",
+                 "uuid": "rename-1", "timestamp": "2026-08-25T10:00:02Z",
+                 "content": "<command-name>/rename</command-name>\n"
+                            "<command-args>新标题</command-args>"},
+            ]
+            f.write_text("\n".join(json.dumps(row, ensure_ascii=False)
+                                    for row in rows) + "\n")
+
+            messages, _ = adapters.ClaudeAdapter().read(str(f))
+
+        visible = [(m["role"], m["text"]) for m in messages
+                   if m["role"] != "status"]
+        self.assertEqual(visible, [("command", "/help")])
+        self.assertFalse(any("<command-" in text or "<local-command" in text
+                             for _role, text in visible))
+
+    def test_claude_bash_protocol_is_semantic_command_and_terminal_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            rows = [
+                {"type": "user", "uuid": "shell-input",
+                 "parentUuid": "root", "timestamp": "2026-08-28T12:00:00Z",
+                 "message": {"role": "user",
+                             "content": "<bash-input> printf '&lt;ok&gt;'"
+                                        "</bash-input>"}},
+                {"type": "user", "uuid": "shell-output",
+                 "parentUuid": "shell-input",
+                 "timestamp": "2026-08-28T12:00:01Z",
+                 "message": {"role": "user",
+                             "content": "<bash-stdout>&lt;ok&gt;\n</bash-stdout>"
+                                        "<bash-stderr>warning</bash-stderr>"}},
+                {"type": "assistant", "uuid": "answer",
+                 "parentUuid": "shell-output",
+                 "timestamp": "2026-08-28T12:00:02Z",
+                 "message": {"role": "assistant", "content": "完成"}},
+            ]
+            f.write_text("\n".join(json.dumps(row, ensure_ascii=False)
+                                    for row in rows) + "\n")
+
+            messages, _ = adapters.ClaudeAdapter().read(str(f))
+
+        visible = [m for m in messages if m["role"] != "status"]
+        self.assertEqual(
+            [(m["role"], m["text"]) for m in visible],
+            [("command", "! printf '<ok>'"),
+             ("tool_result", "<ok>\n\nstderr:\nwarning"),
+             ("assistant", "完成")])
+        self.assertEqual(visible[0]["call_id"], "local-shell:shell-input")
+        self.assertEqual(visible[1]["call_id"], "local-shell:shell-input")
+        self.assertFalse(visible[1]["counted"])
+        self.assertTrue(visible[1]["has_stderr"])
+        self.assertEqual([m["state"] for m in messages if m["role"] == "status"],
+                         ["working"])
+        self.assertFalse(any("<bash-" in m["text"] for m in visible))
 
     def test_claude_notifications_recaps_and_duration_are_events(self):
         with tempfile.TemporaryDirectory() as tmp:

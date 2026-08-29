@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import send_audit
+from . import audit, send_audit
 
 
 DATA_DIR = Path.home() / ".local" / "share" / "sesman"
@@ -46,6 +46,7 @@ def _read() -> list[dict]:
 
 def _write(rows: list[dict]) -> None:
     global _revision
+    before = _read()
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = QUEUE_FILE.with_suffix(".json.tmp")
     payload = json.dumps(
@@ -67,6 +68,7 @@ def _write(rows: list[dict]) -> None:
     except OSError:
         pass
     _revision += 1
+    audit.record_ledger_changes("claude", before, rows)
 
 
 def revision() -> int:
@@ -124,7 +126,7 @@ def snapshot(uid: str) -> dict:
 def tracked() -> list[dict]:
     with _lock:
         return [dict(row) for row in _read()
-                if row.get("state") != "confirmed"]
+                if row.get("state") not in {"confirmed", "aborted", "restored"}]
 
 
 def ready() -> list[dict]:
@@ -216,6 +218,29 @@ def mark_ambiguous(item_id: str, uid: str, error: str) -> dict | None:
         send_audit.record("claude", uid, item_id, "terminal_ambiguous",
                           result.get("text"), error=str(error or ""))
     return result
+
+
+def mark_interrupted(uid: str, restored: bool = False) -> bool:
+    """Retire a submitted prompt that the TUI returned without committing."""
+    with _lock:
+        rows = _read()
+        row = next((item for item in rows if item.get("uid") == uid
+                    and item.get("state") in {
+                        "injecting", "submitted", "ambiguous"}), None)
+        if row is None:
+            return False
+        row.update(
+            state="restored" if restored else "aborted",
+            interrupted_at=time.time(),
+            error=("已中断，正文已回到 Claude 终端草稿"
+                   if restored else "已在 Claude 写入原生用户记录前中断"),
+        )
+        send_audit.record(
+            "claude", uid, str(row.get("id") or ""),
+            "terminal_restored" if restored else "terminal_aborted",
+            row.get("text"))
+        _write(rows)
+        return True
 
 
 def observe(uid: str, messages: list[dict] | None,

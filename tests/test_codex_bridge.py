@@ -128,6 +128,24 @@ class CodexBridgeTests(unittest.TestCase):
                     "  草稿第二行\n\n" + footer)
         self.assertEqual(codex_bridge.composer_state(restored), "editing")
 
+    def test_interrupt_rewind_hint_is_a_live_empty_composer(self):
+        prefix = (
+            "\x1b[38;5;1m■ Failed to branch before the selected prompt:\x1b[0m\n"
+            "\x1b[1;2m› \x1b[0m历史用户消息\n\n"
+            "\x1b[38;5;1m■ Conversation interrupted - tell the model\x1b[0m\n\n")
+        footer = "\x1b[2m  esc again to edit previous message\x1b[0m"
+        empty = (prefix + "\x1b[1m\x1b[38;5;215m›\x1b[0m "
+                 "\x1b[2mUse /skills to list available skills\x1b[0m\n\n" + footer)
+        draft = (prefix + "\x1b[1m\x1b[38;5;215m›\x1b[0m 新消息草稿\n\n"
+                 + footer)
+        unstyled_quote = (prefix + "\x1b[1m›\x1b[0m "
+                          "\x1b[2mUse /skills to list available skills\x1b[0m\n\n"
+                          "  esc again to edit previous message")
+
+        self.assertEqual(codex_bridge.composer_state(empty), "empty")
+        self.assertEqual(codex_bridge.composer_state(draft), "editing")
+        self.assertEqual(codex_bridge.composer_state(unstyled_quote), "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

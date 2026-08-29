@@ -58,22 +58,31 @@ def _epoch(value) -> float | None:
         return None
 
 
-def stop_activity(uid: str, now: float | None = None) -> dict:
-    """记录网页发出的 Escape，截断此前没有原生结束事件的忙态。"""
+def stop_activity(uid: str, now: float | None = None,
+                  reason: str = "网页发送 Escape", state: str = "aborted",
+                  inferred: bool = False) -> dict:
+    """记录已确认的停止点，截断此前没有原生结束事件的忙态。"""
     uid = str(uid or "").strip()
     if not uid:
         raise ValueError("缺少会话 uid")
+    if state not in {"idle", "aborted"}:
+        raise ValueError("无效的停止状态")
     stopped = time.time() if now is None else float(now)
     stopped_iso = datetime.fromtimestamp(stopped, timezone.utc).isoformat()
     with _lock:
         rows = _read()
         previous = rows.get(uid) if isinstance(rows.get(uid), dict) else {}
-        rows[uid] = {**previous, "activity_stopped_at": stopped_iso}
+        rows[uid] = {
+            **previous, "activity_stopped_at": stopped_iso,
+            "activity_stop_reason": str(reason or "会话已停止"),
+            "activity_stop_state": state,
+            "activity_stop_inferred": bool(inferred),
+        }
         _write(rows)
         _activity_revisions[uid] = _activity_revisions.get(uid, 0) + 1
     return {
-        "role": "status", "state": "aborted", "text": "aborted",
-        "ts": stopped_iso, "reason": "网页发送 Escape",
+        "role": "status", "state": state, "text": state,
+        "ts": stopped_iso, "reason": str(reason or "会话已停止"),
     }
 
 
@@ -84,9 +93,40 @@ def stopped_activity(uid: str) -> dict | None:
     if _epoch(stopped) is None:
         return None
     return {
-        "role": "status", "state": "aborted", "text": "aborted",
-        "ts": stopped, "reason": "网页发送 Escape",
+        "role": "status", "state": str(row.get("activity_stop_state") or "aborted"),
+        "text": str(row.get("activity_stop_state") or "aborted"),
+        "ts": stopped,
+        "reason": str(row.get("activity_stop_reason") or "网页发送 Escape"),
     }
+
+
+def clear_inferred_activity_stop(uid: str) -> bool:
+    """运行中的 TUI 推翻先前启发式停止时，只移除那次停止元数据。"""
+    uid = str(uid or "").strip()
+    if not uid:
+        return False
+    with _lock:
+        rows = _read()
+        previous = rows.get(uid) if isinstance(rows.get(uid), dict) else None
+        if not previous:
+            return False
+        # 兼容修复部署前已经写下的启发式记录。显式网页 Escape 的理由不同，
+        # 绝不能因为随后一次终端重绘就被清掉。
+        inferred = bool(previous.get("activity_stop_inferred")) or (
+            previous.get("activity_stop_reason") == "终端已结束或中断")
+        if not inferred:
+            return False
+        row = dict(previous)
+        for key in ("activity_stopped_at", "activity_stop_reason",
+                    "activity_stop_state", "activity_stop_inferred"):
+            row.pop(key, None)
+        if row:
+            rows[uid] = row
+        else:
+            rows.pop(uid, None)
+        _write(rows)
+        _activity_revisions[uid] = _activity_revisions.get(uid, 0) + 1
+        return True
 
 
 def resolve_activity(uid: str, activity: dict | None) -> dict | None:

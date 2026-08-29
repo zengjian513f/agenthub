@@ -27,6 +27,14 @@ class SesmanCli {
       ? { type: 'remove', text: String(message.text || '') } : null;
   }
 
+  normalizeQueuedText(value) {
+    return String(value ?? '');
+  }
+
+  queuedTextMatches(pending, native) {
+    return this.normalizeQueuedText(pending) === this.normalizeQueuedText(native);
+  }
+
   settleQueuedMessage(item, _now, _hasNativeHistory) {
     return item;
   }
@@ -83,6 +91,11 @@ class ClaudeCli extends SesmanCli {
     };
   }
 
+  normalizeQueuedText(value) {
+    // Claude 的原生 user/command 和服务端账本都按编辑器提交语义去掉首尾空白。
+    return String(value ?? '').trim();
+  }
+
   queueAction(message) {
     const normal = super.queueAction(message);
     if (normal !== null) return normal;
@@ -115,6 +128,8 @@ class ClaudeCli extends SesmanCli {
 
   queuedMessageLabel(item) {
     if (!item?.server) return super.queuedMessageLabel(item);
+    if (item.state === 'restored') return '已中断，正文在终端草稿中';
+    if (item.state === 'aborted') return '已中断';
     if (item.state === 'native_queued') return 'Claude 已排队';
     if (item.state === 'ambiguous' || item.state === 'injecting') return '状态待核对';
     if (item.state === 'persisted') return '等待提交';
@@ -179,8 +194,16 @@ class CodexCli extends SesmanCli {
     return fromVersion < 4 ? [] : super.migrateQueuedMessages(items);
   }
 
+  normalizeQueuedText(value) {
+    // Codex TUI 写 rollout 前会裁掉 prompt 首尾空白；内部空格和换行仍须精确。
+    return String(value ?? '').trim();
+  }
+
   queuedMessageLabel(item) {
+    if (item?.state === 'aborted') return '已中断';
     if (item?.state === 'delivering') return '发送中';
+    if (item?.state === 'confirming') return '已送达，等待确认';
+    if (item?.state === 'failed' && +item?.attempts > 0) return '状态待核对';
     if (item?.state === 'failed') return '发送未确认';
     return '排队中';
   }

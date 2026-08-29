@@ -6,7 +6,7 @@ const TERM_RENDER_BATCH_MS = 20;
 const TERM_RENDER_BATCH_MAX = 32 * 1024;
 const TERM_LAYOUT_POLICY_VERSION = 2;
 // 每次页面加载独立生成；不写 local/sessionStorage，复制标签页也不会复制归属。
-const TERM_PAGE_ID = crypto.randomUUID?.()
+const TERM_PAGE_ID = window.__sesmanPageId || crypto.randomUUID?.()
   || [...crypto.getRandomValues(new Uint8Array(16))]
     .map(value => value.toString(16).padStart(2, '0')).join('');
 
@@ -19,7 +19,6 @@ const T = {
   enabled: false,
   height: store.get('termh', 320),
   mode: store.get('termmode', 'full'), // normal(手动分屏) | collapsed(对话) | full(终端)
-  localMouse: store.get('tmouse', false),   // true = 鼠标归浏览器, 可以框选复制
   ctrlArmed: false,                         // 手机 Ctrl / 桌面右 Ctrl：只修饰下一次输入
   sources: {},
   home: '',
@@ -48,11 +47,6 @@ const TERM_FONT_SAMPLE = 'MW0il中文，。！？（）【】';
 let resolvedTermFont = '';
 let resolvedTermFontKey = '';
 let termFontResolveEpoch = 0;
-
-// 应用(claude/codex 的 TUI)申请接管鼠标的那些序列。选择模式下要拦掉,
-// 否则 xterm 会把拖拽当成给应用的鼠标事件, 没法框选。
-const MOUSE_ON = /\x1b\[\?(1000|1002|1003|1005|1006|1015)h/g;
-const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
 
 function termTheme() {
   const css = getComputedStyle(document.querySelector('#xterm') || document.documentElement);
@@ -339,14 +333,118 @@ async function takeover(uid, btn) {
 }
 
 async function post(url, body) {
-  const r = await fetch(appUrl(url), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...body, _build: BUILD_ID }),
+  const traceId = String(body?.request_id || globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const payload = { ...body, _build: BUILD_ID, _trace_id: traceId,
+    _page_id: TERM_PAGE_ID };
+  browserAuditEvent?.('http.request.started', {url, method: 'POST'}, null, {
+    uid: body?.uid || '', traceId, requestId: body?.request_id || '',
   });
-  const data = await r.json();
-  if (data?.reload) markStaleBuild(data.build);
-  return data;
+  const started = performance.now();
+  try {
+    const r = await fetch(appUrl(url), {
+      method: 'POST', headers: {
+        'Content-Type': 'application/json', 'X-Sesman-Trace': traceId,
+        'X-Sesman-Page': TERM_PAGE_ID, 'X-Sesman-Build': BUILD_ID,
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    browserAuditEvent?.('http.response.received', {
+      url, status: r.status, ok: r.ok,
+      duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
+    }, data, {uid: body?.uid || '', traceId, requestId: body?.request_id || '',
+      severity: r.ok ? 'info' : 'warning'});
+    if (data?.reload) markStaleBuild(data.build);
+    return data;
+  } catch (error) {
+    browserAuditEvent?.('http.request.failed', {
+      url, error: String(error?.stack || error),
+      duration_ms: Math.round((performance.now() - started) * 1000) / 1000,
+    }, null, {uid: body?.uid || '', traceId, requestId: body?.request_id || '',
+      severity: 'error'});
+    throw error;
+  }
 }
+
+// ---------------------------------------------------------------- 缺陷报告
+let bugReportToastTimer = 0;
+
+function showBugReportToast(report, worker) {
+  const toast = $('#bug-report-toast');
+  clearTimeout(bugReportToastTimer);
+  toast.replaceChildren();
+  const text = document.createElement('span');
+  text.textContent = `${report} 已保存，Codex 处理会话正在启动`;
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'btn';
+  open.textContent = '打开';
+  open.onclick = async () => {
+    toast.classList.add('hidden');
+    await loadTermList();
+    const pending = (T.pending || []).find(item => item.name === worker.name) || worker;
+    await openPendingSession(pending);
+  };
+  toast.append(text, open);
+  toast.classList.remove('hidden');
+  bugReportToastTimer = setTimeout(() => toast.classList.add('hidden'), 20000);
+}
+
+function openBugReportDialog() {
+  const dialog = $('#bug-report-dialog');
+  $('#bug-report-error').textContent = '';
+  $('#bug-report-go').disabled = false;
+  dialog.showModal();
+  setTimeout(() => $('#bug-report-description').focus(), 0);
+}
+
+// 详情标题栏是动态生成的，使用委托让列表页、普通会话和尚未落盘的
+// 新会话共用同一个入口；手机进入详情后列表顶栏会被完整隐藏。
+document.addEventListener('click', event => {
+  if (!event.target.closest('[data-report-bug]')) return;
+  openBugReportDialog();
+});
+$('#bug-report-dialog .modal-close').onclick = () => $('#bug-report-dialog').close();
+$('#bug-report-dialog .modal-cancel').onclick = () => $('#bug-report-dialog').close();
+$('#bug-report-dialog').addEventListener('click', event => {
+  if (event.target === $('#bug-report-dialog')) $('#bug-report-dialog').close();
+});
+$('#bug-report-form').onsubmit = async event => {
+  event.preventDefault();
+  const description = $('#bug-report-description').value.trim();
+  const error = $('#bug-report-error');
+  if (!description) {
+    error.textContent = '请先描述遇到的问题';
+    $('#bug-report-description').focus();
+    return;
+  }
+  const button = $('#bug-report-go');
+  button.disabled = true;
+  error.textContent = '';
+  const snapshot = browserStateSnapshot('bug-report');
+  browserAuditEvent('bug_report.requested', snapshot.data, snapshot.content);
+  try {
+    const terminalName = takenOver(S.sel) || (T.uid === S.sel ? T.name : '') || '';
+    const d = await post('api/bug-report', {
+      description, uid: S.sel || '', page_id: TERM_PAGE_ID,
+      terminal_name: terminalName, snapshot,
+      cols: Math.max(80, T.term?.cols || 120), rows: Math.max(24, T.term?.rows || 36),
+    });
+    if (d.error) {
+      error.textContent = d.error;
+      return;
+    }
+    $('#bug-report-dialog').close();
+    $('#bug-report-description').value = '';
+    await loadTermList();
+    showBugReportToast(d.report_id, d.worker);
+  } catch (failure) {
+    error.textContent = `提交失败：${failure.message || failure}`;
+  } finally {
+    button.disabled = false;
+  }
+};
 
 // ---------------------------------------------------------------- 新建会话
 function suggestedSessionDir(cwd) {
@@ -673,12 +771,15 @@ function showNewSessionStage(info) {
   renderSide();
   showSessionCount(sidebarSessions().length);
   const src = SOURCES[info.source];
+  const pendingTitle = info.title || `新建 ${src.name} 会话`;
   $('#detail').innerHTML = `<div class="dhead"><div class="dtitle">
     <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
-    <h2>${icon(info.source)}<span>新建 ${esc(src.name)} 会话</span></h2>
+    <h2>${icon(info.source)}<span>${esc(pendingTitle)}</span></h2>
     <div class="dhead-actions" aria-label="会话操作">
       <span class="mobile-msg-summary"><span class="mobile-msg-count" aria-label="0 条消息">0</span></span>
       <button class="iconbtn" id="a-term" title="切换到终端" aria-label="切换到终端">${uiIcon('terminal')}</button>
+      <button class="iconbtn" data-report-bug title="报告当前会话问题"
+        aria-label="报告当前会话问题">${uiIcon('bug')}</button>
       <button class="iconbtn danger" id="a-session-action" title="停止会话" aria-label="停止会话">${uiIcon('power')}</button>
     </div></div>
     <div class="dmeta"><span class="meta-source">${esc(src.name)}</span><span id="mcount-total">0 条消息</span>
@@ -919,26 +1020,7 @@ function renderTakeoverBtn() {
   b.classList.toggle('on', !!name);
   b.classList.toggle('session-live', S.live.has(S.sel));
   b.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
-  renderTermMouseButton(name, b);
   renderComposer();
-}
-
-/** 终端不再另设状态栏；框选开关跟切换/停止按钮共用会话顶栏。 */
-function renderTermMouseButton(name, takeoverButton = $('#a-term')) {
-  let b = $('#tmouse');
-  if (!name || !takeoverButton) {
-    b?.remove();
-    return;
-  }
-  if (!b) {
-    b = document.createElement('button');
-    b.className = 'iconbtn';
-    b.id = 'tmouse';
-    b.innerHTML = uiIcon('select');
-    takeoverButton.after(b);
-    b.onclick = () => setLocalMouse(!T.localMouse);
-  }
-  paintTermMouseButton(b);
 }
 
 // ---------------------------------------------------------------- 终端面板
@@ -1092,7 +1174,7 @@ function ensureTerm(name) {
     } catch { /* WebGL2/硬件加速不可用时保留 DOM renderer */ }
   }
   host.addEventListener('mousedown', e => {
-    const selecting = e.shiftKey || T.localMouse;
+    const selecting = e.shiftKey;
     view.selectionLocked = selecting;
     if (selecting) view.selectionSnapshot = null;
   }, true);
@@ -1120,6 +1202,8 @@ function ensureTerm(name) {
     if (T.name !== name) return;
     d = applyTermCtrl(d);
     if (view.ws?.readyState !== 1) return;
+    browserAuditEvent('terminal.input', {name, bytes: new TextEncoder().encode(d).length},
+      d, {uid: T.uid || '', connectionId: view.auditConnectionId || ''});
     if (view.scrollPos || _wheelRequests.size || _resumeInput) {
       // 等所有已经发出的滚轮请求落地，再由一个服务端请求原子执行
       // 「退出 copy-mode → 写入字符」。直接向 attach 发 q 不可靠，而把
@@ -1158,7 +1242,6 @@ function flushTermOutput(view) {
   let s = view.outputBuffer;
   view.outputBuffer = '';
   if (!s) return;
-  if (T.localMouse) s = s.replace(MOUSE_ON, '');
   view.term.write(terminalColorChunk(view, s));
 }
 
@@ -1490,13 +1573,28 @@ async function attachOwnedTerm(view) {
   const wsUrl = new URL(appUrl('api/term/attach'));
   wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const cols = view.term.cols || 120, rows = view.term.rows || termRows();
+  const connectionId = globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  view.auditConnectionId = connectionId;
   wsUrl.search = new URLSearchParams({name, page: TERM_PAGE_ID, token,
+                                      connection: connectionId,
                                       cols: String(cols), rows: String(rows)});
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   view.ws = ws;
   if (T.name === name) T.ws = ws;
   const dec = new TextDecoder();
+  let outputBytes = 0, outputChunks = 0, outputTimer = 0;
+  const flushOutputAudit = () => {
+    clearTimeout(outputTimer);
+    outputTimer = 0;
+    if (!outputChunks) return;
+    browserAuditEvent('terminal.output_received', {
+      name, bytes: outputBytes, chunks: outputChunks,
+    }, null, {uid: T.uid || '', connectionId});
+    outputBytes = 0;
+    outputChunks = 0;
+  };
   ws.onmessage = e => {
     if (view.ws !== ws) return;           // 已替换连接的尾包不能重画新终端
     if (typeof e.data === 'string') {
@@ -1509,16 +1607,21 @@ async function attachOwnedTerm(view) {
       } catch { /* 普通终端字符串按原样渲染 */ }
     }
     const s = typeof e.data === 'string' ? e.data : dec.decode(e.data, { stream: true });
+    outputBytes += typeof e.data === 'string'
+      ? new TextEncoder().encode(e.data).length : e.data.byteLength;
+    outputChunks++;
+    if (!outputTimer) outputTimer = setTimeout(flushOutputAudit, 750);
     queueTermOutput(view, s);
   };
   ws.onopen = () => {
+    browserAuditEvent('terminal.opened', {name, cols, rows}, null,
+      {uid: T.uid || '', connectionId});
     view.reconnectDelay = 500;
     if (T.name === name) {
       syncTermAliases(view);
       fitTerm(true, true);
       settleActivatedTermView(view);
       setScrollPos(0);
-      if (T.localMouse) view.term.write(MOUSE_OFF);
       focusTermIfRequested(view);
     }
   };
@@ -1526,6 +1629,11 @@ async function attachOwnedTerm(view) {
     if (view.ws !== ws) return;           // 主动换 socket 后，旧 close 事件作废
     queueTermOutput(view, dec.decode());
     flushTermOutput(view);
+    flushOutputAudit();
+    browserAuditEvent('terminal.closed', {
+      name, code: event.code, reason: event.reason, clean: event.wasClean,
+    }, null, {uid: T.uid || '', connectionId,
+      severity: event.code === 1000 ? 'info' : 'warning'});
     view.ws = null;
     if (T.name === name) {
       T.ws = null;
@@ -1541,7 +1649,8 @@ async function attachOwnedTerm(view) {
       if (T.views.get(name) === view && !view.ws) scheduleTermReconnect(view);
     });
   };
-  ws.onerror = () => {};
+  ws.onerror = () => browserAuditEvent('terminal.error', {name}, null,
+    {uid: T.uid || '', connectionId, severity: 'error'});
   return true;
 }
 
@@ -1580,25 +1689,6 @@ function abortWheel() {
 function setScrollPos(n) {
   const view = currentTermViewObject();
   if (view) view.scrollPos = n;
-}
-
-// ---- 鼠标: 交给应用 还是 用来框选 ----
-function setLocalMouse(on) {
-  T.localMouse = on;
-  store.set('tmouse', on);
-  paintTermMouseButton();
-  if (!T.term) return;
-  if (on) T.term.write(MOUSE_OFF);        // 直接告诉 xterm: 应用不要鼠标了
-  else if (T.name) attachTerm(T.name);    // 恢复应用的真实状态最省事的办法是重连
-}
-
-function paintTermMouseButton(b = $('#tmouse')) {
-  if (b) {
-    b.classList.toggle('on', T.localMouse);
-    b.title = T.localMouse ? '鼠标用于框选复制（点击切回交给应用）' : '鼠标交给应用（点击改为框选复制）';
-    b.setAttribute('aria-label', T.localMouse ? '关闭框选复制，把鼠标交给应用' : '启用框选复制');
-    b.setAttribute('aria-pressed', String(T.localMouse));
-  }
 }
 
 function cancelTermReconnect(view = currentTermViewObject()) {

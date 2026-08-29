@@ -1,11 +1,12 @@
 import hashlib
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import claude_queue, send_audit, server
+from sesman import adapters, claude_queue, send_audit, server
 
 
 class ClaudeQueueTests(unittest.TestCase):
@@ -70,6 +71,42 @@ class ClaudeQueueTests(unittest.TestCase):
         claude_queue.observe("claude:u", [
             {"role": "user", "text": "同文", "ts": self.accepted_ts(row)}], None)
         self.assertEqual(claude_queue.list_for("claude:u"), [])
+
+    def test_native_bash_input_repairs_a_false_aborted_shell_command(self):
+        self.enqueue("! bash ~/fixall.sh")
+        claude_queue.mark_injecting("req-1", "claude:u")
+        claude_queue.mark_submitted("req-1", "claude:u")
+        native_ts = self.accepted_ts()
+        self.assertTrue(claude_queue.mark_interrupted("claude:u"))
+
+        transcript = Path(self.tmp.name) / "session.jsonl"
+        transcript.write_text(json.dumps({
+            "type": "user", "uuid": "native-shell", "parentUuid": "root",
+            "timestamp": native_ts,
+            "message": {"role": "user",
+                        "content": "<bash-input> bash ~/fixall.sh</bash-input>"},
+        }) + "\n")
+        messages, _ = adapters.ClaudeAdapter().read(str(transcript))
+
+        command = next(m for m in messages if m["role"] == "command")
+        self.assertEqual(command["text"], "! bash ~/fixall.sh")
+        claude_queue.observe("claude:u", messages, None)
+        self.assertEqual(claude_queue.list_for("claude:u"), [])
+        self.assertIn('"event":"native_committed"',
+                      send_audit.LOG_FILE.read_text())
+
+    def test_interrupted_uncommitted_prompt_becomes_visible_restored_action(self):
+        self.enqueue("被立刻中断")
+        claude_queue.mark_injecting("req-1", "claude:u")
+        claude_queue.mark_submitted("req-1", "claude:u")
+
+        self.assertTrue(claude_queue.mark_interrupted("claude:u", restored=True))
+
+        row = claude_queue.list_for("claude:u")[0]
+        self.assertEqual(row["state"], "restored")
+        self.assertIn("终端草稿", row["error"])
+        self.assertEqual(claude_queue.tracked(), [])
+        self.assertFalse(claude_queue.mark_interrupted("claude:u", restored=True))
 
     def test_immediate_native_prompt_with_old_draft_prefix_retires_suffix_row(self):
         self.enqueue("网页新消息")
@@ -290,7 +327,7 @@ class ClaudeQueueTests(unittest.TestCase):
             })
 
         self.assertEqual(result["_status"], 200)
-        keys.assert_called_once_with(pane["name"], "C-c")
+        keys.assert_called_once_with(pane["name"], "C-u", "C-k")
         self.assertEqual(leave.call_count, 2)
         submit.assert_called_once_with(pane["name"], "网页里的下一条")
         self.assertEqual(claude_queue.list_for("claude:u")[0]["state"], "submitted")
