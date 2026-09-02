@@ -1,3 +1,4 @@
+import re
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +66,30 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn(
             f'<meta name="sesman-build" content="{server.ASSET_VERSION}">', page)
         self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_thinking_messages_are_compact_timeline_notes(self):
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._send = lambda status, data, ctype, headers=None: replies.append(
+            (status, data, ctype, headers))
+
+        handler._static("/style.css")
+
+        status, data, ctype, _headers = replies[0]
+        stylesheet = data.decode("utf-8")
+        rule = re.search(
+            r'\.msg\[data-role="thinking"\]\s*\{(?P<body>[^}]+)\}',
+            stylesheet,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/css", ctype)
+        self.assertIsNotNone(rule)
+        self.assertIn("border: 0", rule.group("body"))
+        self.assertIn("background: transparent", rule.group("body"))
+        self.assertIn("box-shadow: none", rule.group("body"))
+        self.assertIn('.msg[data-role="thinking"]::before', stylesheet)
+        self.assertIn('.msg[data-role="thinking"] > .mb { min-width: 0; padding: 0; }',
+                      stylesheet)
 
 
 class DirectoryCompletionRouteTests(unittest.TestCase):

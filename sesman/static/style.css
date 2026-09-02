@@ -714,7 +714,19 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .msg[data-role="assistant"], .msg[data-role="assistant·subagent"],
 .msg[data-role="user·subagent"] { --bubble: var(--bubble-assistant); }
-.msg[data-role="thinking"] { --bubble: var(--bubble-thinking); }
+.msg[data-role="thinking"] {
+  --bubble: transparent;
+  display: flex; align-items: flex-start; gap: 7px;
+  margin: 1px 0 7px; border: 0; border-radius: 0;
+  background: transparent; color: var(--muted); box-shadow: none; overflow: visible;
+  font-size: 11.5px; line-height: 1.45;
+}
+.msg[data-role="thinking"]::before {
+  content: ""; flex: none; width: 5px; height: 5px; margin: 6px 0 0 3px;
+  border-radius: 50%; background: var(--brand-b);
+}
+.msg[data-role="thinking"] > .mb { min-width: 0; padding: 0; }
+.msg[data-role="thinking"] > .mb p { margin: 0; }
 .msg[data-role="tool"], .msg[data-role="tool_result"],
 .msg[data-role="toolgroup"] {
   --bubble: var(--bubble-tool); color: var(--terminal-fg);
