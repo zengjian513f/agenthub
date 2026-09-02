@@ -3688,8 +3688,13 @@ window.addEventListener('resize', () => setSideWidth(
   parseInt($('#left').style.width, 10) || store.get('width', SIDE_DEFAULT)));
 MOBILE.addEventListener?.('change', e => {
   if (e.matches) {
-    document.body.classList.toggle('mobile-detail',
-      !!S.sel && store.get('mobilePage', 'list') === 'detail');
+    const detailVisible = !!S.sel && store.get('mobilePage', 'list') === 'detail';
+    // 桌面终端跨进手机断点、而手机上次停在列表时，右栏即将被 CSS 隐藏。
+    // 走与返回列表相同的暂存/停用流程，详情重新出现后由 restoreTermPane
+    // 按可见尺寸激活；不能把仍活跃的 xterm 留在 display:none 的祖先下面。
+    if (!detailVisible && typeof T !== 'undefined'
+        && !$('#termpane').classList.contains('hidden')) closeTermPane(true);
+    document.body.classList.toggle('mobile-detail', detailVisible);
   } else {
     document.body.classList.remove('mobile-detail');
   }

@@ -1342,9 +1342,16 @@ function clearTermOutput(view) {
 function termPaneRenderable(view = currentTermViewObject()) {
   if (!view || view !== currentTermViewObject()) return false;
   const pane = $('#termpane');
-  return !pane.classList.contains('hidden')
-    && (MOBILE.matches || T.mode !== 'collapsed')
-    && !pane.classList.contains('term-collapsed');
+  if (pane.classList.contains('hidden')) return false;
+  if (!MOBILE.matches && T.mode === 'collapsed') return false;
+  if (pane.classList.contains('term-collapsed')) return false;
+  // 手机从桌面布局切回会话列表时，#right 会由祖先的 display:none 隐藏，
+  // 但 #termpane 本身没有 hidden 类。FitAddon 在这种容器上会返回内部最小值
+  // 10×5；先确认当前 host 真正参与布局，不能让这组伪尺寸污染 xterm/PTY。
+  const host = view.host;
+  if (!host || host.hidden || !host.isConnected) return false;
+  const rect = host.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
 }
 
 function repaintTermView(view) {

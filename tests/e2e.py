@@ -3280,6 +3280,83 @@ def run(pw):
         check("纯对话吸附态不会把隐藏终端尺寸发送给 tmux",
               collapsed_fit == 0, collapsed_fit)
 
+        hidden_ancestor_fit = p.evaluate("""() => {
+          const view = currentTermViewObject(), ws = view.ws, right = $('#right');
+          const oldDisplay = right.style.display, oldSend = ws.send;
+          const sent = [], before = [view.term.cols, view.term.rows];
+          ws.send = data => sent.push(JSON.parse(data));
+          right.style.display = 'none';
+          try {
+            fitTerm(true);
+            return {before, after:[view.term.cols, view.term.rows],
+                    resizes:sent.filter(x => x.t === 'resize')};
+          } finally {
+            right.style.display = oldDisplay;
+            ws.send = oldSend;
+            layoutTermPane(); fitTerm(true);
+          }
+        }""")
+        check("祖先隐藏时不会用 FitAddon 内部最小尺寸改写终端",
+              hidden_ancestor_fit["after"] == hidden_ancestor_fit["before"]
+              and hidden_ancestor_fit["resizes"] == [], hidden_ancestor_fit)
+
+        # 桌面详情跨进手机断点时，若手机上次停在列表，CSS 会隐藏整个右栏。
+        # 必须先暂存终端视图；随后进入同一详情时再用可见容器尺寸恢复。
+        p.evaluate("""() => {
+          const view = currentTermViewObject(), ws = view.ws;
+          window.__mobileListTermProbe = {
+            view, ws, send:ws.send, sent:[], before:[view.term.cols, view.term.rows]
+          };
+          ws.send = data => window.__mobileListTermProbe.sent.push(JSON.parse(data));
+          store.set('mobilePage', 'list');
+        }""")
+        viewport(390, 780)
+        p.wait_for_timeout(300)
+        mobile_list_terminal = p.evaluate("""() => {
+          const probe = window.__mobileListTermProbe, view = probe.view;
+          return {
+            active:T.name, paneHidden:$('#termpane').classList.contains('hidden'),
+            right:getComputedStyle($('#right')).display,
+            before:probe.before, after:[view.term.cols, view.term.rows],
+            resizes:probe.sent.filter(x => x.t === 'resize'),
+          };
+        }""")
+        check("桌面终端切到手机列表时先暂存视图且不产生伪尺寸",
+              mobile_list_terminal["active"] is None
+              and mobile_list_terminal["paneHidden"]
+              and mobile_list_terminal["right"] == "none"
+              and mobile_list_terminal["after"] == mobile_list_terminal["before"]
+              and mobile_list_terminal["resizes"] == [], mobile_list_terminal)
+        p.evaluate("u => openSession(u)", target)
+        p.wait_for_function("""n => document.body.classList.contains('mobile-detail')
+          && T.name === n && !$('#termpane').classList.contains('hidden')""",
+                            arg=tname, timeout=60000)
+        p.wait_for_timeout(300)
+        mobile_detail_terminal = p.evaluate("""() => {
+          const probe = window.__mobileListTermProbe, view = probe.view;
+          const rect = view.host.getBoundingClientRect();
+          const result = {
+            active:T.name, dimensions:[view.term.cols, view.term.rows],
+            host:[rect.width, rect.height],
+            resizes:probe.sent.filter(x => x.t === 'resize'),
+          };
+          probe.ws.send = probe.send;
+          delete window.__mobileListTermProbe;
+          return result;
+        }""")
+        check("从手机列表进入原详情会按可见区域恢复终端尺寸",
+              mobile_detail_terminal["active"] == tname
+              and mobile_detail_terminal["dimensions"][0] >= 20
+              and mobile_detail_terminal["dimensions"][1] >= 8
+              and all(x > 0 for x in mobile_detail_terminal["host"])
+              and len(mobile_detail_terminal["resizes"]) >= 1
+              and mobile_detail_terminal["resizes"][-1]["cols"]
+                == mobile_detail_terminal["dimensions"][0]
+              and mobile_detail_terminal["resizes"][-1]["rows"]
+                == mobile_detail_terminal["dimensions"][1], mobile_detail_terminal)
+        viewport(1280, 800)
+        p.wait_for_timeout(200)
+
         # 切到纯对话只隐藏终端视图；xterm、WebSocket 和 tmux 都必须原样保留。
         p.evaluate("window.__keptSwitchSocket = T.ws")
         p.click("#a-term")
