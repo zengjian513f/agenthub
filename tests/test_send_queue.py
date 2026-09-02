@@ -291,6 +291,33 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual((delivered["state"], delivered["attempts"]),
                          ("delivering", 1))
 
+    def test_bottom_codex_composer_delivers_with_parked_cursor(self):
+        send_queue.enqueue(
+            "codex:u", "sesman-codex-u", "底边输入框继续", [],
+            {"state": "idle"}, "bottom-parked-cursor")
+        row = send_queue.tracked()[0]
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        pane = {"name": "sesman-codex-u"}
+        lines = ["old output", *([""] * 28), "", "",
+                 "\x1b[1m\x1b[38;5;215m›\x1b[0m "
+                 "\x1b[2mAsk Codex to do anything\x1b[0m"]
+        snapshot = ("\n".join(lines), (2, 29))
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(server.term, "capture_screen_state",
+                             return_value=snapshot), \
+                patch.object(server.term, "leave_copy_mode") as leave, \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.time, "sleep"):
+            server._deliver_outbox_item(row, [pane])
+
+        leave.assert_called_once_with(pane["name"])
+        submit.assert_called_once_with(pane["name"], "底边输入框继续")
+        delivered = send_queue.list_for("codex:u")[0]
+        self.assertEqual((delivered["state"], delivered["attempts"]),
+                         ("delivering", 1))
+
     def test_retry_delivers_from_codex_interrupt_rewind_composer(self):
         send_queue.enqueue(
             "codex:u", "sesman-codex-u", "中断后重试", [],

@@ -150,15 +150,34 @@ def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
             cursor_x, cursor_y = (int(value) for value in cursor)  # type: ignore[union-attr]
         except (TypeError, ValueError):
             return "unknown"
-        if not (0 <= cursor_y < len(clean_lines)) or not clean_lines[cursor_y].strip():
+        if not (0 <= cursor_y < len(clean_lines)):
             return "unknown"
-        start = end = cursor_y
-        while start > 0 and clean_lines[start - 1].strip():
-            start -= 1
-        while end + 1 < len(clean_lines) and clean_lines[end + 1].strip():
-            end += 1
+        if clean_lines[cursor_y].strip():
+            start = end = cursor_y
+            while start > 0 and clean_lines[start - 1].strip():
+                start -= 1
+            while end + 1 < len(clean_lines) and clean_lines[end + 1].strip():
+                end += 1
+        else:
+            # Codex 0.150.1 can render a footerless composer on the physical
+            # bottom row while parking tmux's cursor two blank rows above it.
+            # Accept only that tightly anchored layout: an initial-column
+            # cursor, one or two blank rows before a nonblank bottom block.
+            # This keeps an old styled prompt elsewhere in the transcript from
+            # authorising terminal input.
+            end = len(clean_lines) - 1
+            if (not clean_lines[end].strip()
+                    or not 1 <= end - cursor_y <= 2
+                    or any(clean_lines[i].strip()
+                           for i in range(cursor_y, end))):
+                return "unknown"
+            start = end
+            while start > 0 and clean_lines[start - 1].strip():
+                start -= 1
         marker_col = len(clean_lines[start]) - len(clean_lines[start].lstrip())
-        if cursor_y == start and cursor_x <= marker_col:
+        if cursor_x <= marker_col:
+            return "unknown"
+        if cursor_y < start and cursor_x != marker_col + 2:
             return "unknown"
         # A working frame can also be too short to show the footer.  Prefer a
         # conservative retry over injecting while any nearby live busy marker
