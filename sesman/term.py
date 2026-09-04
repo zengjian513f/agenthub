@@ -506,38 +506,6 @@ def set_window_size_policy(name: str, policy: str = "latest") -> bool:
     return True
 
 
-def normalize_detached_window(name: str, cols: int = 120, rows: int = 32) -> bool:
-    """Give an ownerless tmux a readable fallback size while retaining latest.
-
-    ``resize-window`` temporarily selects manual sizing.  Switching back to
-    ``latest`` afterwards preserves the fallback while detached, then lets the
-    next real browser client take over immediately.
-    """
-    info = session_info(name)
-    if not info or info.get("attached"):
-        return False
-    cols, rows = max(Attach.MIN_COLS, int(cols)), max(Attach.MIN_ROWS, int(rows))
-    _tmux("resize-window", "-t", name, "-x", str(cols), "-y", str(rows),
-          server=info["server"], no_start=True)
-    _tmux("set-window-option", "-t", name, "window-size", "latest",
-          server=info["server"], no_start=True)
-    return True
-
-
-def normalize_detached_windows(cols: int = 120, rows: int = 32) -> int:
-    """Normalize all ownerless sesman panes, normally once at service startup."""
-    normalized = 0
-    for info in list_sessions():
-        if not info.get("owned") or info.get("attached"):
-            continue
-        try:
-            if normalize_detached_window(info["name"], cols, rows):
-                normalized += 1
-        except (OSError, RuntimeError):
-            pass
-    return normalized
-
-
 def in_tmux(pids: list[int]) -> bool:
     """这些进程是不是跑在 tmux 里 (祖先有 tmux server)。"""
     for pid in pids:

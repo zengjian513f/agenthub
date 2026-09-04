@@ -84,26 +84,16 @@ class NewSessionDirectoryTests(unittest.TestCase):
 
 
 class TerminalSubmitTests(unittest.TestCase):
-    def test_detached_window_gets_fallback_but_keeps_latest_policy(self):
-        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER,
-                "attached": False}
-        with patch.object(term, "session_info", return_value=pane), \
+    def test_new_session_uses_fallback_size_only_as_its_initial_size(self):
+        with patch.object(term, "has_session", return_value=False), \
+                patch.object(term, "_configure_managed"), \
                 patch.object(term, "_tmux") as tmux:
-            self.assertTrue(term.normalize_detached_window("sesman-test"))
-        self.assertEqual(tmux.call_args_list, [
-            call("resize-window", "-t", "sesman-test", "-x", "120", "-y", "32",
-                 server=term.MANAGED_SERVER, no_start=True),
-            call("set-window-option", "-t", "sesman-test", "window-size", "latest",
-                 server=term.MANAGED_SERVER, no_start=True),
-        ])
+            name = term.new_session("test", "command")
 
-    def test_attached_window_is_not_normalized_behind_its_client(self):
-        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER,
-                "attached": True}
-        with patch.object(term, "session_info", return_value=pane), \
-                patch.object(term, "_tmux") as tmux:
-            self.assertFalse(term.normalize_detached_window("sesman-test"))
-        tmux.assert_not_called()
+        self.assertEqual(name, "sesman-test")
+        tmux.assert_called_once_with(
+            "new-session", "-d", "-s", "sesman-test", "-x", "120", "-y", "32",
+            "command", server=term.MANAGED_SERVER)
 
     def test_attach_ignores_hidden_xterm_minimum_size(self):
         attach = term.Attach.__new__(term.Attach)

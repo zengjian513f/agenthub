@@ -62,14 +62,6 @@ def _ip_allowed(value: str) -> bool:
     return any(address in network for network in ALLOWED_NETWORKS)
 
 
-def _normalize_terminal_sizes() -> None:
-    """Repair stale detached sizes after old service clients finish exiting."""
-    for delay in (0, 0.5, 2.0):
-        if delay:
-            time.sleep(delay)
-        term.normalize_detached_windows()
-
-
 class _TerminalConnection:
     """Revocable WebSocket transport bound to one ownership lease."""
 
@@ -1477,14 +1469,6 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stop.set()
             att.close()
-            # A direct close leaves tmux at that browser's last dimensions.
-            # Normalize only when genuinely ownerless; a reconnect/takeover is
-            # already about to attach at its own size and must not reflow twice.
-            if not connection.replaced:
-                try:
-                    term.normalize_detached_window(name)
-                except (OSError, RuntimeError):
-                    pass
             TERM_OWNERS.release(name, token)
             connection.closed.set()
             with connection.send_lock:
@@ -1526,12 +1510,6 @@ def main():
         TERMINAL = False
 
     if TERMINAL:
-        # On restart, the previous process's attach children leave the systemd
-        # cgroup concurrently with this process starting.  Repeat briefly so a
-        # client that was still marked attached in the first snapshot is not
-        # left at its old mobile/hidden width.
-        threading.Thread(target=_normalize_terminal_sizes, daemon=True,
-                         name="sesman-term-size").start()
         threading.Thread(target=_outbox_loop, daemon=True, name="sesman-outbox").start()
 
     ALLOWED_IPS.update({"127.0.0.1", "::1", "localhost"})
