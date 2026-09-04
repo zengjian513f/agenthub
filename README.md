@@ -346,7 +346,9 @@ API key 与 access/refresh token；附件只记录既有引用和元数据，不
 点「报告问题」后，私有包写到
 `~/.local/share/sesman/bug-reports/<BUG-id>/`，包含 `manifest.json`、用户描述、浏览器状态、
 相关事件、tmux scrollback 和 Git 状态。随后新建 Codex tmux，会话提示词要求先按
-`AGENTS.md` 用 Playwright 重现，再找出链路中第一个偏差并修复；它不会自动 commit 或 push。
+`AGENTS.md` 用 Playwright 重现，再找出链路中第一个偏差并修复；验证通过后默认只提交本次
+报告产生的修改，创建本地 commit，但不会自动 push。若工作区原有改动与修复重叠、无法
+安全隔离，或测试没有通过，则保留未提交状态并在处理会话中说明。
 如果 Codex 启动失败，诊断包仍会保留。报告按钮会实际调用当前账号配置的 Codex 模型，
 并产生相应模型用量。
 

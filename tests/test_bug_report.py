@@ -43,8 +43,11 @@ class BugReportBundleTests(unittest.TestCase):
         self.assertEqual({row["event"] for row in rows},
                          {"browser.dom.snapshot", "bug_report.created"})
         self.assertEqual((directory / "terminal.txt").read_text(), "terminal frame")
-        self.assertIn("Playwright/headless Chromium",
-                      (directory / "worker-prompt.md").read_text())
+        worker_prompt = (directory / "worker-prompt.md").read_text()
+        self.assertIn("Playwright/headless Chromium", worker_prompt)
+        self.assertIn("默认创建一个本地 commit", worker_prompt)
+        self.assertIn("绝不 push", worker_prompt)
+        self.assertNotIn("不 commit", worker_prompt)
         self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
 
 
