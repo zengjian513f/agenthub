@@ -4386,9 +4386,7 @@ def run(pw):
                   for x in page_overflow_frames), page_overflow_frames)
 
         check("终端不再提供框选模式开关", p.locator("#tmouse").count() == 0)
-        # live TUI 可能在 Playwright 拖拽的同一帧重绘；这里直接从当前
-        # buffer 建立真实 xterm 选区，稳定验证保留与复制路径。
-        selected_text = p.evaluate("""() => {
+        selection_drag = p.evaluate("""() => {
           const view = currentTermViewObject(), term = view.term;
           const buffer = term.buffer.active, needle = 'SESMAN_LOCK_RESUME_OK';
           let lineIndex = -1;
@@ -4398,11 +4396,34 @@ def run(pw):
             if (found >= 0) { lineIndex = i; break; }
           }
           if (lineIndex < 0) throw new Error('selection probe text is absent');
-          view.selectionLocked = true;
-          term.focus(); term.select(0, lineIndex, term.cols);
-          return term.getSelection();
+          term.scrollToLine(lineIndex);
+          const screen = view.host.querySelector('.xterm-screen').getBoundingClientRect();
+          return {row: lineIndex - buffer.viewportY, cols: term.cols, rows: term.rows,
+            rect: {x: screen.x, y: screen.y, width: screen.width, height: screen.height}};
         }""")
-        check("终端仍能建立文本选区", bool(selected_text), repr(selected_text[:30]))
+        cell_width = selection_drag["rect"]["width"] / selection_drag["cols"]
+        cell_height = selection_drag["rect"]["height"] / selection_drag["rows"]
+        select_y = (selection_drag["rect"]["y"]
+                    + (selection_drag["row"] + 0.5) * cell_height)
+        select_x1 = selection_drag["rect"]["x"] + 0.25 * cell_width
+        select_x2 = selection_drag["rect"]["x"] + 22.75 * cell_width
+        p.keyboard.down("Shift")
+        p.mouse.move(select_x1, select_y)
+        p.mouse.down()
+        p.mouse.move(select_x2, select_y, steps=8)
+        p.mouse.up()
+        p.keyboard.up("Shift")
+        p.wait_for_timeout(100)
+        selected_text = p.evaluate("T.term.getSelection()")
+        check("Shift+拖拽能建立并锁定终端文本选区",
+              "SESMAN_LOCK_RESUME_OK" in selected_text
+              and p.evaluate("currentTermViewObject().selectionLocked"),
+              repr(selected_text[:30]))
+        p.mouse.click((select_x1 + select_x2) / 2, select_y, button="right")
+        p.wait_for_timeout(100)
+        check("右键打开复制菜单时保留终端选区与锁定",
+              p.evaluate("T.term.getSelection()") == selected_text
+              and p.evaluate("currentTermViewObject().selectionLocked"))
         p.evaluate("T.term.clearSelection()")       # 模拟 Claude 一次 TUI 重绘清掉选区
         p.wait_for_timeout(100)
         check("Claude 重绘清除选区后会自动恢复",

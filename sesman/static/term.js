@@ -1191,6 +1191,17 @@ function restoreTermSelection(view) {
   });
 }
 
+function termSelectionMouseDown(event) {
+  return new MouseEvent('mousedown', {
+    bubbles: true, cancelable: true, composed: true, view: window,
+    detail: event.detail,
+    screenX: event.screenX, screenY: event.screenY,
+    clientX: event.clientX, clientY: event.clientY,
+    ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey,
+    shiftKey: false, button: event.button, buttons: event.buttons,
+  });
+}
+
 function ensureTerm(name) {
   let view = T.views.get(name);
   if (view) return view;
@@ -1245,10 +1256,23 @@ function ensureTerm(name) {
       view.renderer = 'webgl';
     } catch { /* WebGL2/硬件加速不可用时保留 DOM renderer */ }
   }
+  const forwardedSelectionStarts = new WeakSet();
   host.addEventListener('mousedown', e => {
-    const selecting = e.shiftKey;
-    view.selectionLocked = selecting;
-    if (selecting) view.selectionSnapshot = null;
+    if (forwardedSelectionStarts.has(e) || e.button !== 0) return;
+    view.selectionLocked = e.shiftKey;
+    if (!e.shiftKey) return;
+    view.selectionSnapshot = null;
+    // VT mouse 开启时 xterm 自己用 Shift 强制进入本地选择，必须保留原事件，
+    // 才不会把鼠标发给 vim/less 等里面的程序。
+    if (term.modes.mouseTrackingMode !== 'none') return;
+    // xterm 把 Shift+拖拽解释为“扩展已有选区”，没有旧选区时结果为空。
+    // tmux 用户则用 Shift 绕过终端鼠标模式并开始一次新框选。拦住原事件，
+    // 以普通左键事件启动 xterm 自己的选择器；后续 move/up 仍由它原样处理。
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    const forwarded = termSelectionMouseDown(e);
+    forwardedSelectionStarts.add(forwarded);
+    e.target.dispatchEvent(forwarded);
   }, true);
   term.onSelectionChange(() => {
     if (term.hasSelection()) rememberTermSelection(view);
