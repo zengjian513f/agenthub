@@ -992,10 +992,30 @@ def run(pw):
     check("清空过滤恢复", p.locator(".item").count() == total_before)
 
     # ---- 6. 全文搜索 ----
-    p.fill("#q", "长文本测试")
-    p.press("#q", "Enter")
-    p.wait_for_timeout(3000)
-    p.wait_for_function("document.querySelector('#stat').textContent.includes('命中')", timeout=30000)
+    def initial_search():
+        seq = p.get_attribute("#stat", "data-seq") or ""
+        p.fill("#q", "")
+        p.fill("#q", "长文本测试")
+        p.press("#q", "Enter")
+        # 大型真实会话库第一次要解析全文并填充缓存；按完成序号等待，不用
+        # 固定 sleep 猜测机器速度。NodeA 的 600+ 会话冷扫描偶尔超过 30 秒。
+        p.wait_for_function(
+            "seq => (document.querySelector('#stat').dataset.seq || '') !== seq",
+            arg=seq, timeout=120000)
+        return p.evaluate("""() => ({
+          stat: document.querySelector('#stat').textContent.trim(),
+          hasResults: Array.isArray(S.results),
+          hits: Array.isArray(S.results) ? S.results.length : -1,
+        })""")
+
+    search_state = initial_search()
+    # 真实环境启动时 term.js 可能刚完成第一次 tmux 清单初始化并刷新侧栏；若它
+    # 恰好抢在这里退出搜索态，等初始化稳定后重试一次，结果断言仍保持严格。
+    if not search_state["hasResults"]:
+        p.wait_for_timeout(500)
+        search_state = initial_search()
+    check("全文搜索完成后显示命中状态",
+          search_state["hasResults"] and "命中" in search_state["stat"], search_state)
     check("全文搜索有结果", p.locator(".item").count() >= 1, p.locator("#stat").inner_text())
     check("搜索片段高亮", p.locator(".snip mark").count() > 0)
     check("片段里的高亮词实际可见",
