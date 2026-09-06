@@ -353,7 +353,6 @@ async function rebindSelectedTermSession() {
   if (!linked?.uid || linked.uid === fromUid) return false;
   const toUid = adoptLinkedTermSession(fromUid, linked, 'term-list');
   await openSession(toUid);
-  if (S.sel === toUid && !S.agent) await offerForkParentDeletion(fromUid, toUid);
   return true;
 }
 
@@ -364,7 +363,6 @@ async function toggleLinkedTermSession(uid) {
   const toUid = adoptLinkedTermSession(uid, linked, 'user-toggle');
   if (toUid !== uid && S.sel === uid && !S.agent) {
     await openSession(toUid);
-    if (S.sel === toUid && !S.agent) await offerForkParentDeletion(uid, toUid);
     // 读取新分支期间用户可能已经切到别处，不再抢回终端。
     if (S.sel !== toUid || S.agent) return true;
   } else {

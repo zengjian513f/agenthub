@@ -19,7 +19,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 | 来源 | 路径 | 说明 |
 |---|---|---|
 | Claude | `~/.claude/projects/<编码cwd>/<uuid>.jsonl` | 标题取会话内的 `ai-title`；`<uuid>/subagents/*.jsonl` 为子代理会话，不单列，在详情标题下拉中单独切换 |
-| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 元数据取首行 `session_meta`；标题优先用 `~/.codex/session_index.jsonl` 的 `thread_name`；`thread_source=subagent` 的协作 agent 不单列；双 Esc 回退的父项与新叶子都保留，切到新 UUID 后再询问是否把父项移入回收站 |
+| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 元数据取首行 `session_meta`；标题优先用 `~/.codex/session_index.jsonl` 的 `thread_name`；`thread_source=subagent` 的协作 agent 不单列，也不会被误作回滚分支隐藏父会话 |
 | Grok | `~/.grok/sessions/<urlencoded-cwd>/<uuid>/` | 元数据取 `summary.json`，正文取 `chat_history.jsonl` |
 
 只读原始文件，不改动任何 CLI 的数据。

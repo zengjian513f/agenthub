@@ -959,7 +959,7 @@ def delete(uid: str) -> str:
             sessions = [row for row in _state["sessions"] if row.get("uid") != uid]
             print(f"[agenthub] 删除后的索引协调失败，稍后重试: {e}")
         # 不用移动后的新 inventory 给尚未协调的其他变化背书；下一次 load
-        # 会从旧 files 做完整 diff。Codex 分支任一项删除后这里会立即重算拓扑。
+        # 会从旧 files 做完整 diff。Codex 叶子删除后这里已能立即恢复父项。
         _publish(raw, sessions, _state["files"], None, time.time(), 0.0, True)
         with _search_text_lock:
             _search_text_cache.pop(uid, None)

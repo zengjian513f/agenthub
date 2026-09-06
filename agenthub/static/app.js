@@ -2760,65 +2760,10 @@ async function stopSession(m, button = null) {
   }
 }
 
-async function requestSessionDelete(uid, replacementUid = '') {
-  const url = new URL(appUrl('api/session/' + encodeURIComponent(uid)));
-  if (replacementUid) url.searchParams.set('replacement_uid', replacementUid);
-  const response = await fetch(url, { method: 'DELETE' });
+async function requestSessionDelete(uid) {
+  const response = await fetch(appUrl('api/session/' + encodeURIComponent(uid)),
+    { method: 'DELETE' });
   return { response, data: await response.json() };
-}
-
-const forkDeletionPrompts = new Set();
-
-/** 新分支接管当前详情后，只询问一次；取消时父会话继续留在公开列表。 */
-async function offerForkParentDeletion(fromUid, toUid) {
-  if (!fromUid || !toUid || fromUid === toUid) return false;
-  const parent = S.sessions.find(row => row.uid === fromUid);
-  const replacement = S.sessions.find(row => row.uid === toUid);
-  if (!parent || !replacement
-      || parent.source !== 'codex' || replacement.source !== 'codex'
-      || replacement.forked_from_id !== parent.sid) return false;
-
-  const key = `${fromUid}\0${toUid}`;
-  if (forkDeletionPrompts.has(key)) return false;
-  forkDeletionPrompts.add(key);
-  const remove = confirm(
-    `已切换到回退后的新会话 UUID。\n\n是否删除旧会话「${parent.title}」？\n\n`
-    + '选择“取消”会让旧会话继续显示。旧文件还保存着新会话在回退点之前的历史；'
-    + '删除后重新加载或恢复新会话时，可能缺少这部分内容。文件只会移入回收站，可恢复。');
-  browserAuditEvent('codex.fork.delete_decision', {
-    parent_uid: fromUid, replacement_uid: toUid, remove,
-  }, null, {uid: toUid});
-  if (!remove) return false;
-
-  let response, data;
-  try {
-    ({ response, data } = await requestSessionDelete(fromUid, toUid));
-  } catch (error) {
-    forkDeletionPrompts.delete(key);
-    alert('删除旧会话失败: ' + (error.message || error));
-    return false;
-  }
-  if (!response.ok) {
-    forkDeletionPrompts.delete(key);
-    alert('删除旧会话失败: ' + (data.error || response.status));
-    return false;
-  }
-
-  S.sessions = S.sessions.filter(row => row.uid !== fromUid);
-  if (S.results) S.results = S.results.filter(row => row.uid !== fromUid);
-  S.live.delete(fromUid);
-  S.liveTmux.delete(fromUid);
-  clearUnread(fromUid);
-  S.cursors.delete(viewKey(fromUid));
-  for (const [cacheKey, entry] of cache) {
-    if (entry?.meta?.uid === fromUid) cache.delete(cacheKey);
-  }
-  renderChips();
-  renderSide();
-  showSessionCount(sidebarSessions().length);
-  await loadSessions(true);
-  paintLive();
-  return true;
 }
 
 async function del(m) {
@@ -2909,6 +2854,7 @@ const sameNativeTurn = (a, b) => a?.turn_id != null && b?.turn_id != null
 const isTurnAssistant = m => baseMessageRole(m?.role) === 'assistant';
 const isFinalAssistant = m => isTurnAssistant(m)
   && ['final', 'final_answer', 'end_turn'].includes(m?.phase);
+const isTaskTurnBoundary = m => m?.role === 'event' && m?.event_kind === 'task';
 // rename/compact 等不计入消息数的辅助记录可能写在 final 之后；它们继续留在
 // 时间线，但不应让前面的原生最终答复失去“结论”资格。
 const isPassiveTurnTail = m => m?.counted === false;
@@ -2938,6 +2884,19 @@ function turnConclusion(body, { complete = false, interrupted = false } = {}) {
   let meaningfulEnd = body.length;
   while (meaningfulEnd && isPassiveTurnTail(body[meaningfulEnd - 1])) meaningfulEnd--;
   if (!meaningfulEnd) return null;
+  // Claude 的后台 task-notification 是一轮新的原生 user 输入，但在时间线里会
+  // 转成不打扰主线的 task 事件。若它前面已有主助手 final，那条 final 已经结束
+  // 了用户回合；后续监控短报不能反过来把它降成可折叠的“进展”。
+  for (let boundary = 1; boundary < meaningfulEnd; boundary++) {
+    if (!isTaskTurnBoundary(body[boundary])) continue;
+    let end = boundary;
+    while (end && isPassiveTurnTail(body[end - 1])) end--;
+    if (!end || body[end - 1]?.role !== 'assistant'
+        || !isFinalAssistant(body[end - 1])) continue;
+    let start = end - 1;
+    while (start > 0 && isFinalAssistant(body[start - 1])) start--;
+    return {start, end};
+  }
   const last = body[meaningfulEnd - 1];
   if (isFinalAssistant(last)) {
     let start = meaningfulEnd - 1;

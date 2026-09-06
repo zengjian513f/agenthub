@@ -372,16 +372,9 @@ def run(pw):
       const oldConfirm = window.confirm;
       const opened = [], confirms = [];
       try {
-        // 与真实回退一致：父项和新叶子都在列表；同一根 pane 现在由
-        // term/list 标成新分支 uid。取消删除后父项必须继续显示。
+        // 与真实回退一致：旧叶子已从列表消失，缓存详情仍在；
+        // 同一根 pane 现在由 term/list 标成新分支 uid。
         S.sessions = S.sessions.filter(row => ![fromUid, toUid].includes(row.uid));
-        const now = new Date().toISOString();
-        S.sessions.push({uid:fromUid, source:'codex', sid:rootSid,
-          title:'保留的旧分支', cwd:'/tmp', created:now, updated:now, size:1});
-        S.sessions.push({uid:toUid, source:'codex',
-          sid:'fedcba98-7654-3210-fedc-ba9876543210', root_sid:rootSid,
-          forked_from_id:rootSid, title:'回退后的新分支', cwd:'/tmp',
-          created:now, updated:now, size:1});
         S.sel = fromUid; S.agent = null;
         T.uid = fromUid; T.name = null;
         T.list = [...(T.list || []), {name, uid:toUid}];
@@ -391,30 +384,23 @@ def run(pw):
         openSession = async uid => { opened.push(uid); S.sel = uid; };
         browserAuditEvent = () => {};
         window.confirm = text => { confirms.push(text); return false; };
-        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
-        renderSide();
         const linked = linkedTermSession(fromUid);
         const changed = await rebindSelectedTermSession();
         return {linked, taken:takenOver(fromUid), changed, opened,
           selected:S.sel, termUid:T.uid,
           oldDraft:composerDrafts.has(fromUid),
           newDraft:composerDrafts.get(toUid)?.text || '',
-          confirmCount:confirms.length,
-          confirmMentionsKeep:confirms[0]?.includes('继续显示') || false,
-          parentVisible:!!document.querySelector(
-            `.item[data-uid="${CSS.escape(fromUid)}"]`)};
+          confirmCount:confirms.length};
       } finally {
         openSession = oldOpen; browserAuditEvent = oldAudit; window.confirm = oldConfirm;
-        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
         cache.delete(key); composerDrafts.delete(fromUid); composerDrafts.delete(toUid);
         S.queued.delete(fromUid); S.queued.delete(toUid);
         S.sel = saved.sel; S.agent = saved.agent; S.sessions = saved.sessions;
         T.uid = saved.termUid; T.name = saved.termName; T.list = saved.list;
         composerUid = saved.composerUid;
-        renderSide();
       }
     }""")
-    check("Codex 回退后跟进新分支、询问删除并在取消后保留父项",
+    check("Codex 回退后按根 pane 跟进新分支 uid 并迁移草稿",
           codex_branch_rebind == {
               "linked": {"name": "agenthub-codex-01234567",
                          "uid": "codex:e2e-current-branch"},
@@ -423,63 +409,8 @@ def run(pw):
               "selected": "codex:e2e-current-branch",
               "termUid": "codex:e2e-current-branch",
               "oldDraft": False, "newDraft": "跟随分支的草稿",
-              "confirmCount": 1, "confirmMentionsKeep": True,
-              "parentVisible": True,
+              "confirmCount": 0,
           }, codex_branch_rebind)
-    codex_branch_delete = p.evaluate("""async () => {
-      const fromUid = 'codex:e2e-delete-old-branch';
-      const toUid = 'codex:e2e-delete-new-branch';
-      const parentSid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
-      const saved = {sel:S.sel, agent:S.agent, sessions:S.sessions,
-        results:S.results};
-      const oldRequest = requestSessionDelete, oldLoad = loadSessions;
-      const oldConfirm = window.confirm, oldAudit = browserAuditEvent;
-      const requests = [];
-      try {
-        const now = new Date().toISOString();
-        S.sessions = S.sessions.filter(row => ![fromUid, toUid].includes(row.uid));
-        S.sessions.push({uid:fromUid, source:'codex', sid:parentSid,
-          title:'准备删除的旧分支', cwd:'/tmp', created:now, updated:now, size:1});
-        S.sessions.push({uid:toUid, source:'codex',
-          sid:'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
-          forked_from_id:parentSid, root_sid:parentSid,
-          title:'继续使用的新分支', cwd:'/tmp', created:now, updated:now, size:1});
-        S.sel = toUid; S.agent = null; S.results = null;
-        requestSessionDelete = async (uid, replacementUid) => {
-          requests.push([uid, replacementUid]);
-          return {response:{ok:true}, data:{trash:'/trash/old'}};
-        };
-        loadSessions = async () => true;
-        window.confirm = () => true;
-        browserAuditEvent = () => {};
-        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
-        renderSide();
-        const removed = await offerForkParentDeletion(fromUid, toUid);
-        return {removed, requests, selected:S.sel,
-          parentInState:S.sessions.some(row => row.uid === fromUid),
-          childInState:S.sessions.some(row => row.uid === toUid),
-          parentInDom:!!document.querySelector(
-            `.item[data-uid="${CSS.escape(fromUid)}"]`),
-          childInDom:!!document.querySelector(
-            `.item[data-uid="${CSS.escape(toUid)}"]`)};
-      } finally {
-        requestSessionDelete = oldRequest; loadSessions = oldLoad;
-        window.confirm = oldConfirm; browserAuditEvent = oldAudit;
-        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
-        S.sel=saved.sel; S.agent=saved.agent; S.sessions=saved.sessions;
-        S.results=saved.results;
-        renderSide();
-      }
-    }""")
-    check("确认删除旧分支时只回收父项并保持新 UUID 选中",
-          codex_branch_delete == {
-              "removed": True,
-              "requests": [["codex:e2e-delete-old-branch",
-                            "codex:e2e-delete-new-branch"]],
-              "selected": "codex:e2e-delete-new-branch",
-              "parentInState": False, "childInState": True,
-              "parentInDom": False, "childInDom": True,
-          }, codex_branch_delete)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
       if (!session) return {error:'no codex session'};
@@ -2093,6 +2024,28 @@ def run(pw):
         {role:'tool', name:'exec', summary:'$ active', call_id:'active', turn_id:'active-turn'},
         {role:'tool_result', text:'running', call_id:'active', turn_id:'active-turn'},
       ], {openTail:true, tailComplete:false});
+      // BUG-20260906-213329-413d8d: 后台监控通知没有可见 user 气泡，后来的
+      // final 不能抢走前一条完整答复的结论位置，把“查完了”折进过程合集。
+      const monitored = [
+        {role:'user', text:'检查流水', turn_id:'turn-monitored'},
+        {role:'assistant', text:'正在检查', phase:'progress', turn_id:'turn-monitored'},
+        {role:'tool', name:'exec', summary:'$ inspect', call_id:'inspect',
+         turn_id:'turn-monitored'},
+        {role:'tool_result', text:'healthy', call_id:'inspect', turn_id:'turn-monitored'},
+        {role:'assistant', text:'查完了，流水正常', phase:'final', turn_id:'turn-monitored'},
+        {role:'event', text:'', event_kind:'duration', counted:false,
+         turn_id:'turn-monitored'},
+        {role:'queue_operation', text:'通知入队', operation:'enqueue', counted:false},
+        {role:'queue_operation', text:'', operation:'dequeue', counted:false},
+        {role:'event', text:'监控事件', event_kind:'task', counted:false},
+        {role:'assistant', text:'进度 55%', phase:'final', turn_id:'turn-monitored'},
+        {role:'event', text:'', event_kind:'duration', counted:false,
+         turn_id:'turn-monitored'},
+      ];
+      const monitoredPlan = planTurns(monitored, {tailComplete:true});
+      const monitoredProcess = monitoredPlan.find(item => item.turn)?.turn;
+      const monitoredFinals = monitoredPlan
+        .filter(item => isFinalAssistant(item.m)).map(item => item.m.text);
       const interruptedProcess = interrupted.find(item => item.turn)?.turn;
 
       const incremental = document.createElement('div');
@@ -2160,6 +2113,10 @@ def run(pw):
           && gapTail[1].m?.text === '缺口后的结论'
           && gapTail[2].m?.text === '下一轮',
         activeFragmentStaysExpanded:!activeFragment.some(item => item.turn),
+        backgroundFinalDoesNotReplaceVisibleConclusion:
+          monitoredProcess?.hasConclusion === true
+          && !monitoredProcess.items.some(m => m.text === '查完了，流水正常')
+          && monitoredFinals.join('|') === '查完了，流水正常|进度 55%',
         completedLegacyFallsBackToLastAssistant:legacyComplete.some(item => item.turn),
         incrementalSeal:sealed
           && incremental.children.length === 4
