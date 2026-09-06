@@ -1,0 +1,14 @@
+[Unit]
+Description=AgentHub isolated tmux server
+
+[Service]
+Type=simple
+ExecStart=/home/user/Projects/agenthub/agenthub-tmux-host
+ExecReload=/usr/bin/tmux -N -L agenthub source-file /home/user/Projects/agenthub/agenthub/tmux.conf
+Restart=always
+RestartSec=1
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

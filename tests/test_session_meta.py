@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import session_meta
+from agenthub import session_meta
 
 
 class SessionMetaTests(unittest.TestCase):

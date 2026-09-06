@@ -3,8 +3,8 @@
 为什么绕 tmux 而不是直接注入已有进程:
   - 现有会话是 sshd → zsh → claude 直连 pts, 外部无法写入它的输入队列
   - 内核的 TIOCSTI 注入早已默认关闭 (dev.tty.legacy_tiocsti = 0)
-tmux 提供了合法的输入通道, 而且会话独立于 sesman 存活 —— 关掉浏览器、
-重启 sesman, 会话照常跑。
+tmux 提供了合法的输入通道, 而且会话独立于 agenthub 存活 —— 关掉浏览器、
+重启 agenthub, 会话照常跑。
 
 实现上不用 send-keys + capture-pane 轮询, 而是起一个 pty 跑 `tmux attach`,
 双向转发字节。这样方向键、Ctrl-C、批准提示、鼠标全都原样可用。
@@ -29,9 +29,9 @@ from pathlib import Path
 
 from . import audit, claude_bridge
 
-PREFIX = "sesman-"          # sesman 起的会话用这个前缀, 便于识别
-MANAGED_SERVER = "sesman"   # 独立 socket，不继承用户默认 tmux server 的交互配置
-LEGACY_SERVER = "default"   # 兼容改造前已经启动的 sesman-* 会话
+PREFIX = "agenthub-"          # agenthub 起的会话用这个前缀, 便于识别
+MANAGED_SERVER = "agenthub"   # 独立 socket，不继承用户默认 tmux server 的交互配置
+LEGACY_SERVER = "default"   # 兼容改造前已经启动的 agenthub-* 会话
 TMUX_CONF = Path(__file__).with_name("tmux.conf")
 _config_lock = threading.Lock()
 _managed_configured = False
@@ -275,7 +275,7 @@ def _list_server(server: str) -> list[dict]:
 
 
 def list_sessions() -> list[dict]:
-    """列出专用 server，并兼容默认 server 中改造前留下的 sesman 会话。"""
+    """列出专用 server，并兼容默认 server 中改造前留下的 agenthub 会话。"""
     if not available():
         return []
     managed = _list_server(MANAGED_SERVER)
@@ -310,7 +310,7 @@ def _session_tmux(name: str, *args: str, timeout: int = 10) -> str:
 
 def new_session(name: str, cmd: str, cwd: str | None = None,
                 cols: int = 120, rows: int = 32) -> str:
-    """在 sesman 专用 tmux server 中新建 detached 会话。"""
+    """在 agenthub 专用 tmux server 中新建 detached 会话。"""
     global _managed_configured
     full = name if name.startswith(PREFIX) else PREFIX + name
     if has_session(full):
@@ -402,7 +402,7 @@ def submit_text(name: str, text: str) -> None:
         row = session_info(name)
         if not row:
             raise RuntimeError(f"tmux 会话不存在: {name}")
-        buffer_name = f"sesman-submit-{uuid.uuid4().hex}"
+        buffer_name = f"agenthub-submit-{uuid.uuid4().hex}"
         _tmux("set-buffer", "-b", buffer_name, "--", text,
               server=row["server"], no_start=True)
         try:

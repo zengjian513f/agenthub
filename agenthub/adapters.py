@@ -847,7 +847,7 @@ class ClaudeAdapter:
                 # 新树，供模型从摘要继续；本地 JSONL 中的旧对话却仍然存在。
                 # 对“人看的时间线”，压缩是一个连续边界，应接回边界前由
                 # last-prompt/最后图节点声明的当前叶子。否则每次 compact 后
-                # sesman 都会把全部旧正文误判成已回退分支。
+                # agenthub 都会把全部旧正文误判成已回退分支。
                 if not parent and scan_tip and cls._compact_boundary(rec):
                     parent = scan_tip
                 parents[uid] = str(parent) if parent else None

@@ -1,4 +1,4 @@
-"""Bridge Codex TUI-only approval prompts into sesman's conversation UI.
+"""Bridge Codex TUI-only approval prompts into agenthub's conversation UI.
 
 Codex writes ``request_user_input`` questions to its rollout JSONL, but command
 approvals live only in the terminal screen.  Keep this parser deliberately

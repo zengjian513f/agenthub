@@ -4,7 +4,7 @@ import struct
 import tempfile
 from unittest.mock import call, patch
 
-from sesman import term
+from agenthub import term
 
 
 class DirectoryCompletionTests(unittest.TestCase):
@@ -65,7 +65,7 @@ class NewSessionDirectoryTests(unittest.TestCase):
             missing = term.Path(tmp) / "parent" / "project"
             with patch.object(term, "_which_cli", return_value="/usr/bin/codex"), \
                     patch.object(term, "new_session",
-                                 return_value="sesman-codex-test") as new:
+                                 return_value="agenthub-codex-test") as new:
                 result = term.new_cli_session(
                     "codex", str(missing), create_cwd=True)
 
@@ -90,9 +90,9 @@ class TerminalSubmitTests(unittest.TestCase):
                 patch.object(term, "_tmux") as tmux:
             name = term.new_session("test", "command")
 
-        self.assertEqual(name, "sesman-test")
+        self.assertEqual(name, "agenthub-test")
         tmux.assert_called_once_with(
-            "new-session", "-d", "-s", "sesman-test", "-x", "120", "-y", "32",
+            "new-session", "-d", "-s", "agenthub-test", "-x", "120", "-y", "32",
             "command", server=term.MANAGED_SERVER)
 
     def test_attach_ignores_hidden_xterm_minimum_size(self):
@@ -129,12 +129,12 @@ class TerminalSubmitTests(unittest.TestCase):
                              return_value=type("U", (), {
                                  "__str__": lambda self:
                                  "5bc438e2-9532-47af-9fbd-4eec1a0347d9"})()), \
-                patch.object(term, "new_session", return_value="sesman-claude-test") as new:
+                patch.object(term, "new_session", return_value="agenthub-claude-test") as new:
             result = term.new_cli_session("claude", tmp)
         command = new.call_args.args[1]
         self.assertIn("--settings /tmp/claude-bridge.json", command)
         self.assertIn("--session-id 5bc438e2-9532-47af-9fbd-4eec1a0347d9", command)
-        self.assertEqual(result["name"], "sesman-claude-test")
+        self.assertEqual(result["name"], "agenthub-claude-test")
 
     def test_codex_resume_enables_native_question_tool(self):
         sid = "5bc438e2-9532-47af-9fbd-4eec1a0347d9"
@@ -150,7 +150,7 @@ class TerminalSubmitTests(unittest.TestCase):
     def test_new_codex_session_enables_native_question_tool(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(term, "_which_cli", return_value="/usr/bin/codex"), \
-                patch.object(term, "new_session", return_value="sesman-codex-test") as new:
+                patch.object(term, "new_session", return_value="agenthub-codex-test") as new:
             result = term.new_cli_session("codex", tmp)
         command = shlex.split(new.call_args.args[1])
         self.assertIn("--enable", command)
@@ -158,40 +158,40 @@ class TerminalSubmitTests(unittest.TestCase):
         self.assertIn("suppress_unstable_features_warning=true", command)
         self.assertNotIn("--session-id", command)
         self.assertIsNone(result["sid"])
-        self.assertEqual(result["name"], "sesman-codex-test")
+        self.assertEqual(result["name"], "agenthub-codex-test")
 
     def test_kill_session_treats_concurrent_natural_exit_as_success(self):
-        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
+        pane = {"name": "agenthub-test", "server": term.MANAGED_SERVER}
         with patch.object(term, "session_info", side_effect=[pane, None]), \
                 patch.object(term, "_tmux",
-                             side_effect=RuntimeError("can't find session: sesman-test")):
-            killed = term.kill_session("sesman-test")
+                             side_effect=RuntimeError("can't find session: agenthub-test")):
+            killed = term.kill_session("agenthub-test")
 
         self.assertFalse(killed)
 
     def test_kill_session_still_reports_a_real_tmux_failure(self):
-        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
+        pane = {"name": "agenthub-test", "server": term.MANAGED_SERVER}
         with patch.object(term, "session_info", side_effect=[pane, pane]), \
                 patch.object(term, "_tmux", side_effect=RuntimeError("permission denied")):
             with self.assertRaisesRegex(RuntimeError, "permission denied"):
-                term.kill_session("sesman-test")
+                term.kill_session("agenthub-test")
 
     def test_submit_uses_bracketed_paste_before_enter(self):
-        pane = {"name": "sesman-test", "server": term.MANAGED_SERVER}
+        pane = {"name": "agenthub-test", "server": term.MANAGED_SERVER}
         with patch.object(term, "session_info", return_value=pane), \
                 patch.object(term.uuid, "uuid4") as uuid4, \
                 patch.object(term.time, "sleep") as sleep, \
                 patch.object(term, "_tmux") as tmux:
             uuid4.return_value.hex = "fixed"
-            term.submit_text("sesman-test", "两行\n内容")
+            term.submit_text("agenthub-test", "两行\n内容")
 
         sleep.assert_called_once_with(0.04)
         self.assertEqual(tmux.call_args_list, [
-            call("set-buffer", "-b", "sesman-submit-fixed", "--", "两行\n内容",
+            call("set-buffer", "-b", "agenthub-submit-fixed", "--", "两行\n内容",
                  server=term.MANAGED_SERVER, no_start=True),
-            call("paste-buffer", "-p", "-d", "-b", "sesman-submit-fixed",
-                 "-t", "sesman-test", server=term.MANAGED_SERVER, no_start=True),
-            call("send-keys", "-t", "sesman-test", "--", "Enter",
+            call("paste-buffer", "-p", "-d", "-b", "agenthub-submit-fixed",
+                 "-t", "agenthub-test", server=term.MANAGED_SERVER, no_start=True),
+            call("send-keys", "-t", "agenthub-test", "--", "Enter",
                  server=term.MANAGED_SERVER, no_start=True),
         ])
 
@@ -201,10 +201,10 @@ class TerminalSubmitTests(unittest.TestCase):
                 patch.object(term, "send_keys") as send_keys, \
                 patch.object(term, "kill_pids") as kill_pids, \
                 patch.object(term, "kill_session") as kill_session:
-            stopped = term.graceful_stop("sesman-test", [123], timeout=0)
+            stopped = term.graceful_stop("agenthub-test", [123], timeout=0)
 
         self.assertEqual(stopped, [123])
-        send_keys.assert_called_once_with("sesman-test", "C-d")
+        send_keys.assert_called_once_with("agenthub-test", "C-d")
         kill_pids.assert_not_called()
         kill_session.assert_not_called()
 
@@ -213,24 +213,24 @@ class TerminalSubmitTests(unittest.TestCase):
                 patch.object(term, "send_keys") as send_keys, \
                 patch.object(term, "kill_pids", return_value=[123]) as kill_pids, \
                 patch.object(term, "kill_session") as kill_session:
-            stopped = term.graceful_stop("sesman-test", [123], timeout=0)
+            stopped = term.graceful_stop("agenthub-test", [123], timeout=0)
 
         self.assertEqual(stopped, [123])
         self.assertEqual(send_keys.call_args_list, [
-            call("sesman-test", "C-d"), call("sesman-test", "C-d"),
+            call("agenthub-test", "C-d"), call("agenthub-test", "C-d"),
         ])
         kill_pids.assert_called_once_with([123])
-        kill_session.assert_called_once_with("sesman-test")
+        kill_session.assert_called_once_with("agenthub-test")
 
 
 class TermCaptureTests(unittest.TestCase):
     def test_history_capture_joins_old_soft_wraps_before_browser_reflow(self):
         with patch.object(term, "_session_tmux", return_value="history") as run:
-            self.assertEqual(term.capture_history("sesman-codex-u", 321), "history")
+            self.assertEqual(term.capture_history("agenthub-codex-u", 321), "history")
 
         run.assert_called_once_with(
-            "sesman-codex-u", "capture-pane", "-J", "-p", "-e", "-t",
-            "sesman-codex-u", "-S", "-321")
+            "agenthub-codex-u", "capture-pane", "-J", "-p", "-e", "-t",
+            "agenthub-codex-u", "-S", "-321")
 
 
 if __name__ == "__main__":

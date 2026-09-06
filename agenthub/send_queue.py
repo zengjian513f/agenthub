@@ -1,4 +1,4 @@
-"""Sesman 托管的 Codex 网页发送队列。
+"""AgentHub 托管的 Codex 网页发送队列。
 
 Codex 忙时不会把排队输入写进 rollout，tmux send-keys 成功也不等于 CLI
 已经接收。这里先持久化网页消息，只在原生回合结束且终端画面稳定后交付，
@@ -18,7 +18,7 @@ from pathlib import Path
 from . import audit
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 QUEUE_FILE = DATA_DIR / "send-queue.json"
 VERSION = 1
 READY_DELAY = 0.30

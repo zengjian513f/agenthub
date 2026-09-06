@@ -17,9 +17,9 @@ from datetime import datetime
 from pathlib import Path
 
 from .adapters import ADAPTERS, ClaudeAdapter
-from . import audit, media, session_meta
+from . import audit, media, session_meta, trash
 
-CACHE_DIR = Path.home() / ".cache" / "sesman"
+CACHE_DIR = Path.home() / ".cache" / "agenthub"
 CACHE_FILE = CACHE_DIR / "index.json"
 CACHE_VERSION = 5
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
@@ -27,7 +27,7 @@ WINDOW_CACHE_VERSION = 7
 MESSAGE_CURSOR_VERSION = 7
 WINDOW_CACHE_MIN_BYTES = 8 * 1024 * 1024
 WINDOW_CACHE_MEMORY_ITEMS = 16
-TRASH_DIR = Path.home() / ".local" / "share" / "sesman" / "trash"
+TRASH_DIR = Path.home() / ".local" / "share" / "agenthub" / "trash"
 CHECK_TTL = 0.5       # 高频热路径复用已发布快照；列表轮询仍会及时发现磁盘变化
 
 _lock = threading.Lock()
@@ -375,7 +375,7 @@ def load(force: bool = False) -> list[dict]:
             if _state["initialized"]:
                 _publish(_state["raw"], _state["sessions"], _state["files"],
                          _state["sig"], _state["built_at"], time.monotonic(), True)
-                print(f"[sesman] 索引增量刷新失败，稍后重试: {e}")
+                print(f"[agenthub] 索引增量刷新失败，稍后重试: {e}")
                 return _state["sessions"]
             raise
 
@@ -387,7 +387,7 @@ def load(force: bool = False) -> list[dict]:
         if not dirty:
             _write_cache(raw, sessions, files, sig, built_at)
         if full:
-            print(f"[sesman] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")
+            print(f"[agenthub] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")
         return _state["sessions"]
 
 
@@ -422,7 +422,7 @@ def data_file(s: dict) -> Path:
 
 
 def _claude_effective_tip(s: dict, pos: int | None = None) -> str | None:
-    """合并 Claude 磁盘树与 sesman 从原生 TUI 确认的未落盘回滚。"""
+    """合并 Claude 磁盘树与 agenthub 从原生 TUI 确认的未落盘回滚。"""
     ad = ADAPTERS.get(s.get("source"))
     if not isinstance(ad, ClaudeAdapter):
         return None
@@ -940,7 +940,13 @@ def delete(uid: str) -> str:
     dest_dir = TRASH_DIR / s["source"]
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{stamp}-{src.name}"
+    meta = session_meta.snapshot(uid)
     shutil.move(str(src), str(dest))
+    try:
+        trash.record(dest, s, meta)
+    except OSError as e:
+        # 清单只影响"能否一键恢复"，文件已经安全落在回收站里，不能因此报错。
+        print(f"[agenthub] 回收站清单写入失败，该条目将无法自动恢复: {e}")
     with _lock:
         raw = {name: dict(rows) for name, rows in _state["raw"].items()}
         raw.get(s["source"], {}).pop(str(s["path"]), None)
@@ -951,7 +957,7 @@ def delete(uid: str) -> str:
             # 成 500。先从公开快照移除目标，保留 dirty 让下一轮恢复 Codex
             # 隐藏祖先等拓扑；源文件不会因用户重试而进一步受损。
             sessions = [row for row in _state["sessions"] if row.get("uid") != uid]
-            print(f"[sesman] 删除后的索引协调失败，稍后重试: {e}")
+            print(f"[agenthub] 删除后的索引协调失败，稍后重试: {e}")
         # 不用移动后的新 inventory 给尚未协调的其他变化背书；下一次 load
         # 会从旧 files 做完整 diff。Codex 叶子删除后这里已能立即恢复父项。
         _publish(raw, sessions, _state["files"], None, time.time(), 0.0, True)
@@ -966,6 +972,19 @@ SEARCH_ROLES = frozenset({"user", "assistant", "user·subagent",
                           "assistant·subagent", "thinking", "question", "answer"})
 _search_text_cache = {}
 _search_text_lock = threading.Lock()
+
+
+def invalidate() -> None:
+    """外部改动了会话文件(如从回收站恢复)后, 让下一次读重扫磁盘。
+
+    清空已记录的 inventory 而不是只标 dirty: 恢复是把同一个 inode 原样搬
+    回原路径, 与删除前的 files 逐字段相同, 只标 dirty 会得到空 diff, 被
+    删除时从 raw 摘掉的会话就再也回不来了。
+    """
+    with _lock:
+        if _state["initialized"]:
+            _publish(_state["raw"], _state["sessions"], {}, None,
+                     _state["built_at"], 0.0, True)
 
 
 def build_pattern(query: str, word=False, case=False, regex=False) -> re.Pattern:

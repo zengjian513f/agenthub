@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import send_queue, server
+from agenthub import send_queue, server
 
 
 class SendQueueTests(unittest.TestCase):
@@ -36,7 +36,7 @@ class SendQueueTests(unittest.TestCase):
 
     def test_busy_codex_waits_for_native_turn_end_then_confirms(self):
         item = send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "下一条", [],
+            "codex:u", "agenthub-codex-u", "下一条", [],
             {"state": "working", "ts": "2026-08-09T10:00:00Z"}, "req-1",
             {"start": 100, "head": "head", "anchor": "anchor"})
         self.assertEqual(item["state"], "queued")
@@ -206,11 +206,11 @@ class SendQueueTests(unittest.TestCase):
 
     def test_delivery_never_appends_to_restored_codex_editor(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "新消息", [],
+            "codex:u", "agenthub-codex-u", "新消息", [],
             {"state": "idle"}, "restored")
         row = send_queue.tracked()[0]
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         footer = "gpt-5.6-sol · Context 19% used · Ready"
         screen = "\x1b[1;2m› \x1b[0m旧消息仍在编辑框\n\n" + footer
 
@@ -232,11 +232,11 @@ class SendQueueTests(unittest.TestCase):
 
     def test_idle_unknown_screen_retries_then_fails_without_mutating_terminal(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "继续消息", [],
+            "codex:u", "agenthub-codex-u", "继续消息", [],
             {"state": "idle"}, "unknown")
         row = send_queue.tracked()[0]
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         stale_screen = "• 已完成并上线。\n\n  - 最后一条回答。\n"
 
         with patch.object(server.index, "get", return_value=session), \
@@ -261,11 +261,11 @@ class SendQueueTests(unittest.TestCase):
 
     def test_short_footerless_codex_composer_is_delivered_from_live_cursor(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "短窗口继续", [],
+            "codex:u", "agenthub-codex-u", "短窗口继续", [],
             {"state": "idle"}, "short-footerless")
         row = send_queue.tracked()[0]
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         lines = [
             "• 已完成上一回合。", "", "  这是最后一条回答。", "",
             "─ Worked for 1m 01s " + "─" * 24, "", "", "", "", "", "",
@@ -293,11 +293,11 @@ class SendQueueTests(unittest.TestCase):
 
     def test_bottom_codex_composer_delivers_with_parked_cursor(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "底边输入框继续", [],
+            "codex:u", "agenthub-codex-u", "底边输入框继续", [],
             {"state": "idle"}, "bottom-parked-cursor")
         row = send_queue.tracked()[0]
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         lines = ["old output", *([""] * 28), "", "",
                  "\x1b[1m\x1b[38;5;215m›\x1b[0m "
                  "\x1b[2mAsk Codex to do anything\x1b[0m"]
@@ -320,7 +320,7 @@ class SendQueueTests(unittest.TestCase):
 
     def test_retry_delivers_from_codex_interrupt_rewind_composer(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "中断后重试", [],
+            "codex:u", "agenthub-codex-u", "中断后重试", [],
             {"state": "aborted"}, "retry-after-abort")
         send_queue.mark_failed("retry-after-abort", "Codex 输入框不可识别")
         send_queue.retry(
@@ -328,7 +328,7 @@ class SendQueueTests(unittest.TestCase):
             {"state": "aborted", "ts": "2099-01-01T00:00:00Z"}, "codex:u")
         row = send_queue.ready(10**12)[0]
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         screen = (
             "\x1b[38;5;1m■ Conversation interrupted - tell the model\x1b[0m\n\n"
             "\x1b[1m\x1b[38;5;215m›\x1b[0m "
@@ -350,11 +350,11 @@ class SendQueueTests(unittest.TestCase):
 
     def test_unknown_busy_screen_is_deferred_from_stale_idle(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "下一条", [],
+            "codex:u", "agenthub-codex-u", "下一条", [],
             {"state": "idle"}, "busy-redraw")
         row = send_queue.tracked()[0]
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         screen = "• Working (2s • esc to interrupt)\n› placeholder\n"
 
         with patch.object(server.index, "get", return_value=session), \
@@ -371,11 +371,11 @@ class SendQueueTests(unittest.TestCase):
 
     def test_new_message_is_rejected_while_failed_head_blocks_fifo(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "失败消息", [],
+            "codex:u", "agenthub-codex-u", "失败消息", [],
             {"state": "idle"}, "failed")
         send_queue.mark_failed("failed", "未确认")
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         handler = object.__new__(server.Handler)
         handler._json = lambda payload, status=200: {**payload, "_status": status}
 
@@ -392,7 +392,7 @@ class SendQueueTests(unittest.TestCase):
 
     def test_web_send_requests_confirmation_for_nonempty_codex_composer(self):
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         footer = "gpt-5.6-sol · Context 19% used · Ready"
         screen = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
         cursor = (2, 0)
@@ -419,7 +419,7 @@ class SendQueueTests(unittest.TestCase):
 
     def test_confirmed_web_send_clears_exact_codex_draft_before_enqueue(self):
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         footer = "gpt-5.6-sol · Context 19% used · Ready"
         screen = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
         empty = "\x1b[2m› Ask Codex to do anything\x1b[0m\n\n" + footer
@@ -454,7 +454,7 @@ class SendQueueTests(unittest.TestCase):
 
     def test_changed_codex_draft_is_never_cleared_by_stale_confirmation(self):
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         screen = ("\x1b[1;2m› \x1b[0m确认期间变化的新草稿\n\n"
                   "gpt-5.6-sol · Context 19% used · Ready")
         handler = object.__new__(server.Handler)
@@ -509,13 +509,13 @@ class SendQueueTests(unittest.TestCase):
 
     def test_exception_after_delivery_claim_is_not_retryable(self):
         send_queue.enqueue(
-            "codex:u", "sesman-codex-u", "只发一次", [],
+            "codex:u", "agenthub-codex-u", "只发一次", [],
             {"state": "idle"}, "ambiguous")
         row = send_queue.tracked()[0]
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "sesman-codex-u"}
+        pane = {"name": "agenthub-codex-u"}
         screen = ("\x1b[2m› Use /skills to list available skills\x1b[0m\n\n"
-                  "gpt-5.6-sol · ~/Projects/sesman")
+                  "gpt-5.6-sol · ~/Projects/agenthub")
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
                 patch.object(server.term, "capture_screen_state",

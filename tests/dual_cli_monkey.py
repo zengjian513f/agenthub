@@ -4,7 +4,7 @@ This test is intentionally never part of unittest/e2e discovery.  It creates
 ten real sessions per CLI, pins their cheapest requested models, registers the
 whole run as hidden before starting a TUI, and keeps evidence under the run
 root.  A crash leaves the debug registry in place, so test sessions stay out of
-the user's ordinary sesman list.
+the user's ordinary agenthub list.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sesman import claude_bridge, codex_bridge, debug_runs, term
+from agenthub import claude_bridge, codex_bridge, debug_runs, term
 from monkey_model import (
     ACTIONS,
     ConsistencyOracle,
@@ -158,7 +158,7 @@ class ClaudeDriver(Driver):
             raise RuntimeError("找不到 claude")
         return shlex.join([
             # ``plan`` occasionally refuses even a deterministic echo prompt,
-            # which tests model policy rather than sesman's transport.  Keep
+            # which tests model policy rather than agenthub's transport.  Keep
             # the ordinary permission gate and expose only the one tool needed
             # for the cross-surface question scenario.
             exe, "--setting-sources", "", "--permission-mode", "default",
@@ -266,7 +266,7 @@ class DualMonkey:
         # rejects the second call and can take down Playwright's driver.
         self.dialog_brokers: dict[int, dict] = {}
         self.run_id = f"monkey-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        self.root = Path(tempfile.mkdtemp(prefix=f"sesman-{self.run_id}-"))
+        self.root = Path(tempfile.mkdtemp(prefix=f"agenthub-{self.run_id}-"))
         os.chmod(self.root, 0o700)
         self.artifacts = self.root / "artifacts"
         self.artifacts.mkdir()
@@ -410,10 +410,10 @@ class DualMonkey:
         # asking a cheap model to reproduce that whole identifier introduced
         # content typos unrelated to delivery.  A 40-bit public test label
         # keeps the oracle unique while remaining easy to include naturally.
-        label = ("sesman-test-" + hashlib.sha256(stem.encode()).hexdigest()[:10]
+        label = ("agenthub-test-" + hashlib.sha256(stem.encode()).hexdigest()[:10]
                  + "-req")
         reply = label.removesuffix("-req") + "-rsp"
-        text = (f"This is a local sesman UI synchronization test for request {request}. "
+        text = (f"This is a local agenthub UI synchronization test for request {request}. "
                 "Reply in one short sentence confirming that you saw it, and include "
                 f"the test label {label} after changing its final -req to -rsp.")
         return {"text": text, "request": request, "reply": reply}
@@ -1098,7 +1098,7 @@ class DualMonkey:
         exchange = self.exchange(session, kind, serial)
         request_label = exchange["reply"].removesuffix("-rsp") + "-req"
         exchange["text"] = (
-            f"For local sesman terminal rendering test {exchange['request']}, print "
+            f"For local agenthub terminal rendering test {exchange['request']}, print "
             "integers 1 through 80 one per line, then finish with a line containing "
             f"the test label {request_label} after changing its final -req to -rsp.")
         return exchange
@@ -1425,7 +1425,7 @@ class DualMonkey:
         tool = "AskUserQuestion" if session.source == "claude" else "request_user_input"
         request_label = exchange["reply"].removesuffix("-rsp") + "-req"
         exchange["text"] = (
-            f"For local sesman question UI test {exchange['request']}, use {tool} now "
+            f"For local agenthub question UI test {exchange['request']}, use {tool} now "
             "to ask one question with exactly two options labelled Alpha and Beta. "
             "After the answer, reply in one brief sentence that includes the test label "
             f"{request_label} after changing its final -req to -rsp.")
@@ -2282,7 +2282,7 @@ class DualMonkey:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default=os.environ.get(
-        "SESMAN_BASE", "http://127.0.0.1:8710"))
+        "AGENTHUB_BASE", "http://127.0.0.1:8710"))
     parser.add_argument("--sessions", type=int, default=10)
     parser.add_argument("--duration", type=int, default=DEFAULT_DURATION)
     parser.add_argument("--seed", type=int, default=int(time.time()))

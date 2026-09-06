@@ -1,6 +1,6 @@
 import unittest
 
-from sesman import codex_bridge
+from agenthub import codex_bridge
 
 
 SCREEN = """old output
@@ -118,7 +118,7 @@ class CodexBridgeTests(unittest.TestCase):
         self.assertEqual(codex_bridge.composer_state(screen), "empty")
 
     def test_current_model_footer_marks_live_composer(self):
-        footer = "  gpt-5.6-sol xhigh fast · ~/Projects/sesman"
+        footer = "  gpt-5.6-sol xhigh fast · ~/Projects/agenthub"
         empty = "\x1b[1m›\x1b[0m \x1b[2mUse /skills to list available skills\x1b[0m\n\n" + footer
         restored = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
         self.assertEqual(codex_bridge.composer_state(empty), "empty")
@@ -133,23 +133,23 @@ class CodexBridgeTests(unittest.TestCase):
     def test_current_working_screen_is_not_treated_as_ready(self):
         screen = ("\x1b[1m• Working\x1b[0m \x1b[2m(12s • esc to interrupt)\x1b[0m\n\n"
                   "\x1b[1m›\x1b[0m \x1b[2mRun /review on my current changes\x1b[0m\n\n"
-                  "  gpt-5.6-sol xhigh fast · ~/Projects/sesman")
+                  "  gpt-5.6-sol xhigh fast · ~/Projects/agenthub")
         self.assertEqual(codex_bridge.composer_state(screen), "unknown")
 
     def test_resize_frame_does_not_treat_historic_prompt_as_composer(self):
         screen = ("\x1b[1m›\x1b[0m 历史用户消息\n\n"
                   "• 正在重绘，当前输入框尚未出现\n\n"
-                  "  gpt-5.6-sol xhigh fast · ~/Projects/sesman")
+                  "  gpt-5.6-sol xhigh fast · ~/Projects/agenthub")
         self.assertEqual(codex_bridge.composer_state(screen), "unknown")
 
     def test_rgb_colour_selector_is_not_mistaken_for_dim(self):
-        footer = "  gpt-5.6-sol xhigh fast · ~/Projects/sesman"
+        footer = "  gpt-5.6-sol xhigh fast · ~/Projects/agenthub"
         restored = ("\x1b[1m›\x1b[0m \x1b[38;2;2;120;200m彩色草稿\x1b[0m\n\n"
                     + footer)
         self.assertEqual(codex_bridge.composer_state(restored), "editing")
 
     def test_wrapped_draft_is_one_adjacent_composer_block(self):
-        footer = "  gpt-5.6-sol xhigh fast · ~/Projects/sesman"
+        footer = "  gpt-5.6-sol xhigh fast · ~/Projects/agenthub"
         restored = ("\x1b[1m›\x1b[0m 草稿第一行\n"
                     "  草稿第二行\n\n" + footer)
         self.assertEqual(codex_bridge.composer_state(restored), "editing")

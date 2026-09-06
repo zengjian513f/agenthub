@@ -1,5 +1,5 @@
 @font-face {
-  font-family: "Sesman Cascadia Mono";
+  font-family: "AgentHub Cascadia Mono";
   src: url("fonts/CascadiaMono.woff2") format("woff2-variations");
   font-weight: 200 700; font-style: normal; font-display: swap;
 }
@@ -8,7 +8,7 @@
  * 字面尺寸；xterm 自己按 Unicode 为汉字分配两个单元格，不需要缩小西文
  * 轮廓来凑字体度量上的 1:2。字体文件本身不作修改。 */
 @font-face {
-  font-family: "Sesman Ubuntu Sans Mono";
+  font-family: "AgentHub Ubuntu Sans Mono";
   src: url("fonts/UbuntuSansMono.ttf") format("truetype-variations");
   font-weight: 100 700; font-style: normal; font-display: swap;
 }
@@ -17,7 +17,7 @@
  * 西文和中文，避免 Cascadia 的 8.22px 西文格与 Noto 的 14.03px 汉字
  * 拼成并非 1:2 的网格。没有安装这两套字体的平台会继续走下面的混合回退。 */
 @font-face {
-  font-family: "Sesman CJK Mono Grid";
+  font-family: "AgentHub CJK Mono Grid";
   src: local("Sarasa Mono SC"), local("Noto Sans Mono CJK SC");
   font-weight: 200 700; font-style: normal; font-display: swap;
 }
@@ -25,7 +25,7 @@
 /* 等宽西文字体通常没有汉字。把 CJK 单独路由到无衬线字体，避免 Windows
  * 最后用 generic monospace 的宋体补字；unicode-range 让拉丁字母继续走用户所选字体。 */
 @font-face {
-  font-family: "Sesman CJK Sans";
+  font-family: "AgentHub CJK Sans";
   src: local("Sarasa Mono SC"), local("Noto Sans Mono CJK SC"),
        local("Microsoft YaHei UI"), local("Microsoft YaHei"),
        local("PingFang SC"), local("Noto Sans CJK SC"),
@@ -54,8 +54,8 @@
   --tool: #b7791f;
   --terminal-bg: #f4f6f8;
   --terminal-fg: #252a32;
-  --terminal-font: "Sesman CJK Sans", "Sesman Ubuntu Sans Mono", "Ubuntu Sans Mono",
-    "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono",
+  --terminal-font: "AgentHub CJK Sans", "AgentHub Ubuntu Sans Mono", "Ubuntu Sans Mono",
+    "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono",
     Consola, Consolas, sans-serif;
   --tool-font-size: 12.96px;
   --terminal-font-size: 14.04px;
@@ -392,6 +392,37 @@ body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix
 }
 #new-session-error { min-height: 18px; color: #e5484d; font-size: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 7px; }
+
+/* ---------- 回收站 ---------- */
+.trash-panel { display: flex; flex-direction: column; gap: 9px; min-height: 0; padding: 17px; }
+#trash-note { min-height: 17px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+#trash-note.err { color: #e5484d; }
+.trash-list {
+  flex: 1; min-height: 132px; max-height: min(52dvh, 420px); overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 9px; background: var(--panel-2);
+}
+.trash-item {
+  display: flex; align-items: center; gap: 11px;
+  padding: 9px 11px; border-bottom: 1px solid var(--border);
+}
+.trash-item:last-child { border-bottom: 0; }
+.trash-main { flex: 1; min-width: 0; }
+.trash-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; }
+.trash-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trash-title .ico { flex: none; width: 14px; height: 14px; }
+.trash-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 3px;
+  color: var(--muted); font-size: 11.5px;
+}
+.trash-cwd { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trash-origin {
+  margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--muted); font: 11px/1.4 var(--terminal-font);
+}
+.trash-origin.warn { color: #e5484d; font-family: inherit; }
+.trash-acts { display: flex; flex: none; gap: 6px; }
+.trash-acts .btn { padding: 4px 9px; font-size: 12px; }
+.trash-empty { padding: 28px 16px; color: var(--muted); font-size: 12.5px; text-align: center; }
 
 /* ---------- 布局 ---------- */
 /* 载入进度条 */
@@ -1457,6 +1488,8 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   }
   #xterm { padding-left: 4px; }
 
+  .trash-item { flex-wrap: wrap; }
+  .trash-acts { width: 100%; justify-content: flex-end; }
   #new-session-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   .app-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   .setting-row { grid-template-columns: 1fr; gap: 7px; }

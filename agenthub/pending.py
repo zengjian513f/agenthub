@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 PENDING_FILE = DATA_DIR / "pending-sessions.json"
 _lock = threading.RLock()
 

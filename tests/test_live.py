@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from sesman import live
+from agenthub import live
 
 
 class BareClaudeTests(unittest.TestCase):

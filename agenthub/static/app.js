@@ -1,7 +1,7 @@
 'use strict';
 
 const SOURCES = Object.freeze(Object.fromEntries(
-  Object.values(SESMAN_CLIS).map(cli => [cli.source, {
+  Object.values(AGENTHUB_CLIS).map(cli => [cli.source, {
     name: cli.name, icon: cli.icon, color: cli.color,
   }])));
 
@@ -9,11 +9,11 @@ const SOURCES = Object.freeze(Object.fromEntries(
 const store = {
   get(k, d) {
     try {
-      const v = localStorage.getItem('sesman.' + k);
+      const v = localStorage.getItem('agenthub.' + k);
       return v === null ? d : JSON.parse(v);
     } catch { return d; }
   },
-  set: (k, v) => localStorage.setItem('sesman.' + k, JSON.stringify(v)),
+  set: (k, v) => localStorage.setItem('agenthub.' + k, JSON.stringify(v)),
 };
 
 // 存储结构的版本只由公共层调度；每种 CLI 自己决定怎样迁移旧队列。
@@ -24,7 +24,7 @@ function loadQueuedMessages() {
   const fromVersion = +store.get('queuedMessagesVersion', 1) || 1;
   if (fromVersion !== QUEUED_MESSAGES_VERSION) {
     const migrated = valid.flatMap(([uid, items]) => {
-      const kept = sesmanCli(uid)?.migrateQueuedMessages(
+      const kept = agenthubCli(uid)?.migrateQueuedMessages(
         items, fromVersion, QUEUED_MESSAGES_VERSION) || [];
       return kept.length ? [[uid, kept]] : [];
     });
@@ -36,10 +36,10 @@ function loadQueuedMessages() {
 }
 
 const FONT_CHOICES = {
-  ubuntu: '"Sesman CJK Sans", "Sesman Ubuntu Sans Mono", "Ubuntu Sans Mono", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
-  cascadia: '"Sesman CJK Sans", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
-  system: '"Sesman CJK Sans", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", "Liberation Mono", Consolas, sans-serif',
-  consolas: '"Sesman CJK Sans", Consolas, Consola, "Cascadia Mono", "Liberation Mono", sans-serif',
+  ubuntu: '"AgentHub CJK Sans", "AgentHub Ubuntu Sans Mono", "Ubuntu Sans Mono", "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
+  cascadia: '"AgentHub CJK Sans", "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
+  system: '"AgentHub CJK Sans", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", "Liberation Mono", Consolas, sans-serif',
+  consolas: '"AgentHub CJK Sans", Consolas, Consola, "Cascadia Mono", "Liberation Mono", sans-serif',
 };
 const themeMedia = matchMedia('(prefers-color-scheme: dark)');
 
@@ -94,11 +94,14 @@ const S = {
 
 const $ = s => document.querySelector(s);
 const MOBILE = matchMedia('(max-width: 720px)');
-// 页面既可挂在站点根目录，也可由反代放到 /sesman/ 之类的子路径。
+// 页面既可挂在站点根目录，也可由反代放到 /agenthub/ 之类的子路径。
 const APP_BASE = new URL('.', location.href);
 const DEBUG_RUN = /^[A-Za-z0-9_-]{1,64}$/.test(
   new URLSearchParams(location.search).get('debug_run') || '')
   ? new URLSearchParams(location.search).get('debug_run') : '';
+// 深链：?sid=<source>:<sid> 或 ?sid=<sid>，打开指定会话（labdesk 的会话台账用它跳过来）。
+// 用 CLI 原生会话号而不是 uid —— uid 是会话文件路径的散列，换目录就变。
+const DEEP_SID = (new URLSearchParams(location.search).get('sid') || '').trim().slice(0, 128);
 const appUrl = path => {
   const url = new URL(String(path).replace(/^\//, ''), APP_BASE);
   if (DEBUG_RUN && url.pathname.includes('/api/')) {
@@ -106,13 +109,13 @@ const appUrl = path => {
   }
   return url.toString();
 };
-const BUILD_ID = document.querySelector('meta[name="sesman-build"]')?.content || '';
+const BUILD_ID = document.querySelector('meta[name="agenthub-build"]')?.content || '';
 // One ephemeral page identity joins HTTP, SSE, terminal and final DOM receipts.
 // It intentionally is not persisted: duplicated/restored tabs must remain distinct.
 const AUDIT_PAGE_ID = globalThis.crypto?.randomUUID?.()
   || [...globalThis.crypto.getRandomValues(new Uint8Array(16))]
     .map(value => value.toString(16).padStart(2, '0')).join('');
-window.__sesmanPageId = AUDIT_PAGE_ID;
+window.__agenthubPageId = AUDIT_PAGE_ID;
 
 let browserAuditQueue = [];
 let browserAuditTimer = 0;
@@ -149,8 +152,8 @@ async function flushBrowserAudit(useBeacon = false) {
     const response = await fetch(appUrl('api/audit/browser'), {
       method: 'POST', keepalive: true,
       headers: {
-        'Content-Type': 'application/json', 'X-Sesman-Page': AUDIT_PAGE_ID,
-        'X-Sesman-Build': BUILD_ID,
+        'Content-Type': 'application/json', 'X-AgentHub-Page': AUDIT_PAGE_ID,
+        'X-AgentHub-Build': BUILD_ID,
       },
       body: payload,
     });
@@ -270,7 +273,7 @@ function markStaleBuild(serverBuild = '') {
   document.body.classList.add('stale-build');
   const notice = el('div', 'version-stale');
   notice.setAttribute('role', 'alert');
-  notice.innerHTML = '<span>sesman 已更新。当前页面已停止发送，请重新加载。</span>';
+  notice.innerHTML = '<span>agenthub 已更新。当前页面已停止发送，请重新加载。</span>';
   const reload = el('button', 'btn', '重新加载');
   reload.type = 'button';
   reload.title = serverBuild ? `服务器版本 ${serverBuild}` : '加载新版本';
@@ -430,7 +433,7 @@ function queuedAfterTimestamp(uid) {
 function queuePendingUserMessage(uid, text, media = []) {
   text = String(text || '');
   if (!uid || !text.trim()) return null;
-  const cli = sesmanCli(uid);
+  const cli = agenthubCli(uid);
   if (!cli) return null;
   const created = Date.now();
   const item = cli.createQueuedMessage({
@@ -487,7 +490,7 @@ function acceptServerOutboxVersion(uid, version) {
 }
 
 function syncServerOutbox(uid, items, version = null, { retireMissing = false } = {}) {
-  if (!['claude', 'codex'].includes(sesmanCli(uid)?.source)
+  if (!['claude', 'codex'].includes(agenthubCli(uid)?.source)
       || !Array.isArray(items)) return false;
   if (staleServerOutbox(uid, version)) {
     browserAuditEvent('outbox.snapshot_rejected', {version, reason: 'stale'}, items, {uid});
@@ -592,7 +595,7 @@ async function retryClientQueuedMessage(uid, id) {
 function reconcileQueuedMessages(uid, messages) {
   const items = queuedMessages(uid).slice();
   if (!items.length) return false;
-  const cli = sesmanCli(uid);
+  const cli = agenthubCli(uid);
   if (!cli) return false;
   let changed = false;
   for (const message of messages || []) {
@@ -655,7 +658,7 @@ function reconcileQueuedMessages(uid, messages) {
  *  新输入。服务端已经确认旧输入后 outbox 会消失；若当前活动时间线出现了
  *  因果更晚的另一条 user/command，它不是“仍待确认”，而是已被新分支取代。 */
 function retireSupersededClaudeMessages(uid, ids, messages) {
-  if (sesmanCli(uid)?.source !== 'claude' || !ids?.size) return false;
+  if (agenthubCli(uid)?.source !== 'claude' || !ids?.size) return false;
   const laterInputs = (messages || []).filter(message =>
     ['user', 'command'].includes(message?.role)
     && Number.isFinite(Date.parse(message.ts || '')));
@@ -678,7 +681,7 @@ function expireQueuedMessages(now = Date.now()) {
   let changed = false;
   let selectedChanged = false;
   for (const [uid, current] of S.queued) {
-    const cli = sesmanCli(uid);
+    const cli = agenthubCli(uid);
     if (!cli || !Array.isArray(current)) continue;
     const hasNativeHistory = cache.has(viewKey(uid));
     const settled = current.map(item => cli.settleQueuedMessage(
@@ -767,8 +770,8 @@ async function fetchMessages(uid, opts = {}) {
   try {
     r = await fetch(appUrl(url), {
       signal: opts.signal,
-      headers: {'X-Sesman-Trace': traceId, 'X-Sesman-Page': AUDIT_PAGE_ID,
-        'X-Sesman-Build': BUILD_ID},
+      headers: {'X-AgentHub-Trace': traceId, 'X-AgentHub-Page': AUDIT_PAGE_ID,
+        'X-AgentHub-Build': BUILD_ID},
     });
   } catch (error) {
     browserAuditEvent('http.request.failed', {
@@ -787,7 +790,7 @@ async function fetchMessages(uid, opts = {}) {
   // Content-Length 仍可能是压缩后大小。优先用服务端给出的同口径长度；
   // 连到旧服务端时，压缩响应改显示不定进度，也不伪造一个较小的分母。
   const contentTotal = +r.headers.get('Content-Length') || 0;
-  const decodedTotal = +r.headers.get('X-Sesman-Decoded-Length') || 0;
+  const decodedTotal = +r.headers.get('X-AgentHub-Decoded-Length') || 0;
   const encoded = !!r.headers.get('Content-Encoding');
   const total = decodedTotal || (encoded ? 0 : contentTotal);
   const reader = r.body.getReader();
@@ -1243,7 +1246,7 @@ function watchSession(uid, agent = S.agent) {
   const es = new EventSource(appUrl('api/watch?' + p));
   _es = es;
   _esUid = uid;
-  es.__sesmanConnectionId = connectionId;
+  es.__agenthubConnectionId = connectionId;
   let received = 0;
   browserAuditEvent('sse.connecting', {start: e.end, agent: agent || ''}, null,
     {uid, connectionId});
@@ -1295,7 +1298,7 @@ function closeWatch() {
   clearTimeout(_esRetry);
   if (_es) {
     browserAuditEvent('sse.closed_by_page', {ready_state: _es.readyState}, null,
-      {uid: _esUid, connectionId: _es.__sesmanConnectionId || ''});
+      {uid: _esUid, connectionId: _es.__agenthubConnectionId || ''});
     _es.close(); _es = null; _esUid = null;
   }
 }
@@ -1476,7 +1479,7 @@ function showSessionCount(n) {
 
 const pendingUid = name => `tmux:${name}`;
 
-/** sesman 自己启动、但还没有对话文件的 tmux，也是一条可重新进入的临时会话。 */
+/** agenthub 自己启动、但还没有对话文件的 tmux，也是一条可重新进入的临时会话。 */
 function pendingTmuxSessions() {
   if (typeof T === 'undefined' || !Array.isArray(T.pending)) return [];
   return T.pending.flatMap(t => {
@@ -2406,7 +2409,7 @@ async function stopSession(m, button) {
 }
 
 async function del(m) {
-  if (!confirm(`删除会话「${m.title}」?\n\n文件会移入回收站 ~/.local/share/sesman/trash/, 不会真删。`)) return;
+  if (!confirm(`删除会话「${m.title}」?\n\n文件会移入回收站 ~/.local/share/agenthub/trash/, 不会真删。`)) return;
   closeWatch();                         // 先停 SSE，避免文件移走后 EventSource 自动重连 404
   const r = await fetch(appUrl('api/session/' + encodeURIComponent(m.uid)), { method: 'DELETE' });
   const d = await r.json();
@@ -2419,7 +2422,9 @@ async function del(m) {
   S.sel = null;
   store.set('sel', null);
   renderChips(); renderSide();
-  $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(d.trash)}</code></div>`;
+  $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(d.trash)}</code>`
+    + `<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>`;
+  $('#detail-open-trash').onclick = openTrash;
   showMobileList();
 }
 
@@ -3192,7 +3197,7 @@ function questionNode(m) {
           ${o.description ? `<small>${esc(o.description)}</small>` : ''}</div></${live ? 'button' : 'div'}>`).join('')}</div>` : ''}
     </section>`).join('');
   if (live) {
-    const cli = sesmanCli(m.uid);
+    const cli = agenthubCli(m.uid);
     const cliName = cli?.name || 'CLI';
     const waiting = promptState === 'waiting';
     const direct = waiting && rows.length === 1 && !rows[0].multiple
@@ -3306,7 +3311,7 @@ function renderQueuedMessages(uid = S.sel) {
   const box = $('#msgs');
   if (!box || S.agent || uid !== S.sel) return;
   for (const item of queuedMessages(uid)) {
-    const cli = sesmanCli(uid);
+    const cli = agenthubCli(uid);
     const queuedMessage = {role: 'user', text: item.text, media: item.media,
       counted: false, ts: item.created_iso || item.created_at || item.ts};
     const node = stampMessageTime(msgNode(queuedMessage), [queuedMessage]);
@@ -3389,7 +3394,7 @@ function renderConversationTail(activity, uid = S.sel) {
   // 冲突被丢弃；随后正文 reset 已把它放进完整缓存，但队尾重画过去只看
   // 增量，乐观副本便会永久残留。Claude 有本地副本时，每次画队尾都用
   // 已接受的完整缓存兜底对账一次。通常只有一条、几千项，且仅发送期间执行。
-  if (sesmanCli(uid)?.source === 'claude'
+  if (agenthubCli(uid)?.source === 'claude'
       && queuedMessages(uid).length && entry?.msgs?.length) {
     reconcileQueuedMessages(uid, entry.msgs);
   }
@@ -3438,7 +3443,7 @@ const clipText = t => t.length > CLIP ? t.slice(0, CLIP) + '\n… (点下方按�
 
 let syntaxLoading = false;
 function ensureSyntax() {
-  if (syntaxLoading || window.sesmanHighlight) return;
+  if (syntaxLoading || window.agenthubHighlight) return;
   syntaxLoading = true;
   const script = document.createElement('script');
   script.type = 'module';
@@ -3461,14 +3466,14 @@ function paintSyntax(root = document) {
     + '.tool-diff-line > code[data-code-path]:not([data-syntax-done])');
   const nodes = [...new Set([...blocks, ...summaries, ...tools, ...diffLines])];
   if (!nodes.length) return;
-  if (!window.sesmanHighlight) { ensureSyntax(); return; }
+  if (!window.agenthubHighlight) { ensureSyntax(); return; }
   for (const code of nodes) {
     code.dataset.syntaxDone = '1';
-    const result = code.matches('code.tool-command') && window.sesmanHighlightShellCommand
-      ? window.sesmanHighlightShellCommand(code.textContent)
-      : (code.matches('pre.tool-out') && window.sesmanHighlightSegments
-          ? window.sesmanHighlightSegments(code.textContent, code.dataset.codePath || '')
-          : window.sesmanHighlight(code.textContent, code.dataset.codeLang || '', code.dataset.codePath || ''));
+    const result = code.matches('code.tool-command') && window.agenthubHighlightShellCommand
+      ? window.agenthubHighlightShellCommand(code.textContent)
+      : (code.matches('pre.tool-out') && window.agenthubHighlightSegments
+          ? window.agenthubHighlightSegments(code.textContent, code.dataset.codePath || '')
+          : window.agenthubHighlight(code.textContent, code.dataset.codeLang || '', code.dataset.codePath || ''));
     if (!result?.html) continue;
     code.innerHTML = result.html;
     code.classList.add('hljs');
@@ -3484,7 +3489,7 @@ function paintSyntax(root = document) {
   }
 }
 
-addEventListener('sesman-highlight-ready', () => paintSyntax(document));
+addEventListener('agenthub-highlight-ready', () => paintSyntax(document));
 
 // 轻量 markdown: 代码块 / 表格 / 列表 / 引用 / 标题 / 行内标记
 function md(text, full, media = []) {
@@ -3823,6 +3828,134 @@ function renderOpts() {
 
 $('#reload').onclick = () => { S.results = null; loadSessions(true); };
 
+/* ---------- 回收站 ---------- */
+// 删除只是把会话文件移进 ~/.local/share/agenthub/trash/，这里是它唯一的出口：
+// 看还剩什么、放回原处、或者真的删掉。
+let trashItems = [];
+let trashBusy = false;
+
+function openTrash() {
+  const dlg = $('#trash-dialog');
+  if (!dlg.open) dlg.showModal();
+  loadTrash();
+}
+
+async function loadTrash({ keepNote = false } = {}) {
+  if (!keepNote) setTrashNote('');   // 刷新列表不能把刚做完那件事的回执抹掉
+  $('#trash-list').innerHTML = '<div class="trash-empty">正在读取回收站…</div>';
+  try {
+    const r = await fetch(appUrl('api/trash'));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    trashItems = Array.isArray(d.items) ? d.items : [];
+    renderTrash(d);
+  } catch (e) {
+    trashItems = [];
+    $('#trash-list').innerHTML = '<div class="trash-empty">读取失败</div>';
+    setTrashNote('读取回收站失败: ' + e.message, true);
+  }
+}
+
+function renderTrash(info) {
+  const dir = info?.dir || '';
+  $('#trash-sub').textContent = trashItems.length
+    ? `${trashItems.length} 个已删除会话 · 共 ${fmtSize(info?.size || 0)} · ${dir}`
+    : `回收站是空的 · ${dir}`;
+  $('#trash-purge-all').disabled = !trashItems.length;
+  $('#trash-list').innerHTML = trashItems.length
+    ? trashItems.map(trashRow).join('')
+    : '<div class="trash-empty">没有已删除的会话</div>';
+}
+
+function trashRow(it) {
+  const badge = SOURCES[it.source] ? icon(it.source) : '';
+  const where = it.restorable
+    ? `<div class="trash-origin" title="${esc(it.origin)}">恢复到 ${esc(shortCwd(it.origin, 200))}</div>`
+    : `<div class="trash-origin warn">${esc(it.reason || '无法恢复')}</div>`;
+  return `<div class="trash-item" data-id="${esc(it.id)}">
+    <div class="trash-main">
+      <div class="trash-title">${badge}<span>${esc(it.title)}</span></div>
+      <div class="trash-meta">
+        <span>${esc(fmtTime(it.deleted_at))} 删除</span>
+        <span>${fmtSize(it.size)}</span>
+        <span class="trash-cwd" title="${esc(it.cwd)}">${esc(shortCwd(it.cwd || '(未知)', 34))}</span>
+      </div>
+      ${where}
+    </div>
+    <div class="trash-acts">
+      <button type="button" class="btn" data-act="restore"${it.restorable ? '' : ' disabled'}>恢复</button>
+      <button type="button" class="btn danger" data-act="purge">彻底删除</button>
+    </div>
+  </div>`;
+}
+
+function setTrashNote(text, isError = false) {
+  const box = $('#trash-note');
+  box.textContent = text || '';
+  box.classList.toggle('err', !!text && isError);
+}
+
+async function trashPost(path, body, btn) {
+  trashBusy = true;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(appUrl(path), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { setTrashNote(d.error || `请求失败: ${r.status}`, true); return null; }
+    return d;
+  } catch (e) {
+    setTrashNote('请求失败: ' + e.message, true);
+    return null;
+  } finally {
+    trashBusy = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+$('#trash-list').onclick = async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn || trashBusy) return;
+  const id = btn.closest('.trash-item')?.dataset.id;
+  const item = trashItems.find(x => x.id === id);
+  if (!item) return;
+  if (btn.dataset.act === 'restore') {
+    const d = await trashPost('api/trash/restore', { id: item.id }, btn);
+    if (!d) return;
+    setTrashNote(`已恢复「${item.title}」到 ${d.path}`);
+    await loadTrash({ keepNote: true });
+    S.results = null;
+    await loadSessions(true);       // 恢复的会话立即回到左侧列表
+    return;
+  }
+  if (!confirm(`彻底删除「${item.title}」?\n\n文件将从磁盘移除, 不可恢复。`)) return;
+  const d = await trashPost('api/trash/purge', { id: item.id }, btn);
+  if (!d) return;
+  setTrashNote(`已彻底删除「${item.title}」, 释放 ${fmtSize(d.freed || 0)}`);
+  await loadTrash({ keepNote: true });
+};
+
+async function purgeAllTrash() {
+  if (!trashItems.length || trashBusy) return;
+  if (!confirm(`清空回收站?\n\n将从磁盘彻底删除 ${trashItems.length} 个会话, 不可恢复。`)) return;
+  const d = await trashPost('api/trash/purge', { all: true }, $('#trash-purge-all'));
+  if (!d) return;
+  const failed = (d.errors || []).length;
+  setTrashNote(`已彻底删除 ${d.removed || 0} 个会话, 释放 ${fmtSize(d.freed || 0)}`
+    + (failed ? `; ${failed} 个失败: ${d.errors[0]}` : ''), !!failed);
+  await loadTrash({ keepNote: true });
+}
+
+$('#trash').onclick = openTrash;
+$('#trash-reload').onclick = () => loadTrash();
+$('#trash-purge-all').onclick = purgeAllTrash;
+$('#trash-close').onclick = $('#trash-done').onclick = () => $('#trash-dialog').close();
+$('#trash-dialog').addEventListener('click', e => {
+  if (e.target === $('#trash-dialog')) $('#trash-dialog').close();
+});
+
 function openSettings() {
   $('#setting-font').value = store.get('font', 'ubuntu');
   $('#setting-theme').value = store.get('theme', 'system');
@@ -3852,8 +3985,19 @@ setSideCollapsed(store.get('sideCollapsed', false), false);
 renderOpts();
 renderView();
 pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
+function uidOfDeepLink(spec) {
+  if (!spec) return null;
+  const cut = spec.indexOf(':');
+  const source = cut > 0 ? spec.slice(0, cut) : null;
+  const sid = cut > 0 ? spec.slice(cut + 1) : spec;
+  const hit = S.sessions.find(s => s.sid === sid && (!source || s.source === source))
+    || S.sessions.find(s => s.uid === spec);
+  return hit ? hit.uid : null;
+}
 loadSessions(false).then(ok => {
   if (!ok) return;
+  const deep = uidOfDeepLink(DEEP_SID);
+  if (deep) { openSession(deep); return; }   // 深链优先于上次浏览位置
   const last = store.get('sel', null);       // 恢复上次看的会话
   const savedAgent = store.get('agent', null);
   const restoreDetail = !MOBILE.matches || store.get('mobilePage', 'list') === 'detail';

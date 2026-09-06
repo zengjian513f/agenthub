@@ -1,0 +1,14 @@
+[Unit]
+Description=AgentHub session manager
+Wants=network-online.target agenthub-tmux.service
+After=network-online.target agenthub-tmux.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/Projects/agenthub
+ExecStart=/usr/bin/python3 -u -m agenthub.server --host 0.0.0.0 --port 8710 --allow 192.0.2.134,10.0.0.1 --terminal
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

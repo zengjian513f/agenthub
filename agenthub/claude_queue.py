@@ -20,7 +20,7 @@ from pathlib import Path
 from . import audit, send_audit
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 QUEUE_FILE = DATA_DIR / "claude-send-queue.json"
 VERSION = 1
 TOMBSTONE_SECONDS = 7 * 24 * 60 * 60

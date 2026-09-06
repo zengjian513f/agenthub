@@ -12,7 +12,7 @@ from pathlib import Path
 from . import audit
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 LOG_FILE = DATA_DIR / "send-events.jsonl"
 MAX_BYTES = 16 * 1024 * 1024
 _lock = threading.Lock()

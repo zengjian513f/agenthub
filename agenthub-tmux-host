@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Adopt an already-running AgentHub tmux socket during a live deployment.
+# When that server exits, systemd restarts this helper and launches a new one.
+set -euo pipefail
+
+TMUX_BIN=/usr/bin/tmux
+SERVER=agenthub
+CONF=/home/user/Projects/agenthub/agenthub/tmux.conf
+
+if server_pid=$("$TMUX_BIN" -L "$SERVER" display-message -p '#{pid}' 2>/dev/null); then
+  exec /usr/bin/tail --pid="$server_pid" -f /dev/null
+fi
+
+exec /home/user/.local/bin/with-zshrc "$TMUX_BIN" -D -L "$SERVER" -f "$CONF"

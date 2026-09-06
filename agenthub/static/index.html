@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
-<meta name="sesman-build" content="__SESMAN_ASSET_VERSION__">
-<title>__SESMAN_HOSTNAME__ · 会话管理</title>
+<meta name="agenthub-build" content="__AGENTHUB_ASSET_VERSION__">
+<title>__AGENTHUB_HOSTNAME__ · 会话管理</title>
 <script>
   // 在样式表加载前确定明暗，避免刷新时先闪出另一套颜色。
   (() => {
     let choice = 'system';
-    try { choice = JSON.parse(localStorage.getItem('sesman.theme')) || 'system'; } catch {}
+    try { choice = JSON.parse(localStorage.getItem('agenthub.theme')) || 'system'; } catch {}
     document.documentElement.dataset.theme = choice === 'system'
       ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : choice;
   })();
@@ -17,7 +17,7 @@
 <link rel="stylesheet" href="vendor/xterm.css">
 <link rel="stylesheet" href="vendor/katex/katex.min.css">
 <link rel="preload" href="fonts/UbuntuSansMono.ttf" as="font" type="font/ttf" crossorigin>
-<link rel="stylesheet" href="style.css?v=__SESMAN_ASSET_VERSION__">
+<link rel="stylesheet" href="style.css?v=__AGENTHUB_ASSET_VERSION__">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🗂</text></svg>">
 </head>
 <body>
@@ -77,7 +77,7 @@
 
 <div id="app">
   <header>
-    <div class="brand"><span class="brand-name" title="__SESMAN_HOSTNAME__">__SESMAN_HOSTNAME__</span><small id="stat">加载中…</small><button type="button" id="livecount" class="livecount" aria-pressed="false"></button></div>
+    <div class="brand"><span class="brand-name" title="__AGENTHUB_HOSTNAME__">__AGENTHUB_HOSTNAME__</span><small id="stat">加载中…</small><button type="button" id="livecount" class="livecount" aria-pressed="false"></button></div>
     <button class="btn" id="side-toggle" title="收起会话列表" aria-label="收起会话列表" aria-expanded="true">
       <svg class="ui-icon" aria-hidden="true"><use href="#i-sidebar"/></svg>
     </button>
@@ -92,6 +92,9 @@
       </button>
       <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">
         <svg class="ui-icon" aria-hidden="true"><use href="#i-refresh"/></svg>
+      </button>
+      <button class="btn" id="trash" title="回收站" aria-label="回收站">
+        <svg class="ui-icon" aria-hidden="true"><use href="#i-trash"/></svg>
       </button>
       <button class="btn" id="report-bug" data-report-bug
         title="报告问题" aria-label="报告问题">
@@ -229,6 +232,21 @@
     </div>
   </form>
 </dialog>
+<dialog id="trash-dialog" class="app-dialog" aria-labelledby="trash-title">
+  <div class="trash-panel">
+    <div class="modal-head">
+      <div><h2 id="trash-title">回收站</h2><p id="trash-sub">删除的会话文件保留在磁盘上，可以恢复或彻底清除</p></div>
+      <button type="button" class="modal-close" id="trash-close" title="关闭" aria-label="关闭">×</button>
+    </div>
+    <div id="trash-note" role="status" aria-live="polite"></div>
+    <div id="trash-list" class="trash-list"><div class="trash-empty">正在读取回收站…</div></div>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="trash-reload">刷新</button>
+      <button type="button" class="btn danger" id="trash-purge-all">清空回收站</button>
+      <button type="button" class="btn go" id="trash-done">完成</button>
+    </div>
+  </div>
+</dialog>
 <dialog id="settings-dialog" class="app-dialog" aria-labelledby="settings-title">
   <form method="dialog" class="settings-form">
     <div class="modal-head">
@@ -268,13 +286,13 @@
 </dialog>
 <div id="bug-report-toast" class="bug-report-toast hidden" role="status" aria-live="polite"></div>
 <!-- 列表是首屏核心，必须先执行；终端和公式库较大，延后加载且不能阻塞扫描。 -->
-<script defer src="cli.js?v=__SESMAN_ASSET_VERSION__"></script>
-<script defer src="app.js?v=__SESMAN_ASSET_VERSION__"></script>
+<script defer src="cli.js?v=__AGENTHUB_ASSET_VERSION__"></script>
+<script defer src="app.js?v=__AGENTHUB_ASSET_VERSION__"></script>
 <script defer src="vendor/xterm.js"></script>
 <script defer src="vendor/addon-fit.js"></script>
 <script defer src="vendor/addon-unicode11.js"></script>
 <script defer src="vendor/addon-webgl.js"></script>
-<script defer src="term.js?v=__SESMAN_ASSET_VERSION__"></script>
+<script defer src="term.js?v=__AGENTHUB_ASSET_VERSION__"></script>
 <script defer src="vendor/katex/katex.min.js"></script>
 <script defer src="vendor/katex/auto-render.min.js" onload="refreshFormulae()"></script>
 </body>

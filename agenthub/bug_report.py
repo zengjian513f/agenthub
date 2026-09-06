@@ -15,7 +15,7 @@ from . import audit, index, pending as pending_store, send_protocol, term
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPORT_ROOT = Path.home() / ".local" / "share" / "sesman" / "bug-reports"
+REPORT_ROOT = Path.home() / ".local" / "share" / "agenthub" / "bug-reports"
 EVENT_WINDOW_SECONDS = 15 * 60
 _manifest_lock = threading.Lock()
 
@@ -50,7 +50,7 @@ def _report_id() -> str:
 
 def worker_prompt(report_id: str, report_dir: Path, uid: str,
                   description: str) -> str:
-    return f"""处理 sesman 缺陷报告 {report_id}
+    return f"""处理 agenthub 缺陷报告 {report_id}
 
 用户描述：
 {description.strip()}
@@ -233,7 +233,7 @@ def launch(report: dict, cols: int = 120, rows: int = 36) -> dict:
     )
     thread = threading.Thread(
         target=_inject_worker, args=(report, info), daemon=True,
-        name=f"sesman-{report['report_id']}")
+        name=f"agenthub-{report['report_id']}")
     thread.start()
     return {**info, "report_id": report["report_id"],
             "title": record["title"], "kind": "bug-report"}

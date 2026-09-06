@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import adapters, claude_queue, send_audit, server
+from agenthub import adapters, claude_queue, send_audit, server
 
 
 class ClaudeQueueTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class ClaudeQueueTests(unittest.TestCase):
 
     def enqueue(self, text="消息", item_id="req-1"):
         return claude_queue.enqueue(
-            "claude:u", "sesman-claude-u", text, [], item_id,
+            "claude:u", "agenthub-claude-u", text, [], item_id,
             {"start": 100, "head": "head", "anchor": "anchor"})
 
     def accepted_ts(self, row=None):
@@ -203,7 +203,7 @@ class ClaudeQueueTests(unittest.TestCase):
     def test_restart_recovers_persisted_row_once_before_terminal_touch(self):
         self.enqueue("重启恢复")
         session = {"uid": "claude:u", "source": "claude", "sid": "u"}
-        pane = {"name": "sesman-claude-u"}
+        pane = {"name": "agenthub-claude-u"}
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
@@ -218,7 +218,7 @@ class ClaudeQueueTests(unittest.TestCase):
 
     def test_server_queue_injects_once_for_repeated_http_request(self):
         session = {"uid": "claude:u", "source": "claude", "sid": "u"}
-        pane = {"name": "sesman-claude-u"}
+        pane = {"name": "agenthub-claude-u"}
         handler = object.__new__(server.Handler)
         handler._json = lambda payload, status=200: {**payload, "_status": status}
         body = {
@@ -268,7 +268,7 @@ class ClaudeQueueTests(unittest.TestCase):
 
     def test_server_rejects_claude_send_before_persisting_over_restored_draft(self):
         session = {"uid": "claude:u", "source": "claude", "sid": "u"}
-        pane = {"name": "sesman-claude-u"}
+        pane = {"name": "agenthub-claude-u"}
         rule = "─" * 60
         screen = f"{rule}\n\x1b[39m❯\xa0被 ESC 回填的旧消息\n{rule}\n  ⏵⏵ auto mode on"
         cursor = (24, 1)
@@ -296,7 +296,7 @@ class ClaudeQueueTests(unittest.TestCase):
 
     def test_confirmed_claude_draft_is_cleared_and_verified_before_submit(self):
         session = {"uid": "claude:u", "source": "claude", "sid": "u"}
-        pane = {"name": "sesman-claude-u"}
+        pane = {"name": "agenthub-claude-u"}
         rule = "─" * 60
         draft = f"{rule}\n\x1b[39m❯\xa0旧草稿\n{rule}\n  ⏵⏵ auto mode on"
         empty = f"{rule}\n\x1b[39m❯\xa0\n{rule}\n  Press Ctrl-C again to exit"
@@ -337,7 +337,7 @@ class ClaudeQueueTests(unittest.TestCase):
         claude_queue.mark_injecting("same-request", "claude:u")
         claude_queue.mark_submitted("same-request", "claude:u")
         session = {"uid": "claude:u", "source": "claude", "sid": "u"}
-        pane = {"name": "sesman-claude-u"}
+        pane = {"name": "agenthub-claude-u"}
         handler = object.__new__(server.Handler)
         handler._json = lambda payload, status=200: {**payload, "_status": status}
         driver = server.send_protocol.driver_for("claude")

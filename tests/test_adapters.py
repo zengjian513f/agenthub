@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import adapters, index as session_index, session_meta
+from agenthub import adapters, index as session_index, session_meta
 
 
 class CodexEventTests(unittest.TestCase):

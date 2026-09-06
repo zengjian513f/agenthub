@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sesman import media
+from agenthub import media
 
 
 class MediaDiscoveryTests(unittest.TestCase):
