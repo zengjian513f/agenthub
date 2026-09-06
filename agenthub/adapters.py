@@ -545,7 +545,8 @@ def _strip_grok_user_query(text: str) -> str:
     return re.sub(r"\r?\n$", "", body, count=1)
 
 
-def _is_codex_protocol_injection(role: str, text: str) -> bool:
+def _is_codex_protocol_injection(role: str, text: str,
+                                 native_meta: dict | None = None) -> bool:
     """Codex 重建提示词时写入 rollout 的指令，不是时间线对话。
 
     compact 后这些记录会重新出现；判断不能依赖同时读到 compact 边界，
@@ -553,7 +554,12 @@ def _is_codex_protocol_injection(role: str, text: str) -> bool:
     """
     if role == "developer":
         return True
-    return role == "user" and _is_timeline_protocol(text)
+    if role != "user":
+        return False
+    kinds = (native_meta or {}).get("content_item_kinds")
+    if isinstance(kinds, list) and "goal.internal_context" in kinds:
+        return True
+    return _is_timeline_protocol(text)
 
 
 def _notification_tag(text: str, name: str) -> str:
@@ -1503,7 +1509,11 @@ class CodexAdapter:
                     and p.get("type") == "message" and p.get("role") == "user":
                 txt = "\n".join(x["text"] for x in _flatten_content(p.get("content"))
                                   if x["kind"] == "text")
-                if txt.strip() and not _is_injected(txt):
+                native_meta = p.get("internal_chat_message_metadata_passthrough")
+                if not isinstance(native_meta, dict):
+                    native_meta = {}
+                if (txt.strip() and not _is_injected(txt)
+                        and not _is_codex_protocol_injection("user", txt, native_meta)):
                     first_user = txt
         thread_source = str(meta.get("thread_source") or "")
         source_meta = meta.get("source")
@@ -1722,7 +1732,7 @@ class CodexAdapter:
                     continue
                 if native_role == "user":
                     txt = _strip_codex_abort_prefix(txt)
-                if _is_codex_protocol_injection(native_role, txt):
+                if _is_codex_protocol_injection(native_role, txt, native_meta):
                     continue
                 if txt.strip() or images:
                     shown = txt or "[图片]"

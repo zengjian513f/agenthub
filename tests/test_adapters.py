@@ -255,6 +255,75 @@ class CodexEventTests(unittest.TestCase):
             ("user", "压缩后的真实问题"),
         ])
 
+    def test_goal_internal_context_is_hidden_for_full_and_incremental_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            goal_text = (
+                '<codex_internal_context source="goal">\n'
+                "Continue working toward the active thread goal.\n"
+                "</codex_internal_context>"
+            )
+            goal_meta = {"internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-goal",
+                "content_item_kinds": ["goal.internal_context"],
+            }}
+            rows = [
+                {"timestamp": "2026-09-06T13:20:00Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user", **goal_meta,
+                             "content": [{"type": "input_text", "text": goal_text}]}},
+                {"timestamp": "2026-09-06T13:20:01Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "assistant",
+                             "content": [{"type": "output_text", "text": "继续工作"}]}},
+                {"timestamp": "2026-09-06T13:20:02Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text":
+                                          "请解释标签 " + goal_text}]}},
+            ]
+            lines = [json.dumps(row, ensure_ascii=False) + "\n" for row in rows]
+            rollout.write_text("".join(lines))
+            incremental_start = len(lines[0].encode())
+            adapter = adapters.CodexAdapter()
+            full, _ = adapter.read(str(rollout))
+            incremental, _ = adapter.read(str(rollout), start=incremental_start)
+
+        expected = [
+            ("assistant", "继续工作"),
+            ("user", "请解释标签 " + goal_text),
+        ]
+        self.assertEqual([(m["role"], m["text"]) for m in full], expected)
+        self.assertEqual([(m["role"], m["text"]) for m in incremental], expected)
+
+    def test_goal_internal_context_is_not_used_as_session_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            rollout = root / "2026" / "09" / "06" / "rollout-test.jsonl"
+            rollout.parent.mkdir(parents=True)
+            sid = "00000000-0000-0000-0000-000000000006"
+            rows = [
+                {"timestamp": "2026-09-06T13:20:00Z", "type": "session_meta",
+                 "payload": {"session_id": sid, "cwd": "/tmp/project"}},
+                {"timestamp": "2026-09-06T13:20:01Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user",
+                             "internal_chat_message_metadata_passthrough": {
+                                 "content_item_kinds": ["goal.internal_context"],
+                             },
+                             "content": [{"type": "input_text", "text":
+                                          "内部续跑上下文"}]}},
+                {"timestamp": "2026-09-06T13:20:02Z", "type": "response_item",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": "真实问题"}]}},
+            ]
+            rollout.write_text("\n".join(
+                json.dumps(row, ensure_ascii=False) for row in rows) + "\n")
+            session_index = Path(tmp) / "session_index.jsonl"
+            session_index.write_text("")
+
+            with patch.object(adapters, "CODEX_ROOT", root), \
+                    patch.object(adapters, "CODEX_INDEX", session_index):
+                session = adapters.CodexAdapter().list_sessions()[0]
+
+        self.assertEqual(session["title"], "真实问题")
+
 
 class GrokAdapterTests(unittest.TestCase):
     def test_user_query_wrapper_is_removed_without_hiding_reasoning(self):
