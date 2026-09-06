@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# AgentHub 改名期的兼容 symlink 清理器。
+#
+# 改名时仍在跑的 Claude/Codex/tmux 进程把旧的绝对路径固化在了自己的 argv 和
+# 环境变量里 (hook 脚本、--settings、tmux -f、$TMUX)。这些路径只能等进程自己
+# 结束才安全删除，所以迁移时留下一组 symlink，由本脚本定时检查、确认无人引用
+# 之后再删除，并关掉自己的 timer。
+set -uo pipefail
+
+legacy_name=ses
+legacy_name+=man
+
+LEGACY_LINKS=(
+  "$HOME/Projects/$legacy_name"
+  "$HOME/Projects/agenthub/$legacy_name"
+  "$HOME/.local/share/$legacy_name"
+  "$HOME/.cache/$legacy_name"
+  "/tmp/tmux-$(id -u)/$legacy_name"
+)
+# argv / environ 里出现这些片段, 就说明还有进程依赖旧路径。
+NEEDLES=(
+  "Projects/$legacy_name"
+  "share/$legacy_name"
+  "cache/$legacy_name"
+  "tmux-$(id -u)/$legacy_name"
+)
+
+holders() {
+  local pid comm blob needle
+  for pid in /proc/[0-9]*; do
+    [ -r "$pid/cmdline" ] || continue
+    blob=$(cat "$pid/cmdline" "$pid/environ" 2>/dev/null | tr '\0' '\n')
+    for needle in "${NEEDLES[@]}"; do
+      case "$blob" in
+        *"$needle"*)
+          comm=$(cat "$pid/comm" 2>/dev/null)
+          echo "${pid#/proc/} $comm"
+          break
+          ;;
+      esac
+    done
+  done
+}
+
+remaining=$(holders)
+if [ -n "$remaining" ]; then
+  echo "[agenthub-legacy-paths] 仍有进程引用旧路径, 保留兼容 symlink:"
+  echo "$remaining" | sed 's/^/  /'
+  exit 0
+fi
+
+echo "[agenthub-legacy-paths] 已无进程引用旧路径, 删除兼容 symlink"
+for link in "${LEGACY_LINKS[@]}"; do
+  if [ -L "$link" ]; then
+    unlink "$link" && echo "  removed $link"
+  elif [ -e "$link" ]; then
+    echo "  跳过 $link (不是 symlink, 需要人工确认)"
+  fi
+done
+
+systemctl --user disable --now --no-block agenthub-legacy-paths.timer 2>/dev/null || true
+echo "[agenthub-legacy-paths] 清理完成, timer 已关闭"

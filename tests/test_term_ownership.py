@@ -2,7 +2,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from sesman import term_ownership
+from agenthub import term_ownership
 
 
 class FakeConnection:

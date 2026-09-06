@@ -1,4 +1,4 @@
-"""sesman 自有的会话元数据，不修改任何 CLI 的原生会话文件。"""
+"""agenthub 自有的会话元数据，不修改任何 CLI 的原生会话文件。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 META_FILE = DATA_DIR / "session-meta.json"
 VERSION = 1
 _lock = threading.RLock()
@@ -167,7 +167,7 @@ def pending_timeline_rewind(uid: str) -> dict | None:
 
 
 def finish_timeline_rewind(uid: str, tip: str) -> dict:
-    """把终端已经确认的 Claude 叶子保存为 sesman 的显示时间线。"""
+    """把终端已经确认的 Claude 叶子保存为 agenthub 的显示时间线。"""
     uid = str(uid or "").strip()
     tip = str(tip or "").strip()
     if not uid or not tip:
@@ -229,7 +229,7 @@ def signature() -> str:
 
 
 def set_starred(uid: str, starred: bool) -> dict:
-    """设置收藏状态，返回该会话当前的 sesman 元数据。"""
+    """设置收藏状态，返回该会话当前的 agenthub 元数据。"""
     uid = str(uid or "").strip()
     if not uid:
         raise ValueError("缺少会话 uid")

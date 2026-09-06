@@ -1,4 +1,4 @@
-"""Claude Code 交互态到 sesman 的窄桥接。
+"""Claude Code 交互态到 agenthub 的窄桥接。
 
 Claude 恢复会话时，AskUserQuestion 对话框可能已经显示在 TUI 中，但对应
 tool_use 要等用户回答后才追加到 transcript。这里用 Claude Code 官方 hook
@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 PROMPT_DIR = DATA_DIR / "claude-prompts"
 SETTINGS_FILE = DATA_DIR / "claude-bridge-settings.json"
 VERSION = 1
@@ -161,7 +161,7 @@ def _atomic_json(path: Path, value: dict) -> None:
 
 
 def settings_path() -> str:
-    """生成仅供 sesman 启动的 Claude 进程使用的附加 hook 配置。"""
+    """生成仅供 agenthub 启动的 Claude 进程使用的附加 hook 配置。"""
     script = str(Path(__file__).resolve())
     command = {"type": "command", "command": sys.executable, "args": [script]}
     settings = {
@@ -306,7 +306,7 @@ def main() -> int:
         if isinstance(value, dict):
             handle(value)
     except Exception:
-        # 桥接失败绝不能影响 Claude 的工具调用；诊断由 sesman 测试覆盖，
+        # 桥接失败绝不能影响 Claude 的工具调用；诊断由 agenthub 测试覆盖，
         # 运行时保持无输出并让 Claude 正常继续。
         pass
     return 0

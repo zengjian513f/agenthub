@@ -19,15 +19,15 @@ from pathlib import Path
 from .adapters import ADAPTERS, ClaudeAdapter
 from . import audit, media, session_meta
 
-CACHE_DIR = Path.home() / ".cache" / "sesman"
+CACHE_DIR = Path.home() / ".cache" / "agenthub"
 CACHE_FILE = CACHE_DIR / "index.json"
 CACHE_VERSION = 5
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
-WINDOW_CACHE_VERSION = 7
-MESSAGE_CURSOR_VERSION = 7
+WINDOW_CACHE_VERSION = 8
+MESSAGE_CURSOR_VERSION = 8
 WINDOW_CACHE_MIN_BYTES = 8 * 1024 * 1024
 WINDOW_CACHE_MEMORY_ITEMS = 16
-TRASH_DIR = Path.home() / ".local" / "share" / "sesman" / "trash"
+TRASH_DIR = Path.home() / ".local" / "share" / "agenthub" / "trash"
 CHECK_TTL = 0.5       # 高频热路径复用已发布快照；列表轮询仍会及时发现磁盘变化
 
 _lock = threading.Lock()
@@ -375,7 +375,7 @@ def load(force: bool = False) -> list[dict]:
             if _state["initialized"]:
                 _publish(_state["raw"], _state["sessions"], _state["files"],
                          _state["sig"], _state["built_at"], time.monotonic(), True)
-                print(f"[sesman] 索引增量刷新失败，稍后重试: {e}")
+                print(f"[agenthub] 索引增量刷新失败，稍后重试: {e}")
                 return _state["sessions"]
             raise
 
@@ -387,7 +387,7 @@ def load(force: bool = False) -> list[dict]:
         if not dirty:
             _write_cache(raw, sessions, files, sig, built_at)
         if full:
-            print(f"[sesman] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")
+            print(f"[agenthub] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")
         return _state["sessions"]
 
 
@@ -422,7 +422,7 @@ def data_file(s: dict) -> Path:
 
 
 def _claude_effective_tip(s: dict, pos: int | None = None) -> str | None:
-    """合并 Claude 磁盘树与 sesman 从原生 TUI 确认的未落盘回滚。"""
+    """合并 Claude 磁盘树与 agenthub 从原生 TUI 确认的未落盘回滚。"""
     ad = ADAPTERS.get(s.get("source"))
     if not isinstance(ad, ClaudeAdapter):
         return None
@@ -951,7 +951,7 @@ def delete(uid: str) -> str:
             # 成 500。先从公开快照移除目标，保留 dirty 让下一轮恢复 Codex
             # 隐藏祖先等拓扑；源文件不会因用户重试而进一步受损。
             sessions = [row for row in _state["sessions"] if row.get("uid") != uid]
-            print(f"[sesman] 删除后的索引协调失败，稍后重试: {e}")
+            print(f"[agenthub] 删除后的索引协调失败，稍后重试: {e}")
         # 不用移动后的新 inventory 给尚未协调的其他变化背书；下一次 load
         # 会从旧 files 做完整 diff。Codex 叶子删除后这里已能立即恢复父项。
         _publish(raw, sessions, _state["files"], None, time.time(), 0.0, True)

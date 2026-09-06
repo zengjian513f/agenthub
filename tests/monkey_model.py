@@ -1,6 +1,6 @@
 """Pure state model and independent oracles for the paid dual-CLI monkey.
 
-Nothing in this module starts Claude, Codex, tmux, a browser, or sesman.  The
+Nothing in this module starts Claude, Codex, tmux, a browser, or agenthub.  The
 real harness imports it, while normal unit tests use the exact same scheduler
 and invariants for free.  In particular, terminal classification deliberately
 does not import ``claude_bridge`` or ``codex_bridge``: a production classifier
@@ -46,7 +46,7 @@ def terminal_has(value: str, marker: str) -> bool:
 
 
 def canonical_text(source: str, value: str) -> str:
-    """Mirror only the CLI's input contract, not sesman's implementation."""
+    """Mirror only the CLI's input contract, not agenthub's implementation."""
     text = str(value or "")
     return text.strip() if source in {"claude", "codex"} else text
 

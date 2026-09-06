@@ -1,4 +1,4 @@
-"""Keep paid monkey sessions out of ordinary sesman views.
+"""Keep paid monkey sessions out of ordinary agenthub views.
 
 The registry is process-independent: a monkey writes its root before starting
 any CLI, while the already-running server reloads the small file by mtime.
@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 REGISTRY_FILE = DATA_DIR / "debug-runs.json"
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _lock = threading.RLock()

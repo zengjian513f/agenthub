@@ -10,6 +10,6 @@ __pycache__/
 *~
 
 # Composer uploads are runtime data, including the pre-rename legacy spelling.
-.sesman_attachments/
-.sesman_attachements/
-sesman_attachments/
+.agenthub_attachments/
+.agenthub_attachements/
+agenthub_attachments/

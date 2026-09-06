@@ -1,4 +1,4 @@
-# sesman
+# agenthub
 
 Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务。后端只用 Python 标准库；前端为原生 JS，KaTeX 与 xterm.js 静态内置，无在线依赖和构建步骤。
 
@@ -27,7 +27,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 ## 界面
 
 - **左栏**：两种视图 —— 📁 项目树（按 cwd 分组）/ 🕒 时间轴（按日期倒排，每条单独一行显示所在目录）。分组可折叠，折叠状态存 localStorage。家目录缩写成 `~`，过长的路径中间省略（`/a/b/…/y/z`）——不能用 `direction: rtl` 截左边，bidi 会把开头的 `/` 挪到末尾。
-- **会话星标**：列表项与详情标题共用一个星标开关；星标会话在当前项目/日期分组内靠前。状态写入权限为 `0600` 的 `~/.local/share/sesman/session-meta.json`，不修改 Claude/Codex/Grok 原始记录，换浏览器或重启服务后仍保留，并会同步到其他打开的页面。
+- **会话星标**：列表项与详情标题共用一个星标开关；星标会话在当前项目/日期分组内靠前。状态写入权限为 `0600` 的 `~/.local/share/agenthub/session-meta.json`，不修改 Claude/Codex/Grok 原始记录，换浏览器或重启服务后仍保留，并会同步到其他打开的页面。
 - **来源筛选**：顶栏三个 chip，各带图标与数量，点击开关。
 - **搜索**：输入即按标题/路径过滤；按 `Enter` 对全部会话中解析后的用户、助手和思考正文做全文搜索，结果带命中次数和上下文片段。工具协议、系统注入、compact/记忆上下文和原始 JSON 包装不参与匹配，避免出现会话正文中看不到的大量假命中。快捷键 `/` 聚焦搜索框。
 - **搜索选项**（搜索框内三个开关，状态记在 localStorage）：`Aa` 大小写敏感、`ab|` 全词匹配、`.*` 正则表达式。前端过滤、后端搜索、正文高亮共用同一套匹配规则。
@@ -52,13 +52,13 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 - **状态与询问**：直接解析 Codex `task_started/task_complete/turn_aborted` 和 Claude 回合事件，在消息流底部显示临时 `Working…`、「等待回答」、「已中断」或失败状态，完成后自动移除，不计入消息数或历史正文。`Working…` 还会与当前 CLI 进程的启动时间交叉校验，resume 后停在输入提示符的新进程不会继承旧回合状态。Claude `AskUserQuestion` 和 Codex `request_user_input` 按问题、选项和说明排成专用气泡，回答按用户消息显示；全程读取结构化 JSONL，不做 OCR。
 - **手机适配**：720px 以下改为“会话列表 → 会话详情”的单栏导航，不再硬挤左右栏，并记住当前在列表还是详情，刷新后原页恢复。详情使用紧凑返回键，消息数放在标题栏右侧，运行状态改为终端图标左上角的绿/蓝点；标题栏不设三点菜单，只保留直接操作图标，次要元信息默认省略。状态、来源、视图与刷新压在同一行，极窄屏只省略来源数量；输入框使用短提示词，手机 Enter 只换行、点击发送按钮才提交，并兼容安全区域；展开终端时直接覆盖消息区和输入框，提供 Ctrl（下一键生效）、Tab、方向、翻页和 Esc 触控键。
 - **管理操作**：Claude 子代理可在会话标题处下拉切换，各自保留独立时间线；运行中的会话显示停止按钮，停止后原位变为删除按钮。
-- **问题报告**：顶栏虫形按钮会冻结当前页面、发送账本、tmux scrollback 和最近 15 分钟跨层事件，随后在 sesman 项目目录自动新建一条 Codex 会话处理。原页面不会被切走，右下角可随时打开处理会话。该操作会使用当前 Codex 配置并产生模型用量。
+- **问题报告**：顶栏虫形按钮会冻结当前页面、发送账本、tmux scrollback 和最近 15 分钟跨层事件，随后在 agenthub 项目目录自动新建一条 Codex 会话处理。原页面不会被切走，右下角可随时打开处理会话。该操作会使用当前 Codex 配置并产生模型用量。
 
 ## 界面状态
 
 桌面端左右栏之间的分割线可拖动（下限 200px，右侧至少留 320px），**双击复位**到默认 340px。
 
-刷新后原样恢复的状态，全部存在 localStorage 的 `sesman.*` 键下：
+刷新后原样恢复的状态，全部存在 localStorage 的 `agenthub.*` 键下：
 
 | 键 | 内容 |
 |---|---|
@@ -73,14 +73,14 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 
 ## 删除行为
 
-删除**不做真删**，把原文件/目录移入 `~/.local/share/sesman/trash/<source>/<时间戳>-<原名>`，可手工恢复。
+删除**不做真删**，把原文件/目录移入 `~/.local/share/agenthub/trash/<source>/<时间戳>-<原名>`，可手工恢复。
 
 ## 接管会话（远程控制）
 
 **默认关闭**，服务端要显式加 `--terminal` 才启用 —— 这等于给白名单 IP 开放本机 shell。
 
 ```bash
-./run.sh --terminal          # 或 python3 -m sesman.server --terminal
+./run.sh --terminal          # 或 python3 -m agenthub.server --terminal
 ```
 
 启用后，任何会话的详情页都会出现终端图标。点一下，服务端在后台把这个会话用 tmux 起起来（`claude --resume` / `codex resume` / `grok --resume`，自动沿用它原来的工作目录），**消息流底部立刻出现一个输入框** —— 打字回车就发给会话，回复通过增量同步自动出现在上面的历史里。
@@ -91,9 +91,9 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 
 普通网页模式下 `Ctrl+T`、`Ctrl+W` 等由浏览器保留，xterm 收不到组合键。桌面终端聚焦时按一下右 Ctrl 会锁定下一键，随后直接按 `T` 即向 tmux 发送 `Ctrl+T`，发送后自动解除。左 Ctrl 保持普通行为；手机端的 Ctrl 按钮同样只对下一键生效。
 
-输入框左侧的 `＋` 可添加图片、视频、音频、普通文件和文字引用，也可以直接把剪贴板图片/文件粘贴到输入框或拖入输入区。附件先作为可删除的草稿卡显示，发送时才以原始二进制流上传；服务端按会话 uid 查出真实 cwd，以原文件名保存到 `./sesman_attachments/<id>/`，其中批次 id 在项目目录内从 1 递增，不接受浏览器指定落盘目录。同名且内容相同的文件会复用，同名但内容不同则依次保存为 `文件__1.png`、`文件__2.png`。点击附件卡会在正文插入稳定的 `[附件1]` 引用；删除附件不会重排编号。发送时正文保持原样，末尾另起一段追加 `附件1:./sesman_attachments/<id>/文件名` 清单。纯文字同样保持原样，因此 `/rename` 等斜杠命令不受影响。单文件上限 512 MB，失败会保留正文和附件供重试。
+输入框左侧的 `＋` 可添加图片、视频、音频、普通文件和文字引用，也可以直接把剪贴板图片/文件粘贴到输入框或拖入输入区。附件先作为可删除的草稿卡显示，发送时才以原始二进制流上传；服务端按会话 uid 查出真实 cwd，以原文件名保存到 `./agenthub_attachments/<id>/`，其中批次 id 在项目目录内从 1 递增，不接受浏览器指定落盘目录。同名且内容相同的文件会复用，同名但内容不同则依次保存为 `文件__1.png`、`文件__2.png`。点击附件卡会在正文插入稳定的 `[附件1]` 引用；删除附件不会重排编号。发送时正文保持原样，末尾另起一段追加 `附件1:./agenthub_attachments/<id>/文件名` 清单。纯文字同样保持原样，因此 `/rename` 等斜杠命令不受影响。单文件上限 512 MB，失败会保留正文和附件供重试。
 
-Codex 忙碌时，后续输入在轮到处理前只存在于 TUI 内存、尚未写入 rollout。sesman 会立即在时间线底部持久化显示一条“排队中”的用户消息；切换会话或刷新页面不会消失，原生记录出现后会按正文与时间自动消重。
+Codex 忙碌时，后续输入在轮到处理前只存在于 TUI 内存、尚未写入 rollout。agenthub 会立即在时间线底部持久化显示一条“排队中”的用户消息；切换会话或刷新页面不会消失，原生记录出现后会按正文与时间自动消重。
 
 | 情况 | 行为 |
 |---|---|
@@ -107,21 +107,21 @@ Codex 忙碌时，后续输入在轮到处理前只存在于 TUI 内存、尚未
 也可以在本机用包装脚本起会话，效果一样能被接管：
 
 ```bash
-./sesman-run                 # 默认 claude
-./sesman-run codex
+./agenthub-run                 # 默认 claude
+./agenthub-run codex
 ```
 
-本地终端和网页可以**同时连着同一个会话**。专用 server 中的会话可用 `tmux -L sesman attach -t <name>` 本地接入；普通 `tmux` 命令仍连接用户原来的默认 server。
+本地终端和网页可以**同时连着同一个会话**。专用 server 中的会话可用 `tmux -L agenthub attach -t <name>` 本地接入；普通 `tmux` 命令仍连接用户原来的默认 server。
 
 ### 为什么绕 tmux
 
 已经在跑的会话是 `sshd → zsh → claude` 直连 pts，外部进程无法写入它的输入队列；内核的 `TIOCSTI` 注入早已默认关闭（`dev.tty.legacy_tiocsti = 0`）。所以要接入一个已有会话，只能重新用 tmux 把它拉起来 —— 这也是「接管正在运行的会话必须先结束原实例」的原因。
 
-好处是**会话独立于 sesman 存活**：关掉浏览器、重启 sesman、甚至 sesman 崩了，会话照常跑。
+好处是**会话独立于 agenthub 存活**：关掉浏览器、重启 agenthub、甚至 agenthub 崩了，会话照常跑。
 
-新会话运行在 `tmux -L sesman` 专用 server 中，并加载 [`sesman/tmux.conf`](sesman/tmux.conf)：关闭状态栏、前缀键、tmux 鼠标、自动改名和通知，缩短 Esc 延迟，同时开启 focus events、扩展键和真彩色。默认 tmux server 完全不改；升级前已经存在的 `sesman-*` 会话仍会被发现并路由回原 server，直到自然结束。
+新会话运行在 `tmux -L agenthub` 专用 server 中，并加载 [`agenthub/tmux.conf`](agenthub/tmux.conf)：关闭状态栏、前缀键、tmux 鼠标、自动改名和通知，缩短 Esc 延迟，同时开启 focus events、扩展键和真彩色。默认 tmux server 完全不改；升级前已经存在的 `agenthub-*` 会话仍会被发现并路由回原 server，直到自然结束。
 
-systemd 部署使用独立的 [`deploy/sesman-tmux.service`](deploy/sesman-tmux.service) 以前台模式持有这个 server。它和网页服务处于不同 cgroup，因此重启或升级 sesman 不会结束 CLI；systemd 也能监测并重启异常退出的后端，而不必采用 `KillMode=process` 留下失联的网页 attach 子进程。
+systemd 部署使用独立的 [`deploy/agenthub-tmux.service`](deploy/agenthub-tmux.service) 以前台模式持有这个 server，ExecStart 走 [`agenthub-tmux-host`](agenthub-tmux-host)：socket 上已经有 server 时它只守候，等旧 server 自然退出后再启动正式的新 server，因此改名或迁移不必结束在跑的 CLI。它和网页服务处于不同 cgroup，因此重启或升级 agenthub 不会结束 CLI；systemd 也能监测并重启异常退出的后端，而不必采用 `KillMode=process` 留下失联的网页 attach 子进程。
 
 服务端起一个 PTY 跑 `tmux attach`，WebSocket 双向转发原始字节。专用 server 不让 attach 切换浏览器 xterm 的 alternate screen；连接时只做一次 `capture-pane` 历史回放，之后滚轮完全使用 xterm 本地 scrollback，不再触发 tmux copy-mode 或把滚轮改成方向键。方向键、`Ctrl-C`、批准提示和 CLI 全屏 TUI 仍按真实终端字节传递。WebSocket 是按 RFC 6455 手写的最小实现（`wsock.py`，约 100 行），后端仍然零第三方依赖。
 
@@ -193,7 +193,7 @@ Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex
 
 ## 索引缓存与列表自动刷新
 
-索引缓存在 `~/.cache/sesman/index.json`。缓存同时保存每个主会话的 raw 元数据、
+索引缓存在 `~/.cache/agenthub/index.json`。缓存同时保存每个主会话的 raw 元数据、
 公开列表和上次 inventory，文件用 `(路径, size, mtime_ns, inode)` 判断变化。普通 append
 只重读对应会话：Claude 同时更新尾部标题与子代理，Codex 在内存中重算分叉继承，
 Grok 重读对应 summary；新增、删除和移动也只增删相关 raw row。顶栏 `↻ 刷新`
@@ -230,7 +230,7 @@ Grok 重读对应 summary；新增、删除和移动也只增删相关 raw row�
 
 `tests/e2e.py` 用 Playwright 驱动真实 Chromium 点遍全部交互（列表渲染、来源筛选、两种视图、分组折叠、标题过滤、全文搜索、聊天气泡布局、单层工具输出、自带终端字体与配色、滚动条样式、附件上传/粘贴/引用与 prompt 转换、工具输出折叠、展开全文、公式与图片、子代理独立视图切换、增量同步、刷新、快捷键、接管终端、删除入回收站，以及页面无 JS/HTTP 错误）。
 
-删除相关的断言跑在一个临时造出来的自测会话上（`~/.claude/projects/-tmp-sesman-selftest/`），跑完自动清理，不碰真实会话。
+删除相关的断言跑在一个临时造出来的自测会话上（`~/.claude/projects/-tmp-agenthub-selftest/`），跑完自动清理，不碰真实会话。
 
 ```bash
 pip install playwright && python3 -m playwright install chromium
@@ -275,7 +275,7 @@ python3 tests/dual_cli_monkey.py --replay /path/to/failure-001/replay.json
 ## 结构
 
 ```
-sesman/
+agenthub/
   adapters.py   三家存储格式的解析器, 输出统一的会话元数据与消息
   index.py      索引缓存、增量读取、全文搜索与删除
   media.py      内嵌/本地图片的校验、限额注册与安全读取
@@ -286,7 +286,7 @@ sesman/
   send_audit.py 兼容旧版的紧凑消息交付日志
   send_protocol.py Claude/Codex 交付状态的公共驱动接口
   send_queue.py Codex 网页输入的服务端持久队列与原生记录确认
-  session_meta.py  星标等 sesman 自有会话元数据
+  session_meta.py  星标等 agenthub 自有会话元数据
   server.py     ThreadingHTTPServer 路由与 IP 白名单
   static/       前端 (原生 JS, 无构建步骤；vendor/ 含 KaTeX 与 xterm.js)
 ```
@@ -313,19 +313,19 @@ sesman/
 - `DELETE /api/session/<uid>` — 移入回收站
 
 新建 CLI 在产生第一条正式记录前，会写入权限为 `0600` 的
-`~/.local/share/sesman/pending-sessions.json`。因此刷新或离开网页不会让它从左栏
+`~/.local/share/agenthub/pending-sessions.json`。因此刷新或离开网页不会让它从左栏
 消失；记录保存类型、启动目录、会话 ID、tmux 名和终端尺寸。临时会话也有空对话页、
 输入框和附件入口，手机端可以切换终端/对话，并用关机按钮按 tmux 名直接停止。正式会话
 关联后自动退出临时列表，尚未发送的正文、引用和附件草稿会迁移到正式 uid，不会消失。
 
 Codex 忙时不会把尚未轮到的输入写进 rollout，tmux 接受粘贴也不能证明 Codex
 已经接收。因此已有 Codex 会话的网页输入先持久化到权限为 `0600` 的
-`~/.local/share/sesman/send-queue.json`；观察到原生回合结束且终端画面稳定后才交付，
+`~/.local/share/agenthub/send-queue.json`；观察到原生回合结束且终端画面稳定后才交付，
 服务端会独立续读 rollout，浏览器锁屏或断开也不影响队列推进；最终以其中出现对应的
 `user` 记录确认。
 
 Claude 输入同样先写入权限为 `0600` 的
-`~/.local/share/sesman/claude-send-queue.json`，然后才触碰终端。服务端以请求 ID 幂等，
+`~/.local/share/agenthub/claude-send-queue.json`，然后才触碰终端。服务端以请求 ID 幂等，
 并用原生 `user`、`queue-operation` 和 `/rename` 记录确认结果。只有仍处于 `persisted`
 （可证明尚未触碰终端）的项目才允许恢复交付；从 `injecting` 开始，即使 HTTP 响应丢失或
 服务重启，也只等待原生证据或标记为待核对，绝不自动重发。页面与写请求还携带构建标识，
@@ -334,7 +334,7 @@ Claude 输入同样先写入权限为 `0600` 的
 ### 跨层审计与问题报告
 
 服务端把浏览器 → HTTP → 发送账本 → tmux/PTY → JSONL 解析 → SSE → 浏览器 DOM
-记录为同一条可关联时间线。事件存于 `~/.local/share/sesman/audit.sqlite3`（SQLite
+记录为同一条可关联时间线。事件存于 `~/.local/share/agenthub/audit.sqlite3`（SQLite
 WAL，文件权限 `0600`），顺序由数据库自增序号确定；较大的请求正文、终端片段、规范化
 消息批和 DOM 快照以 SHA-256 寻址、zlib 压缩并去重。默认保留 14 天。诊断写入在后台执行，
 队列、磁盘或数据库失败不会改变消息发送结果。
@@ -344,7 +344,7 @@ WAL，文件权限 `0600`），顺序由数据库自增序号确定；较大的�
 API key 与 access/refresh token；附件只记录既有引用和元数据，不另复制正文附件。
 
 点「报告问题」后，私有包写到
-`~/.local/share/sesman/bug-reports/<BUG-id>/`，包含 `manifest.json`、用户描述、浏览器状态、
+`~/.local/share/agenthub/bug-reports/<BUG-id>/`，包含 `manifest.json`、用户描述、浏览器状态、
 相关事件、tmux scrollback 和 Git 状态。随后新建 Codex tmux，会话提示词要求先按
 `AGENTS.md` 用 Playwright 重现，再找出链路中第一个偏差并修复；验证通过后默认只提交本次
 报告产生的修改，创建本地 commit，但不会自动 push。若工作区原有改动与修复重叠、无法
@@ -354,21 +354,21 @@ API key 与 access/refresh token；附件只记录既有引用和元数据，不
 
 ## 开机自启（可选）
 
-仓库提供两个用户服务：[`deploy/sesman.service`](deploy/sesman.service) 运行网页，
-[`deploy/sesman-tmux.service`](deploy/sesman-tmux.service) 独立持有终端后端。网页服务通过
+仓库提供两个用户服务：[`deploy/agenthub.service`](deploy/agenthub.service) 运行网页，
+[`deploy/agenthub-tmux.service`](deploy/agenthub-tmux.service) 独立持有终端后端。网页服务通过
 `Wants`/`After` 依赖后端，但停止或重启网页不会连带停止后端。若项目路径不同，安装前需同步修改两个文件中的绝对路径。
 
 ```bash
-cp deploy/sesman.service deploy/sesman-tmux.service ~/.config/systemd/user/
+cp deploy/agenthub.service deploy/agenthub-tmux.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now sesman-tmux.service sesman.service
+systemctl --user enable --now agenthub-tmux.service agenthub.service
 ```
 
 ### hub-host 反向代理
 
-线上入口为 `https://example.com/sesman/`。页面资源、API、SSE 和 WebSocket 都使用当前页面的相对基路径，因此根目录直连与 `/sesman/` 子路径可同时工作。
+线上入口为 `https://example.com/agenthub/`。页面资源、API、SSE 和 WebSocket 都使用当前页面的相对基路径，因此根目录直连与 `/agenthub/` 子路径可同时工作。
 
-- 本机服务由 [`deploy/sesman.service`](deploy/sesman.service) 托管，只允许局域网管理端和 WireGuard 对端 `10.0.0.1`。
+- 本机服务由 [`deploy/agenthub.service`](deploy/agenthub.service) 托管，只允许局域网管理端和 WireGuard 对端 `10.0.0.1`。
 - UFW 仅放行 `wg0` 上 `10.0.0.1 → 10.0.0.2:8710/tcp`。
-- ECS 使用 [`deploy/nginx-sesman.conf`](deploy/nginx-sesman.conf) 反代，并复用 `snippets/auth.conf` 的 hub-host 统一鉴权。
+- ECS 使用 [`deploy/nginx-agenthub.conf`](deploy/nginx-agenthub.conf) 反代，并复用 `snippets/auth.conf` 的 hub-host 统一鉴权。
 - Nginx 关闭代理缓冲并保留 Upgrade 头，以支持会话推送和 tmux WebSocket。

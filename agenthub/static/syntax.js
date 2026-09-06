@@ -214,9 +214,9 @@ function highlightSegments(source, rawPath = '') {
   return {html, language, languages: [...languages], detected: true, segmented: true};
 }
 
-window.sesmanLanguageForPath = languageForPath;
-window.sesmanHighlight = highlight;
-window.sesmanHighlightSegments = highlightSegments;
-window.sesmanHighlightShellCommand = shellCommandHighlight;
+window.agenthubLanguageForPath = languageForPath;
+window.agenthubHighlight = highlight;
+window.agenthubHighlightSegments = highlightSegments;
+window.agenthubHighlightShellCommand = shellCommandHighlight;
 
-dispatchEvent(new Event('sesman-highlight-ready'));
+dispatchEvent(new Event('agenthub-highlight-ready'));

@@ -1,4 +1,4 @@
-"""sesman 前端端到端测试: 真实浏览器点遍每个交互。"""
+"""agenthub 前端端到端测试: 真实浏览器点遍每个交互。"""
 import base64
 import gzip
 import hashlib
@@ -17,16 +17,16 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sesman import (claude_queue, pending as pending_store,
+from agenthub import (claude_queue, pending as pending_store,
                     server as server_module, session_meta, term)
 
-BASE = os.environ.get("SESMAN_BASE", "http://127.0.0.1:8710")
-FAKE_PROJ = Path.home() / ".claude" / "projects" / "-tmp-sesman-selftest"
-FAKE_IMG = Path("/tmp/sesman-selftest-image.png")
-FAKE_CWD = Path("/tmp/sesman-selftest")
-PENDING_TERM = "sesman-claude-e2epending"
-PENDING_EXIT_TERM = "sesman-claude-e2eexit"
-TERMINAL_TERM = "sesman-claude-00000000"
+BASE = os.environ.get("AGENTHUB_BASE", "http://127.0.0.1:8710")
+FAKE_PROJ = Path.home() / ".claude" / "projects" / "-tmp-agenthub-selftest"
+FAKE_IMG = Path("/tmp/agenthub-selftest-image.png")
+FAKE_CWD = Path("/tmp/agenthub-selftest")
+PENDING_TERM = "agenthub-claude-e2epending"
+PENDING_EXIT_TERM = "agenthub-claude-e2eexit"
+TERMINAL_TERM = "agenthub-claude-00000000"
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 PASS, FAIL = [], []
 
@@ -62,7 +62,7 @@ def make_fake_session():
     sid = f.stem
     long_text = "长文本测试 " + "x" * 9000
     FAKE_IMG.write_bytes(base64.b64decode(PNG_B64))
-    attachment_image = FAKE_CWD / "sesman_attachments/4/image.png"
+    attachment_image = FAKE_CWD / "agenthub_attachments/4/image.png"
     attachment_image.parent.mkdir(parents=True, exist_ok=True)
     attachment_image.write_bytes(base64.b64decode(PNG_B64))
     render_sample = (
@@ -73,29 +73,29 @@ def make_fake_session():
         "行内公式 $E=mc^2$，块公式：\n\n$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$\n\n"
         "```text\n$code_not_math$\n```\n\n"
         "```python\ndef greet(name):\n    return f\"hello {name}\"\n```\n\n"
-        "```\n{\n  \"name\": \"sesman\",\n  \"enabled\": true\n}\n```\n\n"
+        "```\n{\n  \"name\": \"agenthub\",\n  \"enabled\": true\n}\n```\n\n"
         "句中提到 ` ```python ` 不是围栏，后文不能被吞掉。\n\n"
         f"![本地测试图]({FAKE_IMG})\n\n"
-        "附件1: ./sesman_attachments/4/image.png\n\n"
+        "附件1: ./agenthub_attachments/4/image.png\n\n"
         "不存在的相对图片 ![缺失图](path-or-url)"
     )
     rows = [
-        {"type": "ai-title", "aiTitle": "SESMAN自测会话请删除", "sessionId": sid},
+        {"type": "ai-title", "aiTitle": "AGENTHUB自测会话请删除", "sessionId": sid},
         {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": render_sample}]},
-         "uuid": "a0", "timestamp": "2026-08-06T11:59:00.000Z", "cwd": "/tmp/sesman-selftest",
+         "uuid": "a0", "timestamp": "2026-08-06T11:59:00.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": "自测：第一条用户消息"},
-         "uuid": "u1", "timestamp": "2026-08-06T12:00:00.000Z", "cwd": "/tmp/sesman-selftest",
+         "uuid": "u1", "timestamp": "2026-08-06T12:00:00.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid, "gitBranch": "main"},
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "text", "text": "结构化图片测试"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PNG_B64}},
         ]}, "uuid": "u1-img", "timestamp": "2026-08-06T12:00:00.500Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         # 大小写 / 全词选项使用对话正文样本；工具协议不属于全文搜索范围。
         {"type": "user", "message": {"role": "user", "content":
-         "SesmanCase 与 sesmancase 各一次；wordprobe 与 wordprobe2 各一次"},
-         "uuid": "u1b", "timestamp": "2026-08-06T12:00:01.000Z", "cwd": "/tmp/sesman-selftest",
+         "AgentHubCase 与 agenthubcase 各一次；wordprobe 与 wordprobe2 各一次"},
+         "uuid": "u1b", "timestamp": "2026-08-06T12:00:01.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid},
         {"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "thinking", "thinking": "自测思考内容；正则探针甲Q7内容"},
@@ -104,7 +104,7 @@ def make_fake_session():
              "input": {"command": "echo hi && node --check app.js"}},
             {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/tmp/a.py"}},
             {"type": "tool_use", "id": "bash-2", "name": "Bash", "input": {"command": "echo hi2"}}]},
-         "uuid": "a1", "timestamp": "2026-08-06T12:00:05.000Z", "cwd": "/tmp/sesman-selftest",
+         "uuid": "a1", "timestamp": "2026-08-06T12:00:05.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "bash-1", "content": "hi"},
@@ -112,31 +112,31 @@ def make_fake_session():
              "content": "def loaded_value():\n    return 42"},
             {"type": "tool_result", "tool_use_id": "bash-2", "is_error": True,
              "content": "Error: Exit code 2\n" + "\n".join(f"log {i}" for i in range(12))}]},
-         "uuid": "u2", "timestamp": "2026-08-06T12:00:06.000Z", "cwd": "/tmp/sesman-selftest",
+         "uuid": "u2", "timestamp": "2026-08-06T12:00:06.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>注入的</INSTRUCTIONS>"},
-         "uuid": "u3", "timestamp": "2026-08-06T12:00:07.000Z", "cwd": "/tmp/sesman-selftest",
+         "uuid": "u3", "timestamp": "2026-08-06T12:00:07.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid},
         # 注入记录会被适配器过滤，不能拿它充当工具组边界；显式加入一条
         # 可见正文，保证下面的落单 tool_result 真正覆盖独立卡片路径。
         {"type": "assistant", "message": {"role": "assistant", "content": "工具组结束"},
          "uuid": "a-boundary", "timestamp": "2026-08-06T12:00:07.500Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "content": "单行工具输出不折叠"}]},
-         "uuid": "u4", "timestamp": "2026-08-06T12:00:08.000Z", "cwd": "/tmp/sesman-selftest",
+         "uuid": "u4", "timestamp": "2026-08-06T12:00:08.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid},
         {"type": "assistant", "message": {"role": "assistant", "content": [{
             "type": "tool_use", "id": "edit-1", "name": "Edit", "input": {
-                "file_path": "/tmp/sesman-selftest/demo.py",
+                "file_path": "/tmp/agenthub-selftest/demo.py",
                 "old_string": "def value():\n    return 1",
                 "new_string": "def value():\n    return 2",
             }}]}, "uuid": "edit-a", "timestamp": "2026-08-06T12:00:08.200Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": [{
             "type": "tool_result", "tool_use_id": "edit-1", "content": "文件修改成功"}]},
          "uuid": "edit-u", "timestamp": "2026-08-06T12:00:08.300Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "assistant", "message": {"role": "assistant", "content": [{
             "type": "tool_use", "id": "ask-1", "name": "AskUserQuestion", "input": {"questions": [{
                 "header": "启动方式", "question": "要使用哪种启动方式？", "multiSelect": False,
@@ -144,24 +144,24 @@ def make_fake_session():
                     {"label": "tmux", "description": "保留可重连的终端"},
                     {"label": "普通进程", "description": "直接在当前终端运行"},
                 ]}]}}]}, "uuid": "ask-a", "timestamp": "2026-08-06T12:00:09.000Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content": [{
             "type": "tool_result", "tool_use_id": "ask-1",
             "content": "User has answered your questions: 启动方式=tmux"}]},
          "uuid": "ask-u", "timestamp": "2026-08-06T12:00:10.000Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content":
          "<task-notification>\n<task-id>hidden-id</task-id>\n<status>completed</status>\n"
          "<summary>Monitor event: \"自测训练\"</summary>\n"
          "<result>监控详细结果\n第二行</result>\n</task-notification>"},
          "uuid": "notice-u", "timestamp": "2026-08-06T12:00:11.000Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "system", "subtype": "away_summary", "content": "自测任务已经收口",
-         "timestamp": "2026-08-06T12:00:12.000Z", "cwd": "/tmp/sesman-selftest",
+         "timestamp": "2026-08-06T12:00:12.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": sid},
     ]
     # 模拟老 Claude 会话：大段启动附件会把首个 cwd 挤出前 40 条元数据记录。
-    # 详情仍应从文件尾恢复真实 cwd，不能把项目 slug 猜成 /tmp/sesman/selftest。
+    # 详情仍应从文件尾恢复真实 cwd，不能把项目 slug 猜成 /tmp/agenthub/selftest。
     rows[1:1] = [{"type": "progress", "data": {"n": i}} for i in range(45)]
     # 确定性覆盖前端两层限流：前 40 条命中消息自动展开、前 3000 处命中高亮。
     # 不能拿用户真实会话的文件大小推断命中消息数；大文件也可能只有一条超长消息。
@@ -169,22 +169,22 @@ def make_fake_session():
         "type": "assistant",
         "message": {"role": "assistant", "content": "限流样本 " + "markprobe " * 100},
         "uuid": f"cap-{i}", "timestamp": f"2026-08-06T12:01:{i:02d}.000Z",
-        "cwd": "/tmp/sesman-selftest", "sessionId": sid,
+        "cwd": "/tmp/agenthub-selftest", "sessionId": sid,
     } for i in range(45))
     rows.append({"type": "system", "subtype": "turn_duration", "durationMs": 1234,
-                 "timestamp": "2026-08-06T12:02:00.000Z", "cwd": "/tmp/sesman-selftest",
+                 "timestamp": "2026-08-06T12:02:00.000Z", "cwd": "/tmp/agenthub-selftest",
                  "sessionId": sid})
     rows.extend([
         {"type": "user", "message": {"role": "user", "content": "/compact"},
-         "timestamp": "2026-08-06T12:03:00.000Z", "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "timestamp": "2026-08-06T12:03:00.000Z", "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "system", "subtype": "compact_boundary", "timestamp": "2026-08-06T12:03:02.000Z",
-         "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content":
          "This session is being continued from a previous conversation that ran out of context."},
-         "timestamp": "2026-08-06T12:03:02.100Z", "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "timestamp": "2026-08-06T12:03:02.100Z", "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
         {"type": "user", "message": {"role": "user", "content":
          "<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>"},
-         "timestamp": "2026-08-06T12:03:02.200Z", "cwd": "/tmp/sesman-selftest", "sessionId": sid},
+         "timestamp": "2026-08-06T12:03:02.200Z", "cwd": "/tmp/agenthub-selftest", "sessionId": sid},
     ])
     f.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
     sub = FAKE_PROJ / sid / "subagents"
@@ -213,11 +213,11 @@ def make_window_session():
     FAKE_PROJ.mkdir(parents=True, exist_ok=True)
     f = FAKE_PROJ / "00000000-dead-beef-0000-000000000010.jsonl"
     sid = f.stem
-    rows = [{"type": "ai-title", "aiTitle": "SESMAN分页载入测试", "sessionId": sid}]
+    rows = [{"type": "ai-title", "aiTitle": "AGENTHUB分页载入测试", "sessionId": sid}]
     rows.extend({
         "type": "assistant", "message": {"role": "assistant", "content": f"分页消息 {i:03d}"},
         "uuid": f"page-{i}", "timestamp": "2026-08-06T13:00:00.000Z",
-        "cwd": "/tmp/sesman-selftest", "sessionId": sid,
+        "cwd": "/tmp/agenthub-selftest", "sessionId": sid,
     } for i in range(650))
     f.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
     return f
@@ -238,9 +238,9 @@ def make_cli_resumable(path: Path):
 
 
 def cleanup():
-    tmux_run("sesman", "kill-session", "-t", PENDING_TERM, capture_output=True)
-    tmux_run("sesman", "kill-session", "-t", PENDING_EXIT_TERM, capture_output=True)
-    tmux_run("sesman", "kill-session", "-t", TERMINAL_TERM, capture_output=True)
+    tmux_run("agenthub", "kill-session", "-t", PENDING_TERM, capture_output=True)
+    tmux_run("agenthub", "kill-session", "-t", PENDING_EXIT_TERM, capture_output=True)
+    tmux_run("agenthub", "kill-session", "-t", TERMINAL_TERM, capture_output=True)
     pending_store.discard(PENDING_TERM)
     pending_store.discard(PENDING_EXIT_TERM)
     fake_path = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
@@ -252,7 +252,7 @@ def cleanup():
     shutil.rmtree(FAKE_PROJ, ignore_errors=True)
     shutil.rmtree(FAKE_CWD, ignore_errors=True)
     FAKE_IMG.unlink(missing_ok=True)
-    trash = Path.home() / ".local" / "share" / "sesman" / "trash" / "claude"
+    trash = Path.home() / ".local" / "share" / "agenthub" / "trash" / "claude"
     if trash.is_dir():
         for p in trash.glob("*00000000-dead-beef*"):
             p.unlink(missing_ok=True)
@@ -284,54 +284,57 @@ def run(pw):
 
     # ---- 1. 基本加载 ----
     n_items = p.locator(".item").count()
-    check("会话列表渲染", n_items > 50, n_items)
+    check("会话列表渲染",
+          n_items > 0
+          and p.locator(".item").filter(has_text="AGENTHUB自测会话请删除").count() == 1,
+          n_items)
     check("顶栏统计显示数量", re.search(r"\d+", p.locator("#stat").inner_text()), p.locator("#stat").inner_text())
     check("三个来源 chip 都在", p.locator(".chip").count() == 3)
     check("来源筛选使用原生按钮", p.locator("button.chip").count() == 3)
     check("图标 SVG 渲染", p.locator(".item .ico svg").count() > 0)
     cli_layers = p.evaluate("""() => ({
-      classes:[SESMAN_CLIS.claude instanceof ClaudeCli,
-        SESMAN_CLIS.codex instanceof CodexCli, SESMAN_CLIS.grok instanceof GrokCli,
-        Object.values(SESMAN_CLIS).every(x => x instanceof SesmanCli)],
-      pendingSource:sesmanCli('tmux:sesman-claude-new-e2e')?.source,
-      claudeEnqueue:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
+      classes:[AGENTHUB_CLIS.claude instanceof ClaudeCli,
+        AGENTHUB_CLIS.codex instanceof CodexCli, AGENTHUB_CLIS.grok instanceof GrokCli,
+        Object.values(AGENTHUB_CLIS).every(x => x instanceof AgentHubCli)],
+      pendingSource:agenthubCli('tmux:agenthub-claude-new-e2e')?.source,
+      claudeEnqueue:AGENTHUB_CLIS.claude.queueAction({role:'queue_operation',
         operation:'enqueue', text:'q'}),
-      claudeRemove:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
+      claudeRemove:AGENTHUB_CLIS.claude.queueAction({role:'queue_operation',
         operation:'remove', text:'q'}),
-      claudeDequeue:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
+      claudeDequeue:AGENTHUB_CLIS.claude.queueAction({role:'queue_operation',
         operation:'dequeue', text:''}),
-      claudePopAll:SESMAN_CLIS.claude.queueAction({role:'queue_operation',
+      claudePopAll:AGENTHUB_CLIS.claude.queueAction({role:'queue_operation',
         operation:'popAll', text:'q'}),
-      codexRemove:SESMAN_CLIS.codex.queueAction({role:'queue_operation',
+      codexRemove:AGENTHUB_CLIS.codex.queueAction({role:'queue_operation',
         operation:'remove', text:'q'}),
-      states:[SESMAN_CLIS.claude.createQueuedMessage({created:1000}).state,
-        SESMAN_CLIS.codex.createQueuedMessage({created:1000}).state],
-      claudeSettled:SESMAN_CLIS.claude.settleQueuedMessage(
-        SESMAN_CLIS.claude.createQueuedMessage({created:1000}), 9001, true),
-      claudeMigration:SESMAN_CLIS.claude.migrateQueuedMessages(
+      states:[AGENTHUB_CLIS.claude.createQueuedMessage({created:1000}).state,
+        AGENTHUB_CLIS.codex.createQueuedMessage({created:1000}).state],
+      claudeSettled:AGENTHUB_CLIS.claude.settleQueuedMessage(
+        AGENTHUB_CLIS.claude.createQueuedMessage({created:1000}), 9001, true),
+      claudeMigration:AGENTHUB_CLIS.claude.migrateQueuedMessages(
         [{id:'old', created:1000}], 2, 3),
-      migrations:[SESMAN_CLIS.codex.migrateQueuedMessages([1], 3, 4),
-        SESMAN_CLIS.grok.migrateQueuedMessages([1], 3, 4)],
-      rewind:[SESMAN_CLIS.claude.repeatedEscape(1200, 1000).rewind,
-        SESMAN_CLIS.codex.repeatedEscape(1200, 1000).rewind,
-        SESMAN_CLIS.grok.repeatedEscape(1200, 1000).rewind],
-      rewindBusy:[SESMAN_CLIS.claude.repeatedEscape(
+      migrations:[AGENTHUB_CLIS.codex.migrateQueuedMessages([1], 3, 4),
+        AGENTHUB_CLIS.grok.migrateQueuedMessages([1], 3, 4)],
+      rewind:[AGENTHUB_CLIS.claude.repeatedEscape(1200, 1000).rewind,
+        AGENTHUB_CLIS.codex.repeatedEscape(1200, 1000).rewind,
+        AGENTHUB_CLIS.grok.repeatedEscape(1200, 1000).rewind],
+      rewindBusy:[AGENTHUB_CLIS.claude.repeatedEscape(
           1200, 1000, {busy:true}).rewind,
-        SESMAN_CLIS.codex.repeatedEscape(1200, 1000, {busy:true}).rewind],
-      rewindDraft:[SESMAN_CLIS.claude.repeatedEscape(
+        AGENTHUB_CLIS.codex.repeatedEscape(1200, 1000, {busy:true}).rewind],
+      rewindDraft:[AGENTHUB_CLIS.claude.repeatedEscape(
           1200, 1000, {empty:false}).rewind,
-        SESMAN_CLIS.codex.repeatedEscape(1200, 1000, {empty:false}).rewind],
-      questionKeys:[SESMAN_CLIS.claude.questionAnswerKeys({questions:[{
+        AGENTHUB_CLIS.codex.repeatedEscape(1200, 1000, {empty:false}).rewind],
+      questionKeys:[AGENTHUB_CLIS.claude.questionAnswerKeys({questions:[{
           options:[{label:'一'}, {label:'二'}]}]}, 1),
-        SESMAN_CLIS.codex.questionAnswerKeys({questions:[{
+        AGENTHUB_CLIS.codex.questionAnswerKeys({questions:[{
           options:[{label:'一'}, {label:'二'}]}]}, 1),
-        SESMAN_CLIS.grok.questionAnswerKeys({questions:[{
+        AGENTHUB_CLIS.grok.questionAnswerKeys({questions:[{
           options:[{label:'一'}, {label:'二'}]}]}, 1)],
-      claudeQuestionForm:SESMAN_CLIS.claude.questionFormAnswerKeys({questions:[
+      claudeQuestionForm:AGENTHUB_CLIS.claude.questionFormAnswerKeys({questions:[
         {options:[{label:'一'}, {label:'二'}]},
         {options:[{label:'甲'}, {label:'乙'}, {label:'丙'}]}
       ]}, [1, 2]),
-      codexApproval:SESMAN_CLIS.codex.questionAnswerKeys({kind:'approval', questions:[{
+      codexApproval:AGENTHUB_CLIS.codex.questionAnswerKeys({kind:'approval', questions:[{
           options:[{label:'允许本次', key:'y'}, {label:'始终允许', key:'p'},
             {label:'拒绝', key:'Escape'}]}]}, 1)
     })""")
@@ -362,7 +365,7 @@ def run(pw):
     codex_branch_rebind = p.evaluate("""async () => {
       const fromUid = 'codex:e2e-old-branch', toUid = 'codex:e2e-current-branch';
       const rootSid = '01234567-89ab-cdef-0123-456789abcdef';
-      const name = 'sesman-codex-01234567', key = viewKey(fromUid);
+      const name = 'agenthub-codex-01234567', key = viewKey(fromUid);
       const saved = {sel:S.sel, agent:S.agent, sessions:S.sessions,
         termUid:T.uid, termName:T.name, list:T.list, composerUid};
       const oldOpen = openSession, oldAudit = browserAuditEvent;
@@ -396,9 +399,9 @@ def run(pw):
     }""")
     check("Codex 回退后按根 pane 跟进新分支 uid 并迁移草稿",
           codex_branch_rebind == {
-              "linked": {"name": "sesman-codex-01234567",
+              "linked": {"name": "agenthub-codex-01234567",
                          "uid": "codex:e2e-current-branch"},
-              "taken": "sesman-codex-01234567", "changed": True,
+              "taken": "agenthub-codex-01234567", "changed": True,
               "opened": ["codex:e2e-current-branch"],
               "selected": "codex:e2e-current-branch",
               "termUid": "codex:e2e-current-branch",
@@ -407,7 +410,7 @@ def run(pw):
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
       if (!session) return {error:'no codex session'};
-      const uid = session.uid, key = viewKey(uid), name = `sesman-codex-${session.sid.slice(0, 8)}`;
+      const uid = session.uid, key = viewKey(uid), name = `agenthub-codex-${session.sid.slice(0, 8)}`;
       const oldPost = post, oldList = T.list, oldEntry = cache.get(key);
       const oldQueued = S.queued.get(uid), oldConfirm = window.confirm;
       const requests = [];
@@ -462,7 +465,7 @@ def run(pw):
     claude_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'claude' && x.uid !== S.sel);
       if (!session) return {error:'no claude session'};
-      const uid = session.uid, key = viewKey(uid), name = `sesman-claude-${session.sid.slice(0, 8)}`;
+      const uid = session.uid, key = viewKey(uid), name = `agenthub-claude-${session.sid.slice(0, 8)}`;
       const oldPost = post, oldList = T.list, oldEntry = cache.get(key);
       const oldQueued = S.queued.get(uid), requests = [];
       T.list = [...(T.list || []), {uid, name}];
@@ -500,7 +503,7 @@ def run(pw):
     codex_draft_decline = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex');
       if (!session) return {error:'no codex session'};
-      const uid = session.uid, name = `sesman-codex-${session.sid.slice(0, 8)}`;
+      const uid = session.uid, name = `agenthub-codex-${session.sid.slice(0, 8)}`;
       const oldPost = post, oldFetch = window.fetch, oldConfirm = window.confirm;
       const oldList = T.list, oldComposerUid = composerUid;
       const oldDraft = composerDrafts.get(uid), oldInput = $('#cinput').value;
@@ -545,7 +548,7 @@ def run(pw):
     claude_draft_preflight = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'claude');
       if (!session) return {error:'no claude session'};
-      const uid = session.uid, name = `sesman-claude-${session.sid.slice(0, 8)}`;
+      const uid = session.uid, name = `agenthub-claude-${session.sid.slice(0, 8)}`;
       const oldPost = post, oldConfirm = window.confirm, oldList = T.list;
       const calls = [], confirmations = [];
       T.list = [...(T.list || []), {uid, name}];
@@ -576,7 +579,7 @@ def run(pw):
           and str(claude_draft_preflight.get("body", {}).get("uid", ""))
           .startswith("claude:")
           and str(claude_draft_preflight.get("body", {}).get("name", ""))
-          .startswith("sesman-claude-"), claude_draft_preflight)
+          .startswith("agenthub-claude-"), claude_draft_preflight)
     diff_race = p.evaluate("""async () => {
       const uid = 'codex:synthetic-diff-race', key = viewKey(uid);
       const oldEntry = cache.get(key), oldQueued = S.queued.get(uid);
@@ -853,7 +856,7 @@ def run(pw):
           and p.locator(".stat-unit").is_visible()
           and p.locator(".mobile-label").evaluate_all(
               "nodes => nodes.length === 2 && nodes.every(n => n.getClientRects().length > 0)")
-          and p.locator(".brand-name").inner_text().strip() not in {"", "__SESMAN_HOSTNAME__"}
+          and p.locator(".brand-name").inner_text().strip() not in {"", "__AGENTHUB_HOSTNAME__"}
           and "个会话" in p.locator("#stat").inner_text()
           and p.locator(".mobile-label").all_inner_texts() == ["项目树", "时间轴"])
     brand_style = p.locator(".brand-name").evaluate("""n => {
@@ -871,8 +874,8 @@ def run(pw):
           and brand_style["fill"] == "rgba(0, 0, 0, 0)", brand_style)
 
     # 上传目录只能由服务端根据 uid 决定，原始二进制不走 Base64。
-    fake_uid = p.evaluate("() => S.sessions.find(s => s.title === 'SESMAN自测会话请删除').uid")
-    attachment_payload = b"sesman attachment raw bytes\x00\x01"
+    fake_uid = p.evaluate("() => S.sessions.find(s => s.title === 'AGENTHUB自测会话请删除').uid")
+    attachment_payload = b"agenthub attachment raw bytes\x00\x01"
     attachment_responses = p.evaluate("""async ({uid, bytes}) => {
       async function upload(payload, id = null) {
         const url = new URL(appUrl('api/session/attachment'));
@@ -891,9 +894,9 @@ def run(pw):
     attachment_id = attachment_response["attachment_id"]
     check("附件以原文件名保存到递增编号的受控子目录",
           attachment_id.isdigit()
-          and attachment_path == FAKE_CWD / "sesman_attachments" / attachment_id / "测试 attachment.txt"
+          and attachment_path == FAKE_CWD / "agenthub_attachments" / attachment_id / "测试 attachment.txt"
           and attachment_response["relative_path"]
-          == f"sesman_attachments/{attachment_id}/测试 attachment.txt",
+          == f"agenthub_attachments/{attachment_id}/测试 attachment.txt",
           attachment_response)
     check("附件按原始二进制流完整落盘",
           attachment_path.read_bytes() == attachment_payload
@@ -981,7 +984,7 @@ def run(pw):
     check("分组再展开", g0.locator(".item").nth(0).is_visible() if before_vis else True)
 
     # ---- 5. 标题过滤 ----
-    p.fill("#q", "SESMAN自测")
+    p.fill("#q", "AGENTHUB自测")
     p.wait_for_timeout(250)
     check("标题过滤生效", p.locator(".item").count() == 1, p.locator(".item").count())
     p.fill("#q", "")
@@ -1021,15 +1024,15 @@ def run(pw):
         p.fill("#q", term)
         p.press("#q", "Enter")
         p.wait_for_function(f"document.querySelector('#stat').dataset.seq !== '{seq}'", timeout=90000)
-        it = p.locator(".item").filter(has_text="SESMAN自测")
+        it = p.locator(".item").filter(has_text="AGENTHUB自测")
         if not it.count():
             return 0
         m = re.search(r"命中 (\d+)", it.first.locator(".m").inner_text())
         return int(m.group(1)) if m else 0
 
     check("三个搜索选项按钮都在", p.locator("#opts button").count() == 3)
-    ci = search_hits("SesmanCase")
-    cs = search_hits("SesmanCase", ["case"])
+    ci = search_hits("AgentHubCase")
+    cs = search_hits("AgentHubCase", ["case"])
     check("默认大小写不敏感", ci == 2, ci)
     check("大小写敏感只匹配一次", cs == 1, cs)
     check("选项按钮显示为激活", "on" in (p.locator('#opts button[data-o="case"]').get_attribute("class") or ""))
@@ -1044,7 +1047,7 @@ def run(pw):
     rx = search_hits("正则探针.{0,3}Q7内容", ["regex"])
     check("正则匹配生效", rx >= 1, rx)
     # 列表命中不等于正文高亮: 两条路径的匹配实现是分开的
-    p.locator(".item").filter(has_text="SESMAN自测").first.click()
+    p.locator(".item").filter(has_text="AGENTHUB自测").first.click()
     p.wait_for_selector(".msg", timeout=20000)
     check("正则模式下正文也高亮", p.locator("#msgs mark").count() > 0,
           p.locator("#mcount").inner_text())
@@ -1060,7 +1063,7 @@ def run(pw):
     # 选项持久化
     p.locator('#opts button[data-o="word"]').click()
     p.wait_for_timeout(200)
-    p.reload(wait_until="networkidle")
+    p.reload(wait_until="domcontentloaded")
     p.wait_for_selector(".item", timeout=15000)
     check("选项状态持久化", "on" in (p.locator('#opts button[data-o="word"]').get_attribute("class") or ""))
     p.locator('#opts button[data-o="word"]').click()
@@ -1070,7 +1073,14 @@ def run(pw):
     p.fill("#q", "a")
     p.press("#q", "Enter")
     p.wait_for_function("document.querySelector('#stat').textContent.includes('命中')", timeout=120000)
-    check("海量结果提示已截断", "截断" in p.locator("#stat").inner_text(), p.locator("#stat").inner_text())
+    mass_result = p.locator("#stat").inner_text()
+    mass_count = re.search(r"(\d+) 个会话", mass_result)
+    # 共享部署机的会话池会随清理自然低于服务端 60 条上限；两种合法结果都要
+    # 覆盖：超过上限时明确提示截断，池较小时完整返回且数量不越界。
+    check("海量结果状态符合搜索上限",
+          "截断" in mass_result
+          or ("全文命中" in mass_result and mass_count and int(mass_count.group(1)) <= 60),
+          mass_result)
     seq = p.get_attribute("#stat", "data-seq") or ""
     p.fill("#q", "markprobe")
     p.press("#q", "Enter")
@@ -1078,7 +1088,7 @@ def run(pw):
         f"document.querySelector('#stat').dataset.seq !== '{seq}'"
         " && !document.querySelector('#stat').textContent.includes('搜索中')",
         timeout=120000)
-    p.locator(".item").filter(has_text="SESMAN自测").first.click()
+    p.locator(".item").filter(has_text="AGENTHUB自测").first.click()
     p.wait_for_selector(".msg", timeout=60000)
     n_mark = p.locator("#msgs mark").count()
     check("高亮数量达到且不超过上限", n_mark == 3000, n_mark)
@@ -1101,7 +1111,7 @@ def run(pw):
     p.wait_for_function("document.querySelector('#stat').textContent.includes('命中')", timeout=60000)
     check("搜索命中列表标题也高亮", p.locator(".item .t mark").count() >= 0)
     # 搜索词也会出现在别的会话里, 按标题锁定自测会话
-    p.locator(".item").filter(has_text="SESMAN自测").first.click()
+    p.locator(".item").filter(has_text="AGENTHUB自测").first.click()
     p.wait_for_selector(".msg", timeout=15000)
     check("详情正文出现高亮", p.locator("#msgs mark").count() > 0, p.locator("#msgs mark").count())
     check("命中消息自动展开", p.locator('.msg[data-role="thinking"] .mb').first.is_visible())
@@ -1126,7 +1136,7 @@ def run(pw):
     p.fill("#q", "长文本测试")
     p.press("#q", "Enter")
     p.wait_for_function("document.querySelector('#stat').textContent.includes('命中')", timeout=60000)
-    p.locator(".item").filter(has_text="SESMAN自测").first.click()
+    p.locator(".item").filter(has_text="AGENTHUB自测").first.click()
     p.wait_for_selector("#msgs mark", timeout=15000)
     check("被截断的长消息命中时直接全文展开",
           p.locator(".msg .mb.clip").count() == 0 or p.locator("#msgs mark").count() > 0)
@@ -1134,12 +1144,12 @@ def run(pw):
     p.wait_for_timeout(300)
 
     # ---- 7. 打开自测会话 ----
-    p.fill("#q", "SESMAN自测")
+    p.fill("#q", "AGENTHUB自测")
     p.wait_for_timeout(250)
     p.locator(".item").first.click()
     p.wait_for_selector(".msg", timeout=10000)
     check("选中项高亮", p.locator(".item.sel").count() == 1)
-    check("详情标题正确", "SESMAN自测会话请删除" in p.locator(".dhead h2").inner_text())
+    check("详情标题正确", "AGENTHUB自测会话请删除" in p.locator(".dhead h2").inner_text())
     title_spacing = p.locator(".dhead h2").evaluate("""n => {
       const icon = n.querySelector(':scope > .ico').getBoundingClientRect();
       const title = n.querySelector(':scope > :nth-child(2)').getBoundingClientRect();
@@ -1174,12 +1184,12 @@ def run(pw):
     check("从列表取消星标会同步详情且不会打开别的会话",
           p.evaluate("S.sel") == selected_before_unstar
           and p.locator("#a-star.on").count() == 0)
-    check("详情元信息含 cwd", "/tmp/sesman-selftest" in p.locator(".dmeta").inner_text())
+    check("详情元信息含 cwd", "/tmp/agenthub-selftest" in p.locator(".dmeta").inner_text())
     check("电脑版详情显示会话 UUID",
           "00000000-dead-beef-0000-000000000001" in p.locator(".dmeta").inner_text())
     meta_codes = p.locator(".dmeta code").all_inner_texts()
     check("目录在前且 UUID 内容在后",
-          meta_codes[-2:] == ["/tmp/sesman-selftest", "00000000-dead-beef-0000-000000000001"], meta_codes)
+          meta_codes[-2:] == ["/tmp/agenthub-selftest", "00000000-dead-beef-0000-000000000001"], meta_codes)
     message_url = BASE + "/api/messages/" + urllib.parse.quote(p.evaluate("S.sel"), safe="")
     plain_res = urllib.request.urlopen(urllib.request.Request(
         message_url, headers={"Accept-Encoding": "identity"}), timeout=30)
@@ -1191,7 +1201,7 @@ def run(pw):
     check("大会话 JSON 使用 gzip 降低传输流量",
           gzip_res.headers.get("Content-Encoding") == "gzip"
           and "Accept-Encoding" in gzip_res.headers.get("Vary", "")
-          and int(gzip_res.headers.get("X-Sesman-Decoded-Length", 0))
+          and int(gzip_res.headers.get("X-AgentHub-Decoded-Length", 0))
               == len(gzip.decompress(gzip_body))
           and gzip_data["meta"]["uid"] == p.evaluate("S.sel")
           and len(gzip_body) < len(plain_body) * .7,
@@ -1201,7 +1211,7 @@ def run(pw):
     no_gzip_body = no_gzip_res.read()
     check("客户端拒绝 gzip 时仍返回原始 JSON",
           no_gzip_res.headers.get("Content-Encoding") is None
-          and int(no_gzip_res.headers.get("X-Sesman-Decoded-Length", 0)) == len(no_gzip_body)
+          and int(no_gzip_res.headers.get("X-AgentHub-Decoded-Length", 0)) == len(no_gzip_body)
           and json.loads(no_gzip_body)["meta"]["uid"] == p.evaluate("S.sel"))
     progress_sizes = p.evaluate("""async uid => {
       const samples = [];
@@ -1217,6 +1227,80 @@ def run(pw):
           and progress_sizes["samples"][-1]
               == [progress_sizes["networkBytes"], progress_sizes["networkBytes"]]
           and progress_sizes["networkBytes"] < progress_sizes["bytes"], progress_sizes)
+
+    # 已完成回合首屏只保留用户输入、过程摘要和最终结论。过程正文必须是真正
+    # 的懒加载：折叠时连 Markdown/tool DOM 都不创建，展开后继续沿用原工具组。
+    turn_process = p.locator("#msgs > .turn-process").first
+    process_preview = turn_process.locator(":scope > .turn-toolbar > .turn-preview")
+    process_summary = process_preview.inner_text()
+    check("已完成回合折叠为一条过程合集",
+          turn_process.count() == 1
+          and turn_process.get_attribute("data-role") == "process"
+          and all(part in process_summary for part in ("条进展", "🔧", "修改", "次确认")),
+          process_summary)
+    check("过程合集折叠态不创建正文 DOM",
+          "folded" in (turn_process.get_attribute("class") or "")
+          and turn_process.locator(":scope > .turn-process-body").evaluate(
+              "n => n.hidden && n.childElementCount === 0"))
+    check("过程合集之后永久保留最终结论",
+          turn_process.evaluate("n => n.nextElementSibling?.dataset.role") == "assistant")
+    check("顶栏提供持久化过程折叠开关",
+          p.locator("#a-turns").get_attribute("aria-pressed") == "false"
+          and "on" not in (p.locator("#a-turns").get_attribute("class") or "").split()
+          and p.evaluate("S.compactTurns") is True
+          and p.locator('#a-turns use[href="#i-process"]').count() == 1
+          and process_preview.locator('use[href="#i-process"]').count() == 1)
+
+    process_preview.scroll_into_view_if_needed()
+    p.wait_for_timeout(100)
+    process_top = process_preview.bounding_box()["y"]
+    process_preview.click()
+    p.wait_for_function("document.querySelector('.turn-process-body').childElementCount > 0")
+    p.wait_for_timeout(500)
+    process_top_after = process_preview.bounding_box()["y"]
+    check("点开过程后摘要保持在原视口位置",
+          abs(process_top_after - process_top) <= 2 and p.evaluate("_stick") is False,
+          f"{process_top:.1f} -> {process_top_after:.1f}")
+    p.evaluate("""() => {
+      const box = document.querySelector('#msgs');
+      const body = document.querySelector('.turn-process-body');
+      const br = box.getBoundingClientRect(), rr = body.getBoundingClientRect();
+      box.scrollTop += rr.top + rr.height / 2 - (br.top + br.height / 2);
+    }""")
+    p.wait_for_timeout(250)
+    middle_toolbar = p.evaluate("""() => {
+      const box = document.querySelector('#msgs').getBoundingClientRect();
+      const paddingTop = parseFloat(getComputedStyle(document.querySelector('#msgs')).paddingTop);
+      const toolbar = document.querySelector('.turn-toolbar').getBoundingClientRect();
+      const body = document.querySelector('.turn-process-body').getBoundingClientRect();
+      return {top:toolbar.top, boxTop:box.top, bodyHeight:body.height,
+        boxHeight:box.height, paddingTop,
+        navVisible:document.querySelector('.turn-nav').checkVisibility()};
+    }""")
+    check("长过程滚到中间仍有吸顶导航和收起入口",
+          middle_toolbar["bodyHeight"] > middle_toolbar["boxHeight"]
+          and abs(middle_toolbar["top"] - middle_toolbar["boxTop"]
+                  - middle_toolbar["paddingTop"] - 7) <= 2
+          and middle_toolbar["navVisible"], middle_toolbar)
+    sticky_top = middle_toolbar["top"]
+    turn_process.locator(".turn-collapse").click()
+    p.wait_for_timeout(300)
+    collapsed_top = process_preview.bounding_box()["y"]
+    check("在过程任意位置收起后摘要仍留在眼前",
+          "folded" in (turn_process.get_attribute("class") or "")
+          and process_preview.is_visible()
+          and middle_toolbar["boxTop"] <= collapsed_top
+          <= middle_toolbar["boxTop"] + middle_toolbar["boxHeight"],
+          f"{sticky_top:.1f} -> {collapsed_top:.1f}")
+
+    p.click("#a-turns")
+    p.wait_for_function("!document.querySelector('.turn-process-body').hidden")
+    check("展开所有过程后才物化正文且保留内层工具折叠",
+          p.locator("#a-turns").get_attribute("aria-pressed") == "true"
+          and "on" in (p.locator("#a-turns").get_attribute("class") or "").split()
+          and p.evaluate("store.get('compactTurns')") is False
+          and turn_process.locator(":scope > .turn-process-body").is_visible()
+          and turn_process.locator('.msg[data-role="toolgroup"].folded').count() >= 1)
     roles = p.locator("#msgs [data-role]").evaluate_all("ns => ns.map(n => n.dataset.role)")
     check("消息角色齐全", {"user", "assistant", "thinking", "tool", "tool_result"} <= set(roles), roles)
     check("CLI 注入上下文不进入时间线", "context" not in roles, roles)
@@ -1529,7 +1613,7 @@ def run(pw):
           and light_terminal_surface["sourceBackground"] == "rgb(244, 246, 248)",
           light_terminal_surface)
     ansi_colors = p.evaluate("""() => {
-      const values = s => [...s.matchAll(/(?:38|48);2;(\d+);(\d+);(\d+)/g)]
+      const values = s => [...s.matchAll(/(?:38|48);2;(\\d+);(\\d+);(\\d+)/g)]
         .map(m => m.slice(1).map(Number));
       return {
         truecolor: values(lightTerminalAnsi('\x1b[38;2;255;123;114m'))[0],
@@ -1571,26 +1655,26 @@ def run(pw):
       terminal: termFont(), terminalSize: termFontSize()
     })""")
     check("工具输出保留所选字体且 tmux 保留安全的 CJK 字体回退",
-          "Sesman CJK Sans" in font_pair["tool"] and "Sesman Ubuntu Sans Mono" in font_pair["tool"]
+          "AgentHub CJK Sans" in font_pair["tool"] and "AgentHub Ubuntu Sans Mono" in font_pair["tool"]
           and "Adwaita Mono" in font_pair["tool"]
           and "Ubuntu Mono" in font_pair["tool"] and "Consola" in font_pair["tool"]
-          and "Sesman CJK Sans" in font_pair["terminal"]
-          and "Sesman Ubuntu Sans Mono" in font_pair["terminal"] and "Consola" in font_pair["terminal"]
+          and "AgentHub CJK Sans" in font_pair["terminal"]
+          and "AgentHub Ubuntu Sans Mono" in font_pair["terminal"] and "Consola" in font_pair["terminal"]
           and font_pair["toolSize"] == "12.96px" and font_pair["terminalSize"] == 14.04, font_pair)
     cjk_grid = p.evaluate("""() => ({
-      active: termFont().includes('Sesman CJK Mono Grid'),
-      ratio: terminalFontGridRatio('"Sesman CJK Mono Grid"', termFontSize()),
+      active: termFont().includes('AgentHub CJK Mono Grid'),
+      ratio: terminalFontGridRatio('"AgentHub CJK Mono Grid"', termFontSize()),
       sample: TERM_FONT_SAMPLE
     })""")
     check("可用时只采用汉字宽度严格等于两个西文格的 CJK 字体",
           (not cjk_grid["active"] or abs(cjk_grid["ratio"] - 2) <= .025)
           and "，。！？" in cjk_grid["sample"], cjk_grid)
-    p.evaluate("document.fonts.load('12px \\\"Sesman CJK Sans\\\"', '中文字体')")
+    p.evaluate("document.fonts.load('12px \\\"AgentHub CJK Sans\\\"', '中文字体')")
     check("三套等宽选项的汉字固定回退到无衬线 CJK 字体",
-          p.evaluate("document.fonts.check('12px \\\"Sesman CJK Sans\\\"', '中文字体')"))
-    p.wait_for_function("document.fonts.check('12px \\\"Sesman Ubuntu Sans Mono\\\"')", timeout=15000)
+          p.evaluate("document.fonts.check('12px \\\"AgentHub CJK Sans\\\"', '中文字体')"))
+    p.wait_for_function("document.fonts.check('12px \\\"AgentHub Ubuntu Sans Mono\\\"')", timeout=15000)
     bundled_font = p.evaluate("""() => ({
-      loaded: document.fonts.check('12px "Sesman Ubuntu Sans Mono"'),
+      loaded: document.fonts.check('12px "AgentHub Ubuntu Sans Mono"'),
       requested: performance.getEntriesByName(location.origin + '/fonts/UbuntuSansMono.ttf').length,
       metrics: (() => {
         const context = document.createElement('canvas').getContext('2d');
@@ -1606,8 +1690,8 @@ def run(pw):
           and 7.7 <= bundled_font["metrics"]["zero"] <= 8.0
           and 1.7 <= bundled_font["metrics"]["cjkRatio"] <= 2.025
           and abs(bundled_font["metrics"]["dashRatio"] - 1) <= .025
-          and "Sesman Ubuntu Sans Mono" in bundled_font["resolved"]
-          and "Sesman CJK Mono Grid" not in bundled_font["resolved"],
+          and "AgentHub Ubuntu Sans Mono" in bundled_font["resolved"]
+          and "AgentHub CJK Mono Grid" not in bundled_font["resolved"],
           bundled_font)
     p.click("#settings")
     check("设置窗口集中提供字体、颜色和缓存选项",
@@ -1630,10 +1714,10 @@ def run(pw):
           and settings_applied["cache"] == 512 * 1024 * 1024
           and settings_applied["saved"] == ["system", "dark", 512], settings_applied)
     p.select_option("#setting-font", "consolas")
-    p.wait_for_function("configuredTermFont().startsWith('\"Sesman CJK Sans\", Consolas')")
+    p.wait_for_function("configuredTermFont().startsWith('\"AgentHub CJK Sans\", Consolas')")
     consolas_stack = p.evaluate("configuredTermFont()")
     check("Consola 选项不会让汉字落入 generic monospace 宋体",
-          consolas_stack.startswith('"Sesman CJK Sans", Consolas, Consola')
+          consolas_stack.startswith('"AgentHub CJK Sans", Consolas, Consola')
           and consolas_stack.endswith('sans-serif') and 'monospace' not in consolas_stack,
           consolas_stack)
     p.select_option("#setting-font", "ubuntu")
@@ -1645,7 +1729,7 @@ def run(pw):
         report_requests.append(route.request.post_data_json)
         route.fulfill(status=202, content_type="application/json", body=json.dumps({
             "ok": True, "report_id": "BUG-E2E", "path": "/tmp/BUG-E2E",
-            "worker": {"name": "sesman-codex-new-e2e", "source": "codex",
+            "worker": {"name": "agenthub-codex-new-e2e", "source": "codex",
                        "sid": None, "cwd": str(Path(__file__).resolve().parents[1]),
                        "token": "e2e", "title": "处理 BUG-E2E",
                        "kind": "bug-report", "report_id": "BUG-E2E"},
@@ -1714,7 +1798,7 @@ def run(pw):
           and all(abs(content_widths["boxes"][k]["right"] - content_widths["win"]) <= 1
                   for k in ("messages", "detailHeader", "pageHeader", "progress")),
           content_widths)
-    folded_geo = p.locator("#msgs > .msg.folded").first.evaluate("""n => {
+    folded_geo = p.locator('#msgs .msg[data-role="toolgroup"].folded').first.evaluate("""n => {
       const box = document.querySelector('#msgs').getBoundingClientRect();
       const r = n.getBoundingClientRect();
       return {ratio: r.width / box.width, radius: getComputedStyle(n).borderRadius,
@@ -1761,7 +1845,7 @@ def run(pw):
     check("句中三反引号不会把后文误切成代码块",
           "句中提到 ```python 不是围栏，后文不能被吞掉" in p.locator(".msgs").inner_text()
           and p.locator('code.code-block').filter(has_text="后文不能被吞掉").count() == 0)
-    check("语法高亮依赖从 sesman 本地加载",
+    check("语法高亮依赖从 agenthub 本地加载",
           p.locator('script[src$="syntax.js"]').count() == 1
           and p.locator('script[src^="http"]:not([src^="' + BASE + '"])').count() == 0)
     p.evaluate("""() => {
@@ -1818,6 +1902,182 @@ def run(pw):
     check("不存在的相对图片不发请求", "[图片: 缺失图]" in p.locator(".msgs").inner_text())
 
     # ---- 8b. 连续工具调用合并成组 ----
+    turn_folding = p.evaluate("""() => {
+      const raw = [
+        {role:'user', text:'请完成任务', turn_id:'turn-probe'},
+        {role:'user', text:'[图片]', turn_id:'turn-probe'},
+        {role:'assistant', text:'先检查现状', phase:'progress', turn_id:'turn-probe'},
+        {role:'tool', name:'exec', summary:'$ echo one', call_id:'turn-call-1', turn_id:'turn-probe'},
+        {role:'tool_result', text:'one', call_id:'turn-call-1', turn_id:'turn-probe'},
+        {role:'tool', name:'read', summary:'读 demo.py', call_id:'turn-call-2', turn_id:'turn-probe'},
+        {role:'tool_result', text:'内容', call_id:'turn-call-2', turn_id:'turn-probe'},
+        {role:'question', text:'要继续吗？', call_id:'turn-ask', turn_id:'turn-probe'},
+        {role:'answer', text:'继续', call_id:'turn-ask', turn_id:'turn-probe'},
+        {role:'assistant', text:'任务已完成', phase:'final', turn_id:'turn-probe'},
+      ];
+      const plan = planTurns(raw, {tailComplete:false});
+      const outer = plan.find(item => item.turn)?.turn;
+      const node = turnProcessNode(outer, false);
+      const lazyBeforeOpen = node.classList.contains('folded')
+        && node.querySelector(':scope > .turn-process-body').childElementCount === 0;
+      node._open();
+      const preservesInnerToolFold = !!node.querySelector(
+        ':scope > .turn-process-body > .msg[data-role=toolgroup].folded');
+      const waiting = planTurns(raw.slice(0, -1), {tailComplete:false});
+      const legacy = raw.map(m => {
+        const copy = {...m}; delete copy.phase; delete copy.turn_id; return copy;
+      });
+      const interruptedRaw = legacy.filter((_, i) => i !== 1);
+      const interruptedLast = [...interruptedRaw].reverse().find(isTurnAssistant);
+      interruptedLast.interrupted = true;
+      const interrupted = planTurns(interruptedRaw, {tailComplete:true});
+      const legacyComplete = planTurns(legacy, {tailComplete:true});
+      // Codex 的末次 commentary 后仍可能落下一项工具结果；中断状态应被
+      // 提升为可见末次进展，前后工具仍留在同一个过程合集。
+      const abortedWithTrailingTool = [
+        {role:'user', text:'执行任务', turn_id:'turn-aborted'},
+        {role:'assistant', text:'先检查', phase:'progress', turn_id:'turn-aborted'},
+        {role:'tool', name:'exec', summary:'$ first', call_id:'first', turn_id:'turn-aborted'},
+        {role:'tool_result', text:'first ok', call_id:'first', turn_id:'turn-aborted'},
+        {role:'assistant', text:'中断前状态', phase:'progress', turn_id:'turn-aborted',
+         interrupted:true},
+        {role:'tool', name:'exec', summary:'$ trailing', call_id:'trailing', turn_id:'turn-aborted'},
+        {role:'tool_result', text:'trailing ok', call_id:'trailing', turn_id:'turn-aborted'},
+      ];
+      const abortedPlan = planTurns(abortedWithTrailingTool, {tailComplete:true});
+      const abortedProcess = abortedPlan.find(item => item.turn)?.turn;
+      const abortedNode = turnProcessNode(abortedProcess, false);
+      const shortAbortedPlan = planTurns([
+        {role:'user', text:'短任务', turn_id:'turn-short-aborted'},
+        {role:'assistant', text:'最后状态', phase:'progress',
+         turn_id:'turn-short-aborted', interrupted:true},
+        {role:'tool', name:'exec', summary:'$ verify', call_id:'verify',
+         turn_id:'turn-short-aborted'},
+        {role:'tool_result', text:'ok', call_id:'verify',
+         turn_id:'turn-short-aborted'},
+      ], {tailComplete:true});
+      const incrementalAbort = abortedWithTrailingTool.map(m => {
+        const copy = {...m}; delete copy.interrupted; return copy;
+      });
+      const incrementalMarked = markInterruptedTurn(incrementalAbort, {
+        state:'aborted', turn_id:'turn-aborted', reason:'用户中断',
+      });
+      const abortedIncremental = document.createElement('div');
+      buildPlan(abortedIncremental, planMessages(incrementalAbort), null);
+      const abortedSealed = sealTurnTail(abortedIncremental, {
+        msgs:incrementalAbort, meta:{uid:'turn-aborted'},
+        activity:{state:'aborted', turn_id:'turn-aborted'},
+      }, {defer:false});
+      // BUG-20260906-072235-9128c5: 用户在同一个原生 turn 里追加要求时，
+      // 追加前的 commentary/tool 段没有自己的 final，但已经是历史过程。
+      const steered = [
+        {role:'user', text:'先做 A', turn_id:'turn-steered'},
+        {role:'assistant', text:'A 处理中', phase:'progress', turn_id:'turn-steered'},
+        {role:'tool', name:'exec', summary:'$ do-a', call_id:'a', turn_id:'turn-steered'},
+        {role:'tool_result', text:'a ok', call_id:'a', turn_id:'turn-steered'},
+        {role:'assistant', text:'A 还在处理', phase:'progress', turn_id:'turn-steered'},
+        {role:'user', text:'同时做 B', turn_id:'turn-steered'},
+        {role:'assistant', text:'AB 处理中', phase:'progress', turn_id:'turn-steered'},
+        {role:'tool', name:'exec', summary:'$ do-b', call_id:'b', turn_id:'turn-steered'},
+        {role:'tool_result', text:'b ok', call_id:'b', turn_id:'turn-steered'},
+        {role:'assistant', text:'AB 完成', phase:'final', turn_id:'turn-steered'},
+      ];
+      const steeredPlan = planTurns(steered, {tailComplete:true});
+      const gapHead = planTurns(steered.slice(0, 5), {
+        tailComplete:false, foldTail:true,
+      });
+      const gapTail = planTurns([
+        {role:'assistant', text:'缺口后的进展', phase:'progress', turn_id:'gap-turn'},
+        {role:'tool', name:'exec', summary:'$ resume', call_id:'gap', turn_id:'gap-turn'},
+        {role:'tool_result', text:'ok', call_id:'gap', turn_id:'gap-turn'},
+        {role:'assistant', text:'缺口后的结论', phase:'final', turn_id:'gap-turn'},
+        {role:'user', text:'下一轮', turn_id:'next-turn'},
+      ], {tailComplete:true});
+      const activeFragment = planTurns([
+        {role:'assistant', text:'仍在工作', phase:'progress', turn_id:'active-turn'},
+        {role:'tool', name:'exec', summary:'$ active', call_id:'active', turn_id:'active-turn'},
+        {role:'tool_result', text:'running', call_id:'active', turn_id:'active-turn'},
+      ], {openTail:true, tailComplete:false});
+      const interruptedProcess = interrupted.find(item => item.turn)?.turn;
+
+      const incremental = document.createElement('div');
+      buildPlan(incremental, planMessages(raw), null);
+      const sealed = sealTurnTail(incremental, {
+        msgs:raw, meta:{uid:'turn-probe'}, activity:{state:'idle'}
+      }, {defer:false});
+      return {
+        planShape:plan.length === 4 && plan[0].m?.role === 'user'
+          && plan[1].m?.role === 'user' && plan[2].turn
+          && plan[3].m?.text === '任务已完成',
+        nativeTurnId:outer?.key === 'turn-probe',
+        virtualProcessWrapperIsNotAMessage:node.dataset.counted === 'false',
+        multipartPromptStaysVisible:!outer?.items.some(m => m.role === 'user'),
+        questionAndAnswerStayInside:outer?.items.some(m => m.role === 'question')
+          && outer.items.some(m => m.role === 'answer')
+          && !plan.some(item => item.m?.role === 'answer'),
+        lazyBeforeOpen, materializedAfterOpen:
+          node.querySelector(':scope > .turn-process-body').childElementCount > 0,
+        preservesInnerToolFold,
+        waitingDoesNotGuessConclusion:!waiting.some(item => item.turn),
+        interruptedKeepsLastUpdateOutsideProcess:!!interruptedProcess
+          && interruptedProcess.hasConclusion === true
+          && interruptedProcess.interrupted === true
+          && interrupted.at(-1)?.m?.text === '任务已完成'
+          && interrupted.at(-1)?.m?.interrupted === true,
+        interruptedTrailingToolsStayInProcess:
+          abortedPlan.length === 3
+          && abortedPlan[0].m?.role === 'user'
+          && abortedProcess?.interrupted === true
+          && abortedProcess.items.some(m => m.call_id === 'trailing')
+          && !abortedProcess.items.some(m => m.text === '中断前状态')
+          && abortedPlan[2].m?.text === '中断前状态'
+          && abortedNode.dataset.interrupted === 'true'
+          && abortedNode.querySelector('.turn-to-conclusion')?.textContent
+             === '末次进展 ↓',
+        shortInterruptedTurnStillFoldsItsSingleTool:
+          shortAbortedPlan.length === 3
+          && shortAbortedPlan[1].turn?.items.length === 2
+          && shortAbortedPlan[2].m?.text === '最后状态',
+        incrementalAbortMarksOnlyLastAssistant:
+          incrementalMarked
+          && incrementalAbort.filter(m => m.interrupted).length === 1
+          && incrementalAbort.find(m => m.interrupted)?.text === '中断前状态'
+          && incrementalAbort.find(m => m.interrupted)?.interrupt_reason === '用户中断',
+        incrementalAbortSealsWithoutReload:
+          abortedSealed
+          && [...abortedIncremental.children].map(n => n.dataset.role).join(',')
+             === 'user,process,assistant'
+          && abortedIncremental.lastElementChild.classList.contains('native-interrupted'),
+        steeredHistoryCompactsWithoutLosingPrompts:
+          steeredPlan.length === 5
+          && steeredPlan[0].m?.text === '先做 A'
+          && steeredPlan[1].turn?.hasConclusion === false
+          && steeredPlan[1].turn?.items.at(-1)?.phase === 'progress'
+          && steeredPlan[2].m?.text === '同时做 B'
+          && steeredPlan[3].turn?.hasConclusion === true
+          && steeredPlan[4].m?.text === 'AB 完成',
+        windowGapSidesCompactWithoutCrossGapGuessing:
+          gapHead.length === 2
+          && gapHead[0].m?.text === '先做 A'
+          && gapHead[1].turn?.hasConclusion === false
+          && gapTail.length === 3
+          && gapTail[0].turn?.hasConclusion === true
+          && gapTail[1].m?.text === '缺口后的结论'
+          && gapTail[2].m?.text === '下一轮',
+        activeFragmentStaysExpanded:!activeFragment.some(item => item.turn),
+        completedLegacyFallsBackToLastAssistant:legacyComplete.some(item => item.turn),
+        incrementalSeal:sealed
+          && incremental.children.length === 4
+          && incremental.children[0].dataset.role === 'user'
+          && incremental.children[1].dataset.role === 'user'
+          && incremental.children[2].dataset.role === 'process'
+          && incremental.children[3].dataset.role === 'assistant'
+          && incremental.children[0]._turnSealed === true,
+      };
+    }""")
+    check("过程合集按原生回合边界保留结论、懒加载并兼容旧会话与增量封口",
+          all(turn_folding.values()), turn_folding)
+
     live_tool_grouping = p.evaluate("""() => {
       const box = document.createElement('div');
       const tool = n => ({role:'tool', name:'exec', summary:`$ echo ${n}`,
@@ -2098,7 +2358,7 @@ def run(pw):
     check("切换子代理不改变左侧父会话选中项", p.locator(".item.sel").count() == 1)
     p.locator("#a-view-switch").click()
     p.locator('#session-view-menu button[data-agent=""]').click()
-    p.wait_for_function("document.querySelector('.dhead h2')?.textContent.includes('SESMAN自测会话请删除')")
+    p.wait_for_function("document.querySelector('.dhead h2')?.textContent.includes('AGENTHUB自测会话请删除')")
     check("切回主会话后不残留子代理内容",
           "子代理一的独立结论" not in p.locator("#msgs").inner_text())
 
@@ -2169,10 +2429,10 @@ def run(pw):
     # 先等上一次载入彻底结束, 否则它的 cachePut 会在 clear 之后落地
     p.wait_for_function("!document.querySelector('#prog').classList.contains('on')", timeout=60000)
     window_uid = p.evaluate(
-        "() => S.sessions.find(s => s.title === 'SESMAN分页载入测试').uid")
+        "() => S.sessions.find(s => s.title === 'AGENTHUB分页载入测试').uid")
     # 上一段可能还有没落地的载入, 清两次并等一拍, 否则它的 cachePut 会落在 clear 之后
     p.evaluate("cache.clear()")
-    p.wait_for_load_state("networkidle")
+    p.wait_for_load_state("domcontentloaded")
     p.wait_for_timeout(400)
     p.evaluate("uid => cache.delete(uid)", window_uid)
     reqs.clear()
@@ -2343,7 +2603,7 @@ def run(pw):
           stalled_sync)
 
     # ---- 14a. 增量同步: 会话被 CLI 追加内容后应自动接上 ----
-    p.fill("#q", "SESMAN自测")
+    p.fill("#q", "AGENTHUB自测")
     p.wait_for_timeout(250)
     p.locator(".item").first.click()
     p.wait_for_selector(".msg", timeout=20000)
@@ -2353,7 +2613,7 @@ def run(pw):
         fh.write(json.dumps({
             "type": "user", "message": {"role": "user", "content": "追加的新消息ZZQ"},
             "uuid": "u9", "timestamp": "2026-08-06T12:30:00.000Z",
-            "cwd": "/tmp/sesman-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
+            "cwd": "/tmp/agenthub-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
     p.evaluate("syncSession(S.sel)")
     p.wait_for_function(f"document.querySelector('#mcount-total').textContent !== '{n0} 条消息'",
                         timeout=30000)
@@ -2371,7 +2631,7 @@ def run(pw):
         fh.write(json.dumps({
             "type": "assistant", "message": {"role": "assistant", "content": "助手追加的新内容AAQ"},
             "uuid": "a9", "timestamp": "2026-08-06T12:30:01.000Z",
-            "cwd": "/tmp/sesman-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
+            "cwd": "/tmp/agenthub-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
     p.evaluate("syncSession(S.sel)")
     p.wait_for_function("document.querySelector('.item.sel .item-status')?.textContent === '1'",
                         timeout=30000)
@@ -2389,12 +2649,12 @@ def run(pw):
 
     # 文件被改写(不是追加) → 必须整份重来, 不能把旧内容和新内容拼起来
     txt = fake.read_text().splitlines()
-    fake.write_text("\n".join([json.dumps({"type": "ai-title", "aiTitle": "SESMAN自测会话请删除",
+    fake.write_text("\n".join([json.dumps({"type": "ai-title", "aiTitle": "AGENTHUB自测会话请删除",
                                            "sessionId": fake.stem}, ensure_ascii=False)] + txt[1:]) + "\n")
     with open(fake, "a") as fh:
         fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "改写后追加YYQ"},
                              "uuid": "u10", "timestamp": "2026-08-06T12:31:00.000Z",
-                             "cwd": "/tmp/sesman-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
+                             "cwd": "/tmp/agenthub-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
     p.evaluate("syncSession(S.sel)")
     p.wait_for_function("document.querySelector('#msgs').textContent.includes('改写后追加YYQ')", timeout=30000)
     n2 = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
@@ -2409,6 +2669,13 @@ def run(pw):
     # 误算成“定时轮询”。若恢复自身悬死，这里会明确超时失败。
     p.wait_for_function("diffRecoveries.size === 0 && syncingViews.size === 0",
                         timeout=20000)
+    # 上一段同时使用了主动读取和 SSE。主动读取会推进浏览器游标，已有
+    # EventSource 仍保留建连时的旧游标；重建连接后再测纯推送路径。
+    old_sse_connection = p.evaluate("_es?.__agenthubConnectionId || ''")
+    p.evaluate("watchSession(S.sel, S.agent)")
+    p.wait_for_function("old => _es && _es.readyState === 1"
+                        " && _es.__agenthubConnectionId !== old",
+                        arg=old_sse_connection, timeout=20000)
     p.evaluate("""() => {
       window.__e2eOriginalSyncSession = syncSession;
       window.__e2eOriginalScheduleDiffRecovery = scheduleDiffRecovery;
@@ -2441,7 +2708,7 @@ def run(pw):
             fh.write(json.dumps({
                 "type": "user", "message": {"role": "user", "content": "推送消息RT%d" % i},
                 "uuid": "rt%d" % i, "timestamp": "2026-08-07T12:1%d:00.000Z" % i,
-                "cwd": "/tmp/sesman-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
+                "cwd": "/tmp/agenthub-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
         p.wait_for_function("document.querySelector('#msgs').textContent.includes('推送消息RT%d')" % i,
                             timeout=20000)
         lat.append(time.time() - t0)
@@ -2468,7 +2735,7 @@ def run(pw):
     lines = fake.read_text().splitlines()
     fake.write_text("\n".join(lines[:-2] + [json.dumps(
         {"type": "user", "message": {"role": "user", "content": "推送回滚RBK"}, "uuid": "rbk",
-         "timestamp": "2026-08-07T12:30:00.000Z", "cwd": "/tmp/sesman-selftest",
+         "timestamp": "2026-08-07T12:30:00.000Z", "cwd": "/tmp/agenthub-selftest",
          "sessionId": fake.stem}, ensure_ascii=False)]) + "\n")
     p.wait_for_function("document.querySelector('#msgs').textContent.includes('推送回滚RBK')", timeout=20000)
     check("回滚也是推过来的, 且旧内容清除",
@@ -2577,16 +2844,16 @@ def run(pw):
     p.wait_for_timeout(150)
 
     extra = FAKE_PROJ / "00000000-dead-beef-0000-000000000002.jsonl"
-    extra.write_text(json.dumps({"type": "ai-title", "aiTitle": "SESMAN新会话ZZ",
+    extra.write_text(json.dumps({"type": "ai-title", "aiTitle": "AGENTHUB新会话ZZ",
                                  "sessionId": extra.stem}, ensure_ascii=False) + "\n"
                      + json.dumps({"type": "user", "message": {"role": "user", "content": "新会话正文"},
                                    "uuid": "n1", "timestamp": "2026-08-07T09:00:00.000Z",
-                                   "cwd": "/tmp/sesman-selftest", "sessionId": extra.stem},
+                                   "cwd": "/tmp/agenthub-selftest", "sessionId": extra.stem},
                                   ensure_ascii=False) + "\n")
     p.evaluate("pollSessions()")
     p.wait_for_function(f"S.sessions.length > {n_before}", timeout=30000)
     check("新会话自动出现在列表, 不必手动刷新",
-          p.evaluate("S.sessions.some(s => s.title.includes('SESMAN新会话ZZ'))"))
+          p.evaluate("S.sessions.some(s => s.title.includes('AGENTHUB新会话ZZ'))"))
     check("签名随之更新", p.evaluate("S.sig") != sig0)
     check("自动刷新不丢选中", p.evaluate("S.sel") == sel_uid and p.locator(".item.sel").count() == 1)
     check("自动刷新保持滚动位置",
@@ -2597,12 +2864,12 @@ def run(pw):
     # 未选中的 Claude 会话也要从列表游标续读新增区间；不能只有当前详情页
     # 的 SSE 才会累加角标，更不能为此重新下载整份历史。
     extra_uid = p.evaluate(
-        "() => S.sessions.find(s => s.title.includes('SESMAN新会话ZZ')).uid")
+        "() => S.sessions.find(s => s.title.includes('AGENTHUB新会话ZZ')).uid")
     with open(extra, "a") as fh:
         fh.write(json.dumps({
             "type": "assistant", "message": {"role": "assistant", "content": "后台回复未读BBQ"},
             "uuid": "n2", "parentUuid": "n1", "timestamp": "2026-08-07T09:00:01.000Z",
-            "cwd": "/tmp/sesman-selftest", "sessionId": extra.stem,
+            "cwd": "/tmp/agenthub-selftest", "sessionId": extra.stem,
         }, ensure_ascii=False) + "\n")
     # 服务端会在 500ms 内复用刚发布的 inventory；这里明确跨过该去抖窗口，
     # 测的是后台增量/未读，而不是同一瞬间重复刷新是否重扫磁盘。
@@ -2624,13 +2891,13 @@ def run(pw):
     # 结构没变时只改文字, DOM 节点必须原地不动。
     live_file = FAKE_PROJ / "00000000-dead-beef-0000-000000000003.jsonl"
     live_file.write_text(json.dumps(
-        {"type": "ai-title", "aiTitle": "SESMAN活跃写入", "sessionId": live_file.stem},
+        {"type": "ai-title", "aiTitle": "AGENTHUB活跃写入", "sessionId": live_file.stem},
         ensure_ascii=False) + "\n")
     urllib.request.urlopen(BASE + "/api/sessions?force=1", timeout=60).read()
     p.evaluate("pollSessions()")
-    p.wait_for_function("S.sessions.some(s => s.title.includes('SESMAN活跃写入'))", timeout=30000)
+    p.wait_for_function("S.sessions.some(s => s.title.includes('AGENTHUB活跃写入'))", timeout=30000)
     p.wait_for_timeout(400)
-    live_uid = p.evaluate("() => S.sessions.find(s => s.title.includes('SESMAN活跃写入')).uid")
+    live_uid = p.evaluate("() => S.sessions.find(s => s.title.includes('AGENTHUB活跃写入')).uid")
     p.evaluate("""(uid) => {
       window.__f = { rebuilt: 0, metas: [] };
       window.__w = document.querySelector('.item[data-uid="' + uid + '"]');
@@ -2651,7 +2918,7 @@ def run(pw):
                 fh.write(json.dumps({
                     "type": "user", "message": {"role": "user", "content": "活跃写入%d" % i},
                     "uuid": "lw%d" % i, "timestamp": "2026-08-07T13:00:00.000Z",
-                    "cwd": "/tmp/sesman-selftest", "sessionId": live_file.stem},
+                    "cwd": "/tmp/agenthub-selftest", "sessionId": live_file.stem},
                     ensure_ascii=False) + "\n")
             i += 1
             time.sleep(1.5)
@@ -2672,7 +2939,7 @@ def run(pw):
 
     # 搜索态下不该被自动刷新冲掉
     seq = p.get_attribute("#stat", "data-seq") or ""
-    p.fill("#q", "SESMAN自测")
+    p.fill("#q", "AGENTHUB自测")
     p.press("#q", "Enter")
     p.wait_for_function(f"document.querySelector('#stat').dataset.seq !== '{seq}'", timeout=60000)
     p.wait_for_timeout(300)
@@ -2693,7 +2960,7 @@ def run(pw):
     urllib.request.urlopen(BASE + "/api/sessions?force=1", timeout=60).read()
     p.evaluate("() => { cache.clear(); closeWatch(); }")
     if fake2.exists():
-        p.fill("#q", "SESMAN自测")
+        p.fill("#q", "AGENTHUB自测")
         p.wait_for_timeout(250)
         p.locator(".item").first.click()
         p.wait_for_selector(".msg", timeout=20000)
@@ -2705,7 +2972,7 @@ def run(pw):
             fh.write(json.dumps({
                 "type": "user", "message": {"role": "user", "content": "将被回滚掉XYZ"},
                 "uuid": "xyz", "timestamp": "2026-08-07T11:50:00.000Z",
-                "cwd": "/tmp/sesman-selftest", "sessionId": fake2.stem}, ensure_ascii=False) + "\n")
+                "cwd": "/tmp/agenthub-selftest", "sessionId": fake2.stem}, ensure_ascii=False) + "\n")
         p.wait_for_function("document.querySelector('#msgs').textContent.includes('将被回滚掉XYZ')",
                             timeout=20000)
         # 模拟双 Esc 回滚: 砍掉尾部, 再写入不同内容, 让文件重新变得更长
@@ -2713,7 +2980,7 @@ def run(pw):
         rolled = lines[:-2] + [json.dumps(
             {"type": "user", "message": {"role": "user", "content": "回滚后的新内容QQZ"},
              "uuid": "r%d" % i, "timestamp": "2026-08-07T12:0%d:00.000Z" % i,
-             "cwd": "/tmp/sesman-selftest", "sessionId": fake2.stem}, ensure_ascii=False)
+             "cwd": "/tmp/agenthub-selftest", "sessionId": fake2.stem}, ensure_ascii=False)
             for i in range(4)]
         fake2.write_text("\n".join(rolled) + "\n")
         check("回滚后文件反而更长(只看长度会误判)", fake2.stat().st_size > before[1],
@@ -2748,7 +3015,7 @@ def run(pw):
           {"before": n_before, "after": n_refreshed})
 
     # ---- 14c. 搜索态下切换来源筛选 ----
-    p.fill("#q", "sesman")
+    p.fill("#q", "agenthub")
     p.press("#q", "Enter")
     p.wait_for_function("document.querySelector('#stat').textContent.includes('命中')", timeout=60000)
     hit_all = p.locator(".item").count()
@@ -2787,12 +3054,12 @@ def run(pw):
         check("终端未启用时不显示接管入口", p.locator("#a-term").count() == 0)
         check("终端未启用时不显示新建入口", p.locator("#new-session").is_hidden())
     else:
-        # 新会话进入专用 server，但改造前默认 server 中的 sesman-* 仍须可见、可路由。
-        legacy_name = "sesman-e2e-legacycompat"
+        # 新会话进入专用 server，但改造前默认 server 中的 agenthub-* 仍须可见、可路由。
+        legacy_name = "agenthub-e2e-legacycompat"
         tmux_run("default", "kill-session", "-t", legacy_name, capture_output=True)
         tmux_run("default", "new-session", "-d", "-s", legacy_name, "sleep 60", check=True)
         legacy_row = next((x for x in term_rows() if x["name"] == legacy_name), None)
-        check("默认 server 的旧 sesman 会话仍可见",
+        check("默认 server 的旧 agenthub 会话仍可见",
               legacy_row is not None and legacy_row.get("server") == "default", legacy_row)
         urllib.request.urlopen(urllib.request.Request(
             BASE + "/api/term/kill",
@@ -2947,8 +3214,8 @@ def run(pw):
 
         # 新建 CLI 写出第一条正式记录前只有 pending tmux：手机也必须能切到空
         # 对话页、添加附件，并直接按 tmux 名关机。
-        tmux_run("sesman", "kill-session", "-t", PENDING_TERM, capture_output=True)
-        tmux_run("sesman", "new-session", "-d", "-s", PENDING_TERM,
+        tmux_run("agenthub", "kill-session", "-t", PENDING_TERM, capture_output=True)
+        tmux_run("agenthub", "new-session", "-d", "-s", PENDING_TERM,
                  "-x", "100", "-y", "30", "-c", str(FAKE_CWD),
                  "bash --noprofile --norc", check=True)
         pending_store.put({
@@ -2981,7 +3248,7 @@ def run(pw):
         }""", PENDING_TERM)
         check("临时会话第一条消息前即可上传附件",
               pending_upload["status"] == 200
-              and re.fullmatch(r"sesman_attachments/\d+/pending\.png",
+              and re.fullmatch(r"agenthub_attachments/\d+/pending\.png",
                                pending_upload["data"]["relative_path"]),
               pending_upload)
         migrated_draft = p.evaluate("""() => {
@@ -3005,7 +3272,7 @@ def run(pw):
         p.wait_for_function("n => !T.pending.some(x => x.name === n)", arg=PENDING_TERM,
                             timeout=30000)
         check("手机关机按临时 tmux 名结束并移出列表",
-              tmux_run("sesman", "has-session", "-t", PENDING_TERM,
+              tmux_run("agenthub", "has-session", "-t", PENDING_TERM,
                        capture_output=True).returncode != 0
               and pending_store.get(PENDING_TERM) is None)
         p.wait_for_timeout(900)
@@ -3018,7 +3285,7 @@ def run(pw):
         # 首条消息前直接退出 CLI：临时项、选中详情、终端对象和输入框必须一起
         # 消失，不能留下一个不在左栏、也无法再连接的“新建会话”孤儿页。
         p.evaluate("T.mode = 'normal'")
-        tmux_run("sesman", "new-session", "-d", "-s", PENDING_EXIT_TERM,
+        tmux_run("agenthub", "new-session", "-d", "-s", PENDING_EXIT_TERM,
                  "-x", "100", "-y", "30", "-c", str(FAKE_CWD),
                  "bash --noprofile --norc", check=True)
         pending_store.put({
@@ -3031,7 +3298,7 @@ def run(pw):
         p.evaluate("""n => openPendingSession(
           pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n))""", PENDING_EXIT_TERM)
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
-        tmux_run("sesman", "kill-session", "-t", PENDING_EXIT_TERM, check=True)
+        tmux_run("agenthub", "kill-session", "-t", PENDING_EXIT_TERM, check=True)
         p.wait_for_function("n => S.sel !== pendingUid(n)", arg=PENDING_EXIT_TERM, timeout=30000)
         abandoned = p.evaluate("""n => ({
           selected:S.sel, stored:store.get('sel'), pending:T.pending.some(x => x.name === n),
@@ -3075,8 +3342,8 @@ def run(pw):
         p.wait_for_timeout(1500)
         tname = p.evaluate("T.name")
         tserver = term_server(tname)
-        check("一键接管起了 tmux 会话", tname.startswith("sesman-claude-"), tname)
-        check("新接管会话使用 sesman 专用 server", tserver == "sesman", tserver)
+        check("一键接管起了 tmux 会话", tname.startswith("agenthub-claude-"), tname)
+        check("新接管会话使用 agenthub 专用 server", tserver == "agenthub", tserver)
         check("接管未弹确认框(会话本来就没在跑)", not dialogs, dialogs[:1])
         check("首次打开默认纯终端而不是分屏",
               p.locator("#termpane").is_visible()
@@ -3215,7 +3482,8 @@ def run(pw):
         resize_dedup = p.evaluate("""() => {
           const view = currentTermViewObject(), ws = view.ws;
           const original = ws.send, sent = [];
-          ws.send = data => sent.push(JSON.parse(data));
+          ws.send = data => typeof data === 'string'
+            ? sent.push(JSON.parse(data)) : original.call(ws, data);
           view.lastResizeWs = null; view.lastResizeKey = '';
           try { fitTerm(true); fitTerm(true); } finally { ws.send = original; }
           return sent.filter(x => x.t === 'resize');
@@ -3225,7 +3493,8 @@ def run(pw):
           const view = currentTermViewObject(), ws = view.ws;
           const oldSend = ws.send, oldRefresh = view.term.refresh.bind(view.term);
           const sent = []; let refreshes = 0;
-          ws.send = data => sent.push(JSON.parse(data));
+          ws.send = data => typeof data === 'string'
+            ? sent.push(JSON.parse(data)) : oldSend.call(ws, data);
           view.term.refresh = (start, end) => { refreshes += 1; oldRefresh(start, end); };
           view.lastResizeWs = ws;
           view.lastResizeKey = `${view.term.cols}x${view.term.rows}`;
@@ -3284,7 +3553,8 @@ def run(pw):
           const view = currentTermViewObject(), ws = view.ws, right = $('#right');
           const oldDisplay = right.style.display, oldSend = ws.send;
           const sent = [], before = [view.term.cols, view.term.rows];
-          ws.send = data => sent.push(JSON.parse(data));
+          ws.send = data => typeof data === 'string'
+            ? sent.push(JSON.parse(data)) : oldSend.call(ws, data);
           right.style.display = 'none';
           try {
             fitTerm(true);
@@ -3307,7 +3577,11 @@ def run(pw):
           window.__mobileListTermProbe = {
             view, ws, send:ws.send, sent:[], before:[view.term.cols, view.term.rows]
           };
-          ws.send = data => window.__mobileListTermProbe.sent.push(JSON.parse(data));
+          ws.send = data => {
+            const probe = window.__mobileListTermProbe;
+            if (typeof data === 'string') probe.sent.push(JSON.parse(data));
+            else probe.send.call(probe.ws, data);
+          };
           store.set('mobilePage', 'list');
         }""")
         viewport(390, 780)
@@ -3556,14 +3830,14 @@ def run(pw):
               and p.locator("#cinput").input_value() == "[附件1]", remaining_refs)
         converted_prompt = p.evaluate("""() => buildComposerPrompt(
           '请分析 [附件1]，原样保留 @2', [{
-            number:1, relative_path:'sesman_attachments/7/图.png'
+            number:1, relative_path:'agenthub_attachments/7/图.png'
           }, {
-            number:3, relative_path:'sesman_attachments/7/数据.csv'
+            number:3, relative_path:'agenthub_attachments/7/数据.csv'
           }], [])""")
         check("正文原样保留并在空行后追加精简附件清单",
               converted_prompt == "请分析 [附件1]，原样保留 @2\n\n"
-              "附件1: ./sesman_attachments/7/图.png\n"
-              "附件3: ./sesman_attachments/7/数据.csv",
+              "附件1: ./agenthub_attachments/7/图.png\n"
+              "附件3: ./agenthub_attachments/7/数据.csv",
               converted_prompt)
         check("纯文字 prompt 保持原样以兼容斜杠命令",
               p.evaluate("buildComposerPrompt('/rename abc', [], [])") == "/rename abc")
@@ -3877,7 +4151,7 @@ def run(pw):
 
         # 输入内容要等服务端确认后再清空；网络失败时必须保留草稿，不能假装发出。
         p.evaluate("""() => {
-          window.__sesmanRealPost = post;
+          window.__agenthubRealPost = post;
           post = url => url === 'api/session/draft-status'
             ? Promise.resolve({ok:true, draft_state:'empty'})
             : new Promise(resolve => setTimeout(() => resolve({ok: true}), 300));
@@ -3913,8 +4187,8 @@ def run(pw):
               and failed_ids[0] == failed_ids[1], failed_ids)
         p.fill("#cinput", "")
         p.evaluate("""() => {
-          post = window.__sesmanRealPost;
-          delete window.__sesmanRealPost;
+          post = window.__agenthubRealPost;
+          delete window.__agenthubRealPost;
           delete window.__failedRequestIds;
         }""")
 
@@ -3974,7 +4248,7 @@ def run(pw):
         # 先把网页新消息放进网页编辑器，再模拟 Claude 的 ESC 回填。若反过来，
         # xterm 的 focus-out 会参与 TUI 重画，使测试不再等价于用户遇到的终态。
         p.fill("#cinput", "/help")                  # 本地命令，不消耗模型额度
-        restored_draft = "SESMAN_ESC_RESTORED_DRAFT"
+        restored_draft = "AGENTHUB_ESC_RESTORED_DRAFT"
         term.send_text(tname, restored_draft)
         deadline = time.time() + 5
         while (time.time() < deadline
@@ -4063,11 +4337,11 @@ def run(pw):
               {**draft_diagnostics, "composer": composer_after_send})
 
         # 专用 server 只做托管：无状态栏/前缀/鼠标接管，滚动留给 xterm。
-        for server in ("sesman", "default"):
-            tmux_run(server, "kill-session", "-t", "sesman-wheeltest", capture_output=True)
+        for server in ("agenthub", "default"):
+            tmux_run(server, "kill-session", "-t", "agenthub-wheeltest", capture_output=True)
         wname = term.new_session("wheeltest", "bash --noprofile --norc", "/tmp")
         wserver = term_server(wname)
-        check("测试终端位于专用 server", wserver == "sesman", wserver)
+        check("测试终端位于专用 server", wserver == "agenthub", wserver)
         transparent = {
             "status": tmux_run(wserver, "show-options", "-gv", "status",
                                capture_output=True, text=True).stdout.strip(),
@@ -4085,7 +4359,7 @@ def run(pw):
         check("专用 tmux 已关闭 UI 与输入截获",
               transparent == {"status": "off", "mouse": "off", "prefix": "None",
                               "escape": "10", "focus": "on", "extended": "on"}, transparent)
-        stale_marker = "SESMAN_STALE_PAGE_MUST_NOT_RUN"
+        stale_marker = "AGENTHUB_STALE_PAGE_MUST_NOT_RUN"
         stale_status = 0
         stale_error = ""
         try:
@@ -4156,12 +4430,12 @@ def run(pw):
         check("锁屏恢复后自动重建终端连接",
               p.locator(".thead, #tstatus").count() == 0
               and p.locator("#tmouse").count() == 0)
-        p.keyboard.type("echo SESMAN_LOCK_RESUME_OK")
+        p.keyboard.type("echo AGENTHUB_LOCK_RESUME_OK")
         p.keyboard.press("Enter")
         p.wait_for_function("""() => { const b = T.term.buffer.active; let s = '';
           for (let i = b.viewportY; i < b.viewportY + T.term.rows; i++)
             s += (b.getLine(i)?.translateToString(true) || '');
-          return s.includes('SESMAN_LOCK_RESUME_OK'); }""", timeout=15000)
+          return s.includes('AGENTHUB_LOCK_RESUME_OK'); }""", timeout=15000)
         check("重连后终端输入输出均恢复", True)
 
         scroll_urls = []
@@ -4393,27 +4667,49 @@ def run(pw):
                   for x in page_overflow_frames), page_overflow_frames)
 
         check("终端不再提供框选模式开关", p.locator("#tmouse").count() == 0)
-        selection_drag = p.evaluate("""() => {
+        # 旧探针可能已被大量布局/滚动回归推入 scrollback；在合成 shell 中重新
+        # 输出一条稳定可见的行，再按真实字符坐标执行 Shift 拖拽。
+        selection_needle = "AGENTHUB_SHIFT_SELECT_OK"
+        p.evaluate("T.term.clearSelection(); T.term.scrollToBottom(); T.term.focus()")
+        p.keyboard.type(f"echo {selection_needle}")
+        p.keyboard.press("Enter")
+        p.wait_for_function("""needle => { const b = T.term.buffer.active; let s = '';
+          for (let i = b.viewportY; i < b.viewportY + T.term.rows; i++)
+            s += (b.getLine(i)?.translateToString(true) || '') + '\\n';
+          return s.includes(needle); }""", arg=selection_needle, timeout=15000)
+        selection_drag = p.evaluate("""async needle => {
           const view = currentTermViewObject(), term = view.term;
-          const buffer = term.buffer.active, needle = 'SESMAN_LOCK_RESUME_OK';
-          let lineIndex = -1;
-          for (let i = buffer.length - 1; i >= 0; i--) {
-            const text = buffer.getLine(i)?.translateToString(true) || '';
-            const found = text.indexOf(needle);
-            if (found >= 0) { lineIndex = i; break; }
-          }
-          if (lineIndex < 0) throw new Error('selection probe text is absent');
-          term.scrollToLine(lineIndex);
+          const locate = () => {
+            const buffer = term.buffer.active;
+            for (let i = buffer.length - 1; i >= 0; i--) {
+              const text = buffer.getLine(i)?.translateToString(true) || '';
+              const found = text.indexOf(needle);
+              if (found >= 0) return {buffer, lineIndex:i, found};
+            }
+            return null;
+          };
+          let probe = locate();
+          if (!probe) throw new Error('selection probe text is absent');
+          term.scrollToLine(probe.lineIndex);
+          await new Promise(resolve => requestAnimationFrame(
+            () => requestAnimationFrame(resolve)));
+          probe = locate();
+          if (!probe) throw new Error('selection probe text moved out of buffer');
+          const {buffer, lineIndex, found} = probe;
           const screen = view.host.querySelector('.xterm-screen').getBoundingClientRect();
-          return {row: lineIndex - buffer.viewportY, cols: term.cols, rows: term.rows,
-            rect: {x: screen.x, y: screen.y, width: screen.width, height: screen.height}};
-        }""")
+          return {row: lineIndex - buffer.viewportY, col:found, length:needle.length,
+            cols:term.cols, rows:term.rows,
+            rect:{x:screen.x, y:screen.y, width:screen.width, height:screen.height}};
+        }""", selection_needle)
         cell_width = selection_drag["rect"]["width"] / selection_drag["cols"]
         cell_height = selection_drag["rect"]["height"] / selection_drag["rows"]
         select_y = (selection_drag["rect"]["y"]
                     + (selection_drag["row"] + 0.5) * cell_height)
-        select_x1 = selection_drag["rect"]["x"] + 0.25 * cell_width
-        select_x2 = selection_drag["rect"]["x"] + 22.75 * cell_width
+        select_x1 = (selection_drag["rect"]["x"]
+                     + (selection_drag["col"] + 0.25) * cell_width)
+        select_x2 = (selection_drag["rect"]["x"]
+                     + (selection_drag["col"] + selection_drag["length"] - 0.25)
+                     * cell_width)
         p.keyboard.down("Shift")
         p.mouse.move(select_x1, select_y)
         p.mouse.down()
@@ -4423,7 +4719,7 @@ def run(pw):
         p.wait_for_timeout(100)
         selected_text = p.evaluate("T.term.getSelection()")
         check("Shift+拖拽能建立并锁定终端文本选区",
-              "SESMAN_LOCK_RESUME_OK" in selected_text
+              selection_needle in selected_text
               and p.evaluate("currentTermViewObject().selectionLocked"),
               repr(selected_text[:30]))
         p.mouse.click((select_x1 + select_x2) / 2, select_y, button="right")
@@ -4493,7 +4789,7 @@ def run(pw):
           p.locator("#left").is_hidden() and p.locator("#drag").is_hidden()
           and p.locator("#side-toggle").get_attribute("aria-expanded") == "false"
           and p.locator("#right").bounding_box()["width"] > right_open_width)
-    p.reload(wait_until="networkidle")
+    p.reload(wait_until="domcontentloaded")
     check("侧栏收起状态跨刷新保留",
           p.locator("#left").is_hidden()
           and p.locator("#side-toggle").get_attribute("title") == "展开会话列表")
@@ -4511,7 +4807,7 @@ def run(pw):
     w1 = p.locator("#left").bounding_box()["width"]
     check("拖动改变侧栏宽度", abs(w1 - (w0 + 130)) < 10, f"{w0}->{w1}")
     check("详情区跟着收窄", p.locator("#detail").bounding_box()["width"] < 1600 - w1 + 10)
-    p.reload(wait_until="networkidle")
+    p.reload(wait_until="domcontentloaded")
     # 分组折叠状态会跨刷新保留；DOM 中可能已有 item，但第一条恰好位于已折叠分组。
     p.wait_for_selector(".item:visible", timeout=15000)
     check("刷新后宽度保持", abs(p.locator("#left").bounding_box()["width"] - w1) < 2,
@@ -4533,7 +4829,7 @@ def run(pw):
     p.locator(".chip").nth(2).click()
     p.locator('#opts button[data-o="case"]').click()
     p.wait_for_timeout(300)
-    p.fill("#q", "SESMAN自测")
+    p.fill("#q", "AGENTHUB自测")
     p.wait_for_timeout(250)
     p.locator(".item").first.click()
     p.wait_for_selector(".dhead h2", timeout=15000)
@@ -4543,7 +4839,7 @@ def run(pw):
     group_was_closed = "closed" in (persisted_group.get_attribute("class") or "")
     persisted_group.locator(".ghead").click()  # 翻转一个分组
     p.wait_for_timeout(200)
-    p.reload(wait_until="networkidle")
+    p.reload(wait_until="domcontentloaded")
     # 只要求刷新后保持刚才的翻转结果；前面的交互可能已经折叠了第一组。
     p.wait_for_selector(".ghead", timeout=15000)
     persisted_group = p.locator(f'.group[data-key="{persisted_group_key}"]')
@@ -4566,7 +4862,7 @@ def run(pw):
     p.wait_for_timeout(300)
 
     # ---- 16. 删除 (自测会话) ----
-    p.fill("#q", "SESMAN自测")
+    p.fill("#q", "AGENTHUB自测")
     p.wait_for_timeout(300)
     p.locator(".item").first.click()
     p.wait_for_selector("#a-session-action[title='删除会话']", timeout=10000)
@@ -4579,10 +4875,10 @@ def run(pw):
         p.locator("#a-session-action").click()
     p.wait_for_timeout(200)
     check("删除后提示回收站", "回收站" in p.locator("#detail").inner_text())
-    p.fill("#q", "SESMAN自测")
+    p.fill("#q", "AGENTHUB自测")
     p.wait_for_timeout(300)
     check("删除后从列表消失", p.locator(".item").count() == 0, p.locator(".item").count())
-    trash = list((Path.home() / ".local/share/sesman/trash/claude").glob("*dead-beef*"))
+    trash = list((Path.home() / ".local/share/agenthub/trash/claude").glob("*dead-beef*"))
     check("文件确实移入回收站", len(trash) == 1, trash)
     check("原文件已不在", not (FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl").exists())
 

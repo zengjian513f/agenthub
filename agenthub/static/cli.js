@@ -6,7 +6,7 @@
  * app.js 只保存和渲染乐观消息；某条原生记录是否能确认/结束排队、
  * 旧状态如何迁移、特殊键是否取消队列，都由具体 CLI 实现决定。
  */
-class SesmanCli {
+class AgentHubCli {
   constructor(source, name, icon, color) {
     this.source = source;
     this.name = name;
@@ -69,7 +69,7 @@ class SesmanCli {
   }
 }
 
-class ClaudeCli extends SesmanCli {
+class ClaudeCli extends AgentHubCli {
   constructor() {
     super('claude', 'Claude', 'i-claude', 'var(--claude)');
   }
@@ -183,7 +183,7 @@ class ClaudeCli extends SesmanCli {
   }
 }
 
-class CodexCli extends SesmanCli {
+class CodexCli extends AgentHubCli {
   constructor() {
     super('codex', 'Codex', 'i-codex', 'var(--codex)');
   }
@@ -237,7 +237,7 @@ class CodexCli extends SesmanCli {
   // 服务端确认原生状态已经结束后，仍要继续交付队首消息。
 }
 
-class GrokCli extends SesmanCli {
+class GrokCli extends AgentHubCli {
   constructor() {
     super('grok', 'Grok', 'i-grok', 'var(--grok)');
   }
@@ -249,24 +249,24 @@ class GrokCli extends SesmanCli {
   }
 }
 
-const SESMAN_CLIS = Object.freeze({
+const AGENTHUB_CLIS = Object.freeze({
   claude: new ClaudeCli(),
   codex: new CodexCli(),
   grok: new GrokCli(),
 });
 
-function sesmanCli(sourceOrUid) {
+function agenthubCli(sourceOrUid) {
   const value = String(sourceOrUid || '');
   let source = value.split(':', 1)[0];
-  // 首条原生记录落盘前，新建会话的 uid 是 tmux:sesman-<cli>-...。
+  // 首条原生记录落盘前，新建会话的 uid 是 tmux:agenthub-<cli>-...。
   // 这个阶段也必须使用对应 CLI 的发送确认策略。
   if (source === 'tmux') {
-    source = value.match(/^tmux:sesman-(claude|codex|grok)-/)?.[1] || source;
+    source = value.match(/^tmux:agenthub-(claude|codex|grok)-/)?.[1] || source;
   }
-  return SESMAN_CLIS[source] || null;
+  return AGENTHUB_CLIS[source] || null;
 }
 
 // 供 app.js、term.js 以及 headless 回归共同使用。
 Object.assign(globalThis, {
-  SesmanCli, ClaudeCli, CodexCli, GrokCli, SESMAN_CLIS, sesmanCli,
+  AgentHubCli, ClaudeCli, CodexCli, GrokCli, AGENTHUB_CLIS, agenthubCli,
 });

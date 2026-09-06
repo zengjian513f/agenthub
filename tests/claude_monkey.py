@@ -5,7 +5,7 @@ Claude sessions and therefore only runs when invoked explicitly.  Every session
 is pinned to Haiku with low effort, plan permission mode, no tools, and safe mode.
 
 Usage:
-    SESMAN_BASE=http://127.0.0.1:8710 python3 tests/claude_monkey.py
+    AGENTHUB_BASE=http://127.0.0.1:8710 python3 tests/claude_monkey.py
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sesman import claude_bridge, term
+from agenthub import claude_bridge, term
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
@@ -59,12 +59,12 @@ class Monkey:
         self.run_id = uuid.uuid4().hex[:8]
         if resume_root:
             root = Path(resume_root).resolve()
-            if not root.name.startswith("sesman-claude-monkey-"):
-                raise ValueError("--resume-root 必须是本脚本创建的 sesman-claude-monkey-* 目录")
+            if not root.name.startswith("agenthub-claude-monkey-"):
+                raise ValueError("--resume-root 必须是本脚本创建的 agenthub-claude-monkey-* 目录")
             self.root = root
         else:
             self.root = Path(tempfile.mkdtemp(
-                prefix=f"sesman-claude-monkey-{self.run_id}-"))
+                prefix=f"agenthub-claude-monkey-{self.run_id}-"))
         self.project_stores: list[Path] = []
         self.sessions: list[dict] = []
         self.build = str(self.get("/api/meta")["build"])
@@ -210,9 +210,9 @@ class Monkey:
         for session in self.sessions:
             row = by_sid.get(session["sid"])
             if not row:
-                raise AssertionError(f"sesman 未索引 {session['sid']}")
+                raise AssertionError(f"agenthub 未索引 {session['sid']}")
             session["uid"] = row["uid"]
-        self.ok("6 个 Claude JSONL 都已与 sesman 会话精确关联")
+        self.ok("6 个 Claude JSONL 都已与 agenthub 会话精确关联")
 
     def assert_haiku(self):
         usage = self.usage()
@@ -489,7 +489,7 @@ class Monkey:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default=os.environ.get(
-        "SESMAN_BASE", "http://127.0.0.1:8710"))
+        "AGENTHUB_BASE", "http://127.0.0.1:8710"))
     parser.add_argument("--sessions", type=int, default=6)
     parser.add_argument("--keep-on-failure", action="store_true")
     parser.add_argument("--resume-root", default="",

@@ -1,4 +1,4 @@
-"""Cross-layer diagnostic event log for sesman.
+"""Cross-layer diagnostic event log for agenthub.
 
 The audit trail is deliberately best-effort: losing diagnostics is preferable to
 changing message-delivery semantics.  Callers therefore never see storage errors.
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 
-DATA_DIR = Path.home() / ".local" / "share" / "sesman"
+DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 DB_FILE = DATA_DIR / "audit.sqlite3"
 RETENTION_DAYS = 14
 QUEUE_LIMIT = 20_000
@@ -110,7 +110,7 @@ class EventStore:
             if self._closed or (self._thread and self._thread.is_alive()):
                 return
             self._thread = threading.Thread(
-                target=self._writer, name="sesman-audit", daemon=True)
+                target=self._writer, name="agenthub-audit", daemon=True)
             self._thread.start()
 
     def record(self, event: str, *, uid: str = "", source: str = "",

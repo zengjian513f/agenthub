@@ -1,7 +1,7 @@
 'use strict';
 
 const SOURCES = Object.freeze(Object.fromEntries(
-  Object.values(SESMAN_CLIS).map(cli => [cli.source, {
+  Object.values(AGENTHUB_CLIS).map(cli => [cli.source, {
     name: cli.name, icon: cli.icon, color: cli.color,
   }])));
 
@@ -9,11 +9,11 @@ const SOURCES = Object.freeze(Object.fromEntries(
 const store = {
   get(k, d) {
     try {
-      const v = localStorage.getItem('sesman.' + k);
+      const v = localStorage.getItem('agenthub.' + k);
       return v === null ? d : JSON.parse(v);
     } catch { return d; }
   },
-  set: (k, v) => localStorage.setItem('sesman.' + k, JSON.stringify(v)),
+  set: (k, v) => localStorage.setItem('agenthub.' + k, JSON.stringify(v)),
 };
 
 // 存储结构的版本只由公共层调度；每种 CLI 自己决定怎样迁移旧队列。
@@ -24,7 +24,7 @@ function loadQueuedMessages() {
   const fromVersion = +store.get('queuedMessagesVersion', 1) || 1;
   if (fromVersion !== QUEUED_MESSAGES_VERSION) {
     const migrated = valid.flatMap(([uid, items]) => {
-      const kept = sesmanCli(uid)?.migrateQueuedMessages(
+      const kept = agenthubCli(uid)?.migrateQueuedMessages(
         items, fromVersion, QUEUED_MESSAGES_VERSION) || [];
       return kept.length ? [[uid, kept]] : [];
     });
@@ -36,10 +36,10 @@ function loadQueuedMessages() {
 }
 
 const FONT_CHOICES = {
-  ubuntu: '"Sesman CJK Sans", "Sesman Ubuntu Sans Mono", "Ubuntu Sans Mono", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
-  cascadia: '"Sesman CJK Sans", "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
-  system: '"Sesman CJK Sans", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", "Liberation Mono", Consolas, sans-serif',
-  consolas: '"Sesman CJK Sans", Consolas, Consola, "Cascadia Mono", "Liberation Mono", sans-serif',
+  ubuntu: '"AgentHub CJK Sans", "AgentHub Ubuntu Sans Mono", "Ubuntu Sans Mono", "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
+  cascadia: '"AgentHub CJK Sans", "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
+  system: '"AgentHub CJK Sans", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", "Liberation Mono", Consolas, sans-serif',
+  consolas: '"AgentHub CJK Sans", Consolas, Consola, "Cascadia Mono", "Liberation Mono", sans-serif',
 };
 const themeMedia = matchMedia('(prefers-color-scheme: dark)');
 
@@ -82,6 +82,7 @@ const S = {
   liveTmux: new Set(),// 其中运行在 tmux 里的会话 uid
   liveStarted: new Map(), // uid → 当前 CLI 主进程启动时间（Unix 秒）
   activeOnly: store.get('activeOnly', false), // 左栏只显示仍在运行的会话
+  compactTurns: store.get('compactTurns', true), // 已完成回合只保留过程合集与最终结论
   unread: new Map(store.get('unread', [])),   // uid → {count, tmux}; 只计代理产生的新内容
   cursors: new Map(), // 主会话/子代理 EOF 游标；用于后台会话的精确未读增量
   queued: new Map(loadQueuedMessages()),       // uid → 尚未写入原生会话记录的已发送消息
@@ -94,11 +95,14 @@ const S = {
 
 const $ = s => document.querySelector(s);
 const MOBILE = matchMedia('(max-width: 720px)');
-// 页面既可挂在站点根目录，也可由反代放到 /sesman/ 之类的子路径。
+// 页面既可挂在站点根目录，也可由反代放到 /agenthub/ 之类的子路径。
 const APP_BASE = new URL('.', location.href);
 const DEBUG_RUN = /^[A-Za-z0-9_-]{1,64}$/.test(
   new URLSearchParams(location.search).get('debug_run') || '')
   ? new URLSearchParams(location.search).get('debug_run') : '';
+// 深链：?sid=<source>:<sid> 或 ?sid=<sid>，打开指定会话（labdesk 的会话台账用它跳过来）。
+// 用 CLI 原生会话号而不是 uid —— uid 是会话文件路径的散列，换目录就变。
+const DEEP_SID = (new URLSearchParams(location.search).get('sid') || '').trim().slice(0, 128);
 const appUrl = path => {
   const url = new URL(String(path).replace(/^\//, ''), APP_BASE);
   if (DEBUG_RUN && url.pathname.includes('/api/')) {
@@ -106,13 +110,13 @@ const appUrl = path => {
   }
   return url.toString();
 };
-const BUILD_ID = document.querySelector('meta[name="sesman-build"]')?.content || '';
+const BUILD_ID = document.querySelector('meta[name="agenthub-build"]')?.content || '';
 // One ephemeral page identity joins HTTP, SSE, terminal and final DOM receipts.
 // It intentionally is not persisted: duplicated/restored tabs must remain distinct.
 const AUDIT_PAGE_ID = globalThis.crypto?.randomUUID?.()
   || [...globalThis.crypto.getRandomValues(new Uint8Array(16))]
     .map(value => value.toString(16).padStart(2, '0')).join('');
-window.__sesmanPageId = AUDIT_PAGE_ID;
+window.__agenthubPageId = AUDIT_PAGE_ID;
 
 let browserAuditQueue = [];
 let browserAuditTimer = 0;
@@ -149,8 +153,8 @@ async function flushBrowserAudit(useBeacon = false) {
     const response = await fetch(appUrl('api/audit/browser'), {
       method: 'POST', keepalive: true,
       headers: {
-        'Content-Type': 'application/json', 'X-Sesman-Page': AUDIT_PAGE_ID,
-        'X-Sesman-Build': BUILD_ID,
+        'Content-Type': 'application/json', 'X-AgentHub-Page': AUDIT_PAGE_ID,
+        'X-AgentHub-Build': BUILD_ID,
       },
       body: payload,
     });
@@ -270,7 +274,7 @@ function markStaleBuild(serverBuild = '') {
   document.body.classList.add('stale-build');
   const notice = el('div', 'version-stale');
   notice.setAttribute('role', 'alert');
-  notice.innerHTML = '<span>sesman 已更新。当前页面已停止发送，请重新加载。</span>';
+  notice.innerHTML = '<span>agenthub 已更新。当前页面已停止发送，请重新加载。</span>';
   const reload = el('button', 'btn', '重新加载');
   reload.type = 'button';
   reload.title = serverBuild ? `服务器版本 ${serverBuild}` : '加载新版本';
@@ -430,7 +434,7 @@ function queuedAfterTimestamp(uid) {
 function queuePendingUserMessage(uid, text, media = []) {
   text = String(text || '');
   if (!uid || !text.trim()) return null;
-  const cli = sesmanCli(uid);
+  const cli = agenthubCli(uid);
   if (!cli) return null;
   const created = Date.now();
   const item = cli.createQueuedMessage({
@@ -487,7 +491,7 @@ function acceptServerOutboxVersion(uid, version) {
 }
 
 function syncServerOutbox(uid, items, version = null, { retireMissing = false } = {}) {
-  if (!['claude', 'codex'].includes(sesmanCli(uid)?.source)
+  if (!['claude', 'codex'].includes(agenthubCli(uid)?.source)
       || !Array.isArray(items)) return false;
   if (staleServerOutbox(uid, version)) {
     browserAuditEvent('outbox.snapshot_rejected', {version, reason: 'stale'}, items, {uid});
@@ -592,7 +596,7 @@ async function retryClientQueuedMessage(uid, id) {
 function reconcileQueuedMessages(uid, messages) {
   const items = queuedMessages(uid).slice();
   if (!items.length) return false;
-  const cli = sesmanCli(uid);
+  const cli = agenthubCli(uid);
   if (!cli) return false;
   let changed = false;
   for (const message of messages || []) {
@@ -655,7 +659,7 @@ function reconcileQueuedMessages(uid, messages) {
  *  新输入。服务端已经确认旧输入后 outbox 会消失；若当前活动时间线出现了
  *  因果更晚的另一条 user/command，它不是“仍待确认”，而是已被新分支取代。 */
 function retireSupersededClaudeMessages(uid, ids, messages) {
-  if (sesmanCli(uid)?.source !== 'claude' || !ids?.size) return false;
+  if (agenthubCli(uid)?.source !== 'claude' || !ids?.size) return false;
   const laterInputs = (messages || []).filter(message =>
     ['user', 'command'].includes(message?.role)
     && Number.isFinite(Date.parse(message.ts || '')));
@@ -678,7 +682,7 @@ function expireQueuedMessages(now = Date.now()) {
   let changed = false;
   let selectedChanged = false;
   for (const [uid, current] of S.queued) {
-    const cli = sesmanCli(uid);
+    const cli = agenthubCli(uid);
     if (!cli || !Array.isArray(current)) continue;
     const hasNativeHistory = cache.has(viewKey(uid));
     const settled = current.map(item => cli.settleQueuedMessage(
@@ -767,8 +771,8 @@ async function fetchMessages(uid, opts = {}) {
   try {
     r = await fetch(appUrl(url), {
       signal: opts.signal,
-      headers: {'X-Sesman-Trace': traceId, 'X-Sesman-Page': AUDIT_PAGE_ID,
-        'X-Sesman-Build': BUILD_ID},
+      headers: {'X-AgentHub-Trace': traceId, 'X-AgentHub-Page': AUDIT_PAGE_ID,
+        'X-AgentHub-Build': BUILD_ID},
     });
   } catch (error) {
     browserAuditEvent('http.request.failed', {
@@ -787,7 +791,7 @@ async function fetchMessages(uid, opts = {}) {
   // Content-Length 仍可能是压缩后大小。优先用服务端给出的同口径长度；
   // 连到旧服务端时，压缩响应改显示不定进度，也不伪造一个较小的分母。
   const contentTotal = +r.headers.get('Content-Length') || 0;
-  const decodedTotal = +r.headers.get('X-Sesman-Decoded-Length') || 0;
+  const decodedTotal = +r.headers.get('X-AgentHub-Decoded-Length') || 0;
   const encoded = !!r.headers.get('Content-Encoding');
   const total = decodedTotal || (encoded ? 0 : contentTotal);
   const reader = r.body.getReader();
@@ -883,10 +887,11 @@ function activityFollows(current, incoming) {
 function applyCoveredActivity(uid, agent, entry, data) {
   if (!data.activity_changed || !activityFollows(entry.activity, data.activity)) return;
   entry.activity = data.activity;
+  markInterruptedTurn(entry.msgs, entry.activity);
   if (S.sel !== uid || S.agent !== agent) return;
   const box = $('#msgs');
   $('#activity')?.remove();
-  if (box && entry.activity?.state !== 'working') sealToolTail(box);
+  if (box && entry.activity?.state !== 'working') sealTurnTail(box, entry);
   renderConversationTail(entry.activity, uid);
 }
 
@@ -966,6 +971,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
       text: normalizedQuestionAnswer(m.text) };
   });
   if (data.reset) {                         // 回滚 / 重写过, 缓存作废
+    markInterruptedTurn(data.messages, data.activity);
     cachePut(key, { meta: data.meta, msgs: data.messages, version: data.version,
                     end: data.end, anchor: data.anchor, activity: data.activity, bytes,
                     prompt: data.prompt || null,
@@ -981,7 +987,13 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   e.anchor = data.anchor;
   S.cursors.set(key, { end: data.end, head: data.version.head, anchor: data.anchor });
   e.bytes += bytes;
-  if (data.activity_changed) e.activity = data.activity;
+  if (data.activity_changed) {
+    e.activity = data.activity;
+    // turn_aborted 可能单独成为一个无正文的 SSE 包，也可能与末批正文一起
+    // 到达；两边都补标，不能依赖恰好落在同一次 JSONL 增量读取中。
+    markInterruptedTurn(e.msgs, e.activity);
+    markInterruptedTurn(data.messages, e.activity);
+  }
   else if (e.activity?.state === 'waiting' && data.messages.some(
       m => m.role === 'tool_result' || m.role === 'answer')) {
     // 问题和回答可能分属两次增量读取，第二次已没有 call_id 映射。
@@ -995,7 +1007,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
       const box = $('#msgs');
       $('#activity')?.remove();
       box?.querySelectorAll('.client-outbox').forEach(node => node.remove());
-      if (box && e.activity?.state !== 'working') sealToolTail(box);
+      if (box && e.activity?.state !== 'working') sealTurnTail(box, e);
       renderConversationTail(e.activity, uid);
     }
     return 0;
@@ -1013,7 +1025,11 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
   box.querySelectorAll('.client-outbox').forEach(node => node.remove());
   const built = appendMessages(box, data.messages, null,
     {openTail: e.activity?.state === 'working'});
-  built.forEach(markMatches);
+  const sealed = sealTurnTail(box, e);
+  if (!sealed) {
+    built.forEach(markMatches);
+    if (S.term) updateMatchNav();
+  }
   renderConversationTail(e.activity, uid);
   const c = $('#mcount-total');
   const total = entryTotal(e);
@@ -1243,7 +1259,7 @@ function watchSession(uid, agent = S.agent) {
   const es = new EventSource(appUrl('api/watch?' + p));
   _es = es;
   _esUid = uid;
-  es.__sesmanConnectionId = connectionId;
+  es.__agenthubConnectionId = connectionId;
   let received = 0;
   browserAuditEvent('sse.connecting', {start: e.end, agent: agent || ''}, null,
     {uid, connectionId});
@@ -1295,7 +1311,7 @@ function closeWatch() {
   clearTimeout(_esRetry);
   if (_es) {
     browserAuditEvent('sse.closed_by_page', {ready_state: _es.readyState}, null,
-      {uid: _esUid, connectionId: _es.__sesmanConnectionId || ''});
+      {uid: _esUid, connectionId: _es.__agenthubConnectionId || ''});
     _es.close(); _es = null; _esUid = null;
   }
 }
@@ -1476,7 +1492,7 @@ function showSessionCount(n) {
 
 const pendingUid = name => `tmux:${name}`;
 
-/** sesman 自己启动、但还没有对话文件的 tmux，也是一条可重新进入的临时会话。 */
+/** agenthub 自己启动、但还没有对话文件的 tmux，也是一条可重新进入的临时会话。 */
 function pendingTmuxSessions() {
   if (typeof T === 'undefined' || !Array.isArray(T.pending)) return [];
   return T.pending.flatMap(t => {
@@ -1963,11 +1979,15 @@ function markMatches(root) {
   if (!S.term) return 0;
   const re = reTerm(true);
   if (!re) return 0;
+  const messageBox = $('#msgs');
+  const existing = messageBox && root !== messageBox && messageBox.contains(root)
+    ? messageBox.querySelectorAll('mark').length : 0;
+  const budget = Math.max(0, MARK_MAX - existing);
   // 只高亮正文: 折叠预览是正文副本, 高亮在那里会造成重复计数。
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: n => {
       const msg = n.parentElement.closest('.msg');
-      return n.parentElement.closest('.fold-preview, .katex')
+      return n.parentElement.closest('mark, .fold-preview, .katex')
         || !msg || !SEARCH_ROLES.has(msg.dataset.role)
         ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
     },
@@ -1979,7 +1999,7 @@ function markMatches(root) {
   }
   let count = 0;
   for (const t of targets) {
-    if (count >= MARK_MAX) { S.markCapped = true; break; }   // 搜 "a" 会生成上万节点, 会卡死
+    if (count >= budget) { S.markCapped = true; break; }   // 搜 "a" 会生成上万节点, 会卡死
     const frag = document.createDocumentFragment();
     let last = 0, m;
     re.lastIndex = 0;
@@ -1990,7 +2010,7 @@ function markMatches(root) {
       mk.textContent = m[0];
       frag.appendChild(mk);
       last = m.index + m[0].length;
-      if (++count >= MARK_MAX) { S.markCapped = true; break; }
+      if (++count >= budget) { S.markCapped = true; break; }
     }
     frag.append(t.nodeValue.slice(last));
     t.parentNode.replaceChild(frag, t);
@@ -2008,6 +2028,24 @@ function jumpMark(delta) {
   marks[S.cur].scrollIntoView({ block: 'center', behavior: 'smooth' });
   const c = $('#mcount');
   if (c) c.textContent = `${S.cur + 1}/${marks.length}${S.markCapped ? '+' : ''} 处匹配`;
+}
+
+function updateMatchNav({jump = false} = {}) {
+  const c = $('#mcount');
+  if (!c) return 0;
+  const hits = document.querySelectorAll('#msgs mark').length;
+  c.textContent = hits ? `${hits}${S.markCapped ? '+' : ''} 处匹配` : '本页无匹配';
+  const capped = S.markCapped || S.autoOpen >= AUTO_OPEN_MAX;
+  c.classList.toggle('capped', capped);
+  if (capped) {
+    c.title = `命中过多：只标注前 ${MARK_MAX} 处、自动展开前 ${AUTO_OPEN_MAX} 条，其余标 ● 需手动展开`;
+  } else {
+    c.removeAttribute('title');
+  }
+  $('#m-prev').onclick = () => jumpMark(-1);
+  $('#m-next').onclick = () => jumpMark(1);
+  if (jump && hits) jumpMark(1);
+  return hits;
 }
 
 // ---------------------------------------------------------------- 详情
@@ -2099,6 +2137,41 @@ function stickBottom(box, force) {
   requestAnimationFrame(() => { _selfScroll = false; });
 }
 
+/** 展开/收起大块内容时把触发控件钉在原来的视口坐标。用户点开过程是在看
+ *  这一段，不再属于“持续跟随最底部”；否则 ResizeObserver 会把按钮直接
+ *  推出屏幕。补两帧可覆盖语法高亮等紧随其后的同步布局变化。 */
+function mutateKeepingMessageAnchor(anchor, mutate) {
+  const box = $('#msgs');
+  if (!box || !box.contains(anchor)) return mutate();
+  const top = anchor.getBoundingClientRect().top;
+  _stick = false;
+  _lastTop = box.scrollTop;
+  const restore = () => {
+    if (!anchor.isConnected || box !== $('#msgs')) return;
+    const delta = anchor.getBoundingClientRect().top - top;
+    if (Math.abs(delta) < .5) return;
+    _selfScroll = true;
+    box.scrollTop += delta;
+    _lastTop = box.scrollTop;
+    requestAnimationFrame(() => { _selfScroll = false; });
+  };
+  const result = mutate();
+  restore();
+  requestAnimationFrame(() => {
+    restore();
+    requestAnimationFrame(restore);
+  });
+  return result;
+}
+
+function jumpWithinConversation(target, block = 'center') {
+  const box = $('#msgs');
+  if (!target || !box?.contains(target)) return;
+  _stick = false;
+  _lastTop = box.scrollTop;
+  target.scrollIntoView({block, behavior: 'smooth'});
+}
+
 function watchBottom(box) {
   _stick = true;
   _lastTop = box.scrollTop;
@@ -2116,7 +2189,10 @@ function watchBottom(box) {
     const top = box.scrollTop;
     // 拖滚动条没有 wheel 事件, 靠方向补一手 (排除程序自己滚的那些)
     if (!_selfScroll && performance.now() >= _lockUntil && top < _lastTop - 2) _stick = false;
-    else if (atBottom(box)) _stick = true;         // 回到底部就恢复跟随
+    else if (atBottom(box)) {
+      _stick = true;                               // 回到底部就恢复跟随
+      if (box._turnSealPending) queueMicrotask(() => flushPendingTurnSeal(box));
+    }
     _lastTop = top;
   });
   // 内容高度变化 (展开消息、渲染完成、字体加载…) 时跟随
@@ -2246,11 +2322,13 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
   const partial = entry?.partial;
   const split = partial ? Math.min(+partial.head || 0, msgs.length) : 0;
   const openTail = activity?.state === 'working';
+  const tailComplete = (activity && !['working', 'waiting'].includes(activity.state))
+    || (!activity && !S.live.has(uid));
   const plan = partial
-    ? [...planMessages(msgs.slice(0, split)),
+    ? [...planTurns(msgs.slice(0, split), {tailComplete: false, foldTail: true}),
        {gap: {uid, agent, omitted: partial.omitted}},
-       ...planMessages(msgs.slice(split), {openTail})]
-    : planMessages(msgs, {openTail});
+       ...planTurns(msgs.slice(split), {openTail, tailComplete})]
+    : planTurns(msgs, {openTail, tailComplete});
   const frag = document.createDocumentFragment();
   for (let i = 0; i < plan.length; i += RENDER_BATCH) {
     buildPlan(frag, plan.slice(i, i + RENDER_BATCH), null);
@@ -2266,18 +2344,8 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
   watchBottom(box);
   progressDone();
 
-  const hits = markMatches(box);
-  const c = $('#mcount');
-  if (c) {
-    c.textContent = hits ? `${hits}${S.markCapped ? '+' : ''} 处匹配` : '本页无匹配';
-    if (S.markCapped || S.autoOpen >= AUTO_OPEN_MAX) {
-      c.title = `命中过多：只标注前 ${MARK_MAX} 处、自动展开前 ${AUTO_OPEN_MAX} 条，其余标 ● 需手动展开`;
-      c.classList.add('capped');
-    }
-    $('#m-prev').onclick = () => jumpMark(-1);
-    $('#m-next').onclick = () => jumpMark(1);
-    if (hits) jumpMark(1);
-  }
+  markMatches(box);
+  updateMatchNav({jump: true});
   if (typeof renderComposer === 'function') {
     if (S.agent) $('#composer').classList.add('hidden');
     else renderComposer();
@@ -2320,6 +2388,10 @@ function head(m, total) {
           <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
         </span>
         ${starButtonMarkup(m.uid, !!m.starred, 'iconbtn', 'a-star')}
+        <button class="iconbtn turn-mode${S.compactTurns ? '' : ' on'}" id="a-turns"
+          title="${S.compactTurns ? '展开所有过程' : '折叠已完成过程'}"
+          aria-label="${S.compactTurns ? '展开所有过程' : '折叠已完成过程'}"
+          aria-pressed="${!S.compactTurns}">${uiIcon('process')}</button>
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
           (!m.agent_id && typeof T !== 'undefined' && T.enabled)
             ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
@@ -2345,6 +2417,19 @@ function head(m, total) {
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
   h.querySelector('#a-star').onclick = () => toggleSessionStar(m.uid);
+  const turnMode = h.querySelector('#a-turns');
+  turnMode.onclick = () => {
+    S.compactTurns = !S.compactTurns;
+    store.set('compactTurns', S.compactTurns);
+    turnMode.classList.toggle('on', !S.compactTurns);
+    turnMode.setAttribute('aria-pressed', String(!S.compactTurns));
+    const label = S.compactTurns ? '展开所有过程' : '折叠已完成过程';
+    turnMode.title = turnMode.ariaLabel = label;
+    document.querySelectorAll('#msgs > .turn-process').forEach(
+      node => S.compactTurns ? node._fold?.() : node._open?.());
+    refreshMessageTimeDividers();
+    settle($('#msgs'));
+  };
   const viewSwitch = h.querySelector('#a-view-switch');
   const viewMenu = h.querySelector('#session-view-menu');
   if (viewSwitch && viewMenu) {
@@ -2406,7 +2491,7 @@ async function stopSession(m, button) {
 }
 
 async function del(m) {
-  if (!confirm(`删除会话「${m.title}」?\n\n文件会移入回收站 ~/.local/share/sesman/trash/, 不会真删。`)) return;
+  if (!confirm(`删除会话「${m.title}」?\n\n文件会移入回收站 ~/.local/share/agenthub/trash/, 不会真删。`)) return;
   closeWatch();                         // 先停 SSE，避免文件移走后 EventSource 自动重连 404
   const r = await fetch(appUrl('api/session/' + encodeURIComponent(m.uid)), { method: 'DELETE' });
   const d = await r.json();
@@ -2428,6 +2513,7 @@ async function del(m) {
 const TOOL_ROLES = new Set(['tool', 'tool_result']);
 const SEARCH_ROLES = new Set(['user', 'assistant', 'user·subagent', 'assistant·subagent',
                               'thinking', 'question', 'answer', 'command']);
+const TURN_START_ROLES = new Set(['user', 'user·subagent']);
 const GROUP_MIN = 2;
 const MESSAGE_TIME_GAP_MS = 5 * 60 * 1000;
 const MESSAGE_TIME_CADENCE_MS = 20 * 60 * 1000;
@@ -2482,6 +2568,160 @@ function planMessages(msgs, { openTail = false } = {}) {
   }
   flush(openTail);
   return plan;
+}
+
+const baseMessageRole = role => String(role || '').split('·', 1)[0];
+const isTurnStart = m => TURN_START_ROLES.has(m?.role);
+const sameNativeTurn = (a, b) => a?.turn_id != null && b?.turn_id != null
+  && String(a.turn_id) === String(b.turn_id);
+const isTurnAssistant = m => baseMessageRole(m?.role) === 'assistant';
+const isFinalAssistant = m => isTurnAssistant(m)
+  && ['final', 'final_answer', 'end_turn'].includes(m?.phase);
+// rename/compact 等不计入消息数的辅助记录可能写在 final 之后；它们继续留在
+// 时间线，但不应让前面的原生最终答复失去“结论”资格。
+const isPassiveTurnTail = m => m?.counted === false;
+
+/** 增量中断状态来自 activity 包，可能与最后一条 commentary 分批到达。 */
+function markInterruptedTurn(messages, activity) {
+  const turnId = activity?.state === 'aborted' && activity?.turn_id != null
+    ? String(activity.turn_id) : '';
+  if (!turnId) return false;
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (String(message?.turn_id || '') !== turnId || !isTurnAssistant(message)) continue;
+    if (!isFinalAssistant(message)) {
+      message.interrupted = true;
+      message.interrupt_reason = activity.reason || '本轮在最终答复前被中断';
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+/** 找一轮中需要永久露出的结论块。原生 final 标记优先；明确中断的轮次
+ *  保留最后一条 commentary 作为末次状态。老会话只有在回合已确定结束、
+ *  且最后一个有效节点就是 assistant 时才回退到“最后一条”。 */
+function turnConclusion(body, { complete = false, interrupted = false } = {}) {
+  let meaningfulEnd = body.length;
+  while (meaningfulEnd && isPassiveTurnTail(body[meaningfulEnd - 1])) meaningfulEnd--;
+  if (!meaningfulEnd) return null;
+  const last = body[meaningfulEnd - 1];
+  if (isFinalAssistant(last)) {
+    let start = meaningfulEnd - 1;
+    while (start > 0 && isFinalAssistant(body[start - 1])) start--;
+    return {start, end: meaningfulEnd};
+  }
+  if (complete && interrupted) {
+    for (let i = meaningfulEnd - 1; i >= 0; i--) {
+      if (!isTurnAssistant(body[i]) || !body[i]?.interrupted) continue;
+      return {start: i, end: i + 1, tailStart: meaningfulEnd,
+              inferred: true, interrupted: true};
+    }
+  }
+  if (complete && !interrupted && isTurnAssistant(last) && !last.phase) {
+    return {start: meaningfulEnd - 1, end: meaningfulEnd, inferred: true};
+  }
+  return null;
+}
+
+function visiblePlanSize(plan) {
+  return plan.reduce((n, item) => n + (item.m?.silent ? 0 : (item.m || item.g ? 1 : 0)), 0);
+}
+
+function turnKey(messages, conclusion) {
+  const values = [...messages, ...(conclusion || [])];
+  const native = values.find(m => m?.turn_id)?.turn_id;
+  if (native) return native;
+  const first = messages[0] || conclusion?.[0] || {};
+  return `${first.ts || 'turn'}:${String(first.text || '').slice(0, 80)}`;
+}
+
+/** 单轮外层折叠。用户输入和最终结论仍是普通顶层气泡，中间过程才进入合集；
+ *  合集内部继续复用 planMessages 的工具配对/分组规则。 */
+function planTurnSegment(messages, promptEnd,
+                         {complete = false, foldable = complete, openTail = false} = {}) {
+  const prompts = messages.slice(0, promptEnd);
+  const body = messages.slice(promptEnd);
+  const conclusion = turnConclusion(body, {
+    complete, interrupted: messages.some(m => m?.interrupted),
+  });
+  // 历史段可能因用户在同一次原生 turn 中追加要求，或上一轮被中断，而没有
+  // 自己的 final。它已经被后续 user 明确封口，仍应作为过程折叠；只是不能
+  // 把最后一条 commentary 猜成结论。尚在增长的尾段继续完整铺开。
+  if (!conclusion && !foldable) return planMessages(messages, {openTail});
+  // 中断时最后一条助手状态后面还可能有工具结果。它们仍属于过程；把这条
+  // 状态提升到合集后作为“末次进展”，既不丢工具，也不把工具散回顶层。
+  const process = conclusion?.interrupted
+    ? [...body.slice(0, conclusion.start),
+       ...body.slice(conclusion.end, conclusion.tailStart)]
+    : conclusion ? body.slice(0, conclusion.start) : body;
+  const processPlan = planMessages(process);
+  // 一项换成一项不会节省空间，还会徒增一次点击。
+  const processSize = visiblePlanSize(processPlan);
+  // 中断轮已经要保留末次状态；即便只剩一个工具单元，也应进过程合集，
+  // 否则恰好较短的中断轮会再次把工具卡散在对话主线里。
+  if (!processSize || (processSize < 2 && !conclusion?.interrupted)) {
+    return planMessages(messages);
+  }
+  const finalBlock = conclusion ? body.slice(conclusion.start, conclusion.end) : [];
+  const passiveTail = conclusion
+    ? body.slice(conclusion.tailStart ?? conclusion.end) : [];
+  return [
+    ...prompts.map((m, i) => ({m, sealedTurnHead: i === 0})),
+    {turn: {items: process, plan: processPlan,
+            key: turnKey(messages, finalBlock), hasConclusion: !!conclusion,
+            inferred: !!conclusion?.inferred,
+            interrupted: !!conclusion?.interrupted},
+     open: !S.compactTurns},
+    ...planMessages(finalBlock),
+    ...planMessages(passiveTail),
+  ];
+}
+
+function planTurn(messages, options = {}) {
+  if (!messages.length || !isTurnStart(messages[0])) {
+    return planMessages(messages, {openTail: options.openTail});
+  }
+  // Claude 会把同一次含文字/图片的 user 记录拆成多个规范化气泡。相邻且
+  // turn_id 相同的部分是一份输入，全部留在顶层，不能把图片折进“过程”。
+  let promptEnd = 1;
+  while (promptEnd < messages.length && isTurnStart(messages[promptEnd])
+         && sameNativeTurn(messages[0], messages[promptEnd])) promptEnd++;
+  return planTurnSegment(messages, promptEnd, options);
+}
+
+/** 历史缺口两侧会分别调用，绝不跨缺口猜轮次。answer 是代理提问的回答，
+ *  留在同一轮过程内；只有真正的 user/user·subagent 开新轮。 */
+function planTurns(msgs, {
+  openTail = false, tailComplete = false, foldTail = tailComplete,
+} = {}) {
+  const out = [];
+  let start = msgs.findIndex(isTurnStart);
+  // 窗口缺口可能截在一轮正中：缺口前的尾段可以折叠，但不能据此猜结论；
+  // 缺口后的前缀若被下一条 user 封口，也按无输入的历史过程片段处理。
+  if (start < 0) {
+    return planTurnSegment(msgs, 0, {
+      complete: tailComplete, foldable: foldTail, openTail,
+    });
+  }
+  out.push(...planTurnSegment(msgs.slice(0, start), 0, {
+    complete: true, foldable: true,
+  }));
+  while (start < msgs.length) {
+    let next = start + 1;
+    while (next < msgs.length && isTurnStart(msgs[next])
+           && sameNativeTurn(msgs[start], msgs[next])) next++;
+    while (next < msgs.length && !isTurnStart(msgs[next])) next++;
+    const historical = next < msgs.length;
+    out.push(...planTurn(msgs.slice(start, next), {
+      complete: historical || tailComplete,
+      foldable: historical || foldTail,
+      openTail: !historical && openTail,
+    }));
+    start = next;
+  }
+  return out;
 }
 
 /** 一个工具卡可能同时包含调用和结果，工具组又包含多张卡。
@@ -2559,9 +2799,18 @@ function refreshMessageTimeDividers(box = $('#msgs')) {
 
 function buildPlan(box, plan, before) {
   const built = [];
-  for (const p of plan) {
-    const n = p.gap ? historyGapNode(p.gap) : (p.g ? groupNode(p.g, p.open) : msgNode(p.m));
-    stampMessageTime(n, p.g || (p.m ? [p.m] : []));
+  for (let i = 0; i < plan.length; i++) {
+    const p = plan[i];
+    const n = p.gap ? historyGapNode(p.gap)
+      : (p.turn ? turnProcessNode(p.turn, p.open)
+        : (p.g ? groupNode(p.g, p.open) : msgNode(p.m)));
+    // 整页渲染出来的已折叠回合已经封口。后续只带 activity 的 SSE 不应
+    // 再把它拆掉重建；否则搜索时刚自动展开并高亮的懒加载正文会被替换掉。
+    if (p.sealedTurnHead || (p.m && isTurnStart(p.m) && plan[i + 1]?.turn)) {
+      n._turnSealed = true;
+    }
+    if (p.m?.turn_id != null) n.dataset.turnId = String(p.m.turn_id);
+    stampMessageTime(n, p.turn?.items || p.g || (p.m ? [p.m] : []));
     before ? box.insertBefore(n, before) : box.appendChild(n);
     built.push(n);
   }
@@ -2611,6 +2860,97 @@ function sealToolTail(box) {
   const anchor = trailing[trailing.length - 1].nextElementSibling;
   trailing.forEach(node => node.remove());
   return buildPlan(box, planMessages(items), anchor);
+}
+
+function lastRawTurn(messages) {
+  let start = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (!isTurnStart(messages[i])) continue;
+    if (i > 0 && isTurnStart(messages[i - 1])
+        && sameNativeTurn(messages[i - 1], messages[i])) continue;
+    start = i;
+  }
+  return start < 0 ? [] : messages.slice(start);
+}
+
+function lastRenderedTurnStart(box) {
+  const children = [...box.children];
+  for (let i = children.length - 1; i >= 0; i--) {
+    const node = children[i];
+    if (node.classList?.contains('client-outbox')) continue;
+    if (!node.matches?.('.msg') || !TURN_START_ROLES.has(node.dataset.role)) continue;
+    // 同一原生 user 记录可能是相邻的“文字 + 图片”多个气泡；重建回合时
+    // 从第一块开始移除，避免把文字留在旧 DOM、图片再复制一份。
+    let head = node, j = i;
+    const turnId = node.dataset.turnId;
+    while (turnId && j > 0) {
+      let k = j - 1;
+      while (k >= 0 && children[k].classList?.contains('message-time-divider')) k--;
+      const previous = children[k];
+      if (!previous?.matches?.('.msg')
+          || !TURN_START_ROLES.has(previous.dataset.role)
+          || previous.dataset.turnId !== turnId) break;
+      head = previous;
+      j = k;
+    }
+    return head;
+  }
+  return null;
+}
+
+const isConversationTailNode = node => node?.id === 'activity'
+  || node?.classList?.contains('client-outbox')
+  || node?.classList?.contains('live-question');
+
+/** 增量期间先按现有方式铺开活动回合；final/idle 到达后只重建最后一轮。
+ *  用户正在上翻时延迟封口，避免阅读中的内容突然从脚下消失。 */
+function sealTurnTail(box, entry, {defer = true} = {}) {
+  if (!box || !entry?.msgs?.length) return false;
+  const raw = lastRawTurn(entry.msgs);
+  if (!raw.length) {
+    if (entry.activity?.state !== 'working') sealToolTail(box);
+    return false;
+  }
+  const state = entry.activity?.state;
+  const tailComplete = (state && !['working', 'waiting'].includes(state))
+    || (!entry.activity && !S.live.has(entry.meta?.uid));
+  const plan = planTurn(raw, {complete: tailComplete, openTail: state === 'working'});
+  if (!plan.some(item => item.turn)) {
+    if (state !== 'working') sealToolTail(box);
+    return false;
+  }
+  const start = lastRenderedTurnStart(box);
+  if (!start || start._turnSealed) return false;
+  if (defer && !_stick) {
+    box._turnSealPending = true;
+    return false;
+  }
+  let anchor = start;
+  while (anchor && !isConversationTailNode(anchor)) anchor = anchor.nextElementSibling;
+  for (let node = start; node && node !== anchor;) {
+    const next = node.nextElementSibling;
+    node.remove();
+    node = next;
+  }
+  const built = buildPlan(box, plan, anchor);
+  const rebuiltStart = built.find(node => TURN_START_ROLES.has(node.dataset?.role));
+  if (rebuiltStart) rebuiltStart._turnSealed = true;
+  built.forEach(markMatches);
+  if (S.term) updateMatchNav();
+  box._turnSealPending = false;
+  refreshMessageTimeDividers(box);
+  settle(box);
+  return true;
+}
+
+function flushPendingTurnSeal(box) {
+  if (!box?._turnSealPending || box !== $('#msgs')) return;
+  box._turnSealPending = false;
+  const entry = cache.get(viewKey(S.sel, S.agent));
+  if (!entry) return;
+  // 离开底部期间可能完成了不止一轮；此时用户已经主动回到底部，整页按缓存
+  // 重新规划可一次补齐所有轮次，并仍然停在最新结论。
+  renderSession(entry.meta, entry.msgs, entry.activity, {startWatch: false});
 }
 
 // 折叠工具组只显示语义提纲，不显示角色/时间 header。
@@ -2976,6 +3316,129 @@ function fileChangeNode(m) {
   return n;
 }
 
+function turnProcessSummary(items) {
+  const assistant = items.filter(isTurnAssistant).length;
+  const thinking = items.filter(m => m.role === 'thinking').length;
+  const calls = items.filter(m => m.role === 'tool').length;
+  const orphanResults = calls ? 0 : items.filter(m => m.role === 'tool_result').length;
+  const questions = items.filter(m => m.role === 'question').length;
+  const changes = items.flatMap(m => Array.isArray(m.changes) ? m.changes : []);
+  const paths = [...new Set(changes.map(change => change.path).filter(Boolean))];
+  const added = changes.reduce((n, change) => n + (+change.added || 0), 0);
+  const removed = changes.reduce((n, change) => n + (+change.removed || 0), 0);
+  const errors = items.filter(m => m.error || (Number.isFinite(+m.exit_code) && +m.exit_code !== 0)).length;
+  const times = items.flatMap(m => {
+    const value = Date.parse(m.ts || '');
+    return Number.isFinite(value) ? [value] : [];
+  });
+  const duration = times.length > 1 ? Math.max(...times) - Math.min(...times) : 0;
+  const stats = [];
+  if (assistant) stats.push(`${assistant} 条进展`);
+  if (thinking) stats.push(`${thinking} 段思考`);
+  if (calls || orphanResults) stats.push(`🔧 ${calls || orphanResults}`);
+  if (paths.length) stats.push(`修改 ${paths.length} 个文件${added || removed ? ` +${added} −${removed}` : ''}`);
+  if (questions) stats.push(`${questions} 次确认`);
+  if (errors) stats.push(`⚠ ${errors}`);
+  if (duration >= 1000) stats.push(formatDuration(duration));
+  if (!stats.length) stats.push(`${items.length} 条记录`);
+  return {stats, paths, errors};
+}
+
+/** 已完成回合的外层过程合集。折叠态只造摘要 DOM；第一次展开才渲染 Markdown、
+ *  diff 和现有工具组，大会话既减少高度，也避免为不可见过程支付首屏成本。 */
+function turnProcessNode(turn, initiallyOpen = false) {
+  const items = turn.items || [];
+  const summary = turnProcessSummary(items);
+  const n = el('div', 'msg turn-process folded');
+  n.dataset.role = 'process';
+  // 这是多个原始消息的虚拟容器，不能让 DOM 计数把容器本身再算一条。
+  n.dataset.counted = 'false';
+  if (turn.key) n.dataset.turnId = turn.key;
+  n._turnItems = items;
+  const toolbar = el('div', 'turn-toolbar');
+  n.appendChild(toolbar);
+  const preview = addFoldPreview(toolbar, '', '本轮过程');
+  preview.classList.add('turn-preview');
+  const peek = preview.querySelector('.peek');
+  peek.classList.add('turn-peek');
+  const label = el('b', 'turn-label', uiIcon('process'));
+  const stats = el('span', 'turn-stats');
+  summary.stats.forEach(value => stats.appendChild(el('span', '', value)));
+  peek.replaceChildren(label, stats);
+  const nav = el('div', 'turn-nav');
+  const toStart = el('button', 'turn-nav-btn turn-to-start', '↑ 开头');
+  const collapse = el('button', 'turn-nav-btn turn-collapse', '收起');
+  const toConclusion = el('button', 'turn-nav-btn turn-to-conclusion', '结论 ↓');
+  for (const button of [toStart, collapse, toConclusion]) button.type = 'button';
+  toStart.title = toStart.ariaLabel = '回到本轮过程开头';
+  collapse.title = collapse.ariaLabel = '收起本轮过程';
+  if (turn.interrupted) {
+    n.dataset.interrupted = 'true';
+    toConclusion.textContent = '末次进展 ↓';
+  }
+  toConclusion.title = toConclusion.ariaLabel = turn.interrupted
+    ? '跳到本轮中断前的末次进展' : '跳到本轮最终结论';
+  toConclusion.hidden = turn.hasConclusion === false;
+  nav.append(toStart, collapse, toConclusion);
+  nav.hidden = true;
+  toolbar.appendChild(nav);
+  const expandTitle = summary.paths.length
+    ? `展开过程\n修改文件：${summary.paths.join('\n')}` : '展开过程';
+  if (summary.errors) n.classList.add('has-error');
+  if (turn.inferred) n.dataset.inferred = 'true';
+  const body = el('div', 'turn-process-body');
+  body.hidden = true;
+  n.appendChild(body);
+  let materialized = false;
+  const materialize = () => {
+    if (materialized) return false;
+    buildPlan(body, turn.plan || planMessages(items), null);
+    refreshMessageTimeDividers(body);
+    materialized = true;
+    return true;
+  };
+  const fold = () => {
+    n.classList.add('folded');
+    body.hidden = true;
+    nav.hidden = true;
+    preview.setAttribute('aria-expanded', 'false');
+    preview.setAttribute('aria-label', '展开本轮过程');
+    preview.title = expandTitle;
+  };
+  const open = () => {
+    const built = materialize();
+    n.classList.remove('folded');
+    body.hidden = false;
+    nav.hidden = false;
+    preview.setAttribute('aria-expanded', 'true');
+    preview.setAttribute('aria-label', '收起本轮过程');
+    preview.title = '收起过程';
+    if (built && n.isConnected && S.term) {
+      markMatches(body);
+      updateMatchNav();
+    }
+  };
+  n._fold = fold;
+  n._open = open;
+  const foldAtAnchor = () => mutateKeepingMessageAnchor(toolbar, fold);
+  const openAtAnchor = () => mutateKeepingMessageAnchor(toolbar, open);
+  n._foldAtAnchor = foldAtAnchor;
+  n._openAtAnchor = openAtAnchor;
+  preview.onclick = () => n.classList.contains('folded') ? openAtAnchor() : foldAtAnchor();
+  collapse.onclick = foldAtAnchor;
+  toStart.onclick = () => jumpWithinConversation(n, 'start');
+  toConclusion.onclick = () => {
+    let target = n.nextElementSibling;
+    while (target && !target.matches?.('.msg')) target = target.nextElementSibling;
+    jumpWithinConversation(target);
+  };
+  const found = items.some(m => SEARCH_ROLES.has(m.role) && hasTerm(m.text));
+  if (found && S.autoOpen >= AUTO_OPEN_MAX) n.classList.add('hashit');
+  if (initiallyOpen || (found && S.autoOpen < AUTO_OPEN_MAX)) open();
+  else fold();
+  return n;
+}
+
 function groupNode(items, initiallyOpen = false) {
   // 工具协议不属于对话正文搜索范围。历史段默认折叠；正在增长的尾段展开。
   const n = el('div', 'msg grp' + (initiallyOpen ? '' : ' folded'));
@@ -3192,7 +3655,7 @@ function questionNode(m) {
           ${o.description ? `<small>${esc(o.description)}</small>` : ''}</div></${live ? 'button' : 'div'}>`).join('')}</div>` : ''}
     </section>`).join('');
   if (live) {
-    const cli = sesmanCli(m.uid);
+    const cli = agenthubCli(m.uid);
     const cliName = cli?.name || 'CLI';
     const waiting = promptState === 'waiting';
     const direct = waiting && rows.length === 1 && !rows[0].multiple
@@ -3306,7 +3769,7 @@ function renderQueuedMessages(uid = S.sel) {
   const box = $('#msgs');
   if (!box || S.agent || uid !== S.sel) return;
   for (const item of queuedMessages(uid)) {
-    const cli = sesmanCli(uid);
+    const cli = agenthubCli(uid);
     const queuedMessage = {role: 'user', text: item.text, media: item.media,
       counted: false, ts: item.created_iso || item.created_at || item.ts};
     const node = stampMessageTime(msgNode(queuedMessage), [queuedMessage]);
@@ -3389,7 +3852,7 @@ function renderConversationTail(activity, uid = S.sel) {
   // 冲突被丢弃；随后正文 reset 已把它放进完整缓存，但队尾重画过去只看
   // 增量，乐观副本便会永久残留。Claude 有本地副本时，每次画队尾都用
   // 已接受的完整缓存兜底对账一次。通常只有一条、几千项，且仅发送期间执行。
-  if (sesmanCli(uid)?.source === 'claude'
+  if (agenthubCli(uid)?.source === 'claude'
       && queuedMessages(uid).length && entry?.msgs?.length) {
     reconcileQueuedMessages(uid, entry.msgs);
   }
@@ -3438,7 +3901,7 @@ const clipText = t => t.length > CLIP ? t.slice(0, CLIP) + '\n… (点下方按�
 
 let syntaxLoading = false;
 function ensureSyntax() {
-  if (syntaxLoading || window.sesmanHighlight) return;
+  if (syntaxLoading || window.agenthubHighlight) return;
   syntaxLoading = true;
   const script = document.createElement('script');
   script.type = 'module';
@@ -3461,14 +3924,14 @@ function paintSyntax(root = document) {
     + '.tool-diff-line > code[data-code-path]:not([data-syntax-done])');
   const nodes = [...new Set([...blocks, ...summaries, ...tools, ...diffLines])];
   if (!nodes.length) return;
-  if (!window.sesmanHighlight) { ensureSyntax(); return; }
+  if (!window.agenthubHighlight) { ensureSyntax(); return; }
   for (const code of nodes) {
     code.dataset.syntaxDone = '1';
-    const result = code.matches('code.tool-command') && window.sesmanHighlightShellCommand
-      ? window.sesmanHighlightShellCommand(code.textContent)
-      : (code.matches('pre.tool-out') && window.sesmanHighlightSegments
-          ? window.sesmanHighlightSegments(code.textContent, code.dataset.codePath || '')
-          : window.sesmanHighlight(code.textContent, code.dataset.codeLang || '', code.dataset.codePath || ''));
+    const result = code.matches('code.tool-command') && window.agenthubHighlightShellCommand
+      ? window.agenthubHighlightShellCommand(code.textContent)
+      : (code.matches('pre.tool-out') && window.agenthubHighlightSegments
+          ? window.agenthubHighlightSegments(code.textContent, code.dataset.codePath || '')
+          : window.agenthubHighlight(code.textContent, code.dataset.codeLang || '', code.dataset.codePath || ''));
     if (!result?.html) continue;
     code.innerHTML = result.html;
     code.classList.add('hljs');
@@ -3484,7 +3947,7 @@ function paintSyntax(root = document) {
   }
 }
 
-addEventListener('sesman-highlight-ready', () => paintSyntax(document));
+addEventListener('agenthub-highlight-ready', () => paintSyntax(document));
 
 // 轻量 markdown: 代码块 / 表格 / 列表 / 引用 / 标题 / 行内标记
 function md(text, full, media = []) {
@@ -3852,8 +4315,19 @@ setSideCollapsed(store.get('sideCollapsed', false), false);
 renderOpts();
 renderView();
 pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
+function uidOfDeepLink(spec) {
+  if (!spec) return null;
+  const cut = spec.indexOf(':');
+  const source = cut > 0 ? spec.slice(0, cut) : null;
+  const sid = cut > 0 ? spec.slice(cut + 1) : spec;
+  const hit = S.sessions.find(s => s.sid === sid && (!source || s.source === source))
+    || S.sessions.find(s => s.uid === spec);
+  return hit ? hit.uid : null;
+}
 loadSessions(false).then(ok => {
   if (!ok) return;
+  const deep = uidOfDeepLink(DEEP_SID);
+  if (deep) { openSession(deep); return; }   // 深链优先于上次浏览位置
   const last = store.get('sel', null);       // 恢复上次看的会话
   const savedAgent = store.get('agent', null);
   const restoreDetail = !MOBILE.matches || store.get('mobilePage', 'list') === 'detail';

@@ -1,12 +1,12 @@
 'use strict';
 
 // 接管会话: 在服务端把它用 tmux resume 起来, 然后把终端嵌在会话详情底部。
-// 会话跑在 tmux 里, 所以关掉页面/重启 sesman 都不会打断它。
+// 会话跑在 tmux 里, 所以关掉页面/重启 agenthub 都不会打断它。
 const TERM_RENDER_BATCH_MS = 20;
 const TERM_RENDER_BATCH_MAX = 32 * 1024;
 const TERM_LAYOUT_POLICY_VERSION = 2;
 // 每次页面加载独立生成；不写 local/sessionStorage，复制标签页也不会复制归属。
-const TERM_PAGE_ID = window.__sesmanPageId || crypto.randomUUID?.()
+const TERM_PAGE_ID = window.__agenthubPageId || crypto.randomUUID?.()
   || [...crypto.getRandomValues(new Uint8Array(16))]
     .map(value => value.toString(16).padStart(2, '0')).join('');
 
@@ -14,7 +14,7 @@ const T = {
   term: null,      // xterm 实例
   ws: null,
   name: null,      // 当前挂着的 tmux 会话名
-  uid: null,       // 对应的 sesman 会话
+  uid: null,       // 对应的 agenthub 会话
   views: new Map(), // 已打开过且仍存活的 tmux → xterm/WebSocket；切会话只隐藏
   enabled: false,
   height: store.get('termh', 320),
@@ -107,9 +107,9 @@ async function prepareTerminalFont() {
   try {
     await document.fonts?.load(`${size}px ${configured}`, TERM_FONT_SAMPLE);
     const configuredRatio = terminalFontGridRatio(configured, size);
-    const keepUbuntuGlyphs = configured.includes('"Sesman Ubuntu Sans Mono"');
+    const keepUbuntuGlyphs = configured.includes('"AgentHub Ubuntu Sans Mono"');
     if (!keepUbuntuGlyphs && Math.abs(configuredRatio - 2) > .025) {
-      const grid = '"Sesman CJK Mono Grid"';
+      const grid = '"AgentHub CJK Mono Grid"';
       const faces = await document.fonts?.load(`${size}px ${grid}`, TERM_FONT_SAMPLE);
       const ratio = faces?.length ? terminalFontGridRatio(grid, size) : 0;
       if (Math.abs(ratio - 2) <= .025) resolved = `${grid}, ${configured}`;
@@ -321,7 +321,7 @@ function linkedTermSession(uid) {
   // 优先保留普通会话的叶子名，再用 root_sid 追溯回同一 pane。
   const ids = [...new Set([session.sid, session.root_sid].filter(Boolean))];
   for (const sid of ids) {
-    const name = `sesman-${session.source}-${String(sid).slice(0, 8)}`;
+    const name = `agenthub-${session.source}-${String(sid).slice(0, 8)}`;
     const pane = panes.find(x => x.name === name);
     if (pane) return { name, uid: pane.uid || uid };
   }
@@ -416,8 +416,8 @@ async function post(url, body) {
   try {
     const r = await fetch(appUrl(url), {
       method: 'POST', headers: {
-        'Content-Type': 'application/json', 'X-Sesman-Trace': traceId,
-        'X-Sesman-Page': TERM_PAGE_ID, 'X-Sesman-Build': BUILD_ID,
+        'Content-Type': 'application/json', 'X-AgentHub-Trace': traceId,
+        'X-AgentHub-Page': TERM_PAGE_ID, 'X-AgentHub-Build': BUILD_ID,
       },
       body: JSON.stringify(payload),
     });
@@ -1324,7 +1324,7 @@ function ensureTerm(name) {
   // xterm 的正常 scrollback。改造前遗留在默认 server 的会话仍走旧兼容路径。
   term.attachCustomWheelEventHandler(e => {
     if (T.name !== name) return true;
-    if (T.list?.find(x => x.name === name)?.server === 'sesman') return true;
+    if (T.list?.find(x => x.name === name)?.server === 'agenthub') return true;
     wheelBy(e.deltaY);
     return false;
   });
@@ -2162,7 +2162,7 @@ function syncComposerMode() {
 
 async function prepareTerminalDraft(uid) {
   const name = takenOver(uid);
-  const cli = sesmanCli(uid);
+  const cli = agenthubCli(uid);
   if (!name || !['claude', 'codex'].includes(cli?.source) || uid.startsWith('tmux:')) {
     return { proceed: true, overwriteDraft: '' };
   }
@@ -2187,7 +2187,7 @@ async function prepareTerminalDraft(uid) {
 async function sendToSession(text, keys, uid = S.sel, media = [], options = {}) {
   const name = takenOver(uid);
   if (!name) return false;
-  const cli = sesmanCli(uid);
+  const cli = agenthubCli(uid);
   const serverQueued = !!text && ['claude', 'codex'].includes(cli?.source)
     && !uid.startsWith('tmux:');
   const queuedId = text && !serverQueued && typeof queuePendingUserMessage === 'function'
@@ -2687,14 +2687,14 @@ async function answerCliQuestion(uid, optionIndex) {
   if (rows?.length !== 1 || rows[0].multiple || !rows[0].options?.[optionIndex]) return false;
   // 不同 CLI 的菜单定位语义不同（Claude 用方向键，Codex 用数字直选），
   // 具体按键必须由各自实现决定，不能在公共交互层猜测当前光标位置。
-  const keys = sesmanCli(uid)?.questionAnswerKeys(prompt, optionIndex);
+  const keys = agenthubCli(uid)?.questionAnswerKeys(prompt, optionIndex);
   if (!keys?.length) return false;
   return sendToSession(null, keys, uid);
 }
 
 async function answerCliQuestionForm(uid, optionIndexes) {
   const prompt = activeCliQuestion(uid);
-  const cli = sesmanCli(uid);
+  const cli = agenthubCli(uid);
   if (!cli?.canAnswerQuestionForm(prompt)) return false;
   const groups = cli.questionFormAnswerKeyGroups(prompt, optionIndexes);
   if (!groups?.length) return false;
@@ -2711,7 +2711,7 @@ async function answerCliQuestionForm(uid, optionIndexes) {
 
 async function cancelCliQuestion(uid) {
   composerEscAt = -Infinity;
-  const keys = sesmanCli(uid)?.questionCancelKeys(activeCliQuestion(uid));
+  const keys = agenthubCli(uid)?.questionCancelKeys(activeCliQuestion(uid));
   return keys?.length ? sendToSession(null, keys, uid) : false;
 }
 
@@ -2727,7 +2727,7 @@ async function sendComposerEscape(now = performance.now()) {
   const draft = composerDraft(uid, false);
   const empty = !String($('#cinput')?.value || '').trim()
     && !(draft?.attachments?.length) && !(draft?.quotes?.some(q => q.text?.trim()));
-  const escape = sesmanCli(uid)?.repeatedEscape(now, composerEscAt, { busy, empty })
+  const escape = agenthubCli(uid)?.repeatedEscape(now, composerEscAt, { busy, empty })
     || { rewind: false, nextAt: -Infinity };
   const rewind = escape.rewind;
   composerEscAt = escape.nextAt;

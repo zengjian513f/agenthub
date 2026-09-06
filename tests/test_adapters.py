@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import adapters, index as session_index, session_meta
+from agenthub import adapters, index as session_index, session_meta
 
 
 class CodexEventTests(unittest.TestCase):
@@ -60,6 +60,38 @@ class CodexEventTests(unittest.TestCase):
         self.assertEqual(visible[0]["role"], "user")
         self.assertEqual(visible[0]["text"], "这个作为用户正文保留")
 
+    def test_structured_abort_marks_only_last_assistant_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            meta = {"internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-aborted",
+            }}
+            rows = [
+                {"type": "response_item", "payload": {
+                    "type": "message", "role": "user", **meta,
+                    "content": [{"type": "input_text", "text": "开始"}]}},
+                {"type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "phase": "commentary",
+                    **meta, "content": [{"type": "output_text", "text": "先检查"}]}},
+                {"type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "phase": "commentary",
+                    **meta, "content": [{"type": "output_text", "text": "最后状态"}]}},
+                {"type": "response_item", "payload": {
+                    "type": "custom_tool_call", "name": "exec", "call_id": "c1",
+                    "input": "pwd", **meta}},
+                {"type": "event_msg", "payload": {
+                    "type": "turn_aborted", "turn_id": "turn-aborted",
+                    "reason": "interrupted by user"}},
+            ]
+            rollout.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+            messages, _ = adapters.CodexAdapter().read(str(rollout))
+
+        assistant = [m for m in messages if m["role"] == "assistant"]
+        self.assertNotIn("interrupted", assistant[0])
+        self.assertTrue(assistant[1]["interrupted"])
+        self.assertEqual(assistant[1]["interrupt_reason"], "interrupted by user")
+
     def test_request_user_input_keeps_identity_and_compacts_answers(self):
         with tempfile.TemporaryDirectory() as tmp:
             rollout = Path(tmp) / "rollout.jsonl"
@@ -108,6 +140,39 @@ class CodexEventTests(unittest.TestCase):
                           for m in answers], [
             ("call-ok", "继续", False),
             ("call-cancel", "已取消回答", True),
+        ])
+
+    def test_turn_identity_and_native_answer_phase_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            meta = {"internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-native",
+            }}
+            rows = [
+                {"type": "response_item", "payload": {
+                    "type": "message", "role": "user", **meta,
+                    "content": [{"type": "input_text", "text": "开始"}]}},
+                {"type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "phase": "commentary",
+                    **meta, "content": [{"type": "output_text", "text": "处理中"}]}},
+                {"type": "response_item", "payload": {
+                    "type": "custom_tool_call", "name": "exec", "call_id": "c1",
+                    "input": "pwd", **meta}},
+                {"type": "response_item", "payload": {
+                    "type": "custom_tool_call_output", "call_id": "c1",
+                    "output": "ok", **meta}},
+                {"type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "phase": "final_answer",
+                    **meta, "content": [{"type": "output_text", "text": "完成"}]}},
+            ]
+            rollout.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+            messages, _ = adapters.CodexAdapter().read(str(rollout))
+
+        self.assertTrue(all(m.get("turn_id") == "turn-native" for m in messages))
+        assistant = [m for m in messages if m["role"] == "assistant"]
+        self.assertEqual([(m["text"], m.get("phase")) for m in assistant], [
+            ("处理中", "progress"), ("完成", "final"),
         ])
 
     def test_name_and_compaction_are_visible_but_not_counted_messages(self):
@@ -242,6 +307,28 @@ class GrokAdapterTests(unittest.TestCase):
         self.assertRegex(messages[0]["media"][0]["src"],
                          r"^/api/media/[0-9a-f]{32}$")
 
+    def test_prompt_index_and_tool_free_final_answer_define_a_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            history = session / "chat_history.jsonl"
+            rows = [
+                {"type": "user", "prompt_index": 9, "content": "开始"},
+                {"type": "assistant", "content": "处理中", "tool_calls": [{
+                    "id": "c1", "name": "shell", "arguments": {"command": "pwd"},
+                }]},
+                {"type": "tool_result", "tool_call_id": "c1", "content": "ok"},
+                {"type": "assistant", "content": "完成"},
+            ]
+            history.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+            messages, _ = adapters.GrokAdapter().read(str(session))
+
+        self.assertTrue(all(m.get("turn_id") == "prompt:9" for m in messages))
+        assistant = [m for m in messages if m["role"] == "assistant"]
+        self.assertEqual([(m["text"], m.get("phase")) for m in assistant], [
+            ("处理中", "progress"), ("完成", "final"),
+        ])
+
     def test_old_cursor_resets_after_parser_semantics_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             session_dir = Path(tmp)
@@ -266,6 +353,33 @@ class GrokAdapterTests(unittest.TestCase):
 
 
 class ClaudeProtocolTests(unittest.TestCase):
+    def test_user_uuid_and_end_turn_mark_the_final_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "turn-phase.jsonl"
+            rows = [
+                {"type": "user", "uuid": "user-turn", "parentUuid": None,
+                 "isSidechain": False,
+                 "message": {"role": "user", "content": "开始"}},
+                {"type": "assistant", "uuid": "progress", "parentUuid": "user-turn",
+                 "isSidechain": False,
+                 "message": {"role": "assistant", "stop_reason": "tool_use",
+                             "content": [{"type": "text", "text": "处理中"}]}},
+                {"type": "assistant", "uuid": "final", "parentUuid": "progress",
+                 "isSidechain": False,
+                 "message": {"role": "assistant", "stop_reason": "end_turn",
+                             "content": [{"type": "text", "text": "完成"}]}},
+            ]
+            transcript.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+            messages, _ = adapters.ClaudeAdapter().read(str(transcript))
+
+        visible = [m for m in messages if m["role"] != "status"]
+        self.assertTrue(all(m.get("turn_id") == "user-turn" for m in visible))
+        assistant = [m for m in visible if m["role"] == "assistant"]
+        self.assertEqual([(m["text"], m.get("phase")) for m in assistant], [
+            ("处理中", "progress"), ("完成", "final"),
+        ])
+
     def test_current_claude_screen_identifies_rewound_tip_not_jsonl_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "screen-rewind.jsonl"

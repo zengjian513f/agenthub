@@ -784,6 +784,16 @@ def _msg(role, text="", ts=None, name=None, args=None, media_parts=None, **extra
     return out
 
 
+def _turn_fields(turn_id=None, phase=None) -> dict:
+    """Return compact cross-CLI turn metadata without serializing null fields."""
+    out = {}
+    if turn_id is not None and str(turn_id):
+        out["turn_id"] = str(turn_id)
+    if phase in {"progress", "final"}:
+        out["phase"] = phase
+    return out
+
+
 def _status(state: str, ts=None, **extra):
     return _msg("status", state, ts, state=state, **extra)
 
@@ -847,7 +857,7 @@ class ClaudeAdapter:
                 # 新树，供模型从摘要继续；本地 JSONL 中的旧对话却仍然存在。
                 # 对“人看的时间线”，压缩是一个连续边界，应接回边界前由
                 # last-prompt/最后图节点声明的当前叶子。否则每次 compact 后
-                # sesman 都会把全部旧正文误判成已回退分支。
+                # agenthub 都会把全部旧正文误判成已回退分支。
                 if not parent and scan_tip and cls._compact_boundary(rec):
                     parent = scan_tip
                 parents[uid] = str(parent) if parent else None
@@ -1203,6 +1213,7 @@ class ClaudeAdapter:
             path, start=start, agent=agent, declared_tip=declared_tip,
             abandoned_after=abandoned_after)
         msgs, calls = [], {}
+        current_turn = None
         previous_custom_title = None
         custom_title_seeded = start == 0
         for rec, off in _iter_records(path, start):
@@ -1228,24 +1239,35 @@ class ClaudeAdapter:
                                  else None) for x in text_parts]
                 if hidden_record:
                     continue
+                visible_user_text = any(
+                    command is not None or (
+                        output is None and x.strip()
+                        and x.strip() != "/compact" and notice is None
+                        and not _is_timeline_protocol(x))
+                    for x, notice, command, output in zip(
+                        text_parts, notifications, bash_inputs, bash_outputs))
+                starts_turn = (t == "user" and (not tag or agent)
+                               and not interrupted_branch
+                               and (visible_user_text
+                                    or any(p["kind"] == "image" for p in parts)))
+                if starts_turn:
+                    current_turn = rec.get("uuid") or off
                 if t == "user" and not tag and (
                         rec.get("interruptedMessageId")
                         or any(_is_claude_interrupt(x) for x in text_parts)):
-                    msgs.append(_status("aborted", ts))
+                    msgs.append(_status("aborted", ts, **_turn_fields(current_turn)))
                     continue
-                if t == "user" and not tag and not interrupted_branch and any(
-                        command is not None or (
-                            output is None and x.strip()
-                            and x.strip() != "/compact" and notice is None
-                            and not _is_timeline_protocol(x))
-                        for x, notice, command, output in zip(
-                            text_parts, notifications, bash_inputs, bash_outputs)):
-                    msgs.append(_status("working", ts))
+                if t == "user" and not tag and not interrupted_branch and visible_user_text:
+                    msgs.append(_status("working", ts, **_turn_fields(current_turn)))
                 emitted_interrupted_user = False
                 interrupted_meta = ({
                     "interrupted": True,
                     "interrupt_reason": "输入已中断，未进入当前 Claude 分支",
                 } if interrupted_branch else {})
+                stop_reason = (rec.get("message") or {}).get("stop_reason")
+                assistant_phase = ("final" if stop_reason == "end_turn"
+                                   else "progress" if t == "assistant" and stop_reason
+                                   else None)
                 for p in parts:
                     if not str(p.get("text", "")).strip() and not p.get("media"):
                         continue
@@ -1261,6 +1283,7 @@ class ClaudeAdapter:
                             msgs.append(_msg(
                                 "command", bash_input, ts, call_id=call_id,
                                 local_shell=True, event_id=call_id,
+                                **_turn_fields(current_turn),
                                 **interrupted_meta))
                             emitted_interrupted_user |= interrupted_branch
                         elif bash_output is not None:
@@ -1269,7 +1292,8 @@ class ClaudeAdapter:
                                 "tool_result", bash_output["text"], ts,
                                 name="Shell", call_id=f"local-shell:{parent}",
                                 counted=False,
-                                has_stderr=bash_output["stderr"]))
+                                has_stderr=bash_output["stderr"],
+                                **_turn_fields(current_turn)))
                         elif notice and not tag:
                             notice["ts"] = ts
                             msgs.append(notice)
@@ -1279,28 +1303,36 @@ class ClaudeAdapter:
                             continue
                         else:
                             msgs.append(_msg(role, p["text"], ts, name=tag,
+                                             **_turn_fields(current_turn,
+                                                            assistant_phase),
                                              **interrupted_meta))
                             emitted_interrupted_user |= interrupted_branch
                     elif p["kind"] == "image":
                         msgs.append(_msg(role, p["text"], ts, name=tag,
                                          media_parts=[p.get("media")],
+                                         **_turn_fields(current_turn,
+                                                        assistant_phase),
                                          **interrupted_meta))
                         emitted_interrupted_user |= interrupted_branch
                     elif p["kind"] == "thinking":
-                        msgs.append(_msg("thinking", p["text"], ts, name=tag))
+                        msgs.append(_msg("thinking", p["text"], ts, name=tag,
+                                         **_turn_fields(current_turn)))
                     elif p["kind"] == "tool":
                         calls[p.get("call_id")] = p["name"]
                         msgs.append(_msg("tool", p["text"], ts, name=p["name"],
                                          call_id=p.get("call_id"),
                                          summary=p.get("summary"),
-                                         changes=p.get("changes") or None))
+                                         changes=p.get("changes") or None,
+                                         **_turn_fields(current_turn)))
                     elif p["kind"] == "question":
                         calls[p.get("call_id")] = p["name"]
                         msgs.append(_msg("question", p["text"], ts,
                                          name=p["name"], call_id=p.get("call_id"),
-                                         questions=p["questions"]))
+                                         questions=p["questions"],
+                                         **_turn_fields(current_turn)))
                         if not tag:
-                            msgs.append(_status("waiting", ts))
+                            msgs.append(_status("waiting", ts,
+                                                **_turn_fields(current_turn)))
                     elif p["kind"] == "tool_result":
                         name = calls.get(p.get("call_id"))
                         is_answer = _is_question_tool(name)
@@ -1316,22 +1348,28 @@ class ClaudeAdapter:
                                          call_id=p.get("call_id"),
                                          error=bool(p.get("error")) or
                                                (exit_code is not None and exit_code != 0),
-                                         media_parts=p.get("media"), **output_meta))
+                                         media_parts=p.get("media"),
+                                         **_turn_fields(current_turn), **output_meta))
                         if is_answer and not tag:
-                            msgs.append(_status("working", ts))
+                            msgs.append(_status("working", ts,
+                                                **_turn_fields(current_turn)))
                 if emitted_interrupted_user:
                     msgs.append(_status("aborted", ts,
-                                        reason="输入已中断，未进入当前 Claude 分支"))
+                                        reason="输入已中断，未进入当前 Claude 分支",
+                                        **_turn_fields(current_turn)))
             elif t == "system":
                 if not tag and rec.get("subtype") == "turn_duration":
                     duration = rec.get("durationMs")
-                    msgs.append(_status("idle", ts, duration_ms=duration))
+                    msgs.append(_status("idle", ts, duration_ms=duration,
+                                        **_turn_fields(current_turn)))
                     if isinstance(duration, (int, float)) and duration >= 0:
                         msgs.append(_msg("event", "", ts, counted=False,
-                                         event_kind="duration", duration_ms=duration))
+                                         event_kind="duration", duration_ms=duration,
+                                         **_turn_fields(current_turn)))
                 elif not tag and rec.get("subtype") == "away_summary" and rec.get("content"):
                     msgs.append(_msg("event", _stringify(rec["content"]), ts,
-                                     counted=False, event_kind="recap"))
+                                     counted=False, event_kind="recap",
+                                     **_turn_fields(current_turn)))
                 elif rec.get("subtype") == "local_command":
                     # Claude 2.x writes slash-command protocol as system XML.
                     # /rename already has the earlier custom-title record and
@@ -1344,17 +1382,21 @@ class ClaudeAdapter:
                         event_id = rec.get("uuid") or off
                         msgs.append(_msg("command", command, ts, counted=False,
                                          inferred=True,
-                                         event_id=f"command:{event_id}"))
+                                         event_id=f"command:{event_id}",
+                                         **_turn_fields(current_turn)))
                 elif self._compact_boundary(rec):
                     # /compact 没有 turn_duration；边界记录就是压缩完成点。
                     if not tag:
-                        msgs.append(_status("idle", ts))
+                        msgs.append(_status("idle", ts,
+                                            **_turn_fields(current_turn)))
                     event_id = rec.get("uuid") or ts or off
                     msgs.append(_msg("event", "已压缩", ts, counted=False,
                                      event_kind="compact",
-                                     event_id=f"compact:{event_id}"))
+                                     event_id=f"compact:{event_id}",
+                                     **_turn_fields(current_turn)))
                 elif rec.get("content"):
-                    msgs.append(_msg("system", _stringify(rec["content"]), ts))
+                    msgs.append(_msg("system", _stringify(rec["content"]), ts,
+                                     **_turn_fields(current_turn)))
             elif t == "attachment" and not tag:
                 attachment = rec.get("attachment")
                 # Claude 在工具执行期间吸收排队输入时，不一定再写普通 user
@@ -1366,7 +1408,9 @@ class ClaudeAdapter:
                         and (attachment.get("origin") or {}).get("kind") == "human"
                         and isinstance(attachment.get("prompt"), str)
                         and attachment["prompt"].strip()):
-                    msgs.append(_msg("user", attachment["prompt"], ts))
+                    current_turn = rec.get("uuid") or off
+                    msgs.append(_msg("user", attachment["prompt"], ts,
+                                     **_turn_fields(current_turn)))
             elif t == "queue-operation" and not tag:
                 # Claude 忙时会先把网页送入的 prompt 留在自己的内存队列。
                 # enqueue 证明 CLI 确实接收；dequeue/popAll 表示提升为正式 user，
@@ -1639,12 +1683,32 @@ class CodexAdapter:
                     msgs.append(_status(state, ts, turn_id=p.get("turn_id"),
                                         duration_ms=p.get("duration_ms")))
                 elif event == "turn_aborted":
+                    aborted_turn = str(p.get("turn_id") or "")
+                    # Codex 不会为中断轮补 final_answer。把结构化中断语义落到
+                    # 最后一条 commentary 上，前端才能在整读历史时保留一条
+                    # 可见状态；只标最后一条，避免展开过程后每条进展都显示
+                    # “已中断”。增量读取若没覆盖这条消息，浏览器会用同一个
+                    # activity.turn_id 在缓存中补标。
+                    if aborted_turn:
+                        for message in reversed(msgs):
+                            if (message.get("turn_id") == aborted_turn
+                                    and message.get("role") == "assistant"):
+                                if message.get("phase") != "final":
+                                    message["interrupted"] = True
+                                    message["interrupt_reason"] = (
+                                        p.get("reason") or "本轮在最终答复前被中断")
+                                break
                     msgs.append(_status("aborted", ts, turn_id=p.get("turn_id"),
                                         reason=p.get("reason"), duration_ms=p.get("duration_ms")))
                 continue
             if rec.get("type") != "response_item":
                 continue
             k = p.get("type")
+            native_meta = p.get("internal_chat_message_metadata_passthrough")
+            if not isinstance(native_meta, dict):
+                native_meta = {}
+            turn_id = p.get("turn_id") or native_meta.get("turn_id")
+            turn_meta = _turn_fields(turn_id)
             if k == "message":
                 native_role = p.get("role") or "user"
                 role = native_role
@@ -1662,11 +1726,16 @@ class CodexAdapter:
                     continue
                 if txt.strip() or images:
                     shown = txt or "[图片]"
-                    msgs.append(_msg(role, shown, ts, media_parts=images))
+                    native_phase = p.get("phase")
+                    phase = ("final" if native_phase == "final_answer"
+                             else "progress" if native_phase == "commentary"
+                             else None)
+                    msgs.append(_msg(role, shown, ts, media_parts=images,
+                                     **_turn_fields(turn_id, phase)))
             elif k == "reasoning":
                 txt = "\n".join(x["text"] for x in _flatten_content(p.get("summary")) if x["kind"] == "text")
                 if txt.strip():
-                    msgs.append(_msg("thinking", txt, ts))
+                    msgs.append(_msg("thinking", txt, ts, **turn_meta))
             elif k in ("function_call", "custom_tool_call", "local_shell_call"):
                 name = p.get("name") or k
                 body = p.get("arguments") or p.get("input") or p.get("action") or ""
@@ -1675,13 +1744,14 @@ class CodexAdapter:
                 if question:
                     msgs.append(_msg("question", question["text"], ts, name=name,
                                      call_id=p.get("call_id"),
-                                     questions=question["questions"]))
-                    msgs.append(_status("waiting", ts, turn_id=p.get("turn_id")))
+                                     questions=question["questions"], **turn_meta))
+                    msgs.append(_status("waiting", ts, **turn_meta))
                 else:
                     msgs.append(_msg("tool", _pretty_json(body), ts, name=name,
                                      call_id=p.get("call_id"),
                                      summary=_tool_summary(name, body),
-                                     changes=_tool_file_changes(name, body) or None))
+                                     changes=_tool_file_changes(name, body) or None,
+                                     **turn_meta))
             elif k in ("function_call_output", "custom_tool_call_output", "local_shell_call_output"):
                 name = calls.get(p.get("call_id"))
                 is_answer = _is_question_tool(name)
@@ -1695,11 +1765,12 @@ class CodexAdapter:
                                  call_id=p.get("call_id"),
                                  error=cancelled or (exit_code != 0 if exit_code is not None
                                         else _output_error(out_text) or False),
-                                 **output_meta))
+                                 **turn_meta, **output_meta))
                 if is_answer:
-                    msgs.append(_status("working", ts))
+                    msgs.append(_status("working", ts, **turn_meta))
             elif k in ("web_search_call", "tool_search_call"):
-                msgs.append(_msg("tool", _pretty_json(p.get("arguments") or {}), ts, name=k))
+                msgs.append(_msg("tool", _pretty_json(p.get("arguments") or {}), ts,
+                                 name=k, **turn_meta))
 
         return msgs, end, session_meta
 
@@ -1798,6 +1869,7 @@ class GrokAdapter:
     def read(self, path: str, start: int = 0):
         chat = Path(path) / "chat_history.jsonl"
         msgs, calls, end = [], {}, start
+        current_turn = None
         if not chat.is_file():
             return msgs, end
         for rec, off in _iter_records(chat, start):
@@ -1806,7 +1878,8 @@ class GrokAdapter:
             if t == "reasoning":
                 txt = "\n".join(x["text"] for x in _flatten_content(rec.get("summary")) if x["kind"] == "text")
                 if txt.strip():
-                    msgs.append(_msg("thinking", txt))
+                    msgs.append(_msg("thinking", txt,
+                                     **_turn_fields(current_turn)))
             elif t == "tool_result":
                 parts = _flatten_content(rec.get("content"))
                 txt = "\n".join(x["text"] for x in parts if x.get("kind") != "image" and x.get("text"))
@@ -1814,7 +1887,8 @@ class GrokAdapter:
                 msgs.append(_msg("tool_result", txt or "[图片]",
                                  name=calls.get(rec.get("tool_call_id")),
                                  call_id=rec.get("tool_call_id"),
-                                 error=_output_error(txt) or False, media_parts=images))
+                                 error=_output_error(txt) or False, media_parts=images,
+                                 **_turn_fields(current_turn)))
             elif t in ("user", "assistant", "system"):
                 parts = _flatten_content(rec.get("content"))
                 txt = "\n".join(x["text"] for x in parts if x["kind"] == "text")
@@ -1825,7 +1899,15 @@ class GrokAdapter:
                         shown = _strip_grok_user_query(shown)
                     if not rec.get("synthetic_reason") \
                             and not (t == "user" and _is_timeline_protocol(shown)):
-                        msgs.append(_msg(t, shown, media_parts=images))
+                        if t == "user":
+                            prompt_index = rec.get("prompt_index")
+                            current_turn = (f"prompt:{prompt_index}"
+                                            if prompt_index is not None else f"offset:{off}")
+                        phase = ("final" if t == "assistant" and not rec.get("tool_calls")
+                                 else "progress" if t == "assistant"
+                                 else None)
+                        msgs.append(_msg(t, shown, media_parts=images,
+                                         **_turn_fields(current_turn, phase)))
                 for tc in rec.get("tool_calls") or []:
                     name = tc.get("name") or (tc.get("function") or {}).get("name") or "tool"
                     args = tc.get("arguments") or (tc.get("function") or {}).get("arguments") or ""
@@ -1833,13 +1915,15 @@ class GrokAdapter:
                     question = _question_message(name, args)
                     if question:
                         msgs.append(_msg("question", question["text"],
-                                         questions=question["questions"]))
-                        msgs.append(_status("waiting"))
+                                         questions=question["questions"],
+                                         **_turn_fields(current_turn)))
+                        msgs.append(_status("waiting", **_turn_fields(current_turn)))
                     else:
                         msgs.append(_msg("tool", _pretty_json(args), name=name,
                                          call_id=tc.get("id"),
                                          summary=_tool_summary(name, args),
-                                         changes=_tool_file_changes(name, args) or None))
+                                         changes=_tool_file_changes(name, args) or None,
+                                         **_turn_fields(current_turn)))
         return msgs, end
 
 

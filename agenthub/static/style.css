@@ -1,5 +1,5 @@
 @font-face {
-  font-family: "Sesman Cascadia Mono";
+  font-family: "AgentHub Cascadia Mono";
   src: url("fonts/CascadiaMono.woff2") format("woff2-variations");
   font-weight: 200 700; font-style: normal; font-display: swap;
 }
@@ -8,7 +8,7 @@
  * 字面尺寸；xterm 自己按 Unicode 为汉字分配两个单元格，不需要缩小西文
  * 轮廓来凑字体度量上的 1:2。字体文件本身不作修改。 */
 @font-face {
-  font-family: "Sesman Ubuntu Sans Mono";
+  font-family: "AgentHub Ubuntu Sans Mono";
   src: url("fonts/UbuntuSansMono.ttf") format("truetype-variations");
   font-weight: 100 700; font-style: normal; font-display: swap;
 }
@@ -17,7 +17,7 @@
  * 西文和中文，避免 Cascadia 的 8.22px 西文格与 Noto 的 14.03px 汉字
  * 拼成并非 1:2 的网格。没有安装这两套字体的平台会继续走下面的混合回退。 */
 @font-face {
-  font-family: "Sesman CJK Mono Grid";
+  font-family: "AgentHub CJK Mono Grid";
   src: local("Sarasa Mono SC"), local("Noto Sans Mono CJK SC");
   font-weight: 200 700; font-style: normal; font-display: swap;
 }
@@ -25,7 +25,7 @@
 /* 等宽西文字体通常没有汉字。把 CJK 单独路由到无衬线字体，避免 Windows
  * 最后用 generic monospace 的宋体补字；unicode-range 让拉丁字母继续走用户所选字体。 */
 @font-face {
-  font-family: "Sesman CJK Sans";
+  font-family: "AgentHub CJK Sans";
   src: local("Sarasa Mono SC"), local("Noto Sans Mono CJK SC"),
        local("Microsoft YaHei UI"), local("Microsoft YaHei"),
        local("PingFang SC"), local("Noto Sans CJK SC"),
@@ -54,8 +54,8 @@
   --tool: #b7791f;
   --terminal-bg: #f4f6f8;
   --terminal-fg: #252a32;
-  --terminal-font: "Sesman CJK Sans", "Sesman Ubuntu Sans Mono", "Ubuntu Sans Mono",
-    "Sesman Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono",
+  --terminal-font: "AgentHub CJK Sans", "AgentHub Ubuntu Sans Mono", "Ubuntu Sans Mono",
+    "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono",
     Consola, Consolas, sans-serif;
   --tool-font-size: 12.96px;
   --terminal-font-size: 14.04px;
@@ -626,6 +626,11 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   text-decoration: none;
 }
 .iconbtn { position: relative; width: 28px; height: 28px; border-radius: 6px; padding: 0; }
+.iconbtn.turn-mode {
+  display: inline-flex; align-items: center; justify-content: center; gap: 3px;
+  width: 28px; min-width: 28px; padding: 0;
+}
+.iconbtn.turn-mode .ui-icon { width: 13px; height: 13px; }
 .iconbtn:hover { background: var(--hover); color: var(--text); }
 .iconbtn.on { background: var(--accent); color: #fff; }
 .iconbtn.star-toggle.on, .iconbtn.star-toggle.on:hover { background: transparent; color: var(--star); }
@@ -738,6 +743,74 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .msg[data-role="answer"] {
   --bubble: var(--bubble-user); margin-left: auto; margin-right: 0;
 }
+
+/* 已完成回合的外层过程合集；展开后内部仍沿用原消息与工具折叠样式。 */
+.msg.turn-process {
+  width: 100%; margin-block: -1px 8px; border: 0; border-radius: 0;
+  background: transparent; box-shadow: none; overflow: visible;
+}
+.turn-toolbar {
+  display: flex; align-items: center; gap: 5px; position: relative; z-index: 3;
+  width: fit-content; max-width: 100%;
+}
+.msg.turn-process:not(.folded) > .turn-toolbar {
+  position: sticky; top: 7px;
+}
+.turn-toolbar > .turn-preview {
+  display: flex; flex: 0 1 auto; width: fit-content; min-width: 0;
+  max-width: min(100%, 920px); min-height: 30px;
+  padding: 5px 9px; border: 1px solid var(--border); border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-2) 96%, transparent); color: var(--muted);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--text) 8%, transparent);
+  font: inherit; font-size: 12px; line-height: 1.45; text-align: left;
+  cursor: pointer; user-select: none;
+}
+.turn-toolbar > .turn-preview::before {
+  content: "⌄"; flex: none; width: 12px; color: var(--muted);
+  font-size: 13px; line-height: 1.35; text-align: center;
+}
+.msg.turn-process.folded > .turn-toolbar > .turn-preview::before { content: "›"; }
+.turn-toolbar > .turn-preview:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: var(--hover); color: var(--text);
+}
+.msg.turn-process.has-error > .turn-toolbar > .turn-preview {
+  border-color: color-mix(in srgb, #e5534b 42%, var(--border));
+}
+.msg.turn-process .turn-peek {
+  display: flex; align-items: baseline; gap: 8px; max-width: none;
+  overflow: hidden; white-space: nowrap; opacity: 1;
+}
+.turn-label {
+  display: inline-flex; align-items: center; gap: 4px; flex: none;
+  color: var(--text); font-size: 11.5px;
+}
+.turn-label .ui-icon { width: 13px; height: 13px; }
+.turn-stats {
+  display: flex; align-items: baseline; min-width: 0; overflow: hidden;
+  color: var(--muted); font-size: 11px; white-space: nowrap;
+}
+.turn-stats > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.turn-stats > span + span::before { content: " · "; color: var(--muted); }
+.turn-nav {
+  display: flex; align-items: center; gap: 1px; flex: none; min-height: 30px;
+  padding: 2px; border: 1px solid var(--border); border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-2) 96%, transparent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--text) 8%, transparent);
+}
+.turn-nav[hidden] { display: none; }
+.turn-nav-btn {
+  min-height: 24px; padding: 3px 6px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--muted); font: inherit; font-size: 10.5px;
+  line-height: 1; white-space: nowrap; cursor: pointer;
+}
+.turn-nav-btn:hover { background: var(--hover); color: var(--text); }
+.turn-collapse { color: var(--accent); }
+.turn-process-body {
+  width: 100%; margin-top: 7px; padding: 2px 0 1px 11px;
+  border-left: 1px solid var(--border);
+}
+.turn-process-body[hidden] { display: none; }
 
 .question-body { min-width: 0; }
 .question-item + .question-item { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -1391,6 +1464,14 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   }
   .dhead-actions { max-width: none; flex-wrap: nowrap; gap: 0; }
   .dhead-actions > .iconbtn { width: 32px; height: 32px; }
+  .dhead-actions > .iconbtn.turn-mode { width: 32px; min-width: 32px; padding: 0; }
+  .msg.turn-process:not(.folded) > .turn-toolbar { top: 4px; width: 100%; }
+  .msg.turn-process:not(.folded) > .turn-toolbar > .turn-preview { flex: 1 1 auto; }
+  .turn-nav-btn { width: 25px; padding-inline: 3px; overflow: hidden; font-size: 0; }
+  .turn-nav-btn::after { font-size: 11px; }
+  .turn-to-start::after { content: "↑"; }
+  .turn-collapse::after { content: "收"; }
+  .turn-to-conclusion::after { content: "↓"; }
   .mobile-msg-summary {
     display: inline-flex; align-items: center; margin: 0 3px 0 5px;
   }

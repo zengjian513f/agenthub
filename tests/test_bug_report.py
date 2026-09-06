@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from sesman import audit, bug_report, server
+from agenthub import audit, bug_report, server
 
 
 class BugReportBundleTests(unittest.TestCase):
@@ -58,7 +58,7 @@ class BugReportWorkerTests(unittest.TestCase):
             (directory / "manifest.json").write_text('{"status":"starting"}\n')
             report = {"report_id": "BUG-ready", "path": str(directory),
                       "prompt": "investigate this report"}
-            info = {"name": "sesman-codex-new-ready"}
+            info = {"name": "agenthub-codex-new-ready"}
             driver = MagicMock()
             driver.composer_probe.return_value = {"draft_state": "empty"}
             with patch.object(bug_report.term, "has_session", return_value=True), \
@@ -79,7 +79,7 @@ class BugReportWorkerTests(unittest.TestCase):
             (directory / "manifest.json").write_text('{"status":"captured"}\n')
             report = {"report_id": "BUG-test", "path": str(directory),
                       "prompt": "investigate"}
-            info = {"name": "sesman-codex-new-test", "source": "codex",
+            info = {"name": "agenthub-codex-new-test", "source": "codex",
                     "sid": None, "cwd": str(bug_report.PROJECT_ROOT), "token": "token"}
             fake_thread = MagicMock()
             with patch.object(bug_report.index, "load", return_value=[
@@ -107,14 +107,14 @@ class BugReportWorkerTests(unittest.TestCase):
         handler._display_ip = lambda: "192.0.2.8"
         session = {"uid": "codex:one", "source": "codex", "sid": "one"}
         report = {"report_id": "BUG-test", "path": "/tmp/report"}
-        worker = {"name": "sesman-codex-new-test", "source": "codex",
+        worker = {"name": "agenthub-codex-new-test", "source": "codex",
                   "sid": None, "cwd": str(bug_report.PROJECT_ROOT), "token": "token",
                   "title": "处理 BUG-test", "kind": "bug-report",
                   "report_id": "BUG-test"}
         with patch.object(server, "TERMINAL", True), \
                 patch.object(server.term, "available_sources", return_value={"codex": True}), \
                 patch.object(server.term, "list_sessions",
-                             return_value=[{"name": "sesman-codex-one"}]), \
+                             return_value=[{"name": "agenthub-codex-one"}]), \
                 patch.object(server.term, "capture_history", return_value="screen"), \
                 patch.object(server.index, "get", return_value=session), \
                 patch.object(server.send_protocol, "snapshot", return_value={"outbox": []}), \
@@ -122,7 +122,7 @@ class BugReportWorkerTests(unittest.TestCase):
                 patch.object(server.bug_report, "launch", return_value=worker) as launch:
             result = handler._bug_report({
                 "description": "lost message", "uid": "codex:one",
-                "page_id": "page", "terminal_name": "sesman-codex-one",
+                "page_id": "page", "terminal_name": "agenthub-codex-one",
                 "snapshot": {"data": {}}, "cols": 100, "rows": 30,
             })
 

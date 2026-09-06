@@ -1,4 +1,4 @@
-"""sesman —— Claude / Codex / Grok 会话统一浏览服务 (纯标准库)。"""
+"""agenthub —— Claude / Codex / Grok 会话统一浏览服务 (纯标准库)。"""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ WATCH_POLL = 0.05       # 服务端盯文件的间隔; stat 一个文件是微�
 JSON_GZIP_MIN = 1024    # 小响应省不了多少，避免反而增加压缩 CPU 和头部体积
 JSON_GZIP_LEVEL = 4     # 实测 4.5 MiB → 1.20 MiB / 75 ms，继续加级收益很小
 ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
-ATTACHMENT_DIR = "sesman_attachments"
+ATTACHMENT_DIR = "agenthub_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
 OUTBOX_WAKE = threading.Event()
 TERM_OWNERS = term_ownership.Registry()
@@ -324,7 +324,7 @@ def _outbox_loop() -> None:
 
 
 def _sessions_signature(index_sig: str | None = None) -> str:
-    """原生会话与 sesman 自有元数据共同决定列表版本。"""
+    """原生会话与 agenthub 自有元数据共同决定列表版本。"""
     return f"{index.signature() if index_sig is None else index_sig}:{session_meta.signature()}"
 
 
@@ -341,7 +341,7 @@ def _view_signature(rows: list[dict], run_id: str) -> str:
 
 def _pane_for_session(session: dict, panes: list[dict],
                       pids: list[int] | None = None) -> dict | None:
-    """按规范名或真实进程树找会话所在的 sesman tmux pane。
+    """按规范名或真实进程树找会话所在的 agenthub tmux pane。
 
     Codex 双 Esc 会换新 UUID，但进程仍留在旧 UUID 命名的 tmux session 中；
     这时名称不再可靠，pane 祖先进程才是权威关联。
@@ -408,7 +408,7 @@ def _accepts_gzip(value: str) -> bool:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "sesman"
+    server_version = "agenthub"
     protocol_version = "HTTP/1.1"
 
     # ---- 基础设施 ----------------------------------------------------
@@ -452,11 +452,11 @@ class Handler(BaseHTTPRequestHandler):
         self._audit_method = str(method or "")
         self._audit_path = str(path or "")
         self._audit_trace_id = str(
-            self.headers.get("X-Sesman-Trace", "") if self.headers else "")[:128]
+            self.headers.get("X-AgentHub-Trace", "") if self.headers else "")[:128]
         self._audit_page_id = str(
-            self.headers.get("X-Sesman-Page", "") if self.headers else "")[:128]
+            self.headers.get("X-AgentHub-Page", "") if self.headers else "")[:128]
         self._audit_build = str(
-            self.headers.get("X-Sesman-Build", "") if self.headers else "")[:128]
+            self.headers.get("X-AgentHub-Build", "") if self.headers else "")[:128]
         inferred_uid = (unquote(path[len("/api/messages/"):])
                         if path.startswith("/api/messages/") else
                         unquote(path[len("/api/session/"):])
@@ -557,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
         # Content-Length。单独传递解压长度，让前端进度的分子分母同口径。
         headers = {
             "Vary": "Accept-Encoding",
-            "X-Sesman-Decoded-Length": str(decoded_length),
+            "X-AgentHub-Decoded-Length": str(decoded_length),
         }
         if len(body) >= JSON_GZIP_MIN and _accepts_gzip(
                 self.headers.get("Accept-Encoding", "")):
@@ -1744,7 +1744,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({k: info[k] for k in ("name", "source", "sid", "cwd", "token")})
 
     def _new_session_status(self, q: dict):
-        """等待 CLI 落盘后，把临时 tmux 名称关联到真正的 sesman 会话。"""
+        """等待 CLI 落盘后，把临时 tmux 名称关联到真正的 agenthub 会话。"""
         if not TERMINAL:
             return self._json({"error": "终端未启用"}, 403)
         name = q.get("name", [""])[0]
@@ -1963,9 +1963,9 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         data = f.read_bytes()
         if f.name == "index.html":
-            data = data.replace(b"__SESMAN_HOSTNAME__",
+            data = data.replace(b"__AGENTHUB_HOSTNAME__",
                                 html.escape(HOSTNAME).encode("utf-8"))
-            data = data.replace(b"__SESMAN_ASSET_VERSION__",
+            data = data.replace(b"__AGENTHUB_ASSET_VERSION__",
                                 ASSET_VERSION.encode("ascii"))
         cache = "no-store" if f.name == "index.html" else "no-cache"
         self._send(200, data, ctype, {"Cache-Control": cache})
@@ -1984,11 +1984,11 @@ def main():
     global TERMINAL
     TERMINAL = args.terminal
     if TERMINAL and not term.available():
-        print("[sesman] 警告: 找不到 tmux, 终端功能不可用")
+        print("[agenthub] 警告: 找不到 tmux, 终端功能不可用")
         TERMINAL = False
 
     if TERMINAL:
-        threading.Thread(target=_outbox_loop, daemon=True, name="sesman-outbox").start()
+        threading.Thread(target=_outbox_loop, daemon=True, name="agenthub-outbox").start()
 
     ALLOWED_IPS.update({"127.0.0.1", "::1", "localhost"})
     try:
@@ -2002,12 +2002,12 @@ def main():
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     allowed = sorted(ALLOWED_IPS) + [str(network) for network in ALLOWED_NETWORKS]
-    print(f"[sesman] http://{args.host}:{args.port}  允许: {allowed}"
+    print(f"[agenthub] http://{args.host}:{args.port}  允许: {allowed}"
           + ("  [终端已开启]" if TERMINAL else ""))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\n[sesman] 已停止")
+        print("\n[agenthub] 已停止")
 
 
 if __name__ == "__main__":

@@ -99,7 +99,7 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
             continue
         main = _is_cli(cmd)
 
-        # resume 命令里的 ID 是这个 CLI 进程的权威身份。sesman 若本身从另一个
+        # resume 命令里的 ID 是这个 CLI 进程的权威身份。agenthub 若本身从另一个
         # Claude 会话启动，tmux 子进程会继承旧的 CLAUDE_CODE_SESSION_ID；不能
         # 因此把新旧两个会话都标成活跃。
         cmd_sids = {(m.group(1) or m.group(2)).lower() for m in _CMD_SID.finditer(cmd)}

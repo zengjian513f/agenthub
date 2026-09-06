@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sesman import debug_runs
+from agenthub import debug_runs
 
 
 class DebugRunsTests(unittest.TestCase):
@@ -41,10 +41,10 @@ class DebugRunsTests(unittest.TestCase):
         debug_runs.register("run-2", root)
         debug_runs.add_session(
             "run-2", source="codex", cwd=str(root / "codex/1"),
-            sid="sid-1", uid="codex:test", name="sesman-codex-test")
+            sid="sid-1", uid="codex:test", name="agenthub-codex-test")
 
         for row in ({"uid": "codex:test"}, {"sid": "sid-1"},
-                    {"name": "sesman-codex-test"}):
+                    {"name": "agenthub-codex-test"}):
             self.assertEqual(debug_runs.run_for(row), "run-2")
             self.assertEqual(debug_runs.filter_rows([row]), [])
 

@@ -2,7 +2,7 @@ import re
 import unittest
 from unittest.mock import patch
 
-from sesman import server
+from agenthub import server
 
 
 class AccessAllowlistTests(unittest.TestCase):
@@ -59,12 +59,12 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn(f"<title>{expected} · 会话管理</title>", page)
         self.assertIn(f'>{expected}</span>', page)
         self.assertIn(f'title="{expected}"', page)
-        self.assertNotIn("__SESMAN_HOSTNAME__", page)
-        self.assertNotIn("__SESMAN_ASSET_VERSION__", page)
+        self.assertNotIn("__AGENTHUB_HOSTNAME__", page)
+        self.assertNotIn("__AGENTHUB_ASSET_VERSION__", page)
         self.assertIn(f"app.js?v={server.ASSET_VERSION}", page)
         self.assertIn(f"style.css?v={server.ASSET_VERSION}", page)
         self.assertIn(
-            f'<meta name="sesman-build" content="{server.ASSET_VERSION}">', page)
+            f'<meta name="agenthub-build" content="{server.ASSET_VERSION}">', page)
         self.assertEqual(headers["Cache-Control"], "no-store")
 
     def test_thinking_messages_are_compact_timeline_notes(self):
@@ -108,7 +108,7 @@ class DirectoryCompletionRouteTests(unittest.TestCase):
         complete.assert_not_called()
 
     def test_route_returns_bounded_directory_candidates(self):
-        rows = ["/tmp/sesman/", "/tmp/session/"]
+        rows = ["/tmp/agenthub/", "/tmp/session/"]
         with patch.object(server, "TERMINAL", True), \
                 patch.object(server.term, "complete_directories",
                              return_value=rows) as complete:
@@ -146,7 +146,7 @@ class CreateSessionDirectoryTests(unittest.TestCase):
         put.assert_not_called()
 
     def test_explicit_confirmation_is_forwarded_to_directory_creator(self):
-        info = {"name": "sesman-codex-new-test", "source": "codex",
+        info = {"name": "agenthub-codex-new-test", "source": "codex",
                 "sid": None, "cwd": "/tmp/new-project", "token": "token"}
         with patch.object(server.index, "load", return_value=[]), \
                 patch.object(server.term, "new_cli_session",
@@ -187,7 +187,7 @@ class ClaudeRewindTests(unittest.TestCase):
     def test_begin_records_raw_tip_without_changing_timeline(self):
         session = {"uid": "claude:test", "source": "claude", "sid": "sid",
                    "path": "/tmp/session.jsonl"}
-        pane = {"name": "sesman-claude-test"}
+        pane = {"name": "agenthub-claude-test"}
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
@@ -205,7 +205,7 @@ class ClaudeRewindTests(unittest.TestCase):
     def test_sync_commits_tip_only_after_normal_screen_matches_older_node(self):
         session = {"uid": "claude:test", "source": "claude", "sid": "sid",
                    "path": "/tmp/session.jsonl"}
-        pane = {"name": "sesman-claude-test"}
+        pane = {"name": "agenthub-claude-test"}
         pending = {"from_tip": "discarded", "stale_end": 321}
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
@@ -239,7 +239,7 @@ class StopSessionTests(unittest.TestCase):
         replies = []
         handler._json = lambda payload, status=200: replies.append((payload, status)) or payload
         session = {"uid": "claude:test", "source": "claude", "sid": "sid", "path": "/tmp/s"}
-        pane = {"name": "sesman-claude-test", "owned": True, "pid": 456}
+        pane = {"name": "agenthub-claude-test", "owned": True, "pid": 456}
         events = []
 
         with patch.object(server.index, "get", return_value=session), \
