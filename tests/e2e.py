@@ -3507,11 +3507,18 @@ def run(pw):
               p.locator("#compose-items .draft-quote").count() == 1
               and p.locator("#compose-items .draft-quote textarea").input_value() == "被引用的上下文")
         paste_prevented = p.evaluate("""() => {
-          const file = new File([new Uint8Array([137, 80, 78, 71])], '粘贴图片.png', {type:'image/png'});
-          const transfer = new DataTransfer(); transfer.items.add(file);
-          transfer.setData('text/plain', '剪贴板伴随文字不应再次进入正文');
+          const bytes = new Uint8Array([137, 80, 78, 71]);
+          const file = new File([bytes], '粘贴图片.png', {type:'image/png', lastModified:1000});
+          // 真实 Chromium 会在 files 与 items.getAsFile() 各返回一个对象，
+          // 且同一张图片的 lastModified 可能相差 1ms。
+          const mirror = new File([bytes], '粘贴图片.png', {type:'image/png', lastModified:1001});
+          const clipboard = {
+            files:[file], types:['Files', 'text/plain'],
+            items:[{kind:'file', type:'image/png', getAsFile:() => mirror}],
+            getData:type => type === 'text/plain' ? '剪贴板伴随文字不应再次进入正文' : '',
+          };
           const event = new Event('paste', {bubbles:true, cancelable:true});
-          Object.defineProperty(event, 'clipboardData', {value:transfer});
+          Object.defineProperty(event, 'clipboardData', {value:clipboard});
           document.querySelector('#cinput').dispatchEvent(event);
           return event.defaultPrevented;
         }""")

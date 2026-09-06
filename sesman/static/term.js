@@ -2355,19 +2355,30 @@ function addComposerFiles(files) {
 
 function clipboardAttachmentFiles(data) {
   const files = [];
-  const seen = new Set();
-  const add = file => {
-    if (!(file instanceof File)) return;
-    const key = `${file.name}\0${file.type}\0${file.size}\0${file.lastModified}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    files.push(file);
-  };
+  const mirrored = new Map();
+  const keyOf = file => `${file.name}\0${file.type}\0${file.size}`;
   // Chromium 通常把文件放在 files；部分浏览器/桌面剪贴板只在 items
-  // 暴露非图片文件（CSV 尤其常见）。两边都读并去重。
-  for (const file of [...(data?.files || [])]) add(file);
+  // 暴露非图片文件（CSV 尤其常见）。files 作为主清单；items 中每个同名、
+  // 同类型、同大小的项只抵消一个镜像。不能比较 lastModified：同一张图片的
+  // 两个 Chromium File 对象会相差 1ms；按计数抵消又能保留真正的同名文件。
+  for (const file of [...(data?.files || [])]) {
+    if (!(file instanceof File)) continue;
+    files.push(file);
+    const key = keyOf(file);
+    mirrored.set(key, (mirrored.get(key) || 0) + 1);
+  }
   for (const item of [...(data?.items || [])]) {
-    if (item.kind === 'file') add(item.getAsFile?.());
+    if (item.kind !== 'file') continue;
+    const file = item.getAsFile?.();
+    if (!(file instanceof File)) continue;
+    const key = keyOf(file);
+    const copies = mirrored.get(key) || 0;
+    if (copies) {
+      if (copies === 1) mirrored.delete(key);
+      else mirrored.set(key, copies - 1);
+    } else {
+      files.push(file);
+    }
   }
   return files;
 }
