@@ -1,4 +1,4 @@
-# agenthub
+# AgentHub
 
 Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务。后端只用 Python 标准库；前端为原生 JS，KaTeX 与 xterm.js 静态内置，无在线依赖和构建步骤。
 
@@ -54,6 +54,15 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 - **管理操作**：Claude 子代理可在会话标题处下拉切换，各自保留独立时间线；运行中的会话显示停止按钮，停止后原位变为删除按钮。
 - **问题报告**：顶栏虫形按钮会冻结当前页面、发送账本、tmux scrollback 和最近 15 分钟跨层事件，随后在 agenthub 项目目录自动新建一条 Codex 会话处理。原页面不会被切走，右下角可随时打开处理会话。该操作会使用当前 Codex 配置并产生模型用量。
 
+## 会话深链
+
+`http://<host>:8710/?sid=<source>:<sid>` 直接打开指定会话（也接受不带 `source` 的裸 sid），
+优先于 localStorage 里记的上次浏览位置；找不到匹配时退回默认行为。`sid` 是各 CLI 的原生会话号
+（Claude 的 uuid、Codex 的 rollout id、Grok 的 uuid），不是列表里的 `uid` —— `uid` 是会话文件
+路径的散列，换目录就变，不适合被外部系统长期引用。
+
+T0 研究台账（`research_catalog` 的 `sessions` 表）和 labdesk 的“关联会话”区块就用这个深链回跳。
+
 ## 界面状态
 
 桌面端左右栏之间的分割线可拖动（下限 200px，右侧至少留 320px），**双击复位**到默认 340px。
@@ -73,7 +82,18 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 
 ## 删除行为
 
-删除**不做真删**，把原文件/目录移入 `~/.local/share/agenthub/trash/<source>/<时间戳>-<原名>`，可手工恢复。
+删除**不做真删**，把原文件/目录移入 `~/.local/share/agenthub/trash/<source>/<时间戳>-<原名>`，
+同时在旁边写一份 `…​.agenthub-trash.json` 清单，记下原始路径、标题、cwd 和星标等自有元数据。
+
+顶栏的垃圾桶按钮打开**回收站**：列出每个已删会话的标题、来源、删除时间、占用大小和将要恢复到的
+路径，可以逐条恢复、逐条彻底删除，或一次清空。
+
+- 恢复按清单放回原路径。会话 uid 由路径散列而来，因此放回后 uid 不变，星标等元数据一并回来；
+  原路径若已被同名会话占用则拒绝覆盖，条目留在回收站并说明原因。
+- 清单出现之前删除的旧条目照样能查看和清除；恢复时按 CLI 固有的目录规则推断原路径
+  （Claude 用会话内的 cwd 反推项目目录，Codex 用 rollout 文件名里的日期），推断不出来的条目
+  明确标为不可恢复，不猜位置。
+- 彻底删除会连同该会话遗留在原目录的同名子代理目录一起回收；那个目录只在主会话确实不在时才算孤儿。
 
 ## 接管会话（远程控制）
 
@@ -228,7 +248,7 @@ Grok 重读对应 summary；新增、删除和移动也只增删相关 raw row�
 
 ## 测试
 
-`tests/e2e.py` 用 Playwright 驱动真实 Chromium 点遍全部交互（列表渲染、来源筛选、两种视图、分组折叠、标题过滤、全文搜索、聊天气泡布局、单层工具输出、自带终端字体与配色、滚动条样式、附件上传/粘贴/引用与 prompt 转换、工具输出折叠、展开全文、公式与图片、子代理独立视图切换、增量同步、刷新、快捷键、接管终端、删除入回收站，以及页面无 JS/HTTP 错误）。
+`tests/e2e.py` 用 Playwright 驱动真实 Chromium 点遍全部交互（列表渲染、来源筛选、两种视图、分组折叠、标题过滤、全文搜索、聊天气泡布局、单层工具输出、自带终端字体与配色、滚动条样式、附件上传/粘贴/引用与 prompt 转换、工具输出折叠、展开全文、公式与图片、子代理独立视图切换、增量同步、刷新、快捷键、接管终端、删除入回收站、回收站的查看/恢复/彻底删除，以及页面无 JS/HTTP 错误）。
 
 删除相关的断言跑在一个临时造出来的自测会话上（`~/.claude/projects/-tmp-agenthub-selftest/`），跑完自动清理，不碰真实会话。
 
@@ -310,6 +330,9 @@ agenthub/
 - `POST /api/session/stop` — 从内层 CLI 开始停止运行实例，保留对话记录
 - `POST /api/audit/browser` — 浏览器批量回传 SSE 应用、DOM 和交互回执
 - `POST /api/bug-report` — 冻结诊断上下文并启动一条 Codex 处理会话
+- `GET /api/trash` — 回收站条目、总量与目录位置
+- `POST /api/trash/restore` — 把条目放回原路径（JSON：`{"id":"<source>/<文件名>"}`）
+- `POST /api/trash/purge` — 彻底删除单条（`{"id":…}`）或清空回收站（`{"all":true}`）
 - `DELETE /api/session/<uid>` — 移入回收站
 
 新建 CLI 在产生第一条正式记录前，会写入权限为 `0600` 的
@@ -366,7 +389,9 @@ systemctl --user enable --now agenthub-tmux.service agenthub.service
 
 ### hub-host 反向代理
 
-线上入口为 `https://example.com/agenthub/`。页面资源、API、SSE 和 WebSocket 都使用当前页面的相对基路径，因此根目录直连与 `/agenthub/` 子路径可同时工作。
+NodeA 入口为 `https://node-a.example.com/agenthub/`，NodeB 入口为
+`https://hub.example.com/agenthub-node-b/`。页面资源、API、SSE 和 WebSocket 都使用当前页面的
+相对基路径，因此根目录直连和反向代理子路径可以同时工作。
 
 - 本机服务由 [`deploy/agenthub.service`](deploy/agenthub.service) 托管，只允许局域网管理端和 WireGuard 对端 `10.0.0.1`。
 - UFW 仅放行 `wg0` 上 `10.0.0.1 → 10.0.0.2:8710/tcp`。

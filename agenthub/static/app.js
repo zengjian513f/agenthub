@@ -2504,7 +2504,9 @@ async function del(m) {
   S.sel = null;
   store.set('sel', null);
   renderChips(); renderSide();
-  $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(d.trash)}</code></div>`;
+  $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(d.trash)}</code>`
+    + `<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>`;
+  $('#detail-open-trash').onclick = openTrash;
   showMobileList();
 }
 
@@ -4285,6 +4287,134 @@ function renderOpts() {
 }
 
 $('#reload').onclick = () => { S.results = null; loadSessions(true); };
+
+/* ---------- 回收站 ---------- */
+// 删除只是把会话文件移进 ~/.local/share/agenthub/trash/，这里是它唯一的出口：
+// 看还剩什么、放回原处、或者真的删掉。
+let trashItems = [];
+let trashBusy = false;
+
+function openTrash() {
+  const dlg = $('#trash-dialog');
+  if (!dlg.open) dlg.showModal();
+  loadTrash();
+}
+
+async function loadTrash({ keepNote = false } = {}) {
+  if (!keepNote) setTrashNote('');   // 刷新列表不能把刚做完那件事的回执抹掉
+  $('#trash-list').innerHTML = '<div class="trash-empty">正在读取回收站…</div>';
+  try {
+    const r = await fetch(appUrl('api/trash'));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    trashItems = Array.isArray(d.items) ? d.items : [];
+    renderTrash(d);
+  } catch (e) {
+    trashItems = [];
+    $('#trash-list').innerHTML = '<div class="trash-empty">读取失败</div>';
+    setTrashNote('读取回收站失败: ' + e.message, true);
+  }
+}
+
+function renderTrash(info) {
+  const dir = info?.dir || '';
+  $('#trash-sub').textContent = trashItems.length
+    ? `${trashItems.length} 个已删除会话 · 共 ${fmtSize(info?.size || 0)} · ${dir}`
+    : `回收站是空的 · ${dir}`;
+  $('#trash-purge-all').disabled = !trashItems.length;
+  $('#trash-list').innerHTML = trashItems.length
+    ? trashItems.map(trashRow).join('')
+    : '<div class="trash-empty">没有已删除的会话</div>';
+}
+
+function trashRow(it) {
+  const badge = SOURCES[it.source] ? icon(it.source) : '';
+  const where = it.restorable
+    ? `<div class="trash-origin" title="${esc(it.origin)}">恢复到 ${esc(shortCwd(it.origin, 200))}</div>`
+    : `<div class="trash-origin warn">${esc(it.reason || '无法恢复')}</div>`;
+  return `<div class="trash-item" data-id="${esc(it.id)}">
+    <div class="trash-main">
+      <div class="trash-title">${badge}<span>${esc(it.title)}</span></div>
+      <div class="trash-meta">
+        <span>${esc(fmtTime(it.deleted_at))} 删除</span>
+        <span>${fmtSize(it.size)}</span>
+        <span class="trash-cwd" title="${esc(it.cwd)}">${esc(shortCwd(it.cwd || '(未知)', 34))}</span>
+      </div>
+      ${where}
+    </div>
+    <div class="trash-acts">
+      <button type="button" class="btn" data-act="restore"${it.restorable ? '' : ' disabled'}>恢复</button>
+      <button type="button" class="btn danger" data-act="purge">彻底删除</button>
+    </div>
+  </div>`;
+}
+
+function setTrashNote(text, isError = false) {
+  const box = $('#trash-note');
+  box.textContent = text || '';
+  box.classList.toggle('err', !!text && isError);
+}
+
+async function trashPost(path, body, btn) {
+  trashBusy = true;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(appUrl(path), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { setTrashNote(d.error || `请求失败: ${r.status}`, true); return null; }
+    return d;
+  } catch (e) {
+    setTrashNote('请求失败: ' + e.message, true);
+    return null;
+  } finally {
+    trashBusy = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+$('#trash-list').onclick = async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn || trashBusy) return;
+  const id = btn.closest('.trash-item')?.dataset.id;
+  const item = trashItems.find(x => x.id === id);
+  if (!item) return;
+  if (btn.dataset.act === 'restore') {
+    const d = await trashPost('api/trash/restore', { id: item.id }, btn);
+    if (!d) return;
+    setTrashNote(`已恢复「${item.title}」到 ${d.path}`);
+    await loadTrash({ keepNote: true });
+    S.results = null;
+    await loadSessions(true);       // 恢复的会话立即回到左侧列表
+    return;
+  }
+  if (!confirm(`彻底删除「${item.title}」?\n\n文件将从磁盘移除, 不可恢复。`)) return;
+  const d = await trashPost('api/trash/purge', { id: item.id }, btn);
+  if (!d) return;
+  setTrashNote(`已彻底删除「${item.title}」, 释放 ${fmtSize(d.freed || 0)}`);
+  await loadTrash({ keepNote: true });
+};
+
+async function purgeAllTrash() {
+  if (!trashItems.length || trashBusy) return;
+  if (!confirm(`清空回收站?\n\n将从磁盘彻底删除 ${trashItems.length} 个会话, 不可恢复。`)) return;
+  const d = await trashPost('api/trash/purge', { all: true }, $('#trash-purge-all'));
+  if (!d) return;
+  const failed = (d.errors || []).length;
+  setTrashNote(`已彻底删除 ${d.removed || 0} 个会话, 释放 ${fmtSize(d.freed || 0)}`
+    + (failed ? `; ${failed} 个失败: ${d.errors[0]}` : ''), !!failed);
+  await loadTrash({ keepNote: true });
+}
+
+$('#trash').onclick = openTrash;
+$('#trash-reload').onclick = () => loadTrash();
+$('#trash-purge-all').onclick = purgeAllTrash;
+$('#trash-close').onclick = $('#trash-done').onclick = () => $('#trash-dialog').close();
+$('#trash-dialog').addEventListener('click', e => {
+  if (e.target === $('#trash-dialog')) $('#trash-dialog').close();
+});
 
 function openSettings() {
   $('#setting-font').value = store.get('font', 'ubuntu');

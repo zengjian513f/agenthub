@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
 # agenthub-tmux.service 的 ExecStart 包装。
 #
-# 实时迁移期间，既有 tmux server 仍然持有全部 pane，socket 已切换为 AgentHub。
-# 此时不能再起第二个 server 去抢同一个 socket，否则可能启动失败或挤掉正在
-# 运行的 CLI 会话。
-#
-# 所以本脚本先探测 socket：已经有 server 在托管就只做守候，等它自然退出
-# (机器重启、或最后一个会话结束) 之后，再由本脚本启动正式的新 server。
-# systemd 的 Restart=always 因此不会在过渡期反复失败。
-set -uo pipefail
+# 已有 tmux server 托管 socket 时只守候其进程，不争抢 socket，也不结束其中的
+# CLI 会话；server 退出后由 systemd 重启本脚本并以前台模式接管。
+set -euo pipefail
 
 SOCKET=agenthub
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TMUX_CONF="$SCRIPT_DIR/agenthub/tmux.conf"
-TMUX=${TMUX_BIN:-/usr/bin/tmux}
+TMUX_BIN=${TMUX_BIN:-/usr/bin/tmux}
+ZSH_ENV_WRAPPER=${ZSH_ENV_WRAPPER:-/home/user/.local/bin/with-zshrc}
 
-server_alive() { "$TMUX" -L "$SOCKET" list-sessions >/dev/null 2>&1; }
-
-if server_alive; then
-  echo "[agenthub-tmux] 迁移期: 已有 tmux server 持有 $SOCKET socket, 守候至其退出"
-  while server_alive; do sleep 5; done
-  echo "[agenthub-tmux] 旧 server 已退出, 接管并启动新 server"
+if server_pid=$("$TMUX_BIN" -L "$SOCKET" display-message -p '#{pid}' 2>/dev/null); then
+  echo "[agenthub-tmux] 已有 tmux server 持有 $SOCKET socket，守候 PID $server_pid"
+  exec /usr/bin/tail --pid="$server_pid" -f /dev/null
 fi
 
-exec "$TMUX" -D -L "$SOCKET" -f "$TMUX_CONF"
+if [[ -x "$ZSH_ENV_WRAPPER" ]]; then
+  exec "$ZSH_ENV_WRAPPER" "$TMUX_BIN" -D -L "$SOCKET" -f "$TMUX_CONF"
+fi
+exec "$TMUX_BIN" -D -L "$SOCKET" -f "$TMUX_CONF"

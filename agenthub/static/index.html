@@ -99,6 +99,9 @@
       <button class="btn" id="reload" title="重新扫描磁盘" aria-label="重新扫描磁盘">
         <svg class="ui-icon" aria-hidden="true"><use href="#i-refresh"/></svg>
       </button>
+      <button class="btn" id="trash" title="回收站" aria-label="回收站">
+        <svg class="ui-icon" aria-hidden="true"><use href="#i-trash"/></svg>
+      </button>
       <button class="btn" id="report-bug" data-report-bug
         title="报告问题" aria-label="报告问题">
         <svg class="ui-icon" aria-hidden="true"><use href="#i-bug"/></svg>
@@ -234,6 +237,21 @@
       <button type="submit" class="btn go" id="bug-report-go">保存并启动处理会话</button>
     </div>
   </form>
+</dialog>
+<dialog id="trash-dialog" class="app-dialog" aria-labelledby="trash-title">
+  <div class="trash-panel">
+    <div class="modal-head">
+      <div><h2 id="trash-title">回收站</h2><p id="trash-sub">删除的会话文件保留在磁盘上，可以恢复或彻底清除</p></div>
+      <button type="button" class="modal-close" id="trash-close" title="关闭" aria-label="关闭">×</button>
+    </div>
+    <div id="trash-note" role="status" aria-live="polite"></div>
+    <div id="trash-list" class="trash-list"><div class="trash-empty">正在读取回收站…</div></div>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="trash-reload">刷新</button>
+      <button type="button" class="btn danger" id="trash-purge-all">清空回收站</button>
+      <button type="button" class="btn go" id="trash-done">完成</button>
+    </div>
+  </div>
 </dialog>
 <dialog id="settings-dialog" class="app-dialog" aria-labelledby="settings-title">
   <form method="dialog" class="settings-form">

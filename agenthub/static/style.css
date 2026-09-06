@@ -393,6 +393,37 @@ body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix
 #new-session-error { min-height: 18px; color: #e5484d; font-size: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 7px; }
 
+/* ---------- 回收站 ---------- */
+.trash-panel { display: flex; flex-direction: column; gap: 9px; min-height: 0; padding: 17px; }
+#trash-note { min-height: 17px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+#trash-note.err { color: #e5484d; }
+.trash-list {
+  flex: 1; min-height: 132px; max-height: min(52dvh, 420px); overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 9px; background: var(--panel-2);
+}
+.trash-item {
+  display: flex; align-items: center; gap: 11px;
+  padding: 9px 11px; border-bottom: 1px solid var(--border);
+}
+.trash-item:last-child { border-bottom: 0; }
+.trash-main { flex: 1; min-width: 0; }
+.trash-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; }
+.trash-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trash-title .ico { flex: none; width: 14px; height: 14px; }
+.trash-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 3px;
+  color: var(--muted); font-size: 11.5px;
+}
+.trash-cwd { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trash-origin {
+  margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--muted); font: 11px/1.4 var(--terminal-font);
+}
+.trash-origin.warn { color: #e5484d; font-family: inherit; }
+.trash-acts { display: flex; flex: none; gap: 6px; }
+.trash-acts .btn { padding: 4px 9px; font-size: 12px; }
+.trash-empty { padding: 28px 16px; color: var(--muted); font-size: 12.5px; text-align: center; }
+
 /* ---------- 布局 ---------- */
 /* 载入进度条 */
 #prog {
@@ -1538,6 +1569,8 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   }
   #xterm { padding-left: 4px; }
 
+  .trash-item { flex-wrap: wrap; }
+  .trash-acts { width: 100%; justify-content: flex-end; }
   #new-session-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   .app-dialog { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
   .setting-row { grid-template-columns: 1fr; gap: 7px; }

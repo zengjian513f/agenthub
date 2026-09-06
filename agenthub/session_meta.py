@@ -253,6 +253,26 @@ def set_starred(uid: str, starred: bool) -> dict:
         return dict(row)
 
 
+def snapshot(uid: str) -> dict:
+    """取会话当前的自有元数据, 供删除前留档。"""
+    with _lock:
+        row = _read().get(str(uid or "").strip())
+        return dict(row) if isinstance(row, dict) else {}
+
+
+def restore(uid: str, meta: dict | None) -> None:
+    """会话从回收站放回原位时补回删除前的元数据。"""
+    uid = str(uid or "").strip()
+    if not uid or not isinstance(meta, dict) or not meta:
+        return
+    with _lock:
+        rows = _read()
+        if uid in rows:
+            return      # 同一 uid 已有新记录, 恢复不能把它盖掉
+        rows[uid] = dict(meta)
+        _write(rows)
+
+
 def discard(uid: str) -> None:
     uid = str(uid or "").strip()
     with _lock:

@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .adapters import ADAPTERS, ClaudeAdapter
-from . import audit, media, session_meta
+from . import audit, media, session_meta, trash
 
 CACHE_DIR = Path.home() / ".cache" / "agenthub"
 CACHE_FILE = CACHE_DIR / "index.json"
@@ -940,7 +940,13 @@ def delete(uid: str) -> str:
     dest_dir = TRASH_DIR / s["source"]
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{stamp}-{src.name}"
+    meta = session_meta.snapshot(uid)
     shutil.move(str(src), str(dest))
+    try:
+        trash.record(dest, s, meta)
+    except OSError as e:
+        # 清单只影响"能否一键恢复"，文件已经安全落在回收站里，不能因此报错。
+        print(f"[agenthub] 回收站清单写入失败，该条目将无法自动恢复: {e}")
     with _lock:
         raw = {name: dict(rows) for name, rows in _state["raw"].items()}
         raw.get(s["source"], {}).pop(str(s["path"]), None)
@@ -966,6 +972,19 @@ SEARCH_ROLES = frozenset({"user", "assistant", "user·subagent",
                           "assistant·subagent", "thinking", "question", "answer"})
 _search_text_cache = {}
 _search_text_lock = threading.Lock()
+
+
+def invalidate() -> None:
+    """外部改动了会话文件(如从回收站恢复)后, 让下一次读重扫磁盘。
+
+    清空已记录的 inventory 而不是只标 dirty: 恢复是把同一个 inode 原样搬
+    回原路径, 与删除前的 files 逐字段相同, 只标 dirty 会得到空 diff, 被
+    删除时从 raw 摘掉的会话就再也回不来了。
+    """
+    with _lock:
+        if _state["initialized"]:
+            _publish(_state["raw"], _state["sessions"], {}, None,
+                     _state["built_at"], 0.0, True)
 
 
 def build_pattern(query: str, word=False, case=False, regex=False) -> re.Pattern:

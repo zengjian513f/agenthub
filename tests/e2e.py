@@ -4879,8 +4879,64 @@ def run(pw):
     p.wait_for_timeout(300)
     check("删除后从列表消失", p.locator(".item").count() == 0, p.locator(".item").count())
     trash = list((Path.home() / ".local/share/agenthub/trash/claude").glob("*dead-beef*"))
-    check("文件确实移入回收站", len(trash) == 1, trash)
+    payloads = [x for x in trash if not x.name.endswith(".agenthub-trash.json")]
+    manifests = [x for x in trash if x.name.endswith(".agenthub-trash.json")]
+    check("文件确实移入回收站", len(payloads) == 1, trash)
+    check("回收站同时保存恢复清单", len(manifests) == 1, trash)
     check("原文件已不在", not (FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl").exists())
+
+    # ---- 16b. 回收站: 查看 / 恢复 / 彻底删除 ----
+    fake_file = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
+    p.locator("#trash").click()
+    p.wait_for_selector("#trash-dialog[open]", timeout=10000)
+    rows = p.locator("#trash-list .trash-item").filter(has_text="AGENTHUB自测会话请删除")
+    p.wait_for_function(
+        "() => [...document.querySelectorAll('#trash-list .trash-item')]"
+        ".some(x => x.textContent.includes('AGENTHUB自测会话请删除'))", timeout=15000)
+    check("回收站列出刚删除的会话", rows.count() == 1, rows.count())
+    check("回收站条目显示恢复目标",
+          str(fake_file) in rows.first.locator(".trash-origin").get_attribute("title"))
+
+    with p.expect_response(lambda r: "/api/trash/restore" in r.url, timeout=30000):
+        rows.first.locator("button[data-act='restore']").click()
+    p.wait_for_function(
+        "() => document.querySelector('#trash-note').textContent.includes('已恢复')",
+        timeout=15000)
+    check("恢复后文件回到原目录", fake_file.exists())
+    check("恢复后回收站不再列出该会话", rows.count() == 0, rows.count())
+    p.wait_for_function("() => document.querySelectorAll('.item').length === 1",
+                        timeout=15000)
+    check("恢复后会话回到左侧列表", p.locator(".item").count() == 1)
+
+    p.locator("#trash-done").click()
+    p.locator(".item").first.click()
+    p.wait_for_selector("#a-session-action[title='删除会话']", timeout=10000)
+    p.once("dialog", lambda d: d.accept())
+    with p.expect_response(
+            lambda r: "/api/session/" in r.url and r.request.method == "DELETE",
+            timeout=30000):
+        p.locator("#a-session-action").click()
+    p.locator("#detail-open-trash").click()     # 删除后的空态直接进回收站
+    p.wait_for_selector("#trash-dialog[open]", timeout=10000)
+    p.wait_for_function(
+        "() => [...document.querySelectorAll('#trash-list .trash-item')]"
+        ".some(x => x.textContent.includes('AGENTHUB自测会话请删除'))", timeout=15000)
+    p.once("dialog", lambda d: d.accept())
+    with p.expect_response(lambda r: "/api/trash/purge" in r.url, timeout=30000):
+        rows.first.locator("button[data-act='purge']").click()
+    p.wait_for_function(
+        "() => document.querySelector('#trash-note').textContent.includes('已彻底删除')",
+        timeout=15000)
+    check("彻底删除后回收站条目消失", rows.count() == 0, rows.count())
+    left = list((Path.home() / ".local/share/agenthub/trash/claude").glob("*dead-beef*"))
+    check("彻底删除后磁盘不再留文件", not left, left)
+    p.locator("#trash-done").click()
+
+    # 第二次删除紧跟在恢复后的列表刷新之后；后台增量读取可能正好和删除竞态，
+    # 该自测会话的 messages 404 是预期结果，不属于页面脚本错误。
+    encoded_fake_uid = urllib.parse.quote(fake_uid, safe="")
+    errors[:] = [e for e in errors if not (
+        e.startswith("HTTP 404:") and f"/api/messages/{encoded_fake_uid}" in e)]
 
     # ---- 17. 无 JS 报错 ----
     check("全程无 JS 错误", not errors, errors[:3])

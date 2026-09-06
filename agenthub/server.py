@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
                debug_runs, index, live, media, pending as pending_store,
                send_protocol, send_queue,
-               session_meta, term, term_ownership, wsock)
+               session_meta, term, term_ownership, trash, wsock)
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
@@ -574,7 +574,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
         if u.path in {"/api/session/star", "/api/audit/browser",
-                      "/api/bug-report"}:
+                      "/api/bug-report", "/api/trash/restore",
+                      "/api/trash/purge"}:
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 if n > 4 * 1024 * 1024:
@@ -587,6 +588,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._star_session(body)
             if u.path == "/api/audit/browser":
                 return self._browser_audit(body)
+            if u.path == "/api/trash/restore":
+                return self._restore_trash(body)
+            if u.path == "/api/trash/purge":
+                return self._purge_trash(body)
             return self._bug_report(body)
         if not TERMINAL:
             return self._json({"error": "终端未启用, 服务端需加 --terminal"}, 403)
@@ -874,6 +879,8 @@ class Handler(BaseHTTPRequestHandler):
     def _api_get(self, path: str, q: dict):
         if path == "/api/meta":
             return self._json({"build": ASSET_VERSION, "hostname": HOSTNAME})
+        if path == "/api/trash":
+            return self._json(trash.summary())
         if path == "/api/sessions":
             force = q.get("force", ["0"])[0] == "1"
             known = q.get("sig", [""])[0]
@@ -1344,6 +1351,32 @@ class Handler(BaseHTTPRequestHandler):
                       "end": start},
             )
             self.close_connection = True
+
+    def _restore_trash(self, body: dict):
+        try:
+            result = trash.restore(str(body.get("id") or ""))
+        except KeyError:
+            return self._json({"error": "回收站条目不存在"}, 404)
+        except FileExistsError as e:
+            return self._json({"error": str(e)}, 409)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except OSError as e:
+            return self._json({"error": str(e)}, 500)
+        index.invalidate()   # 文件已回到原处，下一次列表请求必须重扫磁盘
+        return self._json({"ok": True, **result})
+
+    def _purge_trash(self, body: dict):
+        try:
+            if body.get("all"):
+                result = trash.purge_all()
+            else:
+                result = trash.purge(str(body.get("id") or ""))
+        except KeyError:
+            return self._json({"error": "回收站条目不存在"}, 404)
+        except OSError as e:
+            return self._json({"error": str(e)}, 500)
+        return self._json({"ok": True, **result})
 
     def _star_session(self, body: dict):
         uid = str(body.get("uid") or "")
