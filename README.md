@@ -19,7 +19,7 @@ ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 | 来源 | 路径 | 说明 |
 |---|---|---|
 | Claude | `~/.claude/projects/<编码cwd>/<uuid>.jsonl` | 标题取会话内的 `ai-title`；`<uuid>/subagents/*.jsonl` 为子代理会话，不单列，在详情标题下拉中单独切换 |
-| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 元数据取首行 `session_meta`；标题优先用 `~/.codex/session_index.jsonl` 的 `thread_name`；`thread_source=subagent` 的协作 agent 不单列，也不会被误作回滚分支隐藏父会话 |
+| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | 元数据取首行 `session_meta`；标题优先用 `~/.codex/session_index.jsonl` 的 `thread_name`；`thread_source=subagent` 的协作 agent 不单列；双 Esc 回退的父项与新叶子都保留，切到新 UUID 后再询问是否把父项移入回收站 |
 | Grok | `~/.grok/sessions/<urlencoded-cwd>/<uuid>/` | 元数据取 `summary.json`，正文取 `chat_history.jsonl` |
 
 只读原始文件，不改动任何 CLI 的数据。
@@ -81,6 +81,14 @@ T0 研究台账（`research_catalog` 的 `sessions` 表）和 labdesk 的“关�
 搜索词本身不记——重开就停在搜索态会很别扭。
 
 ## 删除行为
+
+**右键**会话行（手机上长按约 0.5 秒）弹出菜单：删除这一条（运行中的会话给的是「停止会话」，
+因为它此刻删不掉），或进入**多选**模式并勾上它。
+多选模式下点会话行即勾选，分组标题（项目路径 / 日期）上的勾选框切换整组，工具条里的「全选」
+覆盖当前筛出的全部会话，一次把它们移入回收站。选中里混有运行中的会话时，确认框会先说明
+有几个将被跳过；服务端再逐条判断并回报「请先停止会话」，不影响同批其余会话；删不掉的那些
+留在选择里，停掉之后直接再点一次删除即可。
+临时会话（还没有对话文件）不参与勾选。Esc 关菜单，再按一次退出选择模式。
 
 删除**不做真删**，把原文件/目录移入 `~/.local/share/agenthub/trash/<source>/<时间戳>-<原名>`，
 同时在旁边写一份 `…​.agenthub-trash.json` 清单，记下原始路径、标题、cwd 和星标等自有元数据。
@@ -248,7 +256,7 @@ Grok 重读对应 summary；新增、删除和移动也只增删相关 raw row�
 
 ## 测试
 
-`tests/e2e.py` 用 Playwright 驱动真实 Chromium 点遍全部交互（列表渲染、来源筛选、两种视图、分组折叠、标题过滤、全文搜索、聊天气泡布局、单层工具输出、自带终端字体与配色、滚动条样式、附件上传/粘贴/引用与 prompt 转换、工具输出折叠、展开全文、公式与图片、子代理独立视图切换、增量同步、刷新、快捷键、接管终端、删除入回收站、回收站的查看/恢复/彻底删除，以及页面无 JS/HTTP 错误）。
+`tests/e2e.py` 用 Playwright 驱动真实 Chromium 点遍全部交互（列表渲染、来源筛选、两种视图、分组折叠、标题过滤、全文搜索、聊天气泡布局、单层工具输出、自带终端字体与配色、滚动条样式、附件上传/粘贴/引用与 prompt 转换、工具输出折叠、展开全文、公式与图片、子代理独立视图切换、增量同步、刷新、快捷键、接管终端、删除入回收站、右键菜单与左栏多选删除、回收站的查看/恢复/彻底删除，以及页面无 JS/HTTP 错误）。
 
 删除相关的断言跑在一个临时造出来的自测会话上（`~/.claude/projects/-tmp-agenthub-selftest/`），跑完自动清理，不碰真实会话。
 
@@ -333,6 +341,7 @@ agenthub/
 - `GET /api/trash` — 回收站条目、总量与目录位置
 - `POST /api/trash/restore` — 把条目放回原路径（JSON：`{"id":"<source>/<文件名>"}`）
 - `POST /api/trash/purge` — 彻底删除单条（`{"id":…}`）或清空回收站（`{"all":true}`）
+- `POST /api/sessions/delete` — 批量移入回收站（JSON：`{"uids":[…]}`），逐条独立成败，返回 `deleted` 与 `errors`
 - `DELETE /api/session/<uid>` — 移入回收站
 
 新建 CLI 在产生第一条正式记录前，会写入权限为 `0600` 的

@@ -356,6 +356,34 @@ def _pane_for_session(session: dict, panes: list[dict],
     )), None)
 
 
+def _sessions_by_pane(sessions: list[dict], panes: list[dict]) -> dict[str, dict]:
+    """Map each pane to its live leaf, falling back to the newest named row."""
+    linked: dict[str, dict] = {}
+    ranks: dict[str, tuple[bool, str]] = {}
+    for session in sessions:
+        pids = live.pids_of(session)
+        pane = _pane_for_session(session, panes, pids=pids)
+        if not pane:
+            continue
+        name = str(pane["name"])
+        rank = (bool(pids), str(session.get("updated") or ""))
+        if name not in linked or rank > ranks[name]:
+            linked[name] = session
+            ranks[name] = rank
+    return linked
+
+
+def _is_direct_codex_fork(parent: dict, replacement: dict | None) -> bool:
+    """Only a direct child may prove that the parent's named tmux was rebound."""
+    return bool(
+        replacement
+        and parent.get("source") == replacement.get("source") == "codex"
+        and str(replacement.get("forked_from_id") or "")
+        == str(parent.get("sid") or "")
+        and replacement.get("uid") != parent.get("uid")
+    )
+
+
 def _codex_prompt(session: dict, pane_name: str = "") -> dict | None:
     """Read a Codex approval that exists only on the live TUI screen."""
     if session.get("agent_id") or session.get("source") != "codex":
@@ -575,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, b"forbidden", "text/plain")
         if u.path in {"/api/session/star", "/api/audit/browser",
                       "/api/bug-report", "/api/trash/restore",
-                      "/api/trash/purge"}:
+                      "/api/trash/purge", "/api/sessions/delete"}:
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 if n > 4 * 1024 * 1024:
@@ -588,6 +616,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._star_session(body)
             if u.path == "/api/audit/browser":
                 return self._browser_audit(body)
+            if u.path == "/api/sessions/delete":
+                return self._delete_sessions(body)
             if u.path == "/api/trash/restore":
                 return self._restore_trash(body)
             if u.path == "/api/trash/purge":
@@ -856,25 +886,63 @@ class Handler(BaseHTTPRequestHandler):
         if not u.path.startswith("/api/session/"):
             return self._json({"error": "not found"}, 404)
         uid = unquote(u.path[len("/api/session/"):])
+        replacement_uid = parse_qs(u.query).get("replacement_uid", [""])[0]
         try:
-            s = index.get(uid)
-            if not s:
-                raise KeyError(uid)
-            name = term.session_name_for(s["source"], s["sid"])
-            if live.is_live(s, force=True) or term.has_session(name):
-                return self._json({"error": "请先停止会话"}, 409)
-            dest = index.delete(uid)
+            dest = self._trash_session(uid, replacement_uid)
         except KeyError:
             return self._json({"error": "会话不存在"}, 404)
+        except RuntimeError as e:
+            return self._json({"error": str(e)}, 409)
         except OSError as e:
             return self._json({"error": str(e)}, 500)
+        self._json({"ok": True, "trash": dest})
+
+    @staticmethod
+    def _trash_session(uid: str, replacement_uid: str = "") -> str:
+        """把一个会话移入回收站; 运行中的会话以 RuntimeError 回报。"""
+        s = index.get(uid)
+        if not s:
+            raise KeyError(uid)
+        replacement = index.get(replacement_uid) if replacement_uid else None
+        replaced_by_fork = _is_direct_codex_fork(s, replacement)
+        name = term.session_name_for(s["source"], s["sid"])
+        # Codex 回退后 tmux 仍沿用父 UUID 的名字，但真实进程已经属于新叶子。
+        # 浏览器必须同时提交并证明直接子项，才允许在不停止新会话的情况下
+        # 回收旧父项；普通运行中会话仍严格拒绝删除。
+        if (live.is_live(s, force=True)
+                or (term.has_session(name) and not replaced_by_fork)):
+            raise RuntimeError("请先停止会话")
+        dest = index.delete(uid)
         try:
             session_meta.discard(uid)
         except OSError:
             pass  # 会话已成功移入回收站，不能把元数据清理失败误报成删除失败
         send_queue.discard_uid(uid)
         claude_queue.discard_uid(uid)
-        self._json({"ok": True, "trash": dest})
+        return dest
+
+    def _delete_sessions(self, body: dict):
+        """批量移入回收站; 逐条独立成败, 运行中的会话跳过而不阻断其余。"""
+        uids, seen = [], set()
+        for raw in body.get("uids") or []:
+            uid = str(raw or "").strip()
+            if uid and uid not in seen:
+                seen.add(uid)
+                uids.append(uid)
+        if not uids:
+            return self._json({"error": "没有选中任何会话"}, 400)
+        deleted, errors = [], []
+        for uid in uids:
+            title = str((index.get(uid) or {}).get("title") or "")
+            try:
+                dest = self._trash_session(uid)
+            except KeyError:
+                errors.append({"uid": uid, "title": title, "error": "会话不存在"})
+            except (RuntimeError, OSError) as e:
+                errors.append({"uid": uid, "title": title, "error": str(e)})
+            else:
+                deleted.append({"uid": uid, "title": title, "trash": dest})
+        return self._json({"ok": True, "deleted": deleted, "errors": errors})
 
     def _api_get(self, path: str, q: dict):
         if path == "/api/meta":
@@ -920,12 +988,8 @@ class Handler(BaseHTTPRequestHandler):
             if tmux_sessions:
                 # 把 tmux pane 映射回当前列表 uid。前端不能只从 pane 名猜 UUID，
                 # 因为 Codex 回退分支会沿用父会话启动时的旧名字。
-                linked: dict[str, dict] = {}
-                for session in debug_runs.filter_rows(index.cached(), run_id):
-                    pane = _pane_for_session(session, tmux_sessions)
-                    if pane and (pane["name"] not in linked
-                                 or session["updated"] > linked[pane["name"]]["updated"]):
-                        linked[pane["name"]] = session
+                linked = _sessions_by_pane(
+                    debug_runs.filter_rows(index.cached(), run_id), tmux_sessions)
                 for pane in tmux_sessions:
                     if pane["name"] in linked:
                         pane["uid"] = linked[pane["name"]]["uid"]

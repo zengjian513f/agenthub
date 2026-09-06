@@ -123,6 +123,12 @@
             <button data-o="regex" title="正则表达式">.*</button>
           </div>
         </div>
+        <div class="side-tools" id="side-tools" hidden>
+          <span id="side-picked"></span>
+          <button type="button" class="btn" id="side-pick-all">全选</button>
+          <button type="button" class="btn danger" id="side-pick-delete" disabled>删除</button>
+          <button type="button" class="btn" id="side-pick-cancel">取消</button>
+        </div>
         <div id="search-progress" role="status" aria-live="polite">
           <div class="search-progress-head"><span>全文搜索</span><b>准备中…</b></div>
           <div class="search-progress-track"><i></i></div>
@@ -183,6 +189,11 @@
   </main>
 </div>
 
+<div id="item-menu" class="ctx-menu" hidden role="menu" aria-label="会话操作">
+  <button type="button" role="menuitem" data-act="stop" hidden>停止会话</button>
+  <button type="button" role="menuitem" data-act="delete">删除会话</button>
+  <button type="button" role="menuitem" data-act="pick">多选…</button>
+</div>
 <dialog id="new-session-dialog" aria-labelledby="new-session-title">
   <form id="new-session-form">
     <div class="modal-head">

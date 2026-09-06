@@ -506,6 +506,50 @@ main { display: flex; flex: 1; min-height: 0; }
   backdrop-filter: blur(8px); pointer-events: none;
 }
 #search-progress.on { display: block; }
+
+/* 会话行的右键 / 长按菜单 */
+.ctx-menu {
+  position: fixed; z-index: 60; min-width: 150px; padding: 4px;
+  border: 1px solid var(--border); border-radius: 9px; background: var(--panel);
+  /* 菜单和列表同为浅底，单靠 1px 边框分不开，用两层阴影托起来 */
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .26), 0 2px 6px rgba(0, 0, 0, .12);
+}
+.ctx-menu[hidden] { display: none; }
+.ctx-menu button {
+  display: block; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text); text-align: left;
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.ctx-menu button[hidden] { display: none; }   /* display:block 会盖掉 hidden */
+.ctx-menu button:hover { background: var(--hover); }
+.ctx-menu button[data-act="delete"] { color: #e5484d; }
+.ctx-menu button[data-act="stop"] { color: var(--live-direct); }
+@media (max-width: 720px) {
+  .ctx-menu { min-width: 168px; }
+  .ctx-menu button { padding: 11px 12px; font-size: 14px; }
+}
+/* 长按要出自己的菜单，不能让系统选词/回调菜单抢先 */
+.item { -webkit-touch-callout: none; }
+@media (hover: none) { .item { -webkit-user-select: none; user-select: none; } }
+#side.picking .item { user-select: none; }
+
+/* 左栏多选：操作栏只在选择模式才占一行 */
+.side-tools {
+  display: flex; align-items: center; gap: 6px; margin-top: 6px;
+  color: var(--muted); font-size: 12px;
+}
+.side-tools[hidden] { display: none; }   /* display:flex 会盖掉 hidden 的默认样式 */
+.side-tools #side-picked { min-width: 0; margin-right: auto; }
+.side-tools .btn { flex: none; padding: 3px 9px; font-size: 12px; }
+.ghead-pick {
+  flex: none; width: 14px; height: 14px; margin: 0 1px 0 0;
+  accent-color: var(--accent); cursor: pointer;
+}
+.item > .item-pick {
+  flex: none; width: 15px; height: 15px; margin: 2px 0 0; accent-color: var(--accent);
+  pointer-events: none;   /* 整行都是热区，勾选框只做状态显示 */
+}
+.item.picked { background: var(--sel); }
 .search-progress-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 12px; }
 .search-progress-head span { color: var(--text); font-weight: 600; }
 .search-progress-head b {
@@ -836,7 +880,6 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   line-height: 1; white-space: nowrap; cursor: pointer;
 }
 .turn-nav-btn:hover { background: var(--hover); color: var(--text); }
-.turn-collapse { color: var(--accent); }
 .turn-process-body {
   width: 100%; margin-top: 7px; padding: 2px 0 1px 11px;
   border-left: 1px solid var(--border);
@@ -1501,7 +1544,6 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   .turn-nav-btn { width: 25px; padding-inline: 3px; overflow: hidden; font-size: 0; }
   .turn-nav-btn::after { font-size: 11px; }
   .turn-to-start::after { content: "↑"; }
-  .turn-collapse::after { content: "收"; }
   .turn-to-conclusion::after { content: "↓"; }
   .mobile-msg-summary {
     display: inline-flex; align-items: center; margin: 0 3px 0 5px;

@@ -369,11 +369,19 @@ def run(pw):
       const saved = {sel:S.sel, agent:S.agent, sessions:S.sessions,
         termUid:T.uid, termName:T.name, list:T.list, composerUid};
       const oldOpen = openSession, oldAudit = browserAuditEvent;
-      const opened = [];
+      const oldConfirm = window.confirm;
+      const opened = [], confirms = [];
       try {
-        // 与真实回退一致：旧叶子已从列表消失，缓存详情仍在；
-        // 同一根 pane 现在由 term/list 标成新分支 uid。
+        // 与真实回退一致：父项和新叶子都在列表；同一根 pane 现在由
+        // term/list 标成新分支 uid。取消删除后父项必须继续显示。
         S.sessions = S.sessions.filter(row => ![fromUid, toUid].includes(row.uid));
+        const now = new Date().toISOString();
+        S.sessions.push({uid:fromUid, source:'codex', sid:rootSid,
+          title:'保留的旧分支', cwd:'/tmp', created:now, updated:now, size:1});
+        S.sessions.push({uid:toUid, source:'codex',
+          sid:'fedcba98-7654-3210-fedc-ba9876543210', root_sid:rootSid,
+          forked_from_id:rootSid, title:'回退后的新分支', cwd:'/tmp',
+          created:now, updated:now, size:1});
         S.sel = fromUid; S.agent = null;
         T.uid = fromUid; T.name = null;
         T.list = [...(T.list || []), {name, uid:toUid}];
@@ -382,22 +390,31 @@ def run(pw):
         composerDrafts.set(fromUid, {text:'跟随分支的草稿', attachments:[], quotes:[]});
         openSession = async uid => { opened.push(uid); S.sel = uid; };
         browserAuditEvent = () => {};
+        window.confirm = text => { confirms.push(text); return false; };
+        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
+        renderSide();
         const linked = linkedTermSession(fromUid);
         const changed = await rebindSelectedTermSession();
         return {linked, taken:takenOver(fromUid), changed, opened,
           selected:S.sel, termUid:T.uid,
           oldDraft:composerDrafts.has(fromUid),
-          newDraft:composerDrafts.get(toUid)?.text || ''};
+          newDraft:composerDrafts.get(toUid)?.text || '',
+          confirmCount:confirms.length,
+          confirmMentionsKeep:confirms[0]?.includes('继续显示') || false,
+          parentVisible:!!document.querySelector(
+            `.item[data-uid="${CSS.escape(fromUid)}"]`)};
       } finally {
-        openSession = oldOpen; browserAuditEvent = oldAudit;
+        openSession = oldOpen; browserAuditEvent = oldAudit; window.confirm = oldConfirm;
+        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
         cache.delete(key); composerDrafts.delete(fromUid); composerDrafts.delete(toUid);
         S.queued.delete(fromUid); S.queued.delete(toUid);
         S.sel = saved.sel; S.agent = saved.agent; S.sessions = saved.sessions;
         T.uid = saved.termUid; T.name = saved.termName; T.list = saved.list;
         composerUid = saved.composerUid;
+        renderSide();
       }
     }""")
-    check("Codex 回退后按根 pane 跟进新分支 uid 并迁移草稿",
+    check("Codex 回退后跟进新分支、询问删除并在取消后保留父项",
           codex_branch_rebind == {
               "linked": {"name": "agenthub-codex-01234567",
                          "uid": "codex:e2e-current-branch"},
@@ -406,7 +423,63 @@ def run(pw):
               "selected": "codex:e2e-current-branch",
               "termUid": "codex:e2e-current-branch",
               "oldDraft": False, "newDraft": "跟随分支的草稿",
+              "confirmCount": 1, "confirmMentionsKeep": True,
+              "parentVisible": True,
           }, codex_branch_rebind)
+    codex_branch_delete = p.evaluate("""async () => {
+      const fromUid = 'codex:e2e-delete-old-branch';
+      const toUid = 'codex:e2e-delete-new-branch';
+      const parentSid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+      const saved = {sel:S.sel, agent:S.agent, sessions:S.sessions,
+        results:S.results};
+      const oldRequest = requestSessionDelete, oldLoad = loadSessions;
+      const oldConfirm = window.confirm, oldAudit = browserAuditEvent;
+      const requests = [];
+      try {
+        const now = new Date().toISOString();
+        S.sessions = S.sessions.filter(row => ![fromUid, toUid].includes(row.uid));
+        S.sessions.push({uid:fromUid, source:'codex', sid:parentSid,
+          title:'准备删除的旧分支', cwd:'/tmp', created:now, updated:now, size:1});
+        S.sessions.push({uid:toUid, source:'codex',
+          sid:'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+          forked_from_id:parentSid, root_sid:parentSid,
+          title:'继续使用的新分支', cwd:'/tmp', created:now, updated:now, size:1});
+        S.sel = toUid; S.agent = null; S.results = null;
+        requestSessionDelete = async (uid, replacementUid) => {
+          requests.push([uid, replacementUid]);
+          return {response:{ok:true}, data:{trash:'/trash/old'}};
+        };
+        loadSessions = async () => true;
+        window.confirm = () => true;
+        browserAuditEvent = () => {};
+        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
+        renderSide();
+        const removed = await offerForkParentDeletion(fromUid, toUid);
+        return {removed, requests, selected:S.sel,
+          parentInState:S.sessions.some(row => row.uid === fromUid),
+          childInState:S.sessions.some(row => row.uid === toUid),
+          parentInDom:!!document.querySelector(
+            `.item[data-uid="${CSS.escape(fromUid)}"]`),
+          childInDom:!!document.querySelector(
+            `.item[data-uid="${CSS.escape(toUid)}"]`)};
+      } finally {
+        requestSessionDelete = oldRequest; loadSessions = oldLoad;
+        window.confirm = oldConfirm; browserAuditEvent = oldAudit;
+        forkDeletionPrompts.delete(`${fromUid}\0${toUid}`);
+        S.sel=saved.sel; S.agent=saved.agent; S.sessions=saved.sessions;
+        S.results=saved.results;
+        renderSide();
+      }
+    }""")
+    check("确认删除旧分支时只回收父项并保持新 UUID 选中",
+          codex_branch_delete == {
+              "removed": True,
+              "requests": [["codex:e2e-delete-old-branch",
+                            "codex:e2e-delete-new-branch"]],
+              "selected": "codex:e2e-delete-new-branch",
+              "parentInState": False, "childInState": True,
+              "parentInDom": False, "childInDom": True,
+          }, codex_branch_delete)
     codex_delivery = p.evaluate("""async () => {
       const session = S.sessions.find(x => x.source === 'codex' && x.uid !== S.sel);
       if (!session) return {error:'no codex session'};
@@ -1295,15 +1368,17 @@ def run(pw):
       const body = document.querySelector('.turn-process-body').getBoundingClientRect();
       return {top:toolbar.top, boxTop:box.top, bodyHeight:body.height,
         boxHeight:box.height, paddingTop,
-        navVisible:document.querySelector('.turn-nav').checkVisibility()};
+        navVisible:document.querySelector('.turn-nav').checkVisibility(),
+        collapseButtons:document.querySelectorAll('.turn-collapse').length};
     }""")
-    check("长过程滚到中间仍有吸顶导航和收起入口",
+    check("长过程滚到中间仍有吸顶导航且不再重复显示收起键",
           middle_toolbar["bodyHeight"] > middle_toolbar["boxHeight"]
           and abs(middle_toolbar["top"] - middle_toolbar["boxTop"]
                   - middle_toolbar["paddingTop"] - 7) <= 2
-          and middle_toolbar["navVisible"], middle_toolbar)
+          and middle_toolbar["navVisible"]
+          and middle_toolbar["collapseButtons"] == 0, middle_toolbar)
     sticky_top = middle_toolbar["top"]
-    turn_process.locator(".turn-collapse").click()
+    process_preview.click()
     p.wait_for_timeout(300)
     collapsed_top = process_preview.bounding_box()["y"]
     check("在过程任意位置收起后摘要仍留在眼前",
@@ -4929,13 +5004,42 @@ def run(pw):
     check("恢复后会话回到左侧列表", p.locator(".item").count() == 1)
 
     p.locator("#trash-done").click()
-    p.locator(".item").first.click()
+    p.locator(".item").first.click()            # 先打开，删除后才有空态入口
     p.wait_for_selector("#a-session-action[title='删除会话']", timeout=10000)
+
+    # ---- 16c. 左栏多选删除 (列表里已筛成只剩自测会话) ----
+    check("平时不占额外一行", p.locator("#side-tools").is_hidden())
+    p.locator(".item").first.click(button="right")
+    p.wait_for_selector("#item-menu:not([hidden])", timeout=10000)
+    check("右键会话行弹出菜单", p.locator("#item-menu button").count() == 2)
+    p.locator('#item-menu button[data-act="pick"]').click()
+    check("菜单进入多选并勾上该行",
+          "已选 1 项" in p.locator("#side-picked").inner_text())
+    check("进入多选后展开操作栏", p.locator("#side-pick-delete").is_visible())
+    check("未勾选时不能删除", p.locator("#side-pick-delete").is_disabled())
+    check("全选后按钮变成全不选", p.locator("#side-pick-all").inner_text() == "全不选")
+    check("分组标题也有勾选框", p.locator(".ghead-pick").count() >= 1)
+    p.locator("#side-pick-all").click()
+    check("点全不选清空选择", p.locator("#side-pick-delete").is_disabled())
+    group_class = p.locator(".group").first.get_attribute("class")
+    p.locator(".ghead-pick").first.click()
+    check("勾分组标题选中该组全部",
+          "已选 1 项" in p.locator("#side-picked").inner_text())
+    check("勾分组标题不会折叠分组",
+          p.locator(".group").first.get_attribute("class") == group_class)
+    p.locator(".item").first.click()            # 选择模式下点行 = 勾选，不打开会话
+    check("点行可取消勾选", p.locator("#side-pick-delete").is_disabled())
+    p.locator(".item").first.click()
+    check("点行即勾选", "已选 1 项" in p.locator("#side-picked").inner_text())
+    check("删除按钮带上数量", "(1)" in p.locator("#side-pick-delete").inner_text())
     p.once("dialog", lambda d: d.accept())
-    with p.expect_response(
-            lambda r: "/api/session/" in r.url and r.request.method == "DELETE",
-            timeout=30000):
-        p.locator("#a-session-action").click()
+    with p.expect_response(lambda r: "/api/sessions/delete" in r.url, timeout=30000):
+        p.locator("#side-pick-delete").click()
+    p.wait_for_function("() => document.querySelectorAll('.item').length === 0",
+                        timeout=15000)
+    check("多选删除后会话从列表消失", p.locator(".item").count() == 0)
+    check("多选删除后操作栏收起", p.locator("#side-tools").is_hidden())
+    check("多选删除后原文件已移走", not fake_file.exists())
     p.locator("#detail-open-trash").click()     # 删除后的空态直接进回收站
     p.wait_for_selector("#trash-dialog[open]", timeout=10000)
     p.wait_for_function(

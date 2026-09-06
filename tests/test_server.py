@@ -33,6 +33,52 @@ class AccessAllowlistTests(unittest.TestCase):
         self.assertEqual(str(server.ALLOWED_NETWORKS[0]), "10.0.0.0/24")
 
 
+class BulkSessionDeleteTests(unittest.TestCase):
+    """左栏多选删除: 一条失败不能把其余会话一起拖住。"""
+
+    @staticmethod
+    def _handler():
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._json = lambda obj, code=200: replies.append((code, obj))
+        return handler, replies
+
+    def test_running_sessions_are_skipped_and_the_rest_still_go(self):
+        handler, replies = self._handler()
+        rows = {"a": {"title": "第一条"}, "b": {"title": "运行中"},
+                "c": {"title": "第三条"}}
+
+        def fake_trash(uid, replacement_uid=""):
+            if uid == "b":
+                raise RuntimeError("请先停止会话")
+            if uid == "missing":
+                raise KeyError(uid)
+            return f"/trash/{uid}"
+
+        with patch.object(server.Handler, "_trash_session", staticmethod(fake_trash)), \
+                patch.object(server.index, "get", rows.get):
+            handler._delete_sessions({"uids": ["a", "b", "c", "missing", "a"]})
+
+        code, body = replies[0]
+        self.assertEqual(code, 200)
+        self.assertEqual([x["uid"] for x in body["deleted"]], ["a", "c"])
+        self.assertEqual([x["trash"] for x in body["deleted"]],
+                         ["/trash/a", "/trash/c"])
+        self.assertEqual([(x["uid"], x["title"], x["error"]) for x in body["errors"]],
+                         [("b", "运行中", "请先停止会话"),
+                          ("missing", "", "会话不存在")])
+
+    def test_empty_selection_is_rejected_before_touching_any_session(self):
+        handler, replies = self._handler()
+        with patch.object(server.Handler, "_trash_session",
+                          staticmethod(lambda *a, **k: self.fail("不该删除任何会话"))):
+            handler._delete_sessions({"uids": ["", None]})
+            handler._delete_sessions({})
+
+        self.assertEqual([code for code, _ in replies], [400, 400])
+        self.assertEqual(replies[0][1]["error"], "没有选中任何会话")
+
+
 class StaticIdentityTests(unittest.TestCase):
     def test_forwarded_ip_is_display_only_and_validated(self):
         handler = object.__new__(server.Handler)
@@ -260,6 +306,84 @@ class StopSessionTests(unittest.TestCase):
         ])
         self.assertEqual(result, {"ok": True, "stopped": True, "tmux": True})
         self.assertEqual(replies, [({"ok": True, "stopped": True, "tmux": True}, 200)])
+
+
+class DeleteSessionTests(unittest.TestCase):
+    @staticmethod
+    def handler(path):
+        handler = object.__new__(server.Handler)
+        handler.path = path
+        handler._audit_begin = lambda method, route: None
+        handler._allowed = lambda: True
+        handler.replies = []
+        handler._json = lambda payload, status=200: (
+            handler.replies.append((payload, status)) or payload)
+        return handler
+
+    def test_direct_codex_fork_parent_can_be_deleted_while_child_owns_tmux(self):
+        parent = {"uid": "codex:old", "source": "codex", "sid": "old-sid"}
+        child = {"uid": "codex:new", "source": "codex", "sid": "new-sid",
+                 "forked_from_id": "old-sid"}
+        handler = self.handler(
+            "/api/session/codex%3Aold?replacement_uid=codex%3Anew")
+
+        def get(uid):
+            return {parent["uid"]: parent, child["uid"]: child}.get(uid)
+
+        with patch.object(server.index, "get", side_effect=get), \
+                patch.object(server.term, "session_name_for",
+                             return_value="agenthub-codex-old"), \
+                patch.object(server.term, "has_session", return_value=True), \
+                patch.object(server.live, "is_live", return_value=False), \
+                patch.object(server.index, "delete", return_value="/trash/old") as delete, \
+                patch.object(server.session_meta, "discard"), \
+                patch.object(server.send_queue, "discard_uid"), \
+                patch.object(server.claude_queue, "discard_uid"):
+            handler.do_DELETE()
+
+        delete.assert_called_once_with(parent["uid"])
+        self.assertEqual(handler.replies[-1],
+                         ({"ok": True, "trash": "/trash/old"}, 200))
+
+    def test_unrelated_replacement_cannot_bypass_running_tmux_guard(self):
+        parent = {"uid": "codex:old", "source": "codex", "sid": "old-sid"}
+        unrelated = {"uid": "codex:new", "source": "codex", "sid": "new-sid",
+                     "forked_from_id": "another-sid"}
+        handler = self.handler(
+            "/api/session/codex%3Aold?replacement_uid=codex%3Anew")
+
+        def get(uid):
+            return {parent["uid"]: parent, unrelated["uid"]: unrelated}.get(uid)
+
+        with patch.object(server.index, "get", side_effect=get), \
+                patch.object(server.term, "session_name_for",
+                             return_value="agenthub-codex-old"), \
+                patch.object(server.term, "has_session", return_value=True), \
+                patch.object(server.live, "is_live", return_value=False), \
+                patch.object(server.index, "delete") as delete:
+            handler.do_DELETE()
+
+        delete.assert_not_called()
+        self.assertEqual(handler.replies[-1], ({"error": "请先停止会话"}, 409))
+
+
+class TmuxSessionMappingTests(unittest.TestCase):
+    def test_live_fork_leaf_wins_named_parent_even_if_parent_timestamp_is_newer(self):
+        pane = {"name": "agenthub-codex-old", "pid": 10, "owned": True}
+        parent = {"uid": "codex:old", "source": "codex", "sid": "old",
+                  "path": "/sessions/old", "updated": "2026-09-06T12:00:00Z"}
+        child = {"uid": "codex:new", "source": "codex", "sid": "new",
+                 "path": "/sessions/new", "forked_from_id": "old",
+                 "updated": "2026-09-06T11:00:00Z"}
+
+        def pids(session):
+            return [123] if session["uid"] == child["uid"] else []
+
+        with patch.object(server.live, "pids_of", side_effect=pids), \
+                patch.object(server, "_pane_for_session", return_value=pane):
+            linked = server._sessions_by_pane([parent, child], [pane])
+
+        self.assertEqual(linked[pane["name"]]["uid"], child["uid"])
 
 
 class StarSessionTests(unittest.TestCase):

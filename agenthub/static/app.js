@@ -89,6 +89,7 @@ const S = {
   outboxVersions: new Map(), // uid → 最近接受的服务端发送账本快照版本
   retiredOutboxEpochs: new Set(), // 服务重启后拒收仍在网络中滞留的旧进程快照
   starBusy: new Set(), // 正在持久化星标的会话，避免多个网页请求在服务端乱序
+  picking: false,     // 左栏多选模式；刻意不持久化，刷新后回到普通浏览
   sig: null,          // 列表对应的磁盘签名
   lastSync: 0,
 };
@@ -1730,6 +1731,255 @@ function visible() {
 // ---------------------------------------------------------------- 左栏
 const sessionStarred = uid => !!S.sessions.find(s => s.uid === uid)?.starred;
 
+/* ---------- 左栏多选删除 ---------- */
+// 一条条删太慢；勾中的会话一次性移入回收站，正在运行的会话由服务端逐条拒绝。
+const pickedSessions = new Set();
+
+/** 列表会被 SSE/轮询整份重画，选择集合里只保留仍然存在且可删的会话。 */
+function syncPickedSessions() {
+  if (!S.picking) {
+    pickedSessions.clear();
+    return pickedSessions;
+  }
+  const alive = new Set(S.sessions.filter(s => !s.pending).map(s => s.uid));
+  for (const uid of [...pickedSessions]) if (!alive.has(uid)) pickedSessions.delete(uid);
+  return pickedSessions;
+}
+
+function setPicking(on) {
+  S.picking = !!on;
+  if (!S.picking) pickedSessions.clear();
+  renderPickBar();
+  const side = $('#side'), top = side.scrollTop;
+  renderSide();
+  side.scrollTop = top;       // 进出选择模式不该把列表弹回顶部
+}
+
+function toggleSessionPick(uid) {
+  pickedSessions.has(uid) ? pickedSessions.delete(uid) : pickedSessions.add(uid);
+  const row = $(`#side .item[data-uid="${CSS.escape(uid)}"]`);
+  if (row) {
+    paintItemPick(row);
+    paintGroupPick(row.closest('.group'));
+  }
+  renderPickBar();
+}
+
+/** 整组一起勾/取消：组内还有没选中的就补齐，已经全选才清空。 */
+function toggleGroupPick(uids, group) {
+  const all = uids.length && uids.every(uid => pickedSessions.has(uid));
+  for (const uid of uids) all ? pickedSessions.delete(uid) : pickedSessions.add(uid);
+  for (const row of group.querySelectorAll('.item[data-uid]')) paintItemPick(row);
+  paintGroupPick(group);
+  renderPickBar();
+}
+
+function paintItemPick(row) {
+  const on = pickedSessions.has(row.dataset.uid);
+  row.classList.toggle('picked', on);
+  const box = row.querySelector('.item-pick');
+  if (box) box.checked = on;
+}
+
+function paintGroupPick(group) {
+  const box = group?.querySelector('.ghead-pick');
+  if (!box) return;
+  const rows = [...group.querySelectorAll('.item:not(.pending)[data-uid]')];
+  const picked = rows.filter(row => pickedSessions.has(row.dataset.uid)).length;
+  box.checked = !!rows.length && picked === rows.length;
+  box.indeterminate = picked > 0 && picked < rows.length;
+}
+
+function pickAllVisible() {
+  const rows = visible().filter(s => !s.pending);
+  const all = rows.length && rows.every(s => pickedSessions.has(s.uid));
+  pickedSessions.clear();
+  if (!all) rows.forEach(s => pickedSessions.add(s.uid));
+  const side = $('#side'), top = side.scrollTop;
+  renderSide();
+  side.scrollTop = top;              // 全选不该把列表弹回顶部
+  renderPickBar();
+}
+
+function renderPickBar() {
+  const picked = S.picking ? pickedSessions.size : 0;
+  $('#side-tools').hidden = !S.picking;   // 不在选择模式时整条不占高度
+  $('#side').classList.toggle('picking', S.picking);
+  $('#side-picked').textContent = picked ? `已选 ${picked} 项` : '点会话行勾选';
+  $('#side-pick-delete').textContent = picked ? `删除 (${picked})` : '删除';
+  $('#side-pick-delete').disabled = !picked;
+  const rows = S.picking ? visible().filter(s => !s.pending) : [];
+  $('#side-pick-all').disabled = !rows.length;
+  $('#side-pick-all').textContent =
+    rows.length && rows.every(s => pickedSessions.has(s.uid)) ? '全不选' : '全选';
+}
+
+async function deleteSessions(uids, button = null) {
+  if (!uids.length) return null;
+  const only = uids.length === 1
+    ? (S.sessions.find(x => x.uid === uids[0])?.title || '') : '';
+  const running = uids.filter(uid => S.live.has(uid)).length;
+  if (!confirm((uids.length === 1
+      ? `删除会话「${only}」?\n\n` : `删除选中的 ${uids.length} 个会话?\n\n`)
+    + '文件会移入回收站 ~/.local/share/agenthub/trash/, 不会真删。'
+    + (running ? `\n其中 ${running} 个还在运行，会被跳过，需要先停止。` : '')))
+    return null;
+  if (button) button.disabled = true;
+  if (uids.includes(S.sel)) closeWatch();   // 文件即将移走，先停掉这条 SSE
+  let d;
+  try {
+    const r = await fetch(appUrl('api/sessions/delete'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uids }),
+    });
+    d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (uids.includes(S.sel)) watchSession(S.sel);   // 一条都没删成，恢复同步
+      alert('删除失败: ' + (d.error || r.status));
+      return null;
+    }
+  } catch (e) {
+    if (uids.includes(S.sel)) watchSession(S.sel);
+    alert('删除失败: ' + e.message);
+    return null;
+  } finally {
+    if (button) button.disabled = false;
+  }
+  const gone = new Set((d.deleted || []).map(x => x.uid));
+  const failed = d.errors || [];
+  if (gone.size) {
+    S.sessions = S.sessions.filter(x => !gone.has(x.uid));
+    if (S.results) S.results = S.results.filter(x => !gone.has(x.uid));
+    if (gone.has(S.sel)) {
+      S.sel = null;
+      store.set('sel', null);
+      $('#detail').innerHTML = '<div class="empty">已移入回收站'
+        + '<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>';
+      $('#detail-open-trash').onclick = openTrash;
+      showMobileList();
+    }
+  }
+  renderChips();
+  renderSide();
+  if (failed.length === 1 && uids.length === 1) {
+    alert('删除失败: ' + failed[0].error);
+  } else if (failed.length) {
+    const lines = failed.slice(0, 5).map(x => `· ${x.title || x.uid}: ${x.error}`);
+    alert(`已删除 ${gone.size} 个，${failed.length} 个没能删除:\n\n`
+      + lines.join('\n') + (failed.length > 5 ? '\n…' : ''));
+  }
+  return { gone, failed };
+}
+
+async function deletePickedSessions() {
+  const result = await deleteSessions([...pickedSessions], $('#side-pick-delete'));
+  if (!result) return;
+  // 删不掉的（多半还在运行）留在选择里，用户停掉会话后可以直接再点删除。
+  pickedSessions.clear();
+  result.failed.forEach(x => pickedSessions.add(x.uid));
+  if (result.failed.length) { renderSide(); renderPickBar(); } else setPicking(false);
+}
+
+$('#side-pick-cancel').onclick = () => setPicking(false);
+$('#side-pick-all').onclick = pickAllVisible;
+$('#side-pick-delete').onclick = deletePickedSessions;
+
+/* ---------- 会话行的右键 / 长按菜单 ---------- */
+// 删除入口不再常驻占位：右键（手机长按）某条会话，才给出删除和进入多选。
+const LONG_PRESS_MS = 480;
+const LONG_PRESS_SLOP = 12;   // 手指按住时的自然微动不该算滑动
+let menuUid = '';
+let longPress = { timer: 0, x: 0, y: 0 };
+let suppressItemClick = false;
+
+function openItemMenu(uid, x, y) {
+  const menu = $('#item-menu');
+  menuUid = uid;
+  // 运行中的会话删不掉，菜单直接给出它此刻唯一能做的事：先停下来。
+  const running = S.live.has(uid);
+  menu.querySelector('[data-act="stop"]').hidden = !running;
+  menu.querySelector('[data-act="delete"]').hidden = running;
+  menu.hidden = false;
+  const box = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, innerWidth - box.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, innerHeight - box.height - 8))}px`;
+  menu.querySelector('button')?.focus({ preventScroll: true });
+}
+
+function closeItemMenu() {
+  $('#item-menu').hidden = true;
+  menuUid = '';
+}
+
+function cancelLongPress() {
+  clearTimeout(longPress.timer);
+  longPress.timer = 0;
+}
+
+const menuTarget = e => e.target.closest('#side .item:not(.pending)');
+
+$('#side').addEventListener('contextmenu', e => {
+  const row = menuTarget(e);
+  if (!row || S.picking) return;      // 选择模式里点选就够了，不再叠一层菜单
+  e.preventDefault();
+  openItemMenu(row.dataset.uid, e.clientX, e.clientY);
+});
+
+$('#side').addEventListener('pointerdown', e => {
+  if (e.pointerType === 'mouse') return;             // 鼠标走 contextmenu
+  const row = menuTarget(e);
+  if (!row || S.picking) return;
+  longPress = { timer: 0, x: e.clientX, y: e.clientY };
+  longPress.timer = setTimeout(() => {
+    longPress.timer = 0;
+    suppressItemClick = true;                        // 长按不该顺手打开会话
+    navigator.vibrate?.(12);
+    openItemMenu(row.dataset.uid, longPress.x, longPress.y);
+  }, LONG_PRESS_MS);
+});
+
+$('#side').addEventListener('pointermove', e => {
+  if (!longPress.timer) return;
+  if (Math.abs(e.clientX - longPress.x) > LONG_PRESS_SLOP
+      || Math.abs(e.clientY - longPress.y) > LONG_PRESS_SLOP) cancelLongPress();
+});
+for (const type of ['pointerup', 'pointercancel', 'pointerleave']) {
+  $('#side').addEventListener(type, cancelLongPress);
+}
+$('#side').addEventListener('scroll', () => { cancelLongPress(); closeItemMenu(); });
+
+// 长按结束时浏览器仍会补一次 click，必须在捕获阶段吃掉。
+$('#side').addEventListener('click', e => {
+  if (!suppressItemClick) return;
+  suppressItemClick = false;
+  e.stopPropagation();
+  e.preventDefault();
+}, true);
+
+$('#item-menu').onclick = async e => {
+  const button = e.target.closest('button[data-act]');
+  if (!button) return;
+  const uid = menuUid;
+  closeItemMenu();
+  if (!uid) return;
+  if (button.dataset.act === 'pick') {
+    pickedSessions.add(uid);       // 从哪条进入多选，就先勾上哪条
+    setPicking(true);
+    return;
+  }
+  if (button.dataset.act === 'stop') {
+    const row = S.sessions.find(x => x.uid === uid);
+    if (row) await stopSession(row);
+    return;
+  }
+  await deleteSessions([uid]);
+};
+
+document.addEventListener('pointerdown', e => {
+  if (!$('#item-menu').hidden && !e.target.closest('#item-menu')) closeItemMenu();
+}, true);
+addEventListener('resize', closeItemMenu);
+
 function starButtonMarkup(uid, starred, cls = '', id = '') {
   const label = starred ? '取消星标' : '标为星标';
   return `<button type="button"${id ? ` id="${id}"` : ''}
@@ -1899,6 +2149,7 @@ function renderSide() {
   const side = $('#side');
   side.innerHTML = '';
   const list = visible();
+  const picked = syncPickedSessions();
   if (!list.length) {
     const text = S.activeOnly
       ? (S.results ? '没有活动的匹配会话' : '没有活动会话')
@@ -1910,23 +2161,37 @@ function renderSide() {
     const g = el('div', 'group' + (S.closed.has(key) ? ' closed' : ''));
     g.dataset.key = key;
     const label = S.view === 'tree' ? shortCwd(key, 999) : key;   // 分组标题不缩写, 只换 ~
+    const groupUids = items.filter(x => !x.pending).map(x => x.uid);
     const head = el('div', 'ghead',
-      `<span class="caret">▼</span><span class="gname" title="${esc(key)}">${esc(label)}</span>
+      `${S.picking ? `<input type="checkbox" class="ghead-pick"
+         aria-label="选中「${esc(label)}」下的全部会话">` : ''}
+       <span class="caret">▼</span><span class="gname" title="${esc(key)}">${esc(label)}</span>
        <span class="gcount">${items.length}</span>`);
     head.onclick = () => {
       S.closed.has(key) ? S.closed.delete(key) : S.closed.add(key);
       store.set('closed', [...S.closed]);
       g.classList.toggle('closed');
     };
+    const groupBox = head.querySelector('.ghead-pick');
+    if (groupBox) {
+      groupBox.onclick = event => {
+        event.stopPropagation();      // 勾整组，不要顺手把分组折叠了
+        toggleGroupPick(groupUids, g);
+      };
+    }
     g.appendChild(head);
     const ul = el('div', 'glist');
     for (const s of items) {
       const meta = itemMeta(s);
+      const pickable = S.picking && !s.pending;
       const it = el('div', 'item' + (S.sel === s.uid ? ' sel' : '')
                               + (s.pending ? ' pending live live-tmux' : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
-                              + (!s.pending && S.liveTmux.has(s.uid) ? ' live-tmux' : ''),
-        `<span class="ico">${icon(s.source)}<span class="item-status"></span></span>
+                              + (!s.pending && S.liveTmux.has(s.uid) ? ' live-tmux' : '')
+                              + (pickable && picked.has(s.uid) ? ' picked' : ''),
+        `${pickable ? `<input type="checkbox" class="item-pick" tabindex="-1"
+           ${picked.has(s.uid) ? 'checked' : ''} aria-label="选中「${esc(s.title)}」">` : ''}
+         <span class="ico">${icon(s.source)}<span class="item-status"></span></span>
          <div class="body">
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
            <div class="m">${esc(meta)}</div>
@@ -1937,7 +2202,11 @@ function renderSide() {
          ${s.pending ? '' : starButtonMarkup(s.uid, !!s.starred, 'item-star')}`);
       it.dataset.uid = s.uid;
       if (s.pending) it.dataset.tmuxName = s.tmuxName;
-      it.onclick = () => s.pending ? openPendingSession(s) : openSession(s.uid);
+      it.onclick = () => {
+        if (pickable) return toggleSessionPick(s.uid);
+        if (S.picking) return;      // 临时会话还没有文件可删，选择模式里不响应
+        s.pending ? openPendingSession(s) : openSession(s.uid);
+      };
       const star = it.querySelector('.item-star');
       if (star) star.onclick = event => {
         event.stopPropagation();
@@ -1948,6 +2217,7 @@ function renderSide() {
     }
     g.appendChild(ul);
     side.appendChild(g);
+    if (groupBox) paintGroupPick(g);
   }
 }
 
@@ -2472,9 +2742,9 @@ function renderSessionAction(m, button = $('#a-session-action')) {
   button.onclick = () => running ? stopSession(m, button) : del(m);
 }
 
-async function stopSession(m, button) {
+async function stopSession(m, button = null) {
   if (!confirm(`停止会话「${m.title}」?\n\n停止后才可以删除会话记录。`)) return;
-  button.disabled = true;
+  if (button) button.disabled = true;
   try {
     const r = await fetch(appUrl('api/session/stop'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2486,25 +2756,85 @@ async function stopSession(m, button) {
     if (typeof loadTermList === 'function') await loadTermList();
     paintLive();
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
+}
+
+async function requestSessionDelete(uid, replacementUid = '') {
+  const url = new URL(appUrl('api/session/' + encodeURIComponent(uid)));
+  if (replacementUid) url.searchParams.set('replacement_uid', replacementUid);
+  const response = await fetch(url, { method: 'DELETE' });
+  return { response, data: await response.json() };
+}
+
+const forkDeletionPrompts = new Set();
+
+/** 新分支接管当前详情后，只询问一次；取消时父会话继续留在公开列表。 */
+async function offerForkParentDeletion(fromUid, toUid) {
+  if (!fromUid || !toUid || fromUid === toUid) return false;
+  const parent = S.sessions.find(row => row.uid === fromUid);
+  const replacement = S.sessions.find(row => row.uid === toUid);
+  if (!parent || !replacement
+      || parent.source !== 'codex' || replacement.source !== 'codex'
+      || replacement.forked_from_id !== parent.sid) return false;
+
+  const key = `${fromUid}\0${toUid}`;
+  if (forkDeletionPrompts.has(key)) return false;
+  forkDeletionPrompts.add(key);
+  const remove = confirm(
+    `已切换到回退后的新会话 UUID。\n\n是否删除旧会话「${parent.title}」？\n\n`
+    + '选择“取消”会让旧会话继续显示。旧文件还保存着新会话在回退点之前的历史；'
+    + '删除后重新加载或恢复新会话时，可能缺少这部分内容。文件只会移入回收站，可恢复。');
+  browserAuditEvent('codex.fork.delete_decision', {
+    parent_uid: fromUid, replacement_uid: toUid, remove,
+  }, null, {uid: toUid});
+  if (!remove) return false;
+
+  let response, data;
+  try {
+    ({ response, data } = await requestSessionDelete(fromUid, toUid));
+  } catch (error) {
+    forkDeletionPrompts.delete(key);
+    alert('删除旧会话失败: ' + (error.message || error));
+    return false;
+  }
+  if (!response.ok) {
+    forkDeletionPrompts.delete(key);
+    alert('删除旧会话失败: ' + (data.error || response.status));
+    return false;
+  }
+
+  S.sessions = S.sessions.filter(row => row.uid !== fromUid);
+  if (S.results) S.results = S.results.filter(row => row.uid !== fromUid);
+  S.live.delete(fromUid);
+  S.liveTmux.delete(fromUid);
+  clearUnread(fromUid);
+  S.cursors.delete(viewKey(fromUid));
+  for (const [cacheKey, entry] of cache) {
+    if (entry?.meta?.uid === fromUid) cache.delete(cacheKey);
+  }
+  renderChips();
+  renderSide();
+  showSessionCount(sidebarSessions().length);
+  await loadSessions(true);
+  paintLive();
+  return true;
 }
 
 async function del(m) {
   if (!confirm(`删除会话「${m.title}」?\n\n文件会移入回收站 ~/.local/share/agenthub/trash/, 不会真删。`)) return;
   closeWatch();                         // 先停 SSE，避免文件移走后 EventSource 自动重连 404
-  const r = await fetch(appUrl('api/session/' + encodeURIComponent(m.uid)), { method: 'DELETE' });
-  const d = await r.json();
-  if (!r.ok) {
+  const { response, data } = await requestSessionDelete(m.uid);
+  if (!response.ok) {
     watchSession(m.uid);                // 删除失败，会话仍在，恢复实时同步
-    return alert('删除失败: ' + (d.error || r.status));
+    return alert('删除失败: ' + (data.error || response.status));
   }
   S.sessions = S.sessions.filter(x => x.uid !== m.uid);
   if (S.results) S.results = S.results.filter(x => x.uid !== m.uid);
   S.sel = null;
   store.set('sel', null);
   renderChips(); renderSide();
-  $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(d.trash)}</code>`
+  $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(data.trash)}</code>`
     + `<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>`;
   $('#detail-open-trash').onclick = openTrash;
   showMobileList();
@@ -3369,11 +3699,9 @@ function turnProcessNode(turn, initiallyOpen = false) {
   peek.replaceChildren(label, stats);
   const nav = el('div', 'turn-nav');
   const toStart = el('button', 'turn-nav-btn turn-to-start', '↑ 开头');
-  const collapse = el('button', 'turn-nav-btn turn-collapse', '收起');
   const toConclusion = el('button', 'turn-nav-btn turn-to-conclusion', '结论 ↓');
-  for (const button of [toStart, collapse, toConclusion]) button.type = 'button';
+  for (const button of [toStart, toConclusion]) button.type = 'button';
   toStart.title = toStart.ariaLabel = '回到本轮过程开头';
-  collapse.title = collapse.ariaLabel = '收起本轮过程';
   if (turn.interrupted) {
     n.dataset.interrupted = 'true';
     toConclusion.textContent = '末次进展 ↓';
@@ -3381,7 +3709,7 @@ function turnProcessNode(turn, initiallyOpen = false) {
   toConclusion.title = toConclusion.ariaLabel = turn.interrupted
     ? '跳到本轮中断前的末次进展' : '跳到本轮最终结论';
   toConclusion.hidden = turn.hasConclusion === false;
-  nav.append(toStart, collapse, toConclusion);
+  nav.append(toStart, toConclusion);
   nav.hidden = true;
   toolbar.appendChild(nav);
   const expandTitle = summary.paths.length
@@ -3427,7 +3755,6 @@ function turnProcessNode(turn, initiallyOpen = false) {
   n._foldAtAnchor = foldAtAnchor;
   n._openAtAnchor = openAtAnchor;
   preview.onclick = () => n.classList.contains('folded') ? openAtAnchor() : foldAtAnchor();
-  collapse.onclick = foldAtAnchor;
   toStart.onclick = () => jumpWithinConversation(n, 'start');
   toConclusion.onclick = () => {
     let target = n.nextElementSibling;
@@ -4271,7 +4598,7 @@ async function runSearch() {
 }
 
 $('#opts').onclick = e => {
-  const b = e.target.closest('button');
+  const b = e.target.closest('button[data-o]');
   if (!b) return;
   const k = b.dataset.o;
   S.opts[k] = !S.opts[k];
@@ -4309,10 +4636,12 @@ async function loadTrash({ keepNote = false } = {}) {
     if (!r.ok) throw new Error(d.error || r.status);
     trashItems = Array.isArray(d.items) ? d.items : [];
     renderTrash(d);
+    return true;
   } catch (e) {
     trashItems = [];
     $('#trash-list').innerHTML = '<div class="trash-empty">读取失败</div>';
     setTrashNote('读取回收站失败: ' + e.message, true);
+    return false;
   }
 }
 
@@ -4326,6 +4655,7 @@ function renderTrash(info) {
     ? trashItems.map(trashRow).join('')
     : '<div class="trash-empty">没有已删除的会话</div>';
 }
+
 
 function trashRow(it) {
   const badge = SOURCES[it.source] ? icon(it.source) : '';
@@ -4384,8 +4714,9 @@ $('#trash-list').onclick = async e => {
   if (btn.dataset.act === 'restore') {
     const d = await trashPost('api/trash/restore', { id: item.id }, btn);
     if (!d) return;
-    setTrashNote(`已恢复「${item.title}」到 ${d.path}`);
-    await loadTrash({ keepNote: true });
+    if (await loadTrash({ keepNote: true })) {
+      setTrashNote(`已恢复「${item.title}」到 ${d.path}`);
+    }
     S.results = null;
     await loadSessions(true);       // 恢复的会话立即回到左侧列表
     return;
@@ -4393,8 +4724,9 @@ $('#trash-list').onclick = async e => {
   if (!confirm(`彻底删除「${item.title}」?\n\n文件将从磁盘移除, 不可恢复。`)) return;
   const d = await trashPost('api/trash/purge', { id: item.id }, btn);
   if (!d) return;
-  setTrashNote(`已彻底删除「${item.title}」, 释放 ${fmtSize(d.freed || 0)}`);
-  await loadTrash({ keepNote: true });
+  if (await loadTrash({ keepNote: true })) {
+    setTrashNote(`已彻底删除「${item.title}」, 释放 ${fmtSize(d.freed || 0)}`);
+  }
 };
 
 async function purgeAllTrash() {
@@ -4403,9 +4735,10 @@ async function purgeAllTrash() {
   const d = await trashPost('api/trash/purge', { all: true }, $('#trash-purge-all'));
   if (!d) return;
   const failed = (d.errors || []).length;
-  setTrashNote(`已彻底删除 ${d.removed || 0} 个会话, 释放 ${fmtSize(d.freed || 0)}`
-    + (failed ? `; ${failed} 个失败: ${d.errors[0]}` : ''), !!failed);
-  await loadTrash({ keepNote: true });
+  if (await loadTrash({ keepNote: true })) {
+    setTrashNote(`已彻底删除 ${d.removed || 0} 个会话, 释放 ${fmtSize(d.freed || 0)}`
+      + (failed ? `; ${failed} 个失败: ${d.errors[0]}` : ''), !!failed);
+  }
 }
 
 $('#trash').onclick = openTrash;
@@ -4437,12 +4770,16 @@ $('#setting-cache').onchange = e => {
 };
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { $('#q').blur(); }
+  if (e.key !== 'Escape') return;
+  if (!$('#item-menu').hidden) return closeItemMenu();
+  if (S.picking) return setPicking(false);
+  $('#q').blur();
 });
 
 setSideWidth(store.get('width', SIDE_DEFAULT));
 setSideCollapsed(store.get('sideCollapsed', false), false);
 renderOpts();
+renderPickBar();
 renderView();
 pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
 function uidOfDeepLink(spec) {
