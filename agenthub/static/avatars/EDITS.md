@@ -7,10 +7,12 @@ The user selected these three source images. They are resized to 256px-wide WebP
 | Tool | Asset | Source |
 | --- | --- | --- |
 | Claude | [dario-wef.webp](dario-wef.webp) | [World Economic Forum](https://www.weforum.org/people/dario-amodei/) |
-| Codex | [sam-stablediffusion.webp](sam-stablediffusion.webp) | [Stable Diffusion Online](https://stablediffusionweb.com/image/26958853-sam-altman-green-screen-laughing) (AI-generated source image) |
+| Codex | [sam-imdb.webp](sam-imdb.webp) | [IMDb: nm10310272](https://www.imdb.com/name/nm10310272/) |
 | Grok | [elon-penglobal.webp](elon-penglobal.webp) | [PENGlobal](https://www.penglobalinc.com/elon-musk-11-fascinating-facts-about-the-worlds-richest-entrepreneur) |
 
 ## Superseded background edits
+
+The previous [sam-stablediffusion.webp](sam-stablediffusion.webp) came from [Stable Diffusion Online](https://stablediffusionweb.com/image/26958853-sam-altman-green-screen-laughing), an AI-generated source image. It is retained for provenance and is no longer displayed.
 
 Edited with the built-in `image_gen.imagegen` tool. The tool did not expose its underlying model version.
 

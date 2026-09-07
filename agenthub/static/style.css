@@ -1448,8 +1448,8 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   --avatar-size: 110%; --avatar-position: center top;
 }
 .source-icon[data-source="codex"] {
-  --source-avatar: url('avatars/sam-stablediffusion.webp');
-  --avatar-size: 140%; --avatar-position: 60% 6%;
+  --source-avatar: url('avatars/sam-imdb.webp');
+  --avatar-size: 100%; --avatar-position: center 10%;
 }
 .source-icon[data-source="grok"] {
   --source-avatar: url('avatars/elon-penglobal.webp');
