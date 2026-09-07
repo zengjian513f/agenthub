@@ -1444,15 +1444,15 @@ body.dragging-v { cursor: row-resize; user-select: none; }
 .spin { padding: 14px; color: var(--muted); font-size: 13px; }
 .ico { width: 14px; height: 14px; }
 .source-icon[data-source="claude"] {
-  --source-avatar: url('avatars/dario-amodei.jpg');
+  --source-avatar: url('avatars/dario-amodei-green.webp');
   --avatar-size: 120%; --avatar-position: center 22%;
 }
 .source-icon[data-source="codex"] {
-  --source-avatar: url('avatars/sam-altman.jpg');
+  --source-avatar: url('avatars/sam-altman-brown.webp');
   --avatar-size: 220%; --avatar-position: 48% 3%;
 }
 .source-icon[data-source="grok"] {
-  --source-avatar: url('avatars/elon-musk.jpg');
+  --source-avatar: url('avatars/elon-musk-purple.webp');
   --avatar-size: 150%; --avatar-position: center 15%;
 }
 :root[data-tool-icons="boss"] .source-icon {
