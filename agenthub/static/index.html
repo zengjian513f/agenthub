@@ -86,7 +86,13 @@
 
 <div id="app">
   <header>
-    <div class="brand"><span class="brand-name" title="__AGENTHUB_HOSTNAME__">__AGENTHUB_HOSTNAME__</span><small id="stat">加载中…</small><button type="button" id="livecount" class="livecount" aria-pressed="false"></button></div>
+    <div class="brand">
+      <span class="brand-name" title="__AGENTHUB_HOSTNAME__">__AGENTHUB_HOSTNAME__</span>
+      <div class="seg" id="session-scope" role="radiogroup" aria-label="会话范围">
+        <button type="button" id="livecount" role="radio" aria-checked="false" tabindex="-1" title="只显示活跃会话"><span>活跃</span><b id="session-active">0</b></button>
+        <button type="button" id="allcount" role="radio" aria-checked="true" tabindex="0" class="on" title="显示全部会话"><span>总数</span><b id="session-total">0</b></button>
+      </div>
+    </div>
     <button class="btn" id="side-toggle" title="收起会话列表" aria-label="收起会话列表" aria-expanded="true">
       <svg class="ui-icon" aria-hidden="true"><use href="#i-sidebar"/></svg>
     </button>
@@ -130,6 +136,7 @@
             <button data-o="regex" title="正则表达式">.*</button>
           </div>
         </div>
+        <div id="stat" role="status">加载中…</div>
         <div class="side-tools" id="side-tools" hidden>
           <span id="side-picked"></span>
           <button type="button" class="btn" id="side-pick-all">全选</button>

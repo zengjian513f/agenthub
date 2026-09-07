@@ -288,7 +288,7 @@ def run(pw):
           n_items > 0
           and p.locator(".item").filter(has_text="AGENTHUB自测会话请删除").count() == 1,
           n_items)
-    check("顶栏统计显示数量", re.search(r"\d+", p.locator("#stat").inner_text()), p.locator("#stat").inner_text())
+    check("顶栏统计显示数量", re.search(r"\d+", p.locator("#session-total").inner_text()), p.locator("#session-total").inner_text())
     check("三个来源 chip 都在", p.locator(".chip").count() == 3)
     check("来源筛选使用原生按钮", p.locator("button.chip").count() == 3)
     check("图标 SVG 渲染", p.locator(".item .ico svg").count() > 0)
@@ -857,11 +857,11 @@ def run(pw):
           mobile_header)
     check("手机顶栏保留机器名、会话数量和视图按钮标签",
           p.locator(".brand-name").is_visible()
-          and p.locator(".stat-unit").is_visible()
+          and p.locator("#session-total").is_visible()
           and p.locator('#view button[aria-label="项目树"]').is_visible()
           and p.locator('#view button[aria-label="时间轴"]').is_visible()
           and p.locator(".brand-name").inner_text().strip() not in {"", "__AGENTHUB_HOSTNAME__"}
-          and "个会话" in p.locator("#stat").inner_text())
+          and p.locator("#session-scope [role=radio]").count() == 2)
     brand_style = p.locator(".brand-name").evaluate("""n => {
       const s = getComputedStyle(n);
       return {background:s.backgroundImage, family:s.fontFamily,
@@ -2826,9 +2826,9 @@ def run(pw):
         shown = p.evaluate("[...S.live].filter(u => document.querySelector(`.item[data-uid=\"${u}\"]`)).length")
         check("列表里可见的活跃会话都标了", marked == shown, f"{marked} vs {shown}")
     live_switch = p.locator("#livecount")
-    check("顶栏活动计数是一个开关",
+    check("顶栏活动计数是一个单选项",
           live_switch.evaluate("n => n.tagName") == "BUTTON"
-          and live_switch.get_attribute("aria-pressed") == "false")
+          and live_switch.get_attribute("aria-checked") == "false")
     check("活动计数不再显示 tmux 文字",
           "tmux" not in live_switch.inner_text().lower(), live_switch.inner_text())
     zero_live = p.evaluate("""() => {
@@ -2847,7 +2847,7 @@ def run(pw):
     }""")
     check("无活动会话时计数仍显示 0",
           zero_live["text"].endswith("0") and zero_live["display"] == "inline-flex"
-          and zero_live["label"].startswith("0 个活动会话"), zero_live)
+          and zero_live["label"].startswith("0 个活跃会话"), zero_live)
     before_live_filter = set(p.locator("#side .item").evaluate_all(
         "nodes => nodes.map(n => n.dataset.uid)"))
     live_switch.click()
@@ -2859,14 +2859,14 @@ def run(pw):
         "nodes => nodes.map(n => n.dataset.uid)"))
     check("活动开关按下后只显示活动会话",
           shown_active == expected_active
-          and live_switch.get_attribute("aria-pressed") == "true",
+          and live_switch.get_attribute("aria-checked") == "true",
           f"shown={shown_active}, expected={expected_active}")
-    live_switch.click()
+    p.locator('#allcount').click()
     p.wait_for_timeout(100)
-    check("再次点击活动开关恢复全部会话",
+    check("点击总数恢复全部会话",
           set(p.locator("#side .item").evaluate_all("nodes => nodes.map(n => n.dataset.uid)"))
           == before_live_filter
-          and live_switch.get_attribute("aria-pressed") == "false")
+          and live_switch.get_attribute("aria-checked") == "false")
     # 活跃标记不该重渲染列表 (会打断滚动/选中)
     p.locator(".item").first.click()
     p.wait_for_selector(".msg", timeout=30000)

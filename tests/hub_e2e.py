@@ -43,6 +43,21 @@ def main():
                 assert page.locator('.ghead').count() == 3
                 assert all(name in page.locator('#side').inner_text() for name in ['NodeA', 'NodeB', 'Vega'])
                 assert len(set(page.evaluate('S.sessions.map(s => s.uid)'))) == 3
+                # Scope is a single choice; zero activity still leaves both counts visible.
+                page.wait_for_function('document.querySelector("#session-total").textContent === "3"')
+                assert page.locator('#session-active').inner_text() == '0'
+                page.locator('#livecount').click()
+                page.locator('#livecount').click()
+                assert page.locator('#livecount').get_attribute('aria-checked') == 'true'
+                assert page.locator('#side .item').count() == 0
+                page.reload()
+                page.wait_for_function('S.sessions.length === 3 && Nodes.list.length === 3')
+                assert page.locator('#livecount').get_attribute('aria-checked') == 'true'
+                page.locator('#livecount').press('ArrowRight')
+                assert page.locator('#allcount').get_attribute('aria-checked') == 'true'
+                assert page.locator('#side .item').count() == 3
+                page.locator('#allcount').click()
+                assert page.locator('#session-scope [aria-checked="true"]').count() == 1
                 def check_toolbar():
                     styles = page.evaluate("""() => ['#node-chips','#chips','#view'].map(q=>{
                       const group=document.querySelector(q), r=group.getBoundingClientRect();
@@ -54,16 +69,25 @@ def main():
                     assert all(r == styles[0] for r in styles), styles
                     assert page.locator('header #node-chips').count() == 1
                     assert page.locator('#node-chips').get_by_role('button', name='全部', exact=True).count() == 0
+                    assert page.locator('#session-scope').bounding_box()['width'] == 162
+                    assert all(b.bounding_box()['width'] == 80 for b in page.locator('#session-scope button').all())
                 check_toolbar()
                 page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-desktop.png')
                 # Single/multi node filters and independent Agent Type intersection.
                 page.get_by_role('button', name='NodeB 1', exact=True).dblclick()
                 page.wait_for_function('visible().length === 1')
+                assert page.locator('#session-total').inner_text() == '1'
                 page.get_by_role('button', name='NodeA 1', exact=True).click()
                 page.wait_for_function('visible().length === 2')
+                assert page.locator('#session-total').inner_text() == '2'
+                page.locator('#chips button[data-source="claude"]').click()
+                assert page.locator('#session-total').inner_text() == '0'
+                page.locator('#chips button[data-source="claude"]').click()
                 page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
                 page.wait_for_function('S.results?.length === 2')
                 assert {r['node_name'] for r in page.evaluate('S.results')} == {'NodeA', 'NodeB'}
+                assert '命中' in page.locator('.side-search #stat').inner_text()
+                assert page.locator('#session-total').inner_text() == '2'
                 # Open identical native IDs on distinct nodes, render media and SSE.
                 for i, name in enumerate(['NodeA', 'NodeB']):
                     uid = federation.qualify(chr(97 + i) * 32, 'claude:same-file-hash', True)

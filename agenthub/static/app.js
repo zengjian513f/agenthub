@@ -1455,18 +1455,7 @@ function paintLive() {
     renderSessionAction(selected);
     renderConversationTail(cache.get(viewKey(selected.uid, S.agent))?.activity, selected.uid);
   }
-  const c = $('#livecount');
-  if (c) {
-    const pending = pendingTmuxSessions().length;
-    const tmux = S.liveTmux.size + pending, direct = Math.max(0, S.live.size - S.liveTmux.size);
-    const total = direct + tmux;
-    c.innerHTML = `<span class="live-direct">● ${direct}</span>`
-      + `<span class="live-tmux-count">● ${tmux}</span>`;
-    c.setAttribute('aria-label', `${total} 个活动会话；${S.activeOnly ? '正在只显示活动会话' : '点击只显示活动会话'}`);
-    c.setAttribute('aria-pressed', String(S.activeOnly));
-    c.title = S.activeOnly ? '显示全部会话' : '只显示活动会话';
-    c.classList.toggle('active-only', S.activeOnly);
-  }
+  renderSessionCounts();
   syncActiveOnlyList();
 }
 
@@ -1481,11 +1470,20 @@ function syncActiveOnlyList() {
   if (side) side.scrollTop = top;
 }
 
-$('#livecount').onclick = () => {
-  S.activeOnly = !S.activeOnly;
+function selectSessionScope(activeOnly) {
+  S.activeOnly = activeOnly;
   store.set('activeOnly', S.activeOnly);
   renderSide();
   paintLive();
+}
+$('#livecount').onclick = () => selectSessionScope(true);
+$('#allcount').onclick = () => selectSessionScope(false);
+$('#session-scope').onkeydown = e => {
+  if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+  e.preventDefault();
+  const active = e.key === 'Home' ? true : e.key === 'End' ? false : !S.activeOnly;
+  selectSessionScope(active);
+  $(active ? '#livecount' : '#allcount').focus();
 };
 
 setInterval(pollLive, LIVE_MS);
@@ -1498,9 +1496,26 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---------------------------------------------------------------- 数据加载
-function showSessionCount(n) {
-  if (HUB_MODE) n = sidebarSessions().filter(nodeSelected).length;
-  $('#stat').innerHTML = `${n}<span class="stat-unit"> 个会话</span>`;
+function renderSessionCounts() {
+  const pool = sidebarSessions().filter(s => !S.off.has(s.source) && nodeSelected(s));
+  const active = pool.filter(s => s.pending || S.live.has(s.uid)).length;
+  $('#session-active').textContent = active;
+  $('#session-total').textContent = pool.length;
+  for (const [id, selected, label] of [
+    ['#livecount', S.activeOnly, `${active} 个活跃会话`],
+    ['#allcount', !S.activeOnly, `${pool.length} 个总会话`],
+  ]) {
+    const button = $(id);
+    button.classList.toggle('on', selected);
+    button.setAttribute('aria-checked', String(selected));
+    button.setAttribute('aria-label', label);
+    button.tabIndex = selected ? 0 : -1;
+  }
+}
+
+function showSessionCount() {
+  renderSessionCounts();
+  $('#stat').textContent = '';
 }
 
 const pendingUid = name => `tmux:${name}`;
@@ -2166,6 +2181,7 @@ function patchSide(list) {
 }
 
 function renderSide() {
+  renderSessionCounts();
   const side = $('#side');
   side.innerHTML = '';
   const list = visible();
@@ -4478,6 +4494,7 @@ MOBILE.addEventListener?.('change', e => {
 
 $('#q').oninput = e => {
   if (S.results) { S.results = null; }     // 改动输入即退出全文搜索态
+  $('#stat').textContent = ''; $('#stat').classList.remove('err');
   if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
   S.term = e.target.value.trim();
   renderSide();
@@ -4539,7 +4556,7 @@ async function runSearch() {
   searchAbort?.abort();
   searchAbort = null;
   searchProgressDone();
-  if (!q) { S.results = null; renderSide(); return; }
+  if (!q) { S.results = null; showSessionCount(); renderSide(); return; }
   if (S.opts.regex && !reTerm(false)) {   // 本地先验一次, 省掉一次全盘扫描
     S.results = [];
     $('#stat').textContent = ' 正则无效';
