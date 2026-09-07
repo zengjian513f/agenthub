@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import threading
 import time
@@ -23,13 +24,17 @@ from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
                debug_runs, index, live, media, pending as pending_store,
                send_protocol, send_queue,
                session_meta, term, term_ownership, trash, wsock)
+from . import federation, create_requests
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
     (STATIC / name).read_bytes()
-    for name in ("style.css", "cli.js", "app.js", "term.js")
+    for name in ("style.css", "cli.js", "nodes.js", "app.js", "term.js")
 )).hexdigest()[:12]
 HOSTNAME = socket.gethostname().strip() or "localhost"
+HUB_MODE = False
+NODE_TOKEN = ""
+NODE_ID = ""
 ALLOWED_IPS: set[str] = set()
 ALLOWED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 TERMINAL = False        # 远程终端 = 远程执行, 必须显式 --terminal 打开
@@ -422,7 +427,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _allowed(self) -> bool:
         ip = self._client_ip()
+        if self.headers.get("X-AgentHub-Protocol") and not self._hub_protocol():
+            return False
+        supplied = self.headers.get("X-AgentHub-Node-Token", "")
+        if supplied and not (NODE_TOKEN and secrets.compare_digest(supplied, NODE_TOKEN)):
+            return False
         return _ip_allowed(ip)
+
+    def _hub_protocol(self) -> bool:
+        supplied = self.headers.get("X-AgentHub-Node-Token", "")
+        return bool(NODE_TOKEN and supplied and secrets.compare_digest(supplied, NODE_TOKEN)
+                    and self.headers.get("X-AgentHub-Protocol") == str(federation.PROTOCOL))
 
     def _client_ip(self) -> str:
         """Actual TCP peer address; proxy headers never participate in identity."""
@@ -622,7 +637,7 @@ class Handler(BaseHTTPRequestHandler):
         text_write = (u.path in {"/api/session/send", "/api/session/outbox/retry"}
                       or (u.path == "/api/term/send" and not body.get("keys")
                           and bool(body.get("text"))))
-        if text_write and str(body.get("_build") or "") != ASSET_VERSION:
+        if text_write and str(body.get("_build") or "") != ASSET_VERSION and not self._hub_protocol():
             # A tab can survive deployments for days.  Old code used a local
             # eight-second guess and exposed a blind retry that duplicated prompts.
             # Reject before touching tmux; even old clients will surface this error
@@ -911,7 +926,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_get(self, path: str, q: dict):
         if path == "/api/meta":
-            return self._json({"build": ASSET_VERSION, "hostname": HOSTNAME})
+            # A supplied credential is checked by _allowed; protocol requests
+            # also require a configured node credential, even on loopback.
+            if self.headers.get("X-AgentHub-Protocol") and not self._hub_protocol():
+                return self._json({"error": "node authentication required"}, 403)
+            return self._json({"build": ASSET_VERSION, "hostname": HOSTNAME,
+                               "mode": "local", "protocol": federation.PROTOCOL,
+                               "node_id": NODE_ID or federation.identity()})
+        if path == "/api/nodes":
+            return self._json({"mode": "local", "nodes": [{
+                "id": NODE_ID or federation.identity(), "name": HOSTNAME, "online": True}]})
         if path == "/api/trash":
             return self._json(trash.summary())
         if path == "/api/sessions":
@@ -1785,6 +1809,19 @@ class Handler(BaseHTTPRequestHandler):
                            "tmux": bool(pane)})
 
     def _create_session(self, body: dict):
+        reply = self._json
+        def execute():
+            captured = []
+            self._json = lambda obj, code=200: captured.append((code, obj))
+            try:
+                self._create_session_once(body)
+                return captured[0]
+            finally:
+                self._json = reply
+        status, result = create_requests.run(body, execute)
+        return reply(result, status)
+
+    def _create_session_once(self, body: dict):
         """用固定 CLI 白名单新建会话；不接受浏览器传入的任意命令。"""
         source = str(body.get("source") or "")
         before = {str(s["sid"]) for s in index.load() if s["source"] == source}
@@ -2029,8 +2066,10 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         data = f.read_bytes()
         if f.name == "index.html":
+            hub_mode = getattr(getattr(self, "server", None), "hub_mode", HUB_MODE)
+            data = data.replace(b"__AGENTHUB_MODE__", b"hub" if hub_mode else b"local")
             data = data.replace(b"__AGENTHUB_HOSTNAME__",
-                                html.escape(HOSTNAME).encode("utf-8"))
+                                html.escape("AgentHub" if hub_mode else HOSTNAME).encode("utf-8"))
             data = data.replace(b"__AGENTHUB_ASSET_VERSION__",
                                 ASSET_VERSION.encode("ascii"))
         cache = "no-store" if f.name == "index.html" else "no-cache"
@@ -2045,9 +2084,16 @@ def main():
                     help="除本机外允许访问的 IP 或 CIDR, 逗号分隔")
     ap.add_argument("--terminal", action="store_true",
                     help="开启 tmux 远程终端。这等于给白名单 IP 开放本机 shell, 谨慎使用")
+    ap.add_argument("--node-token-file", type=Path, help="Hub 节点凭据文件（至少 32 字符）")
+    ap.add_argument("--node-id-file", type=Path, help="持久节点身份文件；默认保存在本机数据目录")
     args = ap.parse_args()
 
-    global TERMINAL
+    global TERMINAL, NODE_TOKEN, NODE_ID
+    NODE_ID = federation.identity(args.node_id_file)
+    if args.node_token_file:
+        NODE_TOKEN = args.node_token_file.read_text().strip()
+        if not re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,256}", NODE_TOKEN):
+            ap.error("node token must contain 32–256 characters")
     TERMINAL = args.terminal
     if TERMINAL and not term.available():
         print("[agenthub] 警告: 找不到 tmux, 终端功能不可用")

@@ -1,0 +1,16 @@
+[Unit]
+Description=AgentHub multi-machine web hub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Adjust to the checkout on the hub-host server; install as a user service.
+WorkingDirectory=%h/Projects/agenthub
+ExecStart=/usr/bin/python3 -u -m agenthub.hub --host 127.0.0.1 --port 8720
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -241,6 +241,7 @@ async function loadTermList() {
     return;
   }
   if (loaded) {
+    applyNodeState(data, 'term');
     T.enabled = !!data.enabled;
     T.list = data.sessions || [];
     T.sources = data.sources || {};
@@ -274,7 +275,7 @@ async function loadTermList() {
   // 重新生成一次标题栏，把接管/切换入口补上。
   const current = typeof cache !== 'undefined' ? cache.get(viewKey(S.sel, S.agent)) : null;
   const oldHead = $('#detail > .dhead');
-  if (T.enabled && current && oldHead && !S.agent && !oldHead.querySelector('#a-term')) {
+  if (sessionTerminalEnabled(S.sel) && current && oldHead && !S.agent && !oldHead.querySelector('#a-term')) {
     oldHead.replaceWith(head(current.meta, messageCount(current.msgs)));
   }
   const after = fingerprint();
@@ -287,7 +288,7 @@ async function loadTermList() {
     paintLive();
   }
   // 刷新页面后仍从持久化 meta 恢复关联轮询；Set 防止重复启动。
-  for (const pending of pendingTmuxSessions()) resolveNewSession(pending);
+  for (const pending of pendingTmuxSessions()) if (!pending.stale) resolveNewSession(pending);
   restoreTermPane(S.sel, S.agent);
 }
 
@@ -321,7 +322,7 @@ function linkedTermSession(uid) {
   // 优先保留普通会话的叶子名，再用 root_sid 追溯回同一 pane。
   const ids = [...new Set([session.sid, session.root_sid].filter(Boolean))];
   for (const sid of ids) {
-    const name = `agenthub-${session.source}-${String(sid).slice(0, 8)}`;
+    const name = (session.node_id ? session.node_id + '~' : '') + `agenthub-${session.source}-${String(sid).slice(0, 8)}`;
     const pane = panes.find(x => x.name === name);
     if (pane) return { name, uid: pane.uid || uid };
   }
@@ -499,6 +500,7 @@ $('#bug-report-form').onsubmit = async event => {
   try {
     const terminalName = takenOver(S.sel) || (T.uid === S.sel ? T.name : '') || '';
     const d = await post('api/bug-report', {
+      ...(HUB_MODE ? {_node: nodeOf(S.sel) || selectedNodeIds()[0]} : {}),
       description, uid: S.sel || '', page_id: TERM_PAGE_ID,
       terminal_name: terminalName, snapshot,
       cols: Math.max(80, T.term?.cols || 120), rows: Math.max(24, T.term?.rows || 36),
@@ -530,6 +532,7 @@ function suggestedSessionDir(cwd) {
 function commonSessionDirs() {
   const dirs = new Map();
   for (const s of S.sessions) {
+    if (HUB_MODE && s.node_id !== newNodeId()) continue;
     const cwd = String(s.cwd || '');
     if (!suggestedSessionDir(cwd)) continue;
     const row = dirs.get(cwd) || { cwd, count: 0, updated: '' };
@@ -537,13 +540,14 @@ function commonSessionDirs() {
     if ((s.updated || '') > row.updated) row.updated = s.updated || '';
     dirs.set(cwd, row);
   }
-  for (const [i, cwd] of store.get('newDirs', []).entries()) {
+  for (const [i, cwd] of store.get(newDirsKey(), []).entries()) {
     if (!cwd?.startsWith('/')) continue;
     const row = dirs.get(cwd) || { cwd, count: 0, updated: '' };
     row.recent = 20 - i;
     dirs.set(cwd, row);
   }
-  if (T.home && !dirs.has(T.home)) dirs.set(T.home, { cwd: T.home, count: 0, updated: '' });
+  const home = newNodeCapabilities().home;
+  if (home && !dirs.has(home)) dirs.set(home, { cwd: home, count: 0, updated: '' });
   return [...dirs.values()].sort((a, b) =>
     (b.recent || 0) - (a.recent || 0) || b.count - a.count
     || b.updated.localeCompare(a.updated) || a.cwd.localeCompare(b.cwd));
@@ -813,18 +817,9 @@ function scheduleCwdCompletions() {
 function openNewSessionDialog() {
   const dialog = $('#new-session-dialog');
   closeCwdPicker();
-  const rows = commonSessionDirs();
-  cwdCompletion.common = rows;
-  for (const input of dialog.querySelectorAll('input[name="new-source"]')) {
-    input.disabled = !T.sources[input.value];
-  }
-  const checked = dialog.querySelector('input[name="new-source"]:checked');
-  if (!checked || checked.disabled) dialog.querySelector('input[name="new-source"]:not(:disabled)')?.click();
-  const selected = S.sessions.find(s => s.uid === S.sel)?.cwd;
-  const cwd = selected || store.get('newDirs', [])[0] || rows[0]?.cwd || T.home || '';
-  $('#new-cwd').value = cwd;
-  $('#new-session-error').textContent = '';
-  $('#new-session-go').disabled = false;
+  newCreateAttempt = null;
+  prepareNewNode();
+  refreshNewNodeFields();
   dialog.showModal();
   renderCommonCwdOptions();
   setTimeout(() => { $('#new-cwd').focus(); $('#new-cwd').select(); }, 0);
@@ -854,7 +849,7 @@ function showNewSessionStage(info) {
         aria-label="报告当前会话问题">${uiIcon('bug')}</button>
       <button class="iconbtn danger" id="a-session-action" title="停止会话" aria-label="停止会话">${uiIcon('power')}</button>
     </div></div>
-    <div class="dmeta"><span class="meta-source">${esc(src.name)}</span><span id="mcount-total">0 条消息</span>
+    <div class="dmeta">${info.node_name ? `<span class="meta-node">${esc(info.node_name)}</span>` : ''}<span class="meta-source">${esc(src.name)}</span><span id="mcount-total">0 条消息</span>
       <span id="dlive" class="dlive on tmux" title="运行于 tmux" aria-label="运行于 tmux">●</span>
       <span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>
   </div><div class="empty new-session-wait">终端已启动，正在等待会话记录落盘…</div>`;
@@ -949,6 +944,7 @@ async function resolveNewSession(info) {
         const response = await fetch(appUrl(`api/term/new-status?name=${encodeURIComponent(info.name)}`),
           { signal: controller.signal });
         d = await response.json();
+        if (HUB_MODE && response.status >= 500) continue;
       } catch {
         if (controller.signal.aborted) return;
         continue;
@@ -994,6 +990,15 @@ async function resolveNewSession(info) {
   }
 }
 
+let newCreateAttempt = null;
+function newSessionRequestId(source, cwd) {
+  const key = JSON.stringify([newNodeId(), source, cwd]);
+  if (newCreateAttempt?.key !== key) newCreateAttempt = {key,
+    rows: termRows(),
+    id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`};
+  return newCreateAttempt.id;
+}
+
 async function createNewSession(e) {
   e.preventDefault();
   const source = $('#new-session-dialog input[name="new-source"]:checked')?.value;
@@ -1004,8 +1009,11 @@ async function createNewSession(e) {
   if (!cwd) { error.textContent = '请选择启动目录'; return; }
   go.disabled = true;
   go.textContent = '创建中…';
+  const dirsKey = newDirsKey();
   try {
-    const request = { source, cwd, cols: 120, rows: termRows() };
+    const requestId = newSessionRequestId(source, cwd);
+    const request = { source, cwd, cols: 120, rows: newCreateAttempt.rows,
+      request_id: requestId, ...(HUB_MODE ? {_node: newNodeId()} : {}) };
     let d = await post('api/term/create', request);
     if (d.needs_create) {
       const target = String(d.cwd || cwd);
@@ -1017,8 +1025,8 @@ async function createNewSession(e) {
       d = await post('api/term/create', { ...request, cwd: target, create_cwd: true });
     }
     if (d.error) { error.textContent = d.error; return; }
-    const recent = [d.cwd, ...store.get('newDirs', []).filter(x => x !== d.cwd)].slice(0, 8);
-    store.set('newDirs', recent);
+    const recent = [d.cwd, ...store.get(dirsKey, []).filter(x => x !== d.cwd)].slice(0, 8);
+    store.set(dirsKey, recent);
     $('#new-session-dialog').close();
     showNewSessionStage(d);
     await loadTermList();
@@ -1457,7 +1465,7 @@ function rememberTermOpen(name, open) {
 }
 
 function restoreTermPane(uid, agent = null) {
-  if (!uid || agent || S.sel !== uid || !T.enabled || !$('#a-term')) return;
+  if (!uid || agent || S.sel !== uid || !sessionTerminalEnabled(uid) || !$('#a-term')) return;
   const name = takenOver(uid);
   if (!name || !T.openViews.has(name)) return;
   T.uid = uid;
@@ -2138,7 +2146,7 @@ function switchComposerDraft(uid) {
 }
 
 function renderComposer() {
-  const name = T.enabled ? takenOver(S.sel) : null;
+  const name = sessionTerminalEnabled(S.sel) ? takenOver(S.sel) : null;
   const box = $('#composer');
   box.classList.toggle('hidden', !name);
   switchComposerDraft(name ? S.sel : null);

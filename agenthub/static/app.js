@@ -9,11 +9,11 @@ const SOURCES = Object.freeze(Object.fromEntries(
 const store = {
   get(k, d) {
     try {
-      const v = localStorage.getItem('agenthub.' + k);
+      const v = localStorage.getItem(STORAGE_PREFIX + k);
       return v === null ? d : JSON.parse(v);
     } catch { return d; }
   },
-  set: (k, v) => localStorage.setItem('agenthub.' + k, JSON.stringify(v)),
+  set: (k, v) => localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)),
 };
 
 // 存储结构的版本只由公共层调度；每种 CLI 自己决定怎样迁移旧队列。
@@ -104,11 +104,16 @@ const DEBUG_RUN = /^[A-Za-z0-9_-]{1,64}$/.test(
 // 深链：?sid=<source>:<sid> 或 ?sid=<sid>，打开指定会话（labdesk 的会话台账用它跳过来）。
 // 用 CLI 原生会话号而不是 uid —— uid 是会话文件路径的散列，换目录就变。
 const DEEP_SID = (new URLSearchParams(location.search).get('sid') || '').trim().slice(0, 128);
+const DEEP_NODE = new URLSearchParams(location.search).get('node') || '';
 const appUrl = path => {
   const url = new URL(String(path).replace(/^\//, ''), APP_BASE);
   if (DEBUG_RUN && url.pathname.includes('/api/')) {
     url.searchParams.set('debug_run', DEBUG_RUN);
   }
+  if (HUB_MODE && !url.searchParams.has('nodes') && /\/api\/(search|trash|trash\/purge)$/.test(url.pathname)) {
+    url.searchParams.set('nodes', selectedNodeIds().join(','));
+  }
+  if (HUB_MODE && url.pathname.endsWith('/api/term/complete-dir')) url.searchParams.set('node', newNodeId());
   return url.toString();
 };
 const BUILD_ID = document.querySelector('meta[name="agenthub-build"]')?.content || '';
@@ -1382,6 +1387,7 @@ setInterval(tickSync, TICK_MS);
 // ---- 活跃会话 ----
 async function refreshLive(force = false) {
   const d = await (await fetch(appUrl('api/live' + (force ? '?force=1' : '')))).json();
+  applyNodeState(d, 'live');
   const next = new Set(d.uids);
   const nextTmux = new Set((d.tmux_uids || []).filter(u => next.has(u)));
   const nextStarted = new Map(Object.entries(d.started_at || {}).map(([u, t]) => [u, +t]));
@@ -1419,7 +1425,7 @@ async function pollLive(force = false) {
 function paintLive() {
   for (const n of document.querySelectorAll('.item')) {
     const pendingRunning = n.dataset.tmuxName
-      && typeof T !== 'undefined' && T.list?.some(t => t.name === n.dataset.tmuxName);
+      && typeof T !== 'undefined' && T.list?.some(t => t.name === n.dataset.tmuxName && !t.stale);
     n.classList.toggle('live', !!pendingRunning || S.live.has(n.dataset.uid));
     n.classList.toggle('live-tmux', !!pendingRunning || S.liveTmux.has(n.dataset.uid));
     paintItemStatus(n);
@@ -1488,6 +1494,7 @@ document.addEventListener('visibilitychange', () => {
 
 // ---------------------------------------------------------------- 数据加载
 function showSessionCount(n) {
+  if (HUB_MODE) n = sidebarSessions().filter(nodeSelected).length;
   $('#stat').innerHTML = `${n}<span class="stat-unit"> 个会话</span>`;
 }
 
@@ -1498,9 +1505,10 @@ function pendingTmuxSessions() {
   if (typeof T === 'undefined' || !Array.isArray(T.pending)) return [];
   return T.pending.flatMap(t => {
     if (!SOURCES[t.source] || (t.sid && S.sessions.some(s =>
-      s.source === t.source && String(s.sid) === String(t.sid)))) return [];
+      s.source === t.source && s.node_id === t.node_id && String(s.sid) === String(t.sid)))) return [];
     const source = t.source;
     return [{
+      node_id: t.node_id, node_name: t.node_name, stale: t.stale,
       uid: pendingUid(t.name), pending: true, name: t.name, tmuxName: t.name, source,
       title: t.title || `新建 ${SOURCES[source].name} 会话`,
       kind: t.kind || '', report_id: t.report_id || '', cwd: t.cwd || '(未知)',
@@ -1682,6 +1690,7 @@ async function loadSessions(force) {
   const seedCursors = S.cursors.size === 0;
   S.sig = d.sig;
   S.sessions = d.sessions;
+  applyNodeState(d, 'sessions');
   refreshSessionMeta();
   renderChips();
   renderSide();
@@ -1695,9 +1704,11 @@ async function pollSessions() {
   if (document.hidden || !S.sig) return;
   try {
     const d = await (await fetch(appUrl('api/sessions?sig=' + encodeURIComponent(S.sig)))).json();
+    applyNodeState(d, 'sessions');
     if (d.unchanged || !d.sessions) return;
     S.sig = d.sig;
     S.sessions = d.sessions;
+    renderNodes();
     refreshSessionMeta();
     renderChips();
     syncSidebarUpdates(d.sessions);
@@ -1722,10 +1733,10 @@ setInterval(pollSessions, LIST_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSessions(); });
 
 function visible() {
-  let pool = (S.results || sidebarSessions()).filter(s => !S.off.has(s.source));
+  let pool = (S.results || sidebarSessions()).filter(s => !S.off.has(s.source) && nodeSelected(s));
   if (S.activeOnly) pool = pool.filter(s => s.pending || S.live.has(s.uid));
   if (!S.term || S.results) return pool;          // 搜索态下服务端已经筛过
-  return pool.filter(s => hasTerm(s.title) || hasTerm(s.cwd));
+  return pool.filter(s => hasTerm(s.title) || hasTerm(s.cwd) || hasTerm(s.node_name || ''));
 }
 
 // ---------------------------------------------------------------- 左栏
@@ -2059,7 +2070,7 @@ function renderChips() {
     if (!wanted.has(old.dataset.source)) old.remove();
   }
   for (const [k, v] of Object.entries(SOURCES)) {
-    const n = sidebarSessions().filter(s => s.source === k).length;
+    const n = sidebarSessions().filter(s => s.source === k && nodeSelected(s)).length;
     let c = box.querySelector(`:scope > .chip[data-source="${CSS.escape(k)}"]`);
     if (c && c.tagName !== 'BUTTON') { c.remove(); c = null; }
     if (!c) {
@@ -2070,6 +2081,7 @@ function renderChips() {
         S.off.has(k) ? S.off.delete(k) : S.off.add(k);
         store.set('off', [...S.off]);
         renderChips(); renderSide();
+        if (HUB_MODE && S.results !== null) void runSearch();
       };
       box.appendChild(c);
     }
@@ -2083,7 +2095,7 @@ function renderChips() {
 function groupBy(list) {
   const m = new Map();
   for (const s of list) {
-    const k = S.view === 'tree' ? (s.cwd || '(未知)') : dayKey(s.updated);
+    const k = S.view === 'tree' ? (s.node_id ? JSON.stringify([s.node_id, s.cwd || '(未知)']) : (s.cwd || '(未知)')) : dayKey(s.updated);
     if (!m.has(k)) m.set(k, []);
     m.get(k).push(s);
   }
@@ -2102,11 +2114,11 @@ function groupBy(list) {
   return keys.map(k => [k, m.get(k)]);
 }
 
-const itemMeta = s => s.pending ? `${fmtTime(s.updated)} · 等待首条消息`
+const itemMeta = s => (s.stale ? '离线缓存 · ' : '') + (s.pending ? `${fmtTime(s.updated)} · 等待首条消息`
   : [fmtTime(s.updated), fmtSize(s.size), s.model || '',
                        s.agents ? `⑂${s.agents}` : '',
                        s.hits ? `命中 ${s.hits}${s.hits_capped ? '+' : ''}` : '']
-                      .filter(Boolean).join(' · ');
+                      .filter(Boolean).join(' · '));
 
 /** 就地更新左栏, 成功返回 true。
  *
@@ -2160,7 +2172,7 @@ function renderSide() {
   for (const [key, items] of groupBy(list)) {
     const g = el('div', 'group' + (S.closed.has(key) ? ' closed' : ''));
     g.dataset.key = key;
-    const label = S.view === 'tree' ? shortCwd(key, 999) : key;   // 分组标题不缩写, 只换 ~
+    const label = S.view === 'tree' ? nodeDirectory(items[0]) : key;   // 分组标题不缩写, 只换 ~
     const groupUids = items.filter(x => !x.pending).map(x => x.uid);
     const head = el('div', 'ghead',
       `${S.picking ? `<input type="checkbox" class="ghead-pick"
@@ -2185,7 +2197,7 @@ function renderSide() {
       const meta = itemMeta(s);
       const pickable = S.picking && !s.pending;
       const it = el('div', 'item' + (S.sel === s.uid ? ' sel' : '')
-                              + (s.pending ? ' pending live live-tmux' : '')
+                              + (s.pending ? (s.stale ? ' pending' : ' pending live live-tmux') : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
                               + (!s.pending && S.liveTmux.has(s.uid) ? ' live-tmux' : '')
                               + (pickable && picked.has(s.uid) ? ' picked' : ''),
@@ -2196,7 +2208,7 @@ function renderSide() {
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
            <div class="m">${esc(meta)}</div>
            ${S.view === 'date'
-             ? `<div class="cwd" title="${esc(s.cwd)}">${esc(shortCwd(s.cwd))}</div>` : ''}
+             ? `<div class="cwd" title="${esc(s.cwd)}">${esc(nodeDirectory(s, 60))}</div>` : ''}
            ${s.snippet ? `<div class="snip">${hl(s.snippet)}</div>` : ''}
          </div>
          ${s.pending ? '' : starButtonMarkup(s.uid, !!s.starred, 'item-star')}`);
@@ -2663,7 +2675,7 @@ function head(m, total) {
           aria-label="${S.compactTurns ? '展开所有过程' : '折叠已完成过程'}"
           aria-pressed="${!S.compactTurns}">${uiIcon('process')}</button>
         ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
-          (!m.agent_id && typeof T !== 'undefined' && T.enabled)
+          (!m.agent_id && sessionTerminalEnabled(m.uid))
             ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
         <button class="iconbtn" data-report-bug title="报告当前会话问题"
           aria-label="报告当前会话问题">${uiIcon('bug')}</button>
@@ -2674,6 +2686,7 @@ function head(m, total) {
       </div>
     </div>
     <div class="dmeta">
+      ${m.node_name ? `<span class="meta-node">${esc(m.node_name)}</span>` : ''}
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       <span id="mcount-total">${total} 条消息</span>
       <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}"
@@ -2682,7 +2695,7 @@ function head(m, total) {
       <span class="meta-secondary">${fmtSize(m.size)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
-      <span class="meta-secondary"><code>${esc(m.cwd)}</code></span>
+      <span class="meta-secondary"><code>${esc(nodeDirectory(m))}</code></span>
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
@@ -3778,6 +3791,7 @@ function groupNode(items, initiallyOpen = false) {
 function safeMediaSrc(src) {
   src = String(src || '');
   if (/^\/api\/media\/[0-9a-f]{32}$/.test(src)) return appUrl(src);
+  if (HUB_MODE && /^\/api\/nodes\/[0-9a-f]{32}\/api\/media\/[0-9a-f]{32}$/.test(src)) return appUrl(src);
   if (!/^https?:\/\//i.test(src)) return '';
   try {
     const u = new URL(src);
@@ -4456,6 +4470,7 @@ MOBILE.addEventListener?.('change', e => {
 
 $('#q').oninput = e => {
   if (S.results) { S.results = null; }     // 改动输入即退出全文搜索态
+  if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
   S.term = e.target.value.trim();
   renderSide();
 };
@@ -4526,6 +4541,7 @@ async function runSearch() {
     return;
   }
   const p = new URLSearchParams({ q });
+  if (HUB_MODE) p.set('source', Object.keys(SOURCES).filter(x => !S.off.has(x)).join(','));
   for (const k of ['case', 'word', 'regex']) if (S.opts[k]) p.set(k, '1');
   const ac = searchAbort = new AbortController();
   searchProgress(0, 0);
@@ -4540,6 +4556,7 @@ async function runSearch() {
   searchAbort = null;
   searchProgressDone();
   const { ok, data: d } = response;
+  applyNodeState(d, 'search');
   if (!ok) {                       // 兜底: 前端漏判的非法模式或网络失败
     S.results = [];
     $('#stat').textContent = ' ' + (d.error || '搜索失败');
@@ -4579,6 +4596,7 @@ $('#reload').onclick = () => { S.results = null; loadSessions(true); };
 // 看还剩什么、放回原处、或者真的删掉。
 let trashItems = [];
 let trashBusy = false;
+let trashScope = [];
 
 function openTrash() {
   const dlg = $('#trash-dialog');
@@ -4590,9 +4608,12 @@ async function loadTrash({ keepNote = false } = {}) {
   if (!keepNote) setTrashNote('');   // 刷新列表不能把刚做完那件事的回执抹掉
   $('#trash-list').innerHTML = '<div class="trash-empty">正在读取回收站…</div>';
   try {
-    const r = await fetch(appUrl('api/trash'));
+    const scope = selectedNodeIds();
+    const r = await fetch(appUrl('api/trash' + (HUB_MODE ? '?nodes=' + scope.join(',') : '')));
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || r.status);
+    applyNodeState(d, 'trash');
+    trashScope = scope;
     trashItems = Array.isArray(d.items) ? d.items : [];
     renderTrash(d);
     return true;
@@ -4627,7 +4648,7 @@ function trashRow(it) {
       <div class="trash-meta">
         <span>${esc(fmtTime(it.deleted_at))} 删除</span>
         <span>${fmtSize(it.size)}</span>
-        <span class="trash-cwd" title="${esc(it.cwd)}">${esc(shortCwd(it.cwd || '(未知)', 34))}</span>
+        <span class="trash-cwd" title="${esc(it.cwd)}">${esc(nodeDirectory(it, 34))}</span>
       </div>
       ${where}
     </div>
@@ -4691,7 +4712,8 @@ $('#trash-list').onclick = async e => {
 async function purgeAllTrash() {
   if (!trashItems.length || trashBusy) return;
   if (!confirm(`清空回收站?\n\n将从磁盘彻底删除 ${trashItems.length} 个会话, 不可恢复。`)) return;
-  const d = await trashPost('api/trash/purge', { all: true }, $('#trash-purge-all'));
+  const d = await trashPost('api/trash/purge' + (HUB_MODE ? '?nodes=' + trashScope.join(',') : ''),
+    { all: true }, $('#trash-purge-all'));
   if (!d) return;
   const failed = (d.errors || []).length;
   if (await loadTrash({ keepNote: true })) {
@@ -4746,7 +4768,8 @@ function uidOfDeepLink(spec) {
   const cut = spec.indexOf(':');
   const source = cut > 0 ? spec.slice(0, cut) : null;
   const sid = cut > 0 ? spec.slice(cut + 1) : spec;
-  const hit = S.sessions.find(s => s.sid === sid && (!source || s.source === source))
+  const matches = S.sessions.filter(s => s.sid === sid && (!source || s.source === source) && (!DEEP_NODE || s.node_id === DEEP_NODE));
+  const hit = (matches.length === 1 ? matches[0] : null)
     || S.sessions.find(s => s.uid === spec);
   return hit ? hit.uid : null;
 }

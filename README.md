@@ -2,6 +2,10 @@
 
 Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务。后端只用 Python 标准库；前端为原生 JS，KaTeX 与 xterm.js 静态内置，无在线依赖和构建步骤。
 
+支持多机器聚合：在 hub-host 运行 `python3 -m agenthub.hub`，注册各机器的 AgentHub，
+统一筛选机器、搜索和管理会话；本地 Web 仍可独立运行。部署与协议说明见
+[多机器架构](docs/multi-node.md)。中央入口需放在已有登录鉴权的反代后。
+
 ## 启动
 
 ```bash

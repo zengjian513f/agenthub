@@ -4,12 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <meta name="agenthub-build" content="__AGENTHUB_ASSET_VERSION__">
+<meta name="agenthub-mode" content="__AGENTHUB_MODE__">
 <title>__AGENTHUB_HOSTNAME__ · 会话管理</title>
 <script>
   // 在样式表加载前确定明暗，避免刷新时先闪出另一套颜色。
   (() => {
     let choice = 'system';
-    try { choice = JSON.parse(localStorage.getItem('agenthub.theme')) || 'system'; } catch {}
+    const prefix = document.querySelector('meta[name="agenthub-mode"]')?.content === 'hub'
+      ? `agenthub.hub.${location.pathname}.` : 'agenthub.';
+    try { choice = JSON.parse(localStorage.getItem(prefix + 'theme')) || 'system'; } catch {}
     document.documentElement.dataset.theme = choice === 'system'
       ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : choice;
   })();
@@ -111,6 +114,8 @@
       </button>
     </div>
   </header>
+  <div id="node-chips" hidden aria-label="机器筛选"></div>
+  <div id="node-notice" hidden role="status"></div>
   <div id="prog"><div class="bar"></div><span class="txt"></span></div>
   <main>
     <div id="left">
@@ -200,6 +205,7 @@
       <div><h2 id="new-session-title">新建会话</h2><p>选择会话类型和启动目录</p></div>
       <button type="button" class="modal-close" title="关闭" aria-label="关闭">×</button>
     </div>
+    <label id="new-node-label" hidden>机器<select id="new-node"></select></label>
     <fieldset class="new-source">
       <legend>会话类型</legend>
       <label><input type="radio" name="new-source" value="claude" checked><span><svg class="ico"><use href="#i-claude"/></svg>Claude</span></label>
@@ -304,6 +310,7 @@
 <div id="bug-report-toast" class="bug-report-toast hidden" role="status" aria-live="polite"></div>
 <!-- 列表是首屏核心，必须先执行；终端和公式库较大，延后加载且不能阻塞扫描。 -->
 <script defer src="cli.js?v=__AGENTHUB_ASSET_VERSION__"></script>
+<script defer src="nodes.js?v=__AGENTHUB_ASSET_VERSION__"></script>
 <script defer src="app.js?v=__AGENTHUB_ASSET_VERSION__"></script>
 <script defer src="vendor/xterm.js"></script>
 <script defer src="vendor/addon-fit.js"></script>
