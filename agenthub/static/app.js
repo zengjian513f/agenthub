@@ -1453,10 +1453,8 @@ function paintLive() {
     const pending = pendingTmuxSessions().length;
     const tmux = S.liveTmux.size + pending, direct = Math.max(0, S.live.size - S.liveTmux.size);
     const total = direct + tmux;
-    c.innerHTML = total
-      ? `${direct ? `<span class="live-direct">● ${direct}</span>` : ''}`
-        + `${tmux ? `<span class="live-tmux-count">● ${tmux}</span>` : ''}`
-      : '<span class="live-direct">● 0</span>';
+    c.innerHTML = `<span class="live-direct">● ${direct}</span>`
+      + `<span class="live-tmux-count">● ${tmux}</span>`;
     c.setAttribute('aria-label', `${total} 个活动会话；${S.activeOnly ? '正在只显示活动会话' : '点击只显示活动会话'}`);
     c.setAttribute('aria-pressed', String(S.activeOnly));
     c.title = S.activeOnly ? '显示全部会话' : '只显示活动会话';

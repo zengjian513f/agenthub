@@ -57,9 +57,9 @@ def main():
                 check_toolbar()
                 page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-desktop.png')
                 # Single/multi node filters and independent Agent Type intersection.
-                page.get_by_role('button', name='● NodeB 1', exact=True).dblclick()
+                page.get_by_role('button', name='NodeB 1', exact=True).dblclick()
                 page.wait_for_function('visible().length === 1')
-                page.get_by_role('button', name='● NodeA 1', exact=True).click()
+                page.get_by_role('button', name='NodeA 1', exact=True).click()
                 page.wait_for_function('visible().length === 2')
                 page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
                 page.wait_for_function('S.results?.length === 2')
