@@ -6,6 +6,9 @@ Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务
 统一筛选机器、搜索和管理会话；本地 Web 仍可独立运行。部署与协议说明见
 [多机器架构](docs/multi-node.md)。中央入口需放在已有登录鉴权的反代后。
 
+开发与发布遵循 [AGENTS.md](AGENTS.md)。影响线上行为的更新需同步中央站及相关节点，
+不能以本机更新或 GitHub 推送代替部署；目标、步骤与验证见 [生产更新说明](docs/deployment.md)。
+
 ## 启动
 
 ```bash
@@ -403,11 +406,11 @@ systemctl --user enable --now agenthub-tmux.service agenthub.service
 
 ### hub-host 反向代理
 
-NodeA 入口为 `https://node-a.example.com/agenthub/`，NodeB 入口为
+中央聚合入口为 `https://hub.example.com/agenthub/`，由 ECS 上的 `agenthub-hub.service`
+提供页面并代理各节点 API。NodeA 独立入口为 `https://node-a.example.com/agenthub/`，NodeB 入口为
 `https://hub.example.com/agenthub-node-b/`。页面资源、API、SSE 和 WebSocket 都使用当前页面的
 相对基路径，因此根目录直连和反向代理子路径可以同时工作。
 
-- 本机服务由 [`deploy/agenthub.service`](deploy/agenthub.service) 托管，只允许局域网管理端和 WireGuard 对端 `10.0.0.1`。
-- UFW 仅放行 `wg0` 上 `10.0.0.1 → 10.0.0.2:8710/tcp`。
-- ECS 使用 [`deploy/nginx-agenthub.conf`](deploy/nginx-agenthub.conf) 反代，并复用 `snippets/auth.conf` 的 hub-host 统一鉴权。
+- 本机服务由 [`deploy/agenthub.service`](deploy/agenthub.service) 托管，通过本机白名单和节点凭据控制访问；保留各机器已有的局域网和 WireGuard 配置。
+- 中央反代示例见 [`deploy/nginx-agenthub-hub.conf`](deploy/nginx-agenthub-hub.conf)，独立节点反代示例见 [`deploy/nginx-agenthub.conf`](deploy/nginx-agenthub.conf)，均复用 `snippets/auth.conf` 的 hub-host 统一鉴权。
 - Nginx 关闭代理缓冲并保留 Upgrade 头，以支持会话推送和 tmux WebSocket。
