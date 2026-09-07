@@ -168,11 +168,22 @@ class HubHTTPTests(unittest.TestCase):
                 self.registry.validate_url(url)
         _, data = self.call('/api/nodes')
         self.assertNotIn(self.a.state['token'], json.dumps(data))
+        self.assertTrue(all('url' not in node for node in data['nodes']))
         self.assertEqual(self.registry.path.stat().st_mode & 0o777, 0o600)
         bad_token = 'sensitive-' * 6 + '\ninvalid'
-        status, error = self.call('/api/nodes', {'name': 'bad', 'url': 'http://127.0.0.1', 'token': bad_token})
-        self.assertEqual(status, 400)
-        self.assertNotIn('sensitive', json.dumps(error))
+        with self.assertRaises(ValueError) as caught:
+            self.registry.register({'name': 'bad', 'url': 'http://127.0.0.1', 'token': bad_token})
+        self.assertNotIn('sensitive', str(caught.exception))
+
+    def test_machine_management_is_not_exposed_over_http(self):
+        before = self.registry.all()
+        status, _ = self.call('/api/nodes', {'name': 'Changed',
+            'url': before[0]['url'], 'token': before[0]['token']})
+        self.assertEqual(status, 405)
+        status, _ = self.call('/api/nodes/' + before[0]['id'], method='DELETE')
+        self.assertEqual(status, 405)
+        self.assertEqual(self.registry.all(), before)
+
 
 
 if __name__ == '__main__':

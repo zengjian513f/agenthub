@@ -43,6 +43,18 @@ def main():
                 assert page.locator('.ghead').count() == 3
                 assert all(name in page.locator('#side').inner_text() for name in ['NodeA', 'NodeB', 'Vega'])
                 assert len(set(page.evaluate('S.sessions.map(s => s.uid)'))) == 3
+                def check_toolbar():
+                    styles = page.evaluate("""() => ['#node-chips','#chips','#view'].map(q=>{
+                      const group=document.querySelector(q), r=group.getBoundingClientRect();
+                      const s=getComputedStyle(group.querySelector('button.on'));
+                      return {top:r.top,height:r.height,background:s.backgroundColor,
+                        radius:getComputedStyle(group).borderRadius,buttonHeight:s.height};
+                    })""")
+                    assert max(r['top'] for r in styles)-min(r['top'] for r in styles) < 1, styles
+                    assert all(r == styles[0] for r in styles), styles
+                    assert page.locator('header #node-chips').count() == 1
+                check_toolbar()
+                page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-desktop.png')
                 # Single/multi node filters and independent Agent Type intersection.
                 page.get_by_role('button', name='● NodeB 1', exact=True).dblclick()
                 page.wait_for_function('visible().length === 1')
@@ -99,16 +111,8 @@ def main():
                 }''')
                 assert uploaded['name'] == 'same-name.png' and 'a' * 32 in uploaded['media']['src']
                 assert nodes[0].state['uploads'][-1][1] == bytes([0, 255, 17, 0])
-                # Machine registration is usable through the rendered management form.
-                page.get_by_role('button', name='管理机器', exact=True).click()
-                page.locator('#nodes-form [name=name]').fill('Vega renamed')
-                page.locator('#nodes-form [name=url]').fill(f'http://127.0.0.1:{nodes[2].server_port}')
-                page.locator('#nodes-form [name=token]').fill(nodes[2].state['token'])
-                page.get_by_role('button', name='注册机器', exact=True).click()
-                page.wait_for_function('Nodes.list.some(n => n.name === "Vega renamed")')
-                assert page.locator('#nodes-form [name=token]').input_value() == ''
-                assert nodes[2].state['token'] not in page.evaluate('JSON.stringify(localStorage)')
-                page.locator('#nodes-close').click()
+                assert page.locator('#nodes-dialog, #nodes-form').count() == 0
+                assert page.get_by_role('button', name='管理机器', exact=True).count() == 0
                 # Explicit node deep link resolves duplicate native IDs and survives reload.
                 deep = context.new_page()
                 deep.goto(base + '?node=' + 'b' * 32 + '&sid=claude:same-native-id')
@@ -120,14 +124,16 @@ def main():
                 nodes[2].state['offline'] = True
                 page.locator('#node-chips').get_by_role('button', name='全部', exact=True).click()
                 page.evaluate('() => loadSessions()')
-                page.wait_for_function('S.sessions.some(s => s.node_name === "Vega renamed" && s.stale)')
+                page.wait_for_function('S.sessions.some(s => s.node_name === "Vega" && s.stale)')
                 assert 'Vega' in page.locator('#node-notice').inner_text()
                 page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
                 page.wait_for_function('S.results?.length === 2')
                 # Mobile: same machine controls, no horizontal document overflow.
                 page.set_viewport_size({'width': 390, 'height': 844})
                 page.evaluate('showMobileList()')
+                check_toolbar()
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-mobile.png')
                 page.screenshot(path='/tmp/agenthub-hub-mobile.png')
                 local = context.new_page(); local.on('pageerror', lambda e: errors.append(str(e)))
                 local.goto(f'http://127.0.0.1:{nodes[0].server_port}')

@@ -158,7 +158,7 @@ class Registry:
 
     def public(self):
         with self.lock:
-            return [{"id": n["id"], "name": n["name"], "url": n["url"],
+            return [{"id": n["id"], "name": n["name"],
                      **self.health.get(n["id"], {"online": None})} for n in self.nodes]
 
 
@@ -201,11 +201,12 @@ class HubHandler(server.Handler):
             if path == "/api/nodes":
                 if self.command == "GET":
                     return self._json({"mode": "hub", "nodes": self.registry.public()})
-                if self.command == "POST":
-                    return self._json(self.registry.register(self.read_body()))
-            if self.command == "DELETE" and re.fullmatch(r"/api/nodes/[a-f0-9]{32}", path):
-                self.registry.remove(path.rsplit("/", 1)[1])
-                return self._json({"ok": True})
+                self.close_connection = True
+                return self._json({"error": "machine management is not available over HTTP"}, 405)
+            if re.fullmatch(r"/api/nodes/[a-f0-9]{32}", path):
+                self.close_connection = True
+                return self._json({"error": "machine management is not available over HTTP"},
+                                  404 if self.command == "GET" else 405)
             explicit = None
             match = re.fullmatch(r"/api/nodes/([a-f0-9]{32})(/api/.*)", path)
             if match:

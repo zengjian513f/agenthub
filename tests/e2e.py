@@ -849,20 +849,19 @@ def run(pw):
       return {brand: box('.brand'), chips: box('.chips'), view: box('#view'),
               actions: box('.header-actions'), header: box('header')};
     }""")
-    check("手机列表顶栏分为信息和操作两排",
-          abs(mobile_header["brand"]["top"] - mobile_header["chips"]["top"]) < 8
-          and mobile_header["view"]["top"] > mobile_header["brand"]["top"]
-          and abs(mobile_header["view"]["top"] - mobile_header["actions"]["top"]) < 4
+    check("手机筛选与视图在第一排，信息和操作在第二排",
+          abs(mobile_header["chips"]["top"] - mobile_header["view"]["top"]) < 1
+          and mobile_header["brand"]["top"] > mobile_header["view"]["top"]
+          and abs(mobile_header["brand"]["top"] - mobile_header["actions"]["top"]) < 4
           and mobile_header["header"]["height"] >= 70,
           mobile_header)
-    check("手机顶栏显示机器名、会话单位和视图文字",
+    check("手机顶栏保留机器名、会话数量和视图按钮标签",
           p.locator(".brand-name").is_visible()
           and p.locator(".stat-unit").is_visible()
-          and p.locator(".mobile-label").evaluate_all(
-              "nodes => nodes.length === 2 && nodes.every(n => n.getClientRects().length > 0)")
+          and p.locator('#view button[aria-label="项目树"]').is_visible()
+          and p.locator('#view button[aria-label="时间轴"]').is_visible()
           and p.locator(".brand-name").inner_text().strip() not in {"", "__AGENTHUB_HOSTNAME__"}
-          and "个会话" in p.locator("#stat").inner_text()
-          and p.locator(".mobile-label").all_inner_texts() == ["项目树", "时间轴"])
+          and "个会话" in p.locator("#stat").inner_text())
     brand_style = p.locator(".brand-name").evaluate("""n => {
       const s = getComputedStyle(n);
       return {background:s.backgroundImage, family:s.fontFamily,

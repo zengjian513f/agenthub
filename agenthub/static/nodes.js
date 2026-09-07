@@ -33,17 +33,16 @@ function renderNodes() {
   const host = document.querySelector('#node-chips');
   if (!host) return;
   const scroll = host.scrollLeft;
+  const toolbarScroll = host.parentElement.scrollLeft;
   host.hidden = false;
   host.replaceChildren();
-  const label = document.createElement('span');
-  label.textContent = '机器';
-  host.appendChild(label);
   const button = (text, on, click, title = '') => {
     const b = document.createElement('button');
-    b.type = 'button'; b.className = 'btn' + (on ? ' on' : '');
+    b.type = 'button'; b.className = on ? 'on' : '';
     b.textContent = text; b.title = title;
     b.setAttribute('aria-pressed', String(on)); b.onclick = click;
     host.appendChild(b);
+    return b;
   };
   const change = () => {
     store.set('nodesOff', [...Nodes.off]);
@@ -54,22 +53,27 @@ function renderNodes() {
   button('全部', Nodes.list.every(n => !Nodes.off.has(n.id)), () => { Nodes.off.clear(); change(); });
   for (const n of Nodes.list) {
     const count = S.sessions.filter(s => s.node_id === n.id).length;
-    button(`${n.online === false ? '○' : n.online === true ? '●' : '◌'} ${n.name} ${count}`,
+    const item = button(`${n.online === false ? '○' : n.online === true ? '●' : '◌'} ${n.name} ${count}`,
       !Nodes.off.has(n.id), e => { Nodes.off.has(n.id) ? Nodes.off.delete(n.id) : Nodes.off.add(n.id); change(); },
       n.online === false ? '离线；列表可能是缓存，运行状态未知' : '点击选择或取消；双击只选这台机器');
-    host.lastChild.ondblclick = () => {
+    const countLabel = document.createElement('b');
+    countLabel.className = 'node-count'; countLabel.textContent = count;
+    item.textContent = `${n.online === false ? '○' : n.online === true ? '●' : '◌'} ${n.name} `;
+    item.appendChild(countLabel);
+    item.dataset.node = n.id;
+    item.ondblclick = () => {
       Nodes.off = new Set(Nodes.list.filter(x => x.id !== n.id).map(x => x.id)); change();
     };
   }
-  button('管理机器', false, openNodesDialog);
   host.scrollLeft = scroll;
+  host.parentElement.scrollLeft = toolbarScroll;
   const notice = document.querySelector('#node-notice');
   const errors = [...Nodes.errors.values()].flat().filter(e => !Nodes.off.has(e.node_id));
   const names = [...new Set(errors.map(e => e.name))];
   notice.hidden = !names.length && !!Nodes.list.length;
   notice.textContent = names.length
     ? `${names.join('、')} 请求失败或超时；当前结果可能不完整，离线机器的运行状态未知。`
-    : '还没有注册机器，点击“管理机器”添加 AgentHub。';
+    : '暂无可用机器。';
 }
 
 async function loadNodes() {
@@ -114,57 +118,8 @@ function refreshNewNodeFields() {
   renderCommonCwdOptions();
 }
 
-async function openNodesDialog() {
-  const dialog = document.querySelector('#nodes-dialog');
-  if (!dialog.open) dialog.showModal();
-  try { await loadNodes(); } catch (e) { document.querySelector('#nodes-error').textContent = e.message; }
-  const list = document.querySelector('#nodes-list');
-  list.replaceChildren();
-  for (const n of Nodes.list) {
-    const row = document.createElement('div'); row.className = 'node-entry';
-    const text = document.createElement('span'); text.textContent = `${n.name} · ${n.url}`;
-    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'btn'; remove.textContent = '移除';
-    remove.onclick = async () => {
-      if (!confirm(`移除机器「${n.name}」的注册？本机服务和会话继续保留。`)) return;
-      remove.disabled = true;
-      try {
-        const r = await fetch(appUrl(`api/nodes/${n.id}`), {method: 'DELETE'});
-        if (!r.ok) throw new Error('移除失败');
-        await openNodesDialog(); await loadSessions(); await loadTermList();
-      } catch (e) { document.querySelector('#nodes-error').textContent = e.message; }
-      finally { remove.disabled = false; }
-    };
-    row.append(text, remove); list.appendChild(row);
-  }
-}
-
 document.addEventListener('DOMContentLoaded', () => {
   if (!HUB_MODE) return;
-  const dialog = document.createElement('dialog'); dialog.id = 'nodes-dialog';
-  dialog.innerHTML = `<form id="nodes-form" class="modal-form">
-    <h2>管理机器</h2><div id="nodes-list"></div>
-    <p>添加机器；同一节点重新注册可更新名称、地址和凭据。</p>
-    <label>机器名称<input name="name" required maxlength="80" autocomplete="off"></label>
-    <label>节点地址<input name="url" required placeholder="http://10.0.0.2:8710" autocomplete="off"></label>
-    <label>节点凭据<input name="token" type="password" required minlength="32" autocomplete="new-password"></label>
-    <div id="nodes-error" role="alert"></div><div class="modal-actions">
-    <button type="button" class="btn" id="nodes-close">关闭</button><button class="btn go">注册机器</button>
-    </div></form>`;
-  document.body.appendChild(dialog);
-  document.querySelector('#nodes-close').onclick = () => { dialog.close(); dialog.querySelector('[name=token]').value = ''; };
-  dialog.querySelector('form').onsubmit = async e => {
-    e.preventDefault();
-    const form = e.target, go = form.querySelector('.go'), error = document.querySelector('#nodes-error');
-    go.disabled = true; error.textContent = '正在验证节点…';
-    try {
-      const r = await fetch(appUrl('api/nodes'), {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(Object.fromEntries(new FormData(form)))});
-      const data = await r.json(); if (!r.ok) throw new Error(data.error || '注册失败');
-      form.reset(); error.textContent = '注册成功';
-      await openNodesDialog(); await loadSessions(); await loadTermList();
-    } catch (e) { error.textContent = e.message; }
-    finally { go.disabled = false; }
-  };
   document.querySelector('#new-node').onchange = () => {
     store.set('newNode', newNodeId()); refreshNewNodeFields();
   };

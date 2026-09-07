@@ -54,14 +54,30 @@ Hub 默认只监听 `127.0.0.1:8720`，放在 hub-host **已有登录鉴权**的
    原来的单机反代入口可以继续保留。Hub 自己提供 HTML/JS/CSS，Nginx 将 API、SSE、
    WebSocket 和附件请求交给 Hub，Hub 再路由到节点。
 
-3. 登录中央页面，点“管理机器”，填写机器名称、私网 URL 和节点凭据。
-   Hub 会验证身份和协议，成功后保存为权限 `0600` 的
-   `~/.local/share/agenthub/hub-nodes.json`。节点凭据不返回浏览器、不存入 localStorage。
-   同一个节点重新注册可以改名、更新 IP 或轮换凭据；移除注册不触碰本机会话。
+3. 节点注册、改名和移除只在服务器上操作。网页不提供管理入口，HTTP 注册和删除接口返回 405；
+   公开机器列表也不返回节点连接地址。注册信息仍保存为权限 `0600` 的
+   `~/.local/share/agenthub/hub-nodes.json`，节点凭据不会发送到浏览器。
+
+   在中央服务器的 checkout 内，可以用本地管理类注册节点。凭据文件通过可信方式传到中央，
+   保持 `0600` 权限；下面的命令不输出凭据：
+
+   ```python
+   from pathlib import Path
+   from agenthub.hub import Registry
+
+   registry = Registry(Path.home() / '.local/share/agenthub/hub-nodes.json',
+                       ['127.0.0.0/8', '::1/128', '10.0.0.0/24'])
+   registry.register({'name': 'NodeA', 'url': 'http://10.0.0.2:8710',
+                      'token': Path('/可信目录/node-a-node-token').read_text().strip()})
+   # 同一节点重新注册可更新名称、地址和凭据；移除使用 registry.remove(node_id)。
+   ```
+
+   完成后执行 `systemctl --user restart agenthub-hub`，让运行中的 Hub 重新读取配置。
+   节点服务与运行中的 CLI 不受影响。
 
 ## 操作和数据边界
 
-- 顶部机器按钮支持多选，双击仅选一台，“全部”恢复所有机器；与 Agent Type 筛选取交集。
+- 顶部机器、Agent Type 和视图共用第一排分段按钮；机器按钮支持多选，双击仅选一台，“全部”恢复所有机器；与 Agent Type 筛选取交集。
 - 项目树按 `(node_id, cwd)` 分组，时间轴和详情均标注机器名称。
 - 新建弹窗明确选择机器；最近目录、目录补全、可用 CLI 都来自目标节点。
 - 列表、搜索、运行状态和回收站聚合；新建、发送、接管、停止、上传、星标和恢复在目标机器执行。
@@ -92,8 +108,6 @@ Hub 默认只监听 `127.0.0.1:8720`，放在 hub-host **已有登录鉴权**的
 ```text
 GET /api/meta                         模式、前端 build、节点协议版本
 GET /api/nodes                        机器列表（不含凭据）
-POST /api/nodes                       注册或更新（name/url/token）
-DELETE /api/nodes/<node_id>            移除注册
 GET /api/sessions[?nodes=...]          汇总列表与签名
 GET /api/search?nodes=...&q=...        汇总全文搜索
 GET /api/live                         汇总实时状态
