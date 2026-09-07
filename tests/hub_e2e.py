@@ -69,8 +69,9 @@ def main():
                     assert all(r == styles[0] for r in styles), styles
                     assert page.locator('header #node-chips').count() == 1
                     assert page.locator('#node-chips').get_by_role('button', name='全部', exact=True).count() == 0
-                    assert page.locator('#session-scope').bounding_box()['width'] == 162
-                    assert all(b.bounding_box()['width'] == 80 for b in page.locator('#session-scope button').all())
+                    assert page.locator('#session-scope').bounding_box()['width'] == 98
+                    assert all(b.bounding_box()['width'] == 48 for b in page.locator('#session-scope button').all())
+                    assert page.locator('.brand-name + #side-toggle + #session-scope').count() == 1
                 check_toolbar()
                 page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-desktop.png')
                 # Single/multi node filters and independent Agent Type intersection.

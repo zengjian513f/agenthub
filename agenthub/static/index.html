@@ -88,14 +88,14 @@
   <header>
     <div class="brand">
       <span class="brand-name" title="__AGENTHUB_HOSTNAME__">__AGENTHUB_HOSTNAME__</span>
+      <button class="btn" id="side-toggle" title="收起会话列表" aria-label="收起会话列表" aria-expanded="true">
+        <svg class="ui-icon" aria-hidden="true"><use href="#i-sidebar"/></svg>
+      </button>
       <div class="seg" id="session-scope" role="radiogroup" aria-label="会话范围">
-        <button type="button" id="livecount" role="radio" aria-checked="false" tabindex="-1" title="只显示活跃会话"><span>活跃</span><b id="session-active">0</b></button>
-        <button type="button" id="allcount" role="radio" aria-checked="true" tabindex="0" class="on" title="显示全部会话"><span>总数</span><b id="session-total">0</b></button>
+        <button type="button" id="livecount" role="radio" aria-checked="false" tabindex="-1" title="只显示活跃会话"><b id="session-active">0</b></button>
+        <button type="button" id="allcount" role="radio" aria-checked="true" tabindex="0" class="on" title="显示全部会话"><b id="session-total">0</b></button>
       </div>
     </div>
-    <button class="btn" id="side-toggle" title="收起会话列表" aria-label="收起会话列表" aria-expanded="true">
-      <svg class="ui-icon" aria-hidden="true"><use href="#i-sidebar"/></svg>
-    </button>
     <div class="header-filters">
       <div class="seg" id="node-chips" hidden role="group" aria-label="机器筛选"></div>
       <div class="seg chips" id="chips" role="group" aria-label="Agent Type 筛选"></div>
