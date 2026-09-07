@@ -1624,6 +1624,8 @@ body.dragging-v { cursor: row-resize; user-select: none; }
 }
 
 @media (max-width: 480px) {
+  header { position: relative; }
+  header .brand-name { position: absolute; top: 12px; right: 8px; max-width: calc(100% - 190px); }
   header:has(#node-chips:not([hidden])) .brand-name { display: none; }
 }
 
