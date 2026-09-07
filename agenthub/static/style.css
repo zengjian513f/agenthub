@@ -203,19 +203,27 @@ header {
 }
 
 .header-filters {
-  display: flex; align-items: center; gap: 10px; min-width: 0;
+  display: flex; align-items: center; gap: 8px; min-width: 0;
   overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain;
 }
 .header-filters::-webkit-scrollbar { display: none; }
-.seg { display: flex; flex: none; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg { display: flex; flex: none; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: var(--panel-2); }
 .seg[hidden] { display: none; }
 .seg button {
   display: inline-flex; align-items: center; justify-content: center; gap: 5px; flex: none;
-  height: 30px; border: 0; border-radius: 0; background: var(--panel-2); color: var(--text);
-  padding: 5px 12px; cursor: pointer; font: inherit; font-size: 13px; white-space: nowrap;
+  height: 30px; border: 0; border-radius: 0; background: transparent; color: var(--muted);
+  padding: 5px 9px; cursor: pointer; font: inherit; font-size: 13px; white-space: nowrap;
+  transition: background-color .12s, color .12s;
 }
-.seg button.on { background: var(--accent); color: #fff; }
-.seg b { font-weight: 500; font-size: 12px; color: inherit; opacity: .8; }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button:hover { background: var(--hover); color: var(--text); }
+.seg button.on { background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); color: var(--text); }
+.seg button.on:hover { background: color-mix(in srgb, var(--accent) 20%, var(--panel-2)); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.seg b { font-weight: 400; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.chip.off .ico { opacity: .45; }
+.node-status { font-size: 9px; color: var(--muted); }
+.on .node-status[data-online="true"] { color: var(--live-direct); }
 
 .qbox {
   flex: 1; max-width: 470px; display: flex; align-items: center; gap: 4px;
@@ -1613,6 +1621,10 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   .report-form { padding: 14px; }
   .bug-report-toast { right: 8px; bottom: max(8px, env(safe-area-inset-bottom)); }
   #new-session-form { padding: 14px; }
+}
+
+@media (max-width: 480px) {
+  header:has(#node-chips:not([hidden])) .brand-name { display: none; }
 }
 
 @media (max-width: 360px) {

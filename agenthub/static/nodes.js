@@ -50,7 +50,6 @@ function renderNodes() {
     showSessionCount(sidebarSessions().filter(nodeSelected).length);
     if (S.results !== null) void runSearch();
   };
-  button('全部', Nodes.list.every(n => !Nodes.off.has(n.id)), () => { Nodes.off.clear(); change(); });
   for (const n of Nodes.list) {
     const count = S.sessions.filter(s => s.node_id === n.id).length;
     const item = button(`${n.online === false ? '○' : n.online === true ? '●' : '◌'} ${n.name} ${count}`,
@@ -58,8 +57,10 @@ function renderNodes() {
       n.online === false ? '离线；列表可能是缓存，运行状态未知' : '点击选择或取消；双击只选这台机器');
     const countLabel = document.createElement('b');
     countLabel.className = 'node-count'; countLabel.textContent = count;
-    item.textContent = `${n.online === false ? '○' : n.online === true ? '●' : '◌'} ${n.name} `;
-    item.appendChild(countLabel);
+    const status = document.createElement('span');
+    status.className = 'node-status'; status.dataset.online = String(n.online);
+    status.textContent = n.online === false ? '○' : n.online === true ? '●' : '◌';
+    item.replaceChildren(status, document.createTextNode(` ${n.name} `), countLabel);
     item.dataset.node = n.id;
     item.ondblclick = () => {
       Nodes.off = new Set(Nodes.list.filter(x => x.id !== n.id).map(x => x.id)); change();

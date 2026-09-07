@@ -53,6 +53,7 @@ def main():
                     assert max(r['top'] for r in styles)-min(r['top'] for r in styles) < 1, styles
                     assert all(r == styles[0] for r in styles), styles
                     assert page.locator('header #node-chips').count() == 1
+                    assert page.locator('#node-chips').get_by_role('button', name='全部', exact=True).count() == 0
                 check_toolbar()
                 page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-desktop.png')
                 # Single/multi node filters and independent Agent Type intersection.
@@ -122,7 +123,8 @@ def main():
                 deep.close()
                 # Offline machine doesn't hide healthy results; local UI stays independent.
                 nodes[2].state['offline'] = True
-                page.locator('#node-chips').get_by_role('button', name='全部', exact=True).click()
+                for button in page.locator('#node-chips button[aria-pressed="false"]').all():
+                    button.click()
                 page.evaluate('() => loadSessions()')
                 page.wait_for_function('S.sessions.some(s => s.node_name === "Vega" && s.stale)')
                 assert 'Vega' in page.locator('#node-notice').inner_text()

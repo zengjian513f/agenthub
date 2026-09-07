@@ -2088,7 +2088,7 @@ function renderChips() {
     c.classList.toggle('off', S.off.has(k));
     c.classList.toggle('on', !S.off.has(k));
     c.setAttribute('aria-pressed', String(!S.off.has(k)));
-    c.querySelector('.ico').style.color = S.off.has(k) ? v.color : 'currentColor';
+    c.querySelector('.ico').style.color = v.color;
     c.querySelector(':scope > b').textContent = n;
     c.title = v.name;
     c.setAttribute('aria-label', `${v.name}，${n} 个会话`);
