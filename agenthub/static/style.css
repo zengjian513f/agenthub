@@ -1443,7 +1443,7 @@ body.dragging-v { cursor: row-resize; user-select: none; }
 .btn.go.on { background: #22c55e; color: #fff; }
 .spin { padding: 14px; color: var(--muted); font-size: 13px; }
 .ico { width: 14px; height: 14px; }
-.source-icon { width: 20px; height: 20px; flex: none; }
+.source-icon { width: 18px; height: 18px; flex: none; }
 .source-icon[data-source="claude"] {
   --source-avatar: url('avatars/dario-wef.webp');
   --avatar-size: 110%; --avatar-position: center top;
@@ -1464,12 +1464,12 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   background-repeat: no-repeat;
 }
 :root[data-tool-icons="boss"] .source-icon > use { visibility: hidden; }
-#side .item > .ico { width: 36px; height: 36px; }
-#side .item > .ico > .source-icon { width: 32px; height: 32px; }
+#side .item > .ico { width: 30px; height: 30px; }
+#side .item > .ico > .source-icon { width: 26px; height: 26px; }
 #side .item-status { right: -4px; }
 .dtitle h2 { align-items: center; }
 .dtitle h2 > .source-icon {
-  width: 32px; height: 32px; margin-top: 0;
+  width: 26px; height: 26px; margin-top: 0;
 }
 .avatar-credits { align-self: flex-end; font-size: 11px; color: var(--muted); }
 
