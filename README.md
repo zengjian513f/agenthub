@@ -2,7 +2,7 @@
 
 Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务。后端只用 Python 标准库；前端为原生 JS，KaTeX 与 xterm.js 静态内置，无在线依赖和构建步骤。
 
-支持多机器聚合：在 hub-host 运行 `python3 -m agenthub.hub`，注册各机器的 AgentHub，
+支持多机器聚合：在中央服务器运行 `python3 -m agenthub.hub`，注册各机器的 AgentHub，
 统一筛选机器、搜索和管理会话；本地 Web 仍可独立运行。部署与协议说明见
 [多机器架构](docs/multi-node.md)。中央入口需放在已有登录鉴权的反代后。
 
@@ -12,12 +12,12 @@ Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务
 ## 启动
 
 ```bash
-./run.sh                       # 0.0.0.0:8710, 放行 192.0.2.134
+./run.sh                       # 0.0.0.0:8710，默认只允许本机访问
 PORT=9000 ./run.sh             # 换端口
 ALLOW=192.0.2.134,192.0.2.147 ./run.sh   # 放行多个 IP
 ```
 
-访问：`http://192.0.2.177:8710`（本机 `http://127.0.0.1:8710`）。
+本机访问：`http://127.0.0.1:8710`。远程访问需显式设置 `ALLOW`；文档中的地址均为示例。
 
 非白名单 IP 一律 403。白名单默认包含本机回环 + `--allow` 指定的地址。
 
@@ -404,13 +404,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now agenthub-tmux.service agenthub.service
 ```
 
-### hub-host 反向代理
+### 反向代理示例
 
-中央聚合入口为 `https://hub.example.com/agenthub/`，由 ECS 上的 `agenthub-hub.service`
+以下域名和节点名称均为示例。中央聚合入口可设为 `https://hub.example.com/agenthub/`，由 `agenthub-hub.service`
 提供页面并代理各节点 API。NodeA 独立入口为 `https://node-a.example.com/agenthub/`，NodeB 入口为
 `https://hub.example.com/agenthub-node-b/`。页面资源、API、SSE 和 WebSocket 都使用当前页面的
 相对基路径，因此根目录直连和反向代理子路径可以同时工作。
 
 - 本机服务由 [`deploy/agenthub.service`](deploy/agenthub.service) 托管，通过本机白名单和节点凭据控制访问；保留各机器已有的局域网和 WireGuard 配置。
-- 中央反代示例见 [`deploy/nginx-agenthub-hub.conf`](deploy/nginx-agenthub-hub.conf)，独立节点反代示例见 [`deploy/nginx-agenthub.conf`](deploy/nginx-agenthub.conf)，均复用 `snippets/auth.conf` 的 hub-host 统一鉴权。
+- 中央反代示例见 [`deploy/nginx-agenthub-hub.conf`](deploy/nginx-agenthub-hub.conf)，独立节点反代示例见 [`deploy/nginx-agenthub.conf`](deploy/nginx-agenthub.conf)，均复用部署环境中 `snippets/auth.conf` 的统一鉴权。
 - Nginx 关闭代理缓冲并保留 Upgrade 头，以支持会话推送和 tmux WebSocket。

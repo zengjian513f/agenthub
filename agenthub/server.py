@@ -2080,7 +2080,7 @@ def main():
     ap = argparse.ArgumentParser(description="Claude/Codex/Grok 会话管理服务")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8710)
-    ap.add_argument("--allow", default="192.0.2.134",
+    ap.add_argument("--allow", default="",
                     help="除本机外允许访问的 IP 或 CIDR, 逗号分隔")
     ap.add_argument("--terminal", action="store_true",
                     help="开启 tmux 远程终端。这等于给白名单 IP 开放本机 shell, 谨慎使用")

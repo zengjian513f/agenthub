@@ -2,21 +2,26 @@
 
 ## Keep production deployments in sync
 
-- The production hub is `https://hub.example.com/agenthub/`. It serves its own
-  frontend; updating NodeA or NodeB alone does not update this website. The same
-  repository also provides both nodes' independently accessible local Web UI.
+- Read the untracked `DEPLOYMENT.local.md` for actual hosts, users, paths, and
+  network settings before deployment. Public documentation contains examples,
+  not production targets; never deploy to the example addresses. If local details
+  are missing, obtain the target information instead of guessing.
+- The central hub serves its own frontend; updating a node alone does not update
+  it. The same repository also provides independently accessible local Web UIs.
 - Unless the user explicitly limits a task to design, review, or local work,
   completing a production-facing fix includes validation, committing and pushing
   the intended changes to GitHub, deploying to every affected target, and checking
   the running result. This is standing authorization for routine updates; do not
   ask again for deployment permission already covered by the task.
 - Shared frontend/assets and shared server/API/protocol changes must reach the
-  central hub, NodeA, and NodeB. For hub-only or node-only code, inspect imports and
+  central hub and all deployed nodes. For hub-only or node-only code, inspect imports and
   request paths before choosing the affected services. Never treat a local browser
-  check or a successful `git push` as evidence that hub-host has been deployed.
+  check or a successful `git push` as evidence that the central hub has been deployed.
 - Follow [the deployment runbook](docs/deployment.md). Inspect remote revisions
   and worktrees first, preserve concurrent changes, and publish the intended
-  committed files and assets. Do not discard remote changes or force-push.
+  committed files and assets. Do not discard remote changes. History rewriting
+  requires user authorization, a private backup, and explicit per-branch leases;
+  it is not part of routine deployment.
 - Restart only affected Web services. Preserve existing tmux/CLI sessions,
   queues, node identities, credentials, and hub registry. Keep the existing public
   login protection and server-side-only machine administration.
@@ -27,6 +32,17 @@
   standalone node access. Report the commit and deployed targets, or state the
   specific target and blocker when publication could not finish. Do not claim
   completion based solely on a local edit, test, or commit.
+
+## Keep deployment and identity information private
+
+- Never commit `DEPLOYMENT.local.md`, real deployment addresses, SSH usernames,
+  personal filesystem paths, credentials, or copies of local runtime data.
+  Use documentation IP ranges, example domains, and user-relative paths in examples.
+- Keep actual deployment settings in ignored local files and installed service
+  overrides. Preserve them during updates; never replace them with public examples.
+- Use the repository owner's GitHub noreply email for new commits. Before making
+  a repository public, inspect all published branches and history for credentials
+  and private metadata. Never publish local backup branches or history bundles.
 
 ## Diagnose browser-visible bugs before changing code
 

@@ -9,7 +9,7 @@ SOCKET=agenthub
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TMUX_CONF="$SCRIPT_DIR/agenthub/tmux.conf"
 TMUX_BIN=${TMUX_BIN:-/usr/bin/tmux}
-ZSH_ENV_WRAPPER=${ZSH_ENV_WRAPPER:-/home/user/.local/bin/with-zshrc}
+ZSH_ENV_WRAPPER=${ZSH_ENV_WRAPPER:-$HOME/.local/bin/with-zshrc}
 
 if server_pid=$("$TMUX_BIN" -L "$SOCKET" display-message -p '#{pid}' 2>/dev/null); then
   echo "[agenthub-tmux] 已有 tmux server 持有 $SOCKET socket，守候 PID $server_pid"

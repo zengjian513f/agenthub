@@ -13,3 +13,11 @@ __pycache__/
 .agenthub_attachments/
 .agenthub_attachements/
 agenthub_attachments/
+
+# Real deployment details and credentials stay on the machine, never in Git.
+/DEPLOYMENT.local.md
+/CLAUDE.local.md
+/.env
+/.env.*
+!/.env.example
+/deploy/*.local.conf

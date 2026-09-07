@@ -1,12 +1,14 @@
 # 生产更新与验证
 
-`hub.example.com/agenthub/` 是独立运行的中央 Hub，自己提供 HTML、JS、CSS 和静态资源。
-它通过 API 访问 NodeA、NodeB。仅更新节点、重启本机或推送 GitHub，都不会更新中央站。
+中央 Hub 独立提供 HTML、JS、CSS 和静态资源，并通过 API 访问各节点。
+仅更新节点、重启本机或推送 GitHub，都不会更新中央站。
 日常开发的完成条件见仓库顶层 [AGENTS.md](../AGENTS.md)。
 
-## 已部署目标
+## 目标配置示例
 
-以下是 2026-09-07 核对的配置；执行时先确认实际服务和目录，不能盲目覆盖已变更的配置。
+下表全部为示例，不对应真实生产环境。实际主机、账号、目录、网段及服务覆盖项保存在
+不纳入 Git 的 `DEPLOYMENT.local.md` 中；部署前必须读取并核对，不能使用下表代替。
+该本地文件应限制访问权限，随机器配置保留，不能上传到 GitHub 或复制到公开文档。
 
 | 目标 | SSH / 代码目录 | 用户服务与监听地址 | 公网入口 |
 | --- | --- | --- | --- |
@@ -14,8 +16,8 @@
 | NodeA | `user@10.0.0.2`，`/home/user/Projects/agenthub` | `agenthub.service`，节点端口 `8710` | `https://node-a.example.com/agenthub/` |
 | NodeB | `user@10.0.0.7`，`/home/user/Projects/agenthub` | `agenthub.service`，节点端口 `8710` | `https://hub.example.com/agenthub-node-b/` |
 
-NodeA、NodeB 是 Git checkout；中央目前通过 `git archive` 发布已提交文件，没有 `.git`，
-由代码目录中的 `.deployment-commit` 记录已发布版本。当前工作分支以实际任务为准，
+节点可以使用 Git checkout；没有 `.git` 的中央部署可通过 `git archive` 发布已提交文件，
+由代码目录中的 `.deployment-commit` 记录已发布版本。具体方式和当前工作分支以本地配置为准，
 不要把某个临时功能分支永远写死为发布分支，也不要擅自切换远端正在使用的分支。
 
 ## 判断更新范围
