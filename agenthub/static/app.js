@@ -58,11 +58,18 @@ function applyFont(choice = store.get('font', 'ubuntu'), persist = false) {
   if (typeof refreshTerminalPreferences === 'function') refreshTerminalPreferences(false);
 }
 
+function applyToolIcons(choice = store.get('toolIcons', 'brand'), persist = false) {
+  if (!['brand', 'boss'].includes(choice)) choice = 'brand';
+  if (persist) store.set('toolIcons', choice);
+  document.documentElement.dataset.toolIcons = choice;
+}
+
 themeMedia.addEventListener('change', () => {
   if (store.get('theme', 'system') === 'system') applyTheme('system');
 });
 applyTheme();
 applyFont();
+applyToolIcons();
 
 const S = {
   sessions: [],
@@ -270,7 +277,7 @@ const el = (tag, cls, html) => {
   return n;
 };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const icon = src => `<svg class="ico" style="color:${SOURCES[src].color}"><use href="#${SOURCES[src].icon}"/></svg>`;
+const icon = src => `<svg class="ico source-icon" data-source="${src}" aria-hidden="true" style="color:${SOURCES[src].color}"><use href="#${SOURCES[src].icon}"/></svg>`;
 const uiIcon = name => `<svg class="ui-icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 
 let staleBuildShown = false;
@@ -4734,6 +4741,7 @@ $('#trash-dialog').addEventListener('click', e => {
 function openSettings() {
   $('#setting-font').value = store.get('font', 'ubuntu');
   $('#setting-theme').value = store.get('theme', 'system');
+  $('#setting-tool-icons').value = document.documentElement.dataset.toolIcons;
   $('#setting-cache').value = String(cacheLimitMb);
   $('#settings-dialog').showModal();
 }
@@ -4744,6 +4752,7 @@ $('#settings-dialog').addEventListener('click', e => {
 });
 $('#setting-font').onchange = e => applyFont(e.target.value, true);
 $('#setting-theme').onchange = e => applyTheme(e.target.value, true);
+$('#setting-tool-icons').onchange = e => applyToolIcons(e.target.value, true);
 $('#setting-cache').onchange = e => {
   cacheLimitMb = Math.max(0, +e.target.value || 0);
   CACHE_MAX_BYTES = cacheLimitMb ? cacheLimitMb * 1024 * 1024 : Infinity;

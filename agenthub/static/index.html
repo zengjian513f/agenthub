@@ -210,9 +210,9 @@
     <label id="new-node-label" hidden>机器<select id="new-node"></select></label>
     <fieldset class="new-source">
       <legend>会话类型</legend>
-      <label><input type="radio" name="new-source" value="claude" checked><span><svg class="ico"><use href="#i-claude"/></svg>Claude</span></label>
-      <label><input type="radio" name="new-source" value="codex"><span><svg class="ico"><use href="#i-codex"/></svg>Codex</span></label>
-      <label><input type="radio" name="new-source" value="grok"><span><svg class="ico"><use href="#i-grok"/></svg>Grok</span></label>
+      <label><input type="radio" name="new-source" value="claude" checked><span><svg class="ico source-icon" data-source="claude" aria-hidden="true"><use href="#i-claude"/></svg>Claude</span></label>
+      <label><input type="radio" name="new-source" value="codex"><span><svg class="ico source-icon" data-source="codex" aria-hidden="true"><use href="#i-codex"/></svg>Codex</span></label>
+      <label><input type="radio" name="new-source" value="grok"><span><svg class="ico source-icon" data-source="grok" aria-hidden="true"><use href="#i-grok"/></svg>Grok</span></label>
     </fieldset>
     <label class="new-cwd-label" for="new-cwd">启动目录<span>输入路径或从下方选择</span></label>
     <div class="new-cwd-combobox">
@@ -295,6 +295,14 @@
         <option value="dark">深色</option>
       </select>
     </label>
+    <label class="setting-row" for="setting-tool-icons">
+      <span><b>工具图标</b><small>Claude / Dario · Codex / Sam · Grok / Elon</small></span>
+      <select id="setting-tool-icons">
+        <option value="brand">原版图标</option>
+        <option value="boss">老板头像</option>
+      </select>
+    </label>
+    <a class="avatar-credits" href="avatars/credits.html" target="_blank" rel="noopener">头像来源与许可</a>
     <label class="setting-row" for="setting-cache">
       <span><b>历史缓存</b><small>tmux 对话固定驻留，不计入此上限</small></span>
       <select id="setting-cache">

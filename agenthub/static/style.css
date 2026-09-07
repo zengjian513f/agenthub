@@ -1458,6 +1458,27 @@ body.dragging-v { cursor: row-resize; user-select: none; }
 .btn.go.on { background: #22c55e; color: #fff; }
 .spin { padding: 14px; color: var(--muted); font-size: 13px; }
 .ico { width: 14px; height: 14px; }
+.source-icon[data-source="claude"] {
+  --source-avatar: url('avatars/dario-amodei.jpg');
+  --avatar-size: 120%; --avatar-position: center 22%;
+}
+.source-icon[data-source="codex"] {
+  --source-avatar: url('avatars/sam-altman.jpg');
+  --avatar-size: 220%; --avatar-position: 48% 3%;
+}
+.source-icon[data-source="grok"] {
+  --source-avatar: url('avatars/elon-musk.jpg');
+  --avatar-size: 150%; --avatar-position: center 15%;
+}
+:root[data-tool-icons="boss"] .source-icon {
+  width: 20px; height: 20px; flex: none; border-radius: 50%;
+  background-image: var(--source-avatar);
+  background-size: var(--avatar-size);
+  background-position: var(--avatar-position);
+  background-repeat: no-repeat;
+}
+:root[data-tool-icons="boss"] .source-icon > use { visibility: hidden; }
+.avatar-credits { align-self: flex-end; font-size: 11px; color: var(--muted); }
 
 /* ---------- 手机：列表与详情分屏显示 ---------- */
 @media (max-width: 720px) {
