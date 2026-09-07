@@ -1,4 +1,16 @@
-# Avatar background edits
+# Avatar assets
+
+## Current selection
+
+The user selected these three source images. They are resized to 256px-wide WebP (quality 88) and displayed using CSS circle crops. No generative edits, relighting, or background replacement are applied to this selection.
+
+| Tool | Asset | Source |
+| --- | --- | --- |
+| Claude | [dario-wef.webp](dario-wef.webp) | [World Economic Forum](https://www.weforum.org/people/dario-amodei/) |
+| Codex | [sam-stablediffusion.webp](sam-stablediffusion.webp) | [Stable Diffusion Online](https://stablediffusionweb.com/image/26958853-sam-altman-green-screen-laughing) (AI-generated source image) |
+| Grok | [elon-penglobal.webp](elon-penglobal.webp) | [PENGlobal](https://www.penglobalinc.com/elon-musk-11-fascinating-facts-about-the-worlds-richest-entrepreneur) |
+
+## Superseded background edits
 
 Edited with the built-in `image_gen.imagegen` tool. The tool did not expose its underlying model version.
 
@@ -27,4 +39,3 @@ Asset: [elon-musk-purple.webp](elon-musk-purple.webp)
 Prompt:
 
 > Edit this photograph for a website avatar. Change the light gray backdrop behind the person to a flat deep purple (#38204F). Everything in the foreground and the composition should remain as in the supplied photo. No text or other additions.
-
