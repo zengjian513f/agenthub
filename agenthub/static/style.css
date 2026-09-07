@@ -1462,6 +1462,9 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   background-repeat: no-repeat;
 }
 :root[data-tool-icons="boss"] .source-icon > use { visibility: hidden; }
+:root[data-tool-icons="boss"] #side .item > .ico { width: 36px; height: 36px; }
+:root[data-tool-icons="boss"] #side .item > .ico > .source-icon { width: 32px; height: 32px; }
+:root[data-tool-icons="boss"] #side .item-status { right: -4px; }
 .avatar-credits { align-self: flex-end; font-size: 11px; color: var(--muted); }
 
 /* ---------- 手机：列表与详情分屏显示 ---------- */
