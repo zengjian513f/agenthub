@@ -17,7 +17,6 @@ from playwright.sync_api import sync_playwright
 from agenthub import hub, server
 from hub_fixture import NodeHandler, PNG, start_node, stop
 from hub_e2e import MountedHub
-from test_desktop_helper import desktop
 
 
 class FileNode(NodeHandler):
@@ -62,18 +61,6 @@ def main():
         for name in ['Example.sln', 'README.md', 'AGENTS.md', 'CLAUDE.md']:
             (checkout / name).write_text('checkout fixture')
         (root / 'CLAUDE.md').write_text('different project')
-        client = root / 'browser-computer'
-        client.mkdir()
-        (client / 'source.py').write_text(source.read_text())
-        (client / 'output/placeholder').parent.mkdir(exist_ok=True)
-        (client / 'output/curve.png').write_bytes(PNG)
-        (client / 'output').mkdir(exist_ok=True)
-        desktop_server = ThreadingHTTPServer(('127.0.0.1', 0), desktop.Handler)
-        desktop_server.config = {'token': 'fixture-pairing', 'origins': [], 'mappings': [
-            {'node': server.NODE_ID or server.federation.identity(), 'remote': str(root), 'local': str(client)}]}
-        opened = []
-        desktop_server.open_target = opened.append
-        threading.Thread(target=desktop_server.serve_forever, daemon=True).start()
         node = start_node('a' * 32, 'FileNode')
         node.RequestHandlerClass = FileNode
         node.state['row']['cwd'] = str(root)
@@ -112,13 +99,6 @@ def main():
                     ctx = browser.new_context()
                     ctx.grant_permissions(['clipboard-read', 'clipboard-write'], origin=base)
                     page = ctx.new_page()
-                    desktop_server.config['origins'].append(base.rstrip('/').replace('/agenthub', ''))
-                    # Use a random loopback port for the real client helper so
-                    # this free test cannot contact any installed user helper.
-                    app_js = (server.STATIC / 'app.js').read_text().replace(
-                        '127.0.0.1:18711', f'127.0.0.1:{desktop_server.server_port}')
-                    page.route('**/app.js*', lambda route: route.fulfill(
-                        body=app_js, content_type='application/javascript'))
                     errors = []
                     page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(base)
@@ -299,28 +279,19 @@ def main():
                     menu = page.locator('#file-menu')
                     assert menu.locator('#file-menu-target').inner_text() == str(source)
                     assert menu.get_by_role('menuitem').all_text_contents() == [
-                        '复制绝对路径', '本地打开', '本地打开目录', '下载']
+                        '复制绝对路径', '复制路径', '下载']
                     menu.get_by_role('menuitem', name='复制绝对路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(source)
-                    link.click(button='right')
-                    menu.get_by_role('menuitem', name='本地打开', exact=True).click()
-                    dialog = page.locator('.desktop-dialog')
-                    dialog.locator('.desktop-pairing').fill('wrong-key')
-                    dialog.get_by_role('button', name='连接并打开').click()
-                    page.wait_for_function("document.querySelector('.desktop-error')?.textContent.includes('配对码')")
-                    assert not opened or opened[-1] != client / 'output/curve.png'
-                    dialog.locator('.desktop-pairing').fill('fixture-pairing')
-                    dialog.get_by_role('button', name='连接并打开').click()
-                    dialog.wait_for(state='detached')
-                    assert opened[-1] == client / 'output/curve.png'
                     text_link.click(button='right')
-                    menu.get_by_role('menuitem', name='本地打开目录', exact=True).click()
-                    page.wait_for_timeout(250)
-                    assert opened[-1] == client
+                    menu.get_by_role('menuitem', name='复制路径', exact=True).click()
+                    assert page.evaluate('navigator.clipboard.readText()') == str(root)
+                    link.click(button='right')
+                    menu.get_by_role('menuitem', name='复制路径', exact=True).click()
+                    assert page.evaluate('navigator.clipboard.readText()') == str(output)
                     directory.click(button='right')
-                    menu.get_by_role('menuitem', name='本地打开目录', exact=True).click()
-                    page.wait_for_timeout(250)
-                    assert opened[-1] == client / 'output'
+                    assert menu.get_by_role('menuitem').all_text_contents() == ['复制绝对路径', '下载']
+                    menu.get_by_role('menuitem', name='复制绝对路径', exact=True).click()
+                    assert page.evaluate('navigator.clipboard.readText()') == str(output)
                     text_link.click(button='right')
                     with page.expect_download() as downloaded:
                         menu.get_by_role('menuitem', name='下载', exact=True).click()
@@ -371,8 +342,6 @@ def main():
                     ctx.close()
                 browser.close()
         finally:
-            desktop_server.shutdown()
-            desktop_server.server_close()
             stop(central)
             stop(node)
 

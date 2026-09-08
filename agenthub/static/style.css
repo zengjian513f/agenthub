@@ -522,10 +522,6 @@ main { display: flex; flex: 1; min-height: 0; }
 .ctx-menu button:hover { background: var(--hover); }
 .ctx-menu button:disabled { opacity: .45; cursor: default; }
 .ctx-menu button[hidden] { display: none; }
-.desktop-target, .desktop-command { white-space: pre-wrap; overflow-wrap: anywhere; }
-.desktop-dialog h2 { margin: 0; font-size: 18px; }
-.desktop-dialog p { margin: 6px 0; }
-.desktop-error { color: #d44; }
 .ctx-menu button[data-act="delete"] { color: #e5484d; }
 .ctx-menu button[data-act="stop"] { color: var(--live-direct); }
 @media (max-width: 720px) {

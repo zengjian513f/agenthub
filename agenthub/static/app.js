@@ -4431,7 +4431,7 @@ async function flushFileChecks() {
           body: JSON.stringify({...context, refs: batch}),
         });
         if (!response.ok) continue;
-        const {resolved, targets = [], node_id = ''} = await response.json();
+        const {resolved, targets = []} = await response.json();
         const details = new Map(targets.map(target => [target.ref, target]));
         for (const node of attached) {
           const detail = details.get(node.dataset.fileRef);
@@ -4444,7 +4444,6 @@ async function flushFileChecks() {
           link.title = path;
           link.dataset.localPath = path;
           link.dataset.fileKind = ['file', 'directory'].includes(detail?.kind) ? detail.kind : 'unknown';
-          link.dataset.fileNode = node_id;
           link.append(...node.childNodes);
           node.replaceWith(link);
         }
@@ -4488,7 +4487,7 @@ fileMenuTargetText.dir = 'auto';
 fileMenu.appendChild(fileMenuTargetText);
 fileMenu.setAttribute('aria-describedby', fileMenuTargetText.id);
 for (const [action, label] of [['copy-path', '复制绝对路径'],
-  ['open-local', '本地打开'], ['open-directory', '本地打开目录'], ['download', '下载'],
+  ['copy-directory', '复制路径'], ['download', '下载'],
   ['copy-url', '复制链接地址'], ['open-web', '在新标签页打开']]) {
   const button = document.createElement('button');
   button.type = 'button'; button.dataset.action = action; button.textContent = label;
@@ -4496,67 +4495,6 @@ for (const [action, label] of [['copy-path', '复制绝对路径'],
 }
 document.body.appendChild(fileMenu);
 let fileMenuTarget = null;
-let desktopPairing = ''; // Page memory only: never include the key in diagnostics/storage.
-
-async function desktopRequest(target, action, pairing) {
-  if (!window.isSecureContext) throw new Error('本地打开需要 HTTPS 页面或 localhost 页面');
-  let response;
-  try {
-    response = await fetch('http://127.0.0.1:18711/open', {
-      method: 'POST', mode: 'cors', credentials: 'omit', redirect: 'error',
-      targetAddressSpace: 'loopback', signal: AbortSignal.timeout(20000),
-      headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + pairing},
-      body: JSON.stringify({node: target.node, path: target.path, kind: target.kind, action}),
-    });
-  } catch { throw new Error('未能连接本机助手。请在浏览器电脑上启动助手，并允许此网页访问本地网络。'); }
-  const data = await response.json();
-  if (!response.ok || !data.ok) throw new Error(data.error || '本地打开失败');
-}
-
-function desktopSetup(target, action, error = '') {
-  const dialog = document.createElement('dialog');
-  dialog.className = 'app-dialog desktop-dialog';
-  dialog.innerHTML = `<form class="settings-form">
-    <h2>在这台电脑上打开</h2>
-    <p>需要在浏览器所在电脑运行本机助手，并配置节点目录到本机挂载或同步目录的对应关系。</p>
-    <p class="desktop-target"></p>
-    <button type="button" class="btn desktop-download">下载本机助手</button>
-    <details><summary>首次配置方法（Python 3.10 或更新版本）</summary>
-      <p>在这台电脑的终端运行下面的命令。替换两个目录占位符，启动后输入助手显示的配对码。没有本地副本时，请使用“下载”。</p>
-      <pre class="desktop-command"></pre>
-    </details>
-    <label>配对码 <input class="desktop-pairing" type="password" autocomplete="off" required></label>
-    <p class="desktop-error" role="alert"></p>
-    <div class="modal-actions"><button type="button" class="btn desktop-cancel">取消</button>
-      <button type="submit" class="btn go">连接并打开</button></div>
-  </form>`;
-  dialog.querySelector('.desktop-target').textContent = `节点：${target.node}\n路径：${target.path}`;
-  // Example uses JSON double-quoted literals only for display, never execution.
-  dialog.querySelector('.desktop-command').textContent =
-    `python desktop-helper.py --origin "${location.origin}" --node "${target.node}" `
-    + '--remote-root "节点目录绝对路径" --local-root "本机对应目录绝对路径"';
-  dialog.querySelector('.desktop-error').textContent = error;
-  dialog.querySelector('.desktop-download').onclick = () => {
-    const link = document.createElement('a'); link.href = appUrl('/desktop-helper.py');
-    link.download = 'desktop-helper.py'; document.body.appendChild(link); link.click(); link.remove();
-  };
-  dialog.querySelector('.desktop-cancel').onclick = () => dialog.close();
-  dialog.addEventListener('close', () => dialog.remove());
-  dialog.querySelector('form').onsubmit = async event => {
-    event.preventDefault();
-    const button = dialog.querySelector('[type="submit"]');
-    const pairing = dialog.querySelector('.desktop-pairing').value.trim();
-    button.disabled = true;
-    try {
-      await desktopRequest(target, action, pairing);
-      desktopPairing = pairing;
-      dialog.close();
-    } catch (err) { dialog.querySelector('.desktop-error').textContent = err.message; }
-    finally { button.disabled = false; }
-  };
-  document.body.appendChild(dialog); dialog.showModal();
-}
-
 function closeFileMenu() { fileMenu.hidden = true; fileMenuTarget = null; }
 
 async function copyFileText(text) {
@@ -4575,11 +4513,12 @@ document.addEventListener('contextmenu', event => {
   if (!link) return;
   event.preventDefault(); closeItemMenu();
   fileMenuTarget = {path: link.dataset.localPath, href: link.href,
-    kind: link.dataset.referenceKind === 'web' ? 'web' : link.dataset.fileKind, node: link.dataset.fileNode};
+    kind: link.dataset.referenceKind === 'web' ? 'web' : link.dataset.fileKind};
   fileMenuTargetText.textContent = fileMenuTarget.kind === 'web' ? fileMenuTarget.href : fileMenuTarget.path;
   const actions = fileMenuTarget.kind === 'web'
     ? ['copy-url', 'open-web']
-    : ['copy-path', 'open-local', 'open-directory', 'download'];
+    : fileMenuTarget.kind === 'file' ? ['copy-path', 'copy-directory', 'download']
+    : ['copy-path', 'download'];
   fileMenu.setAttribute('aria-label', fileMenuTarget.kind === 'web' ? '链接操作' : '文件操作');
   for (const button of fileMenu.querySelectorAll('button')) {
     button.hidden = !actions.includes(button.dataset.action);
@@ -4588,11 +4527,6 @@ document.addEventListener('contextmenu', event => {
   download.disabled = fileMenuTarget.kind !== 'file';
   download.title = fileMenuTarget.kind === 'directory' ? '目录不作为文件下载' :
     fileMenuTarget.kind !== 'file' ? '文件类型尚未确认，请刷新后重试' : '';
-  for (const action of ['open-local', 'open-directory']) {
-    const button = fileMenu.querySelector(`[data-action="${action}"]`);
-    button.disabled = !['file', 'directory'].includes(fileMenuTarget.kind) || !fileMenuTarget.node;
-    button.title = button.disabled ? '目标信息尚未确认，请刷新后重试' : '在浏览器所在电脑打开';
-  }
   fileMenu.hidden = false;
   const box = fileMenu.getBoundingClientRect();
   fileMenu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - box.width - 8))}px`;
@@ -4622,15 +4556,11 @@ fileMenu.addEventListener('click', async event => {
   closeFileMenu();
   try {
     if (action === 'copy-path') await copyFileText(target.path);
+    else if (action === 'copy-directory' && target.kind === 'file') {
+      await copyFileText(target.path.slice(0, target.path.lastIndexOf('/')) || '/');
+    }
     else if (action === 'copy-url') await copyFileText(target.href);
     else if (action === 'open-web') window.open(target.href, '_blank', 'noopener,noreferrer');
-    else if (action === 'open-local' || action === 'open-directory') {
-      if (!desktopPairing) desktopSetup(target, action);
-      else {
-        try { await desktopRequest(target, action, desktopPairing); }
-        catch (error) { desktopSetup(target, action, error.message); }
-      }
-    }
     else if (action === 'download') {
       const url = new URL(target.href); url.searchParams.set('download', '1');
       const link = document.createElement('a'); link.href = url.href;
