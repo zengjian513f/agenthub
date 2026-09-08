@@ -108,6 +108,7 @@ def main():
                     assert response.status == 200 and response.body() == PNG
                     assert 'sandbox' in response.headers['content-security-policy']
                     text_link = page.locator('.msg[data-role=assistant] a').filter(has_text='source.py')
+                    assert text_link.inner_text() == '[source.py](source.py:12)'
                     response = ctx.request.get(text_link.get_attribute('href'))
                     assert response.status == 200 and response.text() == source.read_text()
                     directory = page.locator('.msg[data-role=assistant] a').filter(has_text='./output')
@@ -117,11 +118,13 @@ def main():
                     checks = page.evaluate(r'''() => {
                       const host = document.createElement('div');
                       host.innerHTML = md('已存curve.png，路径/source.py。 `source.py:12`\n\n'
-                        + '[`源码`](source.py:12) [坏](javascript:alert(1)) [坏](data:text/html,hi)\n\n'
+                        + '[`源码`](source.py:12) [文档](<https://example.com/help> "说明") '
+                        + '[坏](javascript:alert(1)) [坏](data:text/html,hi)\n\n'
                         + 'https://example.com/a_(b)。 www.example.com。 <HTTPS://example.com/auto> A/D\n\n'
                         + '```sh\ncat /private/file.txt\n```\n\n'
                         + '`print("curve.png")` ![image](https://example.com/img.png)', true, [], {uid:S.sel, agent:'child'});
                       return {
+                        text:host.textContent,
                         refs:[...host.querySelectorAll('a')].map(a=>({text:a.textContent,href:a.href})),
                         nested:host.querySelectorAll('a a').length,
                         codeLinks:host.querySelectorAll('pre a').length,
@@ -133,11 +136,16 @@ def main():
                     assert not checks['nested'] and not checks['codeLinks'] and not checks['unsafe'], checks
                     assert checks['images'] == 1 and checks['code'] == 'cat /private/file.txt', checks
                     refs = checks['refs']
+                    assert any(r['text'] == '[源码](source.py:12)' for r in refs), refs
+                    assert any(r['text'] == '[文档](<https://example.com/help> "说明")'
+                               and r['href'] == 'https://example.com/help' for r in refs), refs
+                    assert '[坏](javascript:alert(1))' in checks['text'], checks
                     assert any(r['text'] == 'curve.png' and 'agent=child' in r['href'] for r in refs), refs
                     assert any(r['text'] == 'source.py:12' for r in refs), refs
                     assert any(r['href'] == 'https://example.com/a_(b)' for r in refs), refs
                     assert any(r['href'] == 'https://www.example.com/' for r in refs), refs
                     assert any(r['href'] == 'https://example.com/auto' for r in refs), refs
+                    assert any(r['text'] == '<HTTPS://example.com/auto>' for r in refs), refs
                     assert not any(r['text'] == 'A/D' for r in refs), refs
                     assert not any('print' in r['text'] for r in refs), refs
                     # An unfinished Markdown target must not trigger exponential

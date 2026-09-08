@@ -4449,17 +4449,18 @@ function inline(s, media = [], context = {}) {
     links.push(html);
     return `\u0000LINK${links.length - 1}\u0000`;
   };
-  s = s.replace(/<(https?:\/\/[^<>\s]+)>/gi,
-    (raw, ref) => keepLink(referenceLink(ref, esc(ref), context) || esc(raw)));
-  // Preserve explicit labels before recognizing bare URLs/paths. One balanced
-  // parenthesis pair in a target covers common URL and filename forms.
+  // Keep the original link text visible, including its path/URL. Replacing it
+  // with only the label hides useful CLI output behind a remote file endpoint.
+  // One balanced parenthesis pair covers common URL and filename forms.
   s = s.replace(/\[([^\]\n]+)\]\(\s*(<[^>\n]+>|(?:[^\s()]|\([^\s()]*\))+)(?:\s+["'][^"']*["'])?\s*\)/g,
-    (raw, label, target) => {
-      const content = esc(label).replace(/\u0000CODE(\d+)\u0000/g,
+    (raw, _label, target) => {
+      const content = esc(raw).replace(/\u0000CODE(\d+)\u0000/g,
         (_, i) => codeLabels[+i] || '');
       const html = referenceLink(target.replace(/^<|>$/g, ''), content, context, true);
       return keepLink(html || content);
     });
+  s = s.replace(/<(https?:\/\/[^<>\s]+)>/gi,
+    (raw, ref) => keepLink(referenceLink(ref, esc(raw), context) || esc(raw)));
   s = s.replace(RE_REFERENCE, (raw, offset, source) => {
     // Do not link a suffix of a scheme, identifier or email address.
     if (offset && /[\w@/:.-]/.test(source[offset - 1])) return raw;
