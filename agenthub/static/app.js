@@ -4482,6 +4482,11 @@ function referenceLink(ref, label, context, explicit = false) {
 const fileMenu = document.createElement('div');
 fileMenu.id = 'file-menu'; fileMenu.className = 'ctx-menu'; fileMenu.hidden = true;
 fileMenu.setAttribute('role', 'menu'); fileMenu.setAttribute('aria-label', '文件操作');
+const fileMenuTargetText = document.createElement('div');
+fileMenuTargetText.id = 'file-menu-target'; fileMenuTargetText.className = 'ctx-menu-target';
+fileMenuTargetText.dir = 'auto';
+fileMenu.appendChild(fileMenuTargetText);
+fileMenu.setAttribute('aria-describedby', fileMenuTargetText.id);
 for (const [action, label] of [['copy-text', '复制文本'], ['copy-path', '复制绝对路径'],
   ['open-local', '本地打开'], ['open-directory', '本地打开目录'], ['download', '下载'],
   ['copy-url', '复制链接地址'], ['open-web', '在新标签页打开']]) {
@@ -4571,6 +4576,7 @@ document.addEventListener('contextmenu', event => {
   event.preventDefault(); closeItemMenu();
   fileMenuTarget = {text: link.textContent, path: link.dataset.localPath, href: link.href,
     kind: link.dataset.referenceKind === 'web' ? 'web' : link.dataset.fileKind, node: link.dataset.fileNode};
+  fileMenuTargetText.textContent = fileMenuTarget.kind === 'web' ? fileMenuTarget.href : fileMenuTarget.path;
   const actions = fileMenuTarget.kind === 'web'
     ? ['copy-text', 'copy-url', 'open-web']
     : ['copy-text', 'copy-path', 'open-local', 'open-directory', 'download'];
@@ -4595,7 +4601,9 @@ document.addEventListener('pointerdown', event => {
   if (!fileMenu.contains(event.target)) closeFileMenu();
 }, true);
 addEventListener('resize', closeFileMenu);
-document.addEventListener('scroll', closeFileMenu, true);
+document.addEventListener('scroll', event => {
+  if (!fileMenu.contains(event.target)) closeFileMenu();
+}, true);
 fileMenu.addEventListener('keydown', event => {
   const buttons = [...fileMenu.querySelectorAll('button:not(:disabled):not([hidden])')];
   const index = buttons.indexOf(document.activeElement);

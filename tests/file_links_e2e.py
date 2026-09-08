@@ -155,6 +155,7 @@ def main():
                     assert text_link.get_attribute('data-file-kind') == 'file'
                     assert directory.get_attribute('data-file-kind') == 'directory'
                     directory.click(button='right')
+                    assert page.locator('#file-menu-target').inner_text() == str(output)
                     assert page.locator('#file-menu [data-action="download"]').is_disabled()
                     page.keyboard.press('Escape')
                     assert any(path == '/api/session/file' and q['uid'] == [node.state['row']['uid']]
@@ -239,6 +240,7 @@ def main():
                     web_link = page.locator('.msg[data-role=assistant] a').filter(has_text='文档')
                     web_link.click(button='right')
                     web_menu = page.locator('#file-menu')
+                    assert web_menu.locator('#file-menu-target').inner_text() == 'https://example.com/a_(b)'
                     assert web_menu.get_by_role('menuitem').all_text_contents() == [
                         '复制文本', '复制链接地址', '在新标签页打开']
                     web_menu.get_by_role('menuitem', name='复制文本', exact=True).click()
@@ -256,6 +258,7 @@ def main():
                     popup.close()
                     text_link.click(button='right')
                     menu = page.locator('#file-menu')
+                    assert menu.locator('#file-menu-target').inner_text() == str(source)
                     assert menu.get_by_role('menuitem').all_text_contents() == [
                         '复制文本', '复制绝对路径', '本地打开', '本地打开目录', '下载']
                     menu.get_by_role('menuitem', name='复制文本', exact=True).click()
@@ -289,6 +292,27 @@ def main():
                     assert download.suggested_filename == 'source.py'
                     download.save_as(root / 'downloaded.py')
                     assert (root / 'downloaded.py').read_bytes() == source.read_bytes()
+                    # Long targets remain readable/selectable without pushing
+                    # actions outside a narrow viewport or closing on scroll.
+                    page.set_viewport_size({'width': 360, 'height': 640})
+                    page.evaluate('showMobileDetail()')
+                    long_url = 'https://example.com/' + 'long-segment/' * 100 + '?q=%3Cscript%3E'
+                    page.evaluate('''url => {
+                      const host=document.createElement('div');host.id='long-link-fixture';host.className='mb';
+                      host.innerHTML=inline('[长链接]('+url+')');document.querySelector('#msgs').appendChild(host);
+                    }''', long_url)
+                    page.locator('#long-link-fixture a').click(button='right')
+                    assert menu.locator('#file-menu-target').inner_text() == long_url
+                    box = menu.bounding_box()
+                    assert box['x'] >= 0 and box['x'] + box['width'] <= 360
+                    assert box['y'] >= 0 and box['y'] + box['height'] <= 640
+                    menu.locator('#file-menu-target').evaluate('(el) => el.scrollTop = el.scrollHeight')
+                    page.wait_for_timeout(50)
+                    assert menu.is_visible()
+                    assert menu.locator('script').count() == 0
+                    page.keyboard.press('Escape')
+                    page.locator('#long-link-fixture').evaluate('(el) => el.remove()')
+                    page.set_viewport_size({'width': 1280, 'height': 720})
                     # An unfinished Markdown target must not trigger exponential
                     # backtracking while an assistant is still streaming it.
                     page.evaluate("md('[unfinished](' + 'a'.repeat(10000), true)")

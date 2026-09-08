@@ -507,6 +507,12 @@ main { display: flex; flex: 1; min-height: 0; }
   box-shadow: 0 10px 30px rgba(0, 0, 0, .26), 0 2px 6px rgba(0, 0, 0, .12);
 }
 .ctx-menu[hidden] { display: none; }
+#file-menu { width: min(380px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow-y: auto; }
+.ctx-menu-target {
+  padding: 8px 10px; margin-bottom: 4px; border-bottom: 1px solid var(--border);
+  font-size: 12px; line-height: 1.5; color: var(--text); user-select: text;
+  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 8em; overflow-y: auto;
+}
 .ctx-menu button {
   display: block; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px;
   background: transparent; color: var(--text); text-align: left;
