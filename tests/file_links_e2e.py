@@ -255,23 +255,12 @@ def main():
                         copy_menu.get_by_role('menuitem', name='复制链接地址', exact=True).click()
                         assert page.evaluate('navigator.clipboard.readText()') == destination
                         page.locator('#copy-menu-probe').evaluate('(el) => el.remove()')
-                    # An absolute file path also has only one copy value. A
-                    # relative display path still differs from the absolute one.
-                    text_link.evaluate('el => {el.dataset.savedLabel=el.textContent;el.textContent=el.dataset.localPath}')
-                    text_link.click(button='right')
-                    assert page.locator('#file-menu').get_by_role('menuitem', name='复制文本', exact=True).count() == 0
-                    assert page.locator('#file-menu').get_by_role('menuitem', name='复制绝对路径', exact=True).count() == 1
-                    page.keyboard.press('Escape')
-                    text_link.evaluate('el => {el.textContent=el.dataset.savedLabel;delete el.dataset.savedLabel}')
                     web_link = page.locator('.msg[data-role=assistant] a').filter(has_text='文档')
                     web_link.click(button='right')
                     web_menu = page.locator('#file-menu')
                     assert web_menu.locator('#file-menu-target').inner_text() == 'https://example.com/a_(b)'
                     assert web_menu.get_by_role('menuitem').all_text_contents() == [
-                        '复制文本', '复制链接地址', '在新标签页打开']
-                    web_menu.get_by_role('menuitem', name='复制文本', exact=True).click()
-                    assert page.evaluate('navigator.clipboard.readText()') == '文档'
-                    web_link.click(button='right')
+                        '复制链接地址', '在新标签页打开']
                     web_menu.get_by_role('menuitem', name='复制链接地址', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == 'https://example.com/a_(b)'
                     ctx.route('https://example.com/**', lambda route: route.fulfill(body='fixture'))
@@ -286,10 +275,7 @@ def main():
                     menu = page.locator('#file-menu')
                     assert menu.locator('#file-menu-target').inner_text() == str(source)
                     assert menu.get_by_role('menuitem').all_text_contents() == [
-                        '复制文本', '复制绝对路径', '本地打开', '本地打开目录', '下载']
-                    menu.get_by_role('menuitem', name='复制文本', exact=True).click()
-                    assert page.evaluate('navigator.clipboard.readText()') == 'source.py'
-                    text_link.click(button='right')
+                        '复制绝对路径', '本地打开', '本地打开目录', '下载']
                     menu.get_by_role('menuitem', name='复制绝对路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(source)
                     link.click(button='right')

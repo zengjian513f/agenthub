@@ -4487,7 +4487,7 @@ fileMenuTargetText.id = 'file-menu-target'; fileMenuTargetText.className = 'ctx-
 fileMenuTargetText.dir = 'auto';
 fileMenu.appendChild(fileMenuTargetText);
 fileMenu.setAttribute('aria-describedby', fileMenuTargetText.id);
-for (const [action, label] of [['copy-text', '复制文本'], ['copy-path', '复制绝对路径'],
+for (const [action, label] of [['copy-path', '复制绝对路径'],
   ['open-local', '本地打开'], ['open-directory', '本地打开目录'], ['download', '下载'],
   ['copy-url', '复制链接地址'], ['open-web', '在新标签页打开']]) {
   const button = document.createElement('button');
@@ -4574,24 +4574,15 @@ document.addEventListener('contextmenu', event => {
   const link = event.target.closest('.mb a[data-local-path], .mb a[data-reference-kind="web"]');
   if (!link) return;
   event.preventDefault(); closeItemMenu();
-  fileMenuTarget = {text: link.textContent, path: link.dataset.localPath, href: link.href,
+  fileMenuTarget = {path: link.dataset.localPath, href: link.href,
     kind: link.dataset.referenceKind === 'web' ? 'web' : link.dataset.fileKind, node: link.dataset.fileNode};
   fileMenuTargetText.textContent = fileMenuTarget.kind === 'web' ? fileMenuTarget.href : fileMenuTarget.path;
   const actions = fileMenuTarget.kind === 'web'
-    ? ['copy-text', 'copy-url', 'open-web']
-    : ['copy-text', 'copy-path', 'open-local', 'open-directory', 'download'];
-  const displayed = fileMenuTarget.text.trim();
-  const destination = fileMenuTarget.kind === 'web' ? fileMenuTarget.href : fileMenuTarget.path;
-  let duplicateCopy = !displayed || displayed === destination;
-  if (fileMenuTarget.kind === 'web' && /^(https?:\/\/|www\.)/i.test(displayed)) {
-    try {
-      // A browser may add the trailing slash or encode Unicode in a bare URL.
-      duplicateCopy = new URL(/^www\./i.test(displayed) ? 'https://' + displayed : displayed).href === destination;
-    } catch { /* A descriptive label still has its own copy operation. */ }
-  }
+    ? ['copy-url', 'open-web']
+    : ['copy-path', 'open-local', 'open-directory', 'download'];
   fileMenu.setAttribute('aria-label', fileMenuTarget.kind === 'web' ? '链接操作' : '文件操作');
   for (const button of fileMenu.querySelectorAll('button')) {
-    button.hidden = !actions.includes(button.dataset.action) || (button.dataset.action === 'copy-text' && duplicateCopy);
+    button.hidden = !actions.includes(button.dataset.action);
   }
   const download = fileMenu.querySelector('[data-action="download"]');
   download.disabled = fileMenuTarget.kind !== 'file';
@@ -4630,8 +4621,7 @@ fileMenu.addEventListener('click', async event => {
   if (!action || !target) return;
   closeFileMenu();
   try {
-    if (action === 'copy-text') await copyFileText(target.text);
-    else if (action === 'copy-path') await copyFileText(target.path);
+    if (action === 'copy-path') await copyFileText(target.path);
     else if (action === 'copy-url') await copyFileText(target.href);
     else if (action === 'open-web') window.open(target.href, '_blank', 'noopener,noreferrer');
     else if (action === 'open-local' || action === 'open-directory') {
