@@ -1,5 +1,6 @@
 """Free browser regression for Codex rewind visibility using native JSONL fixtures."""
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -67,7 +68,10 @@ def main():
                     patch.object(adapters, 'CODEX_INDEX', root / 'index'), \
                     patch.object(live, 'pids_of', return_value=[123]), \
                     sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
+                launch = dict(headless=True)
+                if executable := os.environ.get('PLAYWRIGHT_CHROMIUM_EXECUTABLE'):
+                    launch['executable_path'] = executable
+                browser = pw.chromium.launch(**launch)
                 for target in (node, central):
                     for choice in ('keep', 'hide', 'escape'):
                         for f in root.glob('rollout-*.jsonl'):
@@ -138,29 +142,68 @@ def main():
                         assert not errors, errors
                         context.close()
                         print(f'PASS {"hub" if target is central else "node"}: {choice}, reload, repeated rewind, restore')
-                # Existing branches prompt on open; identical IDs on another node cannot be hidden.
-                context = browser.new_context(viewport=dict(width=390, height=844))
+                # A historical fork is not a new rewind, even without a saved choice.
+                for target in (node, central):
+                    context = browser.new_context(viewport=dict(width=375, height=620))
+                    page = context.new_page()
+                    errors = []
+                    page.on('pageerror', lambda e: errors.append(str(e)))
+                    base = f'http://127.0.0.1:{target.server_port}/'
+                    page.goto(base)
+                    page.wait_for_selector('#side .item')
+                    child_uid = page.evaluate('(sid) => S.sessions.find(s => s.sid === sid).uid', child)
+                    assert page.evaluate('[...forkParentChoices]') == []
+                    page.locator(f'.item[data-uid="{child_uid}"]').click()
+                    page.wait_for_selector('#detail .msg')
+                    assert page.locator('dialog[open]').count() == 0
+                    page.evaluate('loadSessions(true)')
+                    page.evaluate('pollSessions()')
+                    assert page.locator('dialog[open]').count() == 0
+                    # Refresh restores the selected historical branch on mobile.
+                    page.reload()
+                    page.wait_for_selector('#detail .msg')
+                    assert page.evaluate('S.sel') == child_uid
+                    assert page.locator('dialog[open]').count() == 0
+                    page.goto(base + '?sid=' + child)
+                    page.wait_for_selector('#detail .msg')
+                    assert page.evaluate('S.sel') == child_uid
+                    assert page.locator('dialog[open]').count() == 0
+                    assert page.evaluate('[...forkParentChoices]') == []
+                    assert page.evaluate('sidebarSessions().length') == 3
+                    assert not errors, errors
+                    context.close()
+                    print(f'PASS {"hub" if target is central else "node"}: historical branch open, rescan, poll, restore, deep link')
+
+                # A new branch still prompts on mobile; matching SIDs on other nodes stay visible.
+                context = browser.new_context(viewport=dict(width=375, height=620))
                 page = context.new_page()
+
+                def with_other_node(route):
+                    response = route.fetch()
+                    data = response.json()
+                    original = next(r for r in data['sessions'] if r['sid'] == grandchild)
+                    data['sessions'].insert(0, dict(original, uid='other-node-parent', node_id='other-node'))
+                    route.fulfill(response=response, json=data)
+
+                page.route('**/api/sessions*', with_other_node)
                 page.goto(f'http://127.0.0.1:{central.server_port}/')
                 page.wait_for_selector('#side .item')
                 assert page.locator('dialog[open]').count() == 0
-                page.evaluate('''(sid) => {
-                  const parent = S.sessions.find(s => s.sid === sid);
-                  S.sessions.push({...parent, uid:'other-node-parent', node_id:'other-node'});
-                }''', parent)
-                child_uid = page.evaluate('(sid) => S.sessions.find(s => s.sid === sid).uid', child)
-                page.evaluate('(uid) => openSession(uid)', child_uid)
+                write('44444444-4444-4444-4444-444444444444', grandchild)
+                page.evaluate('pollSessions()')
                 dialog = page.locator('#fork-parent-dialog')
                 dialog.wait_for(state='visible')
+                assert grandchild in dialog.inner_text()
                 box = dialog.bounding_box()
-                assert box['x'] >= 0 and box['x'] + box['width'] <= 390
+                assert box['x'] >= 0 and box['x'] + box['width'] <= 375
                 dialog.locator('button[value="hide"]').click()
                 dialog.wait_for(state='hidden')
+                page.wait_for_function('forkParentChoices.size === 1')
                 assert page.evaluate("visible().some(s => s.uid === 'other-node-parent')")
-                page.screenshot(path='/tmp/agenthub-codex-fork-after.png')
+                assert page.evaluate('sidebarSessions().length') == 4
                 context.close()
                 browser.close()
-                print('PASS existing branch, mobile dialog, node identity isolation')
+                print('PASS new branch mobile dialog, node identity isolation')
         finally:
             stop(central)
             stop(node)

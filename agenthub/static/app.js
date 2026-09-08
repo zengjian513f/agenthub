@@ -1567,6 +1567,7 @@ function showForkParentPrompt() {
 }
 
 function noticeSessionForks(previous) {
+  // 父子关系是持久元数据；只有列表新增分支才提示，打开历史分支不代表刚发生回退。
   const known = new Set(previous.map(s => s.uid));
   for (const child of S.sessions) {
     if (known.has(child.uid)) continue;
@@ -1574,8 +1575,6 @@ function noticeSessionForks(previous) {
       && s.sid === child.forked_from_id && (s.node_id || '') === (child.node_id || ''));
     if (parent) offerForkParentChoice(child);
   }
-  // 首次打开或断线重连后，也能为正在查看的已有分支提供选择。
-  offerForkParentChoice(S.sessions.find(s => s.uid === S.sel));
 }
 
 $('#fork-parent-dialog').addEventListener('close', () => {
@@ -2431,7 +2430,6 @@ async function openSession(uid, agent = null) {
   }
   S.sel = uid;
   S.agent = selectedAgent;
-  if (!selectedAgent) offerForkParentChoice(S.sessions.find(s => s.uid === uid));
   clearUnread(uid);
   store.set('sel', uid);
   store.set('agent', S.agent ? { uid, id: S.agent } : null);
