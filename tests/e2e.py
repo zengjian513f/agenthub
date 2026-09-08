@@ -384,9 +384,10 @@ def run(pw):
         openSession = async uid => { opened.push(uid); S.sel = uid; };
         browserAuditEvent = () => {};
         window.confirm = text => { confirms.push(text); return false; };
-        const linked = linkedTermSession(fromUid);
+        const exact = linkedTermSession(fromUid);
+        const linked = linkedTermSession(fromUid, {followReplacement:true});
         const changed = await rebindSelectedTermSession();
-        return {linked, taken:takenOver(fromUid), changed, opened,
+        return {exact, linked, taken:takenOver(fromUid), changed, opened,
           selected:S.sel, termUid:T.uid,
           oldDraft:composerDrafts.has(fromUid),
           newDraft:composerDrafts.get(toUid)?.text || '',
@@ -402,9 +403,10 @@ def run(pw):
     }""")
     check("Codex 回退后按根 pane 跟进新分支 uid 并迁移草稿",
           codex_branch_rebind == {
+              "exact": None,
               "linked": {"name": "agenthub-codex-01234567",
                          "uid": "codex:e2e-current-branch"},
-              "taken": "agenthub-codex-01234567", "changed": True,
+              "taken": None, "changed": True,
               "opened": ["codex:e2e-current-branch"],
               "selected": "codex:e2e-current-branch",
               "termUid": "codex:e2e-current-branch",

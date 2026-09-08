@@ -22,6 +22,7 @@ def main():
         child = '22222222-2222-2222-2222-222222222222'
         grandchild = '33333333-3333-3333-3333-333333333333'
         rows = []
+        term_sessions = []
         adapter = adapters.CodexAdapter()
 
         def write(sid, ancestor=None):
@@ -44,6 +45,10 @@ def main():
                     uids, _owned = live.active_processes(rows)
                     return self._json(dict(uids=uids, tmux_uids=uids,
                                            started_at={}))
+                if path == '/api/term/list':
+                    return self._json(dict(enabled=True,
+                        sources=dict(claude=True, codex=True), home='/tmp/fork-test',
+                        sessions=term_sessions, pending=[]))
                 if path.startswith('/api/messages/'):
                     row = next(r for r in rows if r['uid'] == unquote(path.rsplit('/', 1)[1]))
                     self.state['row'] = row
@@ -173,6 +178,50 @@ def main():
                     assert not errors, errors
                     context.close()
                     print(f'PASS {"hub" if target is central else "node"}: historical branch open, rescan, poll, restore, deep link')
+
+                # The root-stable tmux name belongs to the current child only. Opening that
+                # terminal and then clicking its visible historical parent must not let the
+                # next term/list poll rebound the explicit history view to the child.
+                child_row = next(row for row in rows if row['sid'] == child)
+                term_sessions[:] = [dict(
+                    name=f'agenthub-codex-{parent[:8]}', uid=child_row['uid'])]
+                for target in (node, central):
+                    context = browser.new_context(viewport=dict(width=1100, height=850))
+                    page = context.new_page()
+                    errors = []
+                    page.on('pageerror', lambda e: errors.append(str(e)))
+                    page.goto(f'http://127.0.0.1:{target.server_port}/')
+                    page.wait_for_selector('#side .item')
+                    ids = page.evaluate('''(sids) => Object.fromEntries(sids.map(sid => {
+                      const row = S.sessions.find(session => session.sid === sid);
+                      return [sid, row.uid];
+                    }))''', [parent, child])
+                    parent_uid, child_uid = ids[parent], ids[child]
+                    page.evaluate('loadTermList()')
+                    page.locator(f'.item[data-uid="{child_uid}"]').click()
+                    page.wait_for_selector('#a-term')
+                    page.locator('#a-term').click()
+                    page.wait_for_function(
+                        '(uid) => S.sel === uid && T.uid === uid && !!T.name', arg=child_uid)
+
+                    page.locator(f'.item[data-uid="{parent_uid}"]').click()
+                    page.wait_for_function('(uid) => S.sel === uid', arg=parent_uid)
+                    page.evaluate('loadTermList()')
+                    state = page.evaluate('''([parentUid, childUid]) => ({
+                      selected:S.sel, termUid:T.uid, exact:takenOver(parentUid),
+                      replacement:linkedTermSession(parentUid, {followReplacement:true})?.uid,
+                      composerHidden:document.querySelector('#composer').classList.contains('hidden'),
+                    })''', [parent_uid, child_uid])
+                    assert state == dict(selected=parent_uid, termUid=child_uid, exact=None,
+                                         replacement=child_uid, composerHidden=True), state
+                    expect(page.locator('#a-term')).to_have_attribute(
+                        'title', '切换到当前会话终端')
+                    page.locator('#a-term').click()
+                    page.wait_for_function('(uid) => S.sel === uid', arg=child_uid)
+                    assert not errors, errors
+                    context.close()
+                    print(f'PASS {"hub" if target is central else "node"}: historical parent remains selected across terminal poll')
+                term_sessions.clear()
 
                 # A new branch still prompts on mobile; matching SIDs on other nodes stay visible.
                 context = browser.new_context(viewport=dict(width=375, height=620))

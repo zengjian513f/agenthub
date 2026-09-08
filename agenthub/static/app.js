@@ -2820,8 +2820,9 @@ function head(m, total) {
   const tb = h.querySelector('#a-term');
   if (tb) {
     tb.onclick = async () => {
-      if (takenOver(m.uid)) await toggleLinkedTermSession(m.uid);
-      else await takeover(m.uid, tb);
+      if (linkedTermSession(m.uid, { followReplacement: true })) {
+        await toggleLinkedTermSession(m.uid);
+      } else await takeover(m.uid, tb);
     };
     setTimeout(renderTakeoverBtn, 0);
   }

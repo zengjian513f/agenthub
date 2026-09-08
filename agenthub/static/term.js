@@ -298,9 +298,17 @@ function sessionTermMeta(uid) {
     || null;
 }
 
-/** 返回会话所在的稳定 tmux pane 以及 pane 当前对应的 uid。 */
-function linkedTermSession(uid) {
+/** 返回会话所在的稳定 tmux pane 以及 pane 当前对应的 uid。
+ *
+ * 默认只接受 pane 的精确 uid 归属。Codex 回退后，同一个稳定 pane 会改绑到
+ * 新叶子；只有负责跟进回退或用户明确切换终端的调用方才允许追随这个替代 uid。
+ */
+function linkedTermSession(uid, { followReplacement = false } = {}) {
   const panes = [...(T.list || []), ...(T.pending || [])];
+  const linked = (pane, name = pane?.name) => {
+    if (!pane || (!followReplacement && pane.uid && pane.uid !== uid)) return null;
+    return { name, uid: pane.uid || uid };
+  };
   if (String(uid || '').startsWith('tmux:')) {
     const name = String(uid).slice(5);
     const pane = panes.find(x => x.name === name);
@@ -313,7 +321,8 @@ function linkedTermSession(uid) {
   // 服务端映射出的 pane.uid 才是当前原生叶子。
   if (T.uid === uid && T.name) {
     const active = panes.find(x => x.name === T.name);
-    if (active) return { name: active.name, uid: active.uid || uid };
+    const result = linked(active);
+    if (result) return result;
   }
 
   const session = sessionTermMeta(uid);
@@ -324,7 +333,8 @@ function linkedTermSession(uid) {
   for (const sid of ids) {
     const name = (session.node_id ? session.node_id + '~' : '') + `agenthub-${session.source}-${String(sid).slice(0, 8)}`;
     const pane = panes.find(x => x.name === name);
-    if (pane) return { name, uid: pane.uid || uid };
+    const result = linked(pane, name);
+    if (result) return result;
   }
   return null;
 }
@@ -350,7 +360,7 @@ async function rebindSelectedTermSession() {
   const fromUid = T.uid;
   if (!fromUid || S.sel !== fromUid || S.agent
       || String(fromUid).startsWith('tmux:')) return false;
-  const linked = linkedTermSession(fromUid);
+  const linked = linkedTermSession(fromUid, { followReplacement: true });
   if (!linked?.uid || linked.uid === fromUid) return false;
   const toUid = adoptLinkedTermSession(fromUid, linked, 'term-list');
   await openSession(toUid);
@@ -359,7 +369,7 @@ async function rebindSelectedTermSession() {
 
 /** 顶栏切换前先跟进 pane 的当前分支，然后再执行原本的对话/终端切换。 */
 async function toggleLinkedTermSession(uid) {
-  const linked = linkedTermSession(uid);
+  const linked = linkedTermSession(uid, { followReplacement: true });
   if (!linked) return false;
   const toUid = adoptLinkedTermSession(uid, linked, 'user-toggle');
   if (toUid !== uid && S.sel === uid && !S.agent) {
@@ -1088,10 +1098,13 @@ function renderTakeoverBtn() {
   const b = $('#a-term');
   if (!b) return;
   const name = takenOver(S.sel);
+  const replacement = name ? null
+    : linkedTermSession(S.sel, { followReplacement: true });
   const paneOpen = !!name && !$('#termpane').classList.contains('hidden');
   const switchToChat = paneOpen && (MOBILE.matches || T.mode === 'full');
   const terminalVisible = paneOpen && (MOBILE.matches || T.mode !== 'collapsed');
-  const label = !name ? '接管会话'
+  const label = replacement ? '切换到当前会话终端'
+    : !name ? '接管会话'
     : MOBILE.matches ? (paneOpen ? '切换到对话' : '切换到终端')
     : switchToChat ? '切换到对话' : '切换到终端';
   b.innerHTML = uiIcon(switchToChat ? 'chat' : 'terminal');
