@@ -57,6 +57,11 @@ def main():
         image.write_bytes(PNG)
         source = root / 'source.py'
         source.write_text('print("fixture")\n')
+        checkout = root / 'checkout'
+        checkout.mkdir()
+        for name in ['Example.sln', 'README.md', 'AGENTS.md', 'CLAUDE.md']:
+            (checkout / name).write_text('checkout fixture')
+        (root / 'CLAUDE.md').write_text('different project')
         client = root / 'browser-computer'
         client.mkdir()
         (client / 'source.py').write_text(source.read_text())
@@ -81,7 +86,10 @@ def main():
                  'text': '曲线已出（`curve.png`，上图）。\n\n'
                          '源码：[`source.py`](source.py:12)，目录：(`./output`)。\n\n'
                          '门/筛选臂同期还在缓慢爬升。`missing.png` [缺失](missing.txt)\n\n'
-                         '链接：https://example.com/a?q=1&x=2。 [文档](https://example.com/a_(b))'}
+                         '链接：https://example.com/a?q=1&x=2。 [文档](https://example.com/a_(b))\n\n'
+                         f'代码已拉下来，位于 `{checkout}`。自带 `Example.sln`、`README.md`、'
+                         '`AGENTS.md`、`CLAUDE.md`。版本 `4.1`，分支 `release/3.0`，'
+                         '命令 `cat README.md`，网址 `https://example.com/repo`。'}
         registry = hub.Registry(root / 'nodes.json', ['127.0.0.0/8'])
         registry.register({'name': 'FileNode', 'url': f'http://127.0.0.1:{node.server_port}',
                            'token': node.state['token']})
@@ -126,6 +134,20 @@ def main():
                     node.state['messages'].append(reply)
                     link = page.locator('.msg[data-role=assistant] a').filter(has_text='curve.png')
                     link.wait_for()
+                    def check_checkout_links():
+                        reply_dom = page.locator('.msg[data-role=assistant]')
+                        for ref in [str(checkout), 'Example.sln', 'README.md', 'AGENTS.md']:
+                            target = reply_dom.locator('a[data-local-path]').filter(has_text=ref)
+                            target.wait_for()
+                            assert target.locator('code').inner_text() == ref
+                            assert target.get_attribute('data-local-path') == str(
+                                checkout if ref == str(checkout) else checkout / ref)
+                            assert ctx.request.get(target.get_attribute('href')).status == 200
+                        for ref in ['CLAUDE.md', '4.1', 'release/3.0', 'cat README.md']:
+                            assert reply_dom.locator('a').filter(has_text=ref).count() == 0
+                        assert reply_dom.locator('a[href="https://example.com/repo"] code').inner_text() == 'https://example.com/repo'
+                        assert any('Example.sln' in check['refs'] for check in node.state['file_checks'])
+                    check_checkout_links()
                     assert page.locator('.msg[data-role=assistant] a').filter(has_text='筛选臂').count() == 0
                     assert page.locator('.msg[data-role=assistant] a').filter(has_text='missing').count() == 0
                     assert link.get_attribute('title') == str(image)
@@ -141,6 +163,7 @@ def main():
                     # Same reference must work on a fresh initial/windowed load.
                     page.reload()
                     link.wait_for()
+                    check_checkout_links()
                     response = ctx.request.get(link.get_attribute('href'))
                     assert response.status == 200 and response.body() == PNG
                     assert 'sandbox' in response.headers['content-security-policy']
@@ -191,6 +214,7 @@ def main():
                     assert '[坏]' not in checks['text'], checks
                     assert len([r for r in refs if r['text'] == '源码']) == 1, refs
                     assert len([r for r in refs if r['text'] == 'curve.png']) == 1, refs
+                    assert len([r for r in refs if r['text'] == 'source.py:12']) == 1, refs
                     assert any(r['href'] == 'https://example.com/inside' for r in refs), refs
                     assert any(r['href'] == 'https://example.com/a_(b)' for r in refs), refs
                     assert any(r['text'] == 'output/curve(final).png' for r in refs), refs

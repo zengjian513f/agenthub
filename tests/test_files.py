@@ -26,6 +26,31 @@ class SessionFileTests(unittest.TestCase):
     def test_short_image_name_resolves_prior_tool_path(self):
         self.assertEqual(self.resolve("curve.png"), self.image)
 
+    def test_basenames_in_mentioned_directory_without_changing_cwd(self):
+        project = self.cwd / 'checkout'
+        project.mkdir()
+        names = ['Example.sln', 'README.md', 'AGENTS.md']
+        for name in names:
+            (project / name).write_text('fixture')
+        self.messages.append({'role': 'assistant', 'text':
+                              f'代码位于 `{project}`，自带 ' + '、'.join(f'`{n}`' for n in names)})
+        with patch.object(files, '_referenced_directories', wraps=files._referenced_directories) as scan:
+            self.assertEqual(files.resolve_many(self.messages, str(self.cwd), names),
+                             {name: str(project / name) for name in names})
+            self.assertEqual(scan.call_count, 1)
+        self.assertEqual(self.resolve('README.md'), project / 'README.md')
+        # Check all recorded roots for collisions, including the session cwd.
+        (self.cwd / 'README.md').write_text('different project')
+        with self.assertRaisesRegex(ValueError, '多个同名'):
+            self.resolve('README.md')
+        (project / 'private.txt').write_text('unmentioned')
+        (project / 'nested').mkdir()
+        (project / 'nested/deep.txt').write_text('not a direct child')
+        self.messages.append({'role': 'assistant', 'text': '`deep.txt`'})
+        for ref in ['private.txt', str(project / 'README.md'), 'deep.txt']:
+            with self.subTest(ref=ref), self.assertRaises(FileNotFoundError):
+                self.resolve(ref)
+
     def test_file_lookup_uses_current_window_before_full_native_history(self):
         handler = object.__new__(server.Handler)
         view = {"uid": "claude:fixture"}

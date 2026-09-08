@@ -68,39 +68,57 @@ def resolve(messages: list[dict], cwd: str, ref: str) -> Path:
 def resolve_many(messages: list[dict], cwd: str, requested: list[str]) -> dict[str, str]:
     refs = references(messages)
     resolved = {}
+    directories = None
     for ref in dict.fromkeys(requested):
         try:
-            resolved[ref] = str(_resolve(refs, cwd, ref))
+            if clean_ref(ref) in refs and '/' not in clean_ref(ref) and directories is None:
+                directories = _referenced_directories(refs, cwd)
+            resolved[ref] = str(_resolve(refs, cwd, ref, directories))
         except (ValueError, FileNotFoundError):
             pass  # Missing/ambiguous references stay ordinary text in the UI.
     return resolved
 
 
-def _resolve(refs: set[str], cwd: str, ref: str) -> Path:
+def _existing(raw: str, cwd: str) -> Path | None:
+    if not raw or "://" in raw or "\x00" in raw:
+        return None
+    try:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            if not cwd or not Path(cwd).is_absolute():
+                return None
+            path = Path(cwd) / path
+        path = path.resolve(strict=True)
+        return path if path.is_file() or path.is_dir() else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _referenced_directories(refs: set[str], cwd: str) -> set[Path]:
+    return {p for raw in refs if '/' in raw
+            if (p := _existing(raw, cwd)) is not None and p.is_dir()}
+
+
+def _resolve(refs: set[str], cwd: str, ref: str,
+             directories: set[Path] | None = None) -> Path:
     if not ref or len(ref) > 4096 or "\x00" in ref:
         raise ValueError("无效的文件引用")
     ref = clean_ref(ref)
     if ref not in refs:
         raise FileNotFoundError("该路径未出现在此会话中")
 
-    def existing(raw):
-        if not raw or "://" in raw or "\x00" in raw:
-            return None
-        try:
-            path = Path(raw).expanduser()
-            if not path.is_absolute():
-                if not cwd or not Path(cwd).is_absolute():
-                    return None
-                path = Path(cwd) / path
-            path = path.resolve(strict=True)
-            return path if path.is_file() or path.is_dir() else None
-        except (OSError, ValueError, RuntimeError):
-            return None
-
     # Explicit paths have one meaning. Short names may refer to tool output in
     # a subdirectory; refuse collisions instead of opening an unrelated file.
     candidates = {ref} if "/" in ref else {r for r in refs if Path(r).name == ref}
-    paths = {p for raw in candidates if (p := existing(raw)) is not None}
+    paths = {p for raw in candidates if (p := _existing(raw, cwd)) is not None}
+    if '/' not in ref and Path(ref).name == ref:
+        # A reply may name files inside a newly cloned/output directory while
+        # the session cwd stays at its parent. Check only direct children of
+        # directories explicitly recorded in the session, never recurse.
+        if directories is None:
+            directories = _referenced_directories(refs, cwd)
+        paths.update(p for directory in directories
+                     if (p := _existing(str(directory / ref), cwd)) is not None)
     if len(paths) > 1:
         raise ValueError("会话中有多个同名文件，请点击完整路径")
     if not paths:

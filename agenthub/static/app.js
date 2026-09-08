@@ -4689,8 +4689,8 @@ function inline(s, media = [], context = {}) {
     const html = referenceLink(ref, esc(ref), context);
     return html ? keepLink(html) + raw.slice(ref.length) : raw;
   };
-  // Only parentheses opt prose into linkification. In particular a label or
-  // a path-looking phrase outside them must remain exactly ordinary text.
+  // Parentheses opt prose into linkification. Code spans are explicit
+  // references too, including when they appear outside parentheses.
   const parenthesized = (part, explicit) => {
     // A complete target may itself contain balanced parentheses. Do not split
     // a URL or a filename such as report(final).pdf into several links.
@@ -4724,6 +4724,8 @@ function inline(s, media = [], context = {}) {
   }
   parts.push(s.slice(start));
   s = parts.join('');
+  s = s.replace(/\u0000CODE(\d+)\u0000/g, (raw, i) =>
+    keepLink(referenceLink(codeText[+i], codeLabels[+i], context) || codeLabels[+i]));
   return emphasis(esc(s))
     .replace(/\u0000LINK(\d+)\u0000/g, (_, i) => links[+i] || '')
     .replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeSpans[+i] || '')
