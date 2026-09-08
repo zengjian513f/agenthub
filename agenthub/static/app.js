@@ -2710,8 +2710,6 @@ function head(m, total) {
       </div>
     </div>
     <div class="dmeta">
-      ${m.node_name ? `<span class="meta-node">${esc(m.node_name)}</span>` : ''}
-      <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       <span id="mcount-total">${total} 条消息</span>
       <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}"
         title="${tmuxLive ? '运行于 tmux' : '运行中'}" aria-label="${tmuxLive ? '运行于 tmux' : '运行中'}">●</span>
@@ -2719,7 +2717,9 @@ function head(m, total) {
       <span class="meta-secondary">${fmtSize(m.size)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
-      <span class="meta-secondary"><code>${esc(nodeDirectory(m))}</code></span>
+      ${m.node_name ? `<span class="meta-node">${esc(m.node_name)}</span>` : ''}
+      <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
+      <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;

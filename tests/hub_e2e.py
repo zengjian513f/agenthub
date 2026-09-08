@@ -94,9 +94,16 @@ def main():
                     uid = federation.qualify(chr(97 + i) * 32, 'claude:same-file-hash', True)
                     page.evaluate('(uid) => openSession(uid)', uid)
                     page.wait_for_function('(name) => document.querySelector("#msgs")?.textContent.includes("reply " + name)', arg=name)
+                    def check_session_identity():
+                        fields = page.locator('.dmeta > span').all_text_contents()
+                        assert fields[-4:] == [name, 'Claude', nodes[i].state['row']['cwd'],
+                                               nodes[i].state['row']['sid']], fields
+                        assert fields.count(name) == 1, fields
+                    check_session_identity()
                     page.wait_for_function('Array.from(document.querySelectorAll("#msgs img")).some(i => i.complete && i.naturalWidth > 0)')
                     nodes[i].state['messages'].append({'role': 'assistant', 'text': name + ' streamed update', 'ts': '2026-09-07T00:01:00Z'})
                     page.wait_for_function('(name) => document.querySelector("#msgs")?.textContent.includes(name + " streamed update")', arg=name)
+                    check_session_identity()
                 # Real nodes heartbeat every 20s: an idle stream must outlive HTTP's 10s timeout.
                 nodes[1].state['pause_stream'] = True
                 watch_count = len([p for p, _ in nodes[1].state['gets'] if p == '/api/watch'])
