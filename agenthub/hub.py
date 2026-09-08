@@ -517,7 +517,8 @@ class HubHandler(server.Handler):
                 return
             self.send_response(response.status)
             self.send_header("Content-Type", ctype)
-            for key in ("Content-Length", "Content-Disposition", "X-Content-Type-Options", "Cache-Control"):
+            for key in ("Content-Length", "Content-Disposition", "X-Content-Type-Options", "Cache-Control",
+                        "Content-Security-Policy"):
                 if response.getheader(key):
                     self.send_header(key, response.getheader(key))
             self.send_header("Connection", "close")

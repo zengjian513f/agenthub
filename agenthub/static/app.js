@@ -3894,7 +3894,8 @@ function msgNode(m) {
   n.dataset.role = m.role;
   if (m.counted === false) n.dataset.counted = 'false';
   const body = el('div', 'mb');
-  const render = full => md(m.text, full, m.media) + mediaGallery(m.media);
+  const linkContext = {uid: S.sel, agent: S.agent};
+  const render = full => md(m.text, full, m.media, linkContext) + mediaGallery(m.media);
   const paint = full => { body.innerHTML = render(full); renderFormulae(body); paintSyntax(body); };
   paint(hit);
   n.appendChild(body);
@@ -4276,13 +4277,13 @@ function paintSyntax(root = document) {
 addEventListener('agenthub-highlight-ready', () => paintSyntax(document));
 
 // 轻量 markdown: 代码块 / 表格 / 列表 / 引用 / 标题 / 行内标记
-function md(text, full, media = []) {
+function md(text, full, media = [], context = {}) {
   const source = full ? text : clipText(text);
   const lines = source.split('\n');
   const output = [], prose = [];
   const flush = () => {
     if (!prose.length) return;
-    output.push(blocks(prose.join('\n'), media));
+    output.push(blocks(prose.join('\n'), media, context));
     prose.length = 0;
   };
   for (let i = 0; i < lines.length;) {
@@ -4325,7 +4326,7 @@ const isSep = s => /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(s) && s.includes('-');
 const cells = s => s.trim().replace(/^\||\|$/g, '').split('|').map(x => x.trim());
 const isTable = (ls, i) => ls[i].includes('|') && i + 1 < ls.length && isSep(ls[i + 1]);
 
-function blocks(src, media = []) {
+function blocks(src, media = [], context = {}) {
   const ls = src.split('\n');
   let out = '', i = 0;
   while (i < ls.length) {
@@ -4340,13 +4341,13 @@ function blocks(src, media = []) {
       i += 2;
       const rows = [];
       while (i < ls.length && ls[i].trim() && ls[i].includes('|')) rows.push(cells(ls[i++]));
-      out += `<div class="tw"><table><thead><tr>${head.map((c, j) => `<th ${at(j)}>${inline(c, media)}</th>`).join('')}</tr></thead>`
-        + `<tbody>${rows.map(r => `<tr>${r.map((c, j) => `<td ${at(j)}>${inline(c, media)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+      out += `<div class="tw"><table><thead><tr>${head.map((c, j) => `<th ${at(j)}>${inline(c, media, context)}</th>`).join('')}</tr></thead>`
+        + `<tbody>${rows.map(r => `<tr>${r.map((c, j) => `<td ${at(j)}>${inline(c, media, context)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
       continue;
     }
 
     const h = line.match(RE_HEAD);
-    if (h) { out += `<h3 class="h${h[1].length}">${inline(h[2], media)}</h3>`; i++; continue; }
+    if (h) { out += `<h3 class="h${h[1].length}">${inline(h[2], media, context)}</h3>`; i++; continue; }
 
     if (RE_HR.test(line)) { out += '<hr>'; i++; continue; }
 
@@ -4358,7 +4359,7 @@ function blocks(src, media = []) {
         while (i < ls.length && ls[i].trim() && !RE_LIST.test(ls[i]) && /^\s{2,}/.test(ls[i])) {
           item += '\n' + ls[i++].trim();     // 续行并入当前条目
         }
-        items.push(`<li>${inline(item, media)}</li>`);
+        items.push(`<li>${inline(item, media, context)}</li>`);
       }
       out += `<${tag}>${items.join('')}</${tag}>`;
       continue;
@@ -4367,7 +4368,7 @@ function blocks(src, media = []) {
     if (RE_QUOTE.test(line)) {
       const qs = [];
       while (i < ls.length && RE_QUOTE.test(ls[i])) qs.push(ls[i++].replace(RE_QUOTE, ''));
-      out += `<blockquote>${inline(qs.join('\n'), media)}</blockquote>`;
+      out += `<blockquote>${inline(qs.join('\n'), media, context)}</blockquote>`;
       continue;
     }
 
@@ -4376,7 +4377,7 @@ function blocks(src, media = []) {
            && !RE_QUOTE.test(ls[i]) && !RE_HR.test(ls[i]) && !isTable(ls, i)) {
       para.push(ls[i++]);
     }
-    if (para.length) out += `<p>${inline(para.join('\n'), media)}</p>`;
+    if (para.length) out += `<p>${inline(para.join('\n'), media, context)}</p>`;
     else i++;                                 // 兜底: 保证 i 一定前进
   }
   return out;
@@ -4385,14 +4386,52 @@ function blocks(src, media = []) {
 const RE_MD_IMAGE = /!\[([^\]]*)\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/g;
 const RE_CODE_SPAN = /(^|[^`])(`+)(?!`)([^\n]*?)(?<!`)\2(?!`)/g;
 
-function inline(s, media = []) {
-  const codeSpans = [];
+const RE_REFERENCE = /(?<![A-Za-z0-9_@/:.-])(?:(?:https?:\/\/|www\.)[^\s<>"'`\u0000，。；、！？]+|(?:~\/|\.\.?\/|\/|[A-Za-z0-9_.-]+\/)[^\s<>"'`\u0000，。；、！？()[\]{}]+|[A-Za-z0-9_-][A-Za-z0-9_.-]*\.[A-Za-z][A-Za-z0-9_-]*(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)?)/gi;
+
+function trimReference(raw) {
+  let ref = raw.replace(/[.,;:!?]+$/, '');
+  for (const [left, right] of [['(', ')'], ['[', ']']]) {
+    while (ref.endsWith(right) && ref.split(right).length > ref.split(left).length) ref = ref.slice(0, -1);
+  }
+  return ref;
+}
+
+function referenceLink(ref, label, context, explicit = false) {
+  let href = '';
+  if (/^(https?:\/\/|www\.)/i.test(ref)) {
+    try {
+      const url = new URL(/^www\./i.test(ref) ? 'https://' + ref : ref);
+      if (!['http:', 'https:'].includes(url.protocol)) return '';
+      href = url.href;
+    } catch { return ''; }
+  } else {
+    // Browser file:// navigation cannot reach a remote node. Resolve only
+    // references present in this session, through its authenticated API.
+    const withoutLine = ref.replace(/(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)$/, '');
+    if (!context.uid || /^[a-z][a-z0-9+.-]*:/i.test(withoutLine) || ref.startsWith('//')) return '';
+    if (/^[A-Z0-9]+(?:\/[A-Z0-9]+)+$/.test(ref)) return '';
+    const path = /^(?:~\/|\.\.?\/|\/)[^\n]+$/.test(ref)
+      || /^[^\s<>]+\/[^\s<>]+$/.test(ref)
+      || /^[\w.-]+\.[a-zA-Z][\w.-]*(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)?$/.test(ref);
+    if (!path && !explicit) return '';
+    const query = new URLSearchParams({uid: context.uid, ref});
+    if (context.agent) query.set('agent', context.agent);
+    href = appUrl('/api/session/file') + '?' + query;
+  }
+  return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+}
+
+function inline(s, media = [], context = {}) {
+  s = String(s).replace(/\u0000/g, '');
+  const codeSpans = [], codeLabels = [];
   s = s.replace(RE_CODE_SPAN, (_, prefix, _ticks, raw) => {
     // Markdown 代码跨度允许内容中出现更长的反引号串，例如用单反引号
     // 包住 ```python。先占位再处理图片/粗体，避免代码内容被二次解析。
     const content = raw.startsWith(' ') && raw.endsWith(' ') && /\S/.test(raw)
       ? raw.slice(1, -1) : raw;
-    codeSpans.push(`<code>${esc(content)}</code>`);
+    const code = `<code>${esc(content)}</code>`;
+    codeLabels.push(code);
+    codeSpans.push(referenceLink(content, code, context) || code);
     return `${prefix}\u0000CODE${codeSpans.length - 1}\u0000`;
   });
   const images = [];
@@ -4405,9 +4444,33 @@ function inline(s, media = []) {
     images.push(html);
     return `\u0000IMG${images.length - 1}\u0000`;
   });
+  const links = [];
+  const keepLink = html => {
+    links.push(html);
+    return `\u0000LINK${links.length - 1}\u0000`;
+  };
+  s = s.replace(/<(https?:\/\/[^<>\s]+)>/gi,
+    (raw, ref) => keepLink(referenceLink(ref, esc(ref), context) || esc(raw)));
+  // Preserve explicit labels before recognizing bare URLs/paths. One balanced
+  // parenthesis pair in a target covers common URL and filename forms.
+  s = s.replace(/\[([^\]\n]+)\]\(\s*(<[^>\n]+>|(?:[^\s()]|\([^\s()]*\))+)(?:\s+["'][^"']*["'])?\s*\)/g,
+    (raw, label, target) => {
+      const content = esc(label).replace(/\u0000CODE(\d+)\u0000/g,
+        (_, i) => codeLabels[+i] || '');
+      const html = referenceLink(target.replace(/^<|>$/g, ''), content, context, true);
+      return keepLink(html || content);
+    });
+  s = s.replace(RE_REFERENCE, (raw, offset, source) => {
+    // Do not link a suffix of a scheme, identifier or email address.
+    if (offset && /[\w@/:.-]/.test(source[offset - 1])) return raw;
+    const ref = trimReference(raw);
+    const html = referenceLink(ref, esc(ref), context);
+    return html ? keepLink(html) + raw.slice(ref.length) : raw;
+  });
   return esc(s)
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>')
+    .replace(/\u0000LINK(\d+)\u0000/g, (_, i) => links[+i] || '')
     .replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeSpans[+i] || '')
     .replace(/\u0000IMG(\d+)\u0000/g, (_, i) => images[+i] || '');
 }

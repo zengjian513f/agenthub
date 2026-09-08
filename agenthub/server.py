@@ -24,7 +24,7 @@ from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
                debug_runs, index, live, media, pending as pending_store,
                send_protocol, send_queue,
                session_meta, term, term_ownership, trash, wsock)
-from . import federation, create_requests
+from . import federation, create_requests, files
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
@@ -1032,6 +1032,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"history": history, "end": result["end"],
                                "version": result["version"],
                                "anchor": result.get("anchor", "")})
+
+        if path == "/api/session/file":
+            session = index.get(q.get("uid", [""])[0])
+            if not session:
+                return self._json({"error": "会话不存在"}, 404)
+            try:
+                view = index.session_view(session, q.get("agent", [""])[0])
+                messages = index.messages_for(view)["messages"]
+                target = files.resolve(messages, view.get("cwd", ""), q.get("ref", [""])[0])
+                data, mime, headers = files.read(target)
+            except KeyError:
+                return self._json({"error": "子会话不存在"}, 404)
+            except FileNotFoundError as e:
+                return self._json({"error": str(e)}, 404)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            except OSError:
+                return self._json({"error": "无法读取此文件"}, 403)
+            return self._send(200, data, mime, headers)
 
         if path.startswith("/api/media/"):
             token = path[len("/api/media/"):]

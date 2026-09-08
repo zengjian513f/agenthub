@@ -1140,6 +1140,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   font: 12px ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 .mb p { margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+.mb a:not(.media-link) { color: var(--accent); text-underline-offset: 2px; }
 .mb h3 { font-size: 14px; margin: 11px 0 4px; font-weight: 650; }
 .mb h3.h1 { font-size: 16px; }
 .mb h3.h2 { font-size: 15px; }
