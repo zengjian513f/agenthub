@@ -62,10 +62,24 @@ def resolve(messages: list[dict], cwd: str, ref: str) -> Path:
     Never search the filesystem recursively or accept an unmentioned request.
     Use the complete selected branch so initial windows and SSE behave alike.
     """
+    return _resolve(references(messages), cwd, ref)
+
+
+def resolve_many(messages: list[dict], cwd: str, requested: list[str]) -> dict[str, str]:
+    refs = references(messages)
+    resolved = {}
+    for ref in dict.fromkeys(requested):
+        try:
+            resolved[ref] = str(_resolve(refs, cwd, ref))
+        except (ValueError, FileNotFoundError):
+            pass  # Missing/ambiguous references stay ordinary text in the UI.
+    return resolved
+
+
+def _resolve(refs: set[str], cwd: str, ref: str) -> Path:
     if not ref or len(ref) > 4096 or "\x00" in ref:
         raise ValueError("无效的文件引用")
     ref = clean_ref(ref)
-    refs = references(messages)
     if ref not in refs:
         raise FileNotFoundError("该路径未出现在此会话中")
 

@@ -26,6 +26,39 @@ class SessionFileTests(unittest.TestCase):
     def test_short_image_name_resolves_prior_tool_path(self):
         self.assertEqual(self.resolve("curve.png"), self.image)
 
+    def test_batch_only_returns_existing_unambiguous_session_references(self):
+        self.messages.append({"role": "assistant", "text":
+                              "门/筛选臂同期还在缓慢爬升，missing.png，`./output`"})
+        private = self.cwd / "private.txt"
+        private.write_text("unmentioned")
+        requested = ["curve.png", "missing.png", "/筛选臂同期还在缓慢爬升", "./output", str(private)]
+        with patch.object(files, "references", wraps=files.references) as scan:
+            self.assertEqual(files.resolve_many(self.messages, str(self.cwd), requested),
+                             {"curve.png": str(self.image), "./output": str(self.image.parent)})
+            self.assertEqual(scan.call_count, 1)
+        (self.cwd / 'curve.png').write_bytes(b'other')
+        self.assertEqual(files.resolve_many(self.messages, str(self.cwd), ['curve.png']), {})
+        self.image.unlink()
+        self.assertEqual(files.resolve_many(self.messages, str(self.cwd), [str(self.image)]), {})
+
+    def test_batch_route_checks_inputs_and_selected_session(self):
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._json = lambda body, status=200: replies.append((status, body))
+        session = {"uid": "claude:fixture", "cwd": str(self.cwd)}
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.index, "messages_for", return_value={"messages": self.messages}):
+            handler._resolve_files({"uid": session["uid"], "refs": ["curve.png", "missing.txt"]})
+            self.assertEqual(replies[-1], (200, {"resolved": {"curve.png": str(self.image)}}))
+            for refs in (None, "curve.png", [None], ["x"] * 257, ["x" * 4097]):
+                handler._resolve_files({"refs": refs})
+                self.assertEqual(replies[-1][0], 400)
+            handler._resolve_files({"refs": ["curve.png"], "agent": "unknown"})
+            self.assertEqual(replies[-1][0], 404)
+        with patch.object(server.index, "get", return_value=None):
+            handler._resolve_files({"uid": "unknown", "refs": ["curve.png"]})
+            self.assertEqual(replies[-1][0], 404)
+
     def test_duplicate_names_are_not_guessed_even_in_cwd(self):
         (self.cwd / "curve.png").write_bytes(b"unrelated")
         with self.assertRaisesRegex(ValueError, "多个同名"):

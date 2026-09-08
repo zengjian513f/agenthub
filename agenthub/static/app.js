@@ -3896,7 +3896,10 @@ function msgNode(m) {
   const body = el('div', 'mb');
   const linkContext = {uid: S.sel, agent: S.agent};
   const render = full => md(m.text, full, m.media, linkContext) + mediaGallery(m.media);
-  const paint = full => { body.innerHTML = render(full); renderFormulae(body); paintSyntax(body); };
+  const paint = full => {
+    body.innerHTML = render(full); renderFormulae(body); paintSyntax(body);
+    checkFileReferences(body, linkContext);
+  };
   paint(hit);
   n.appendChild(body);
   const setAction = addAction(n);
@@ -4396,6 +4399,49 @@ function trimReference(raw) {
   return ref;
 }
 
+const pendingFileChecks = new Map();
+let fileCheckTimer = 0;
+
+function checkFileReferences(root, context) {
+  const nodes = [...root.querySelectorAll('span[data-file-ref]')];
+  if (!nodes.length || !context.uid) return;
+  const key = JSON.stringify([context.uid, context.agent || '']);
+  if (!pendingFileChecks.has(key)) pendingFileChecks.set(key, {context, nodes: []});
+  pendingFileChecks.get(key).nodes.push(...nodes);
+  if (!fileCheckTimer) fileCheckTimer = setTimeout(flushFileChecks, 50);
+}
+
+async function flushFileChecks() {
+  fileCheckTimer = 0;
+  const groups = [...pendingFileChecks.values()];
+  pendingFileChecks.clear();
+  for (const {context, nodes} of groups) {
+    const attached = nodes.filter(node => node.isConnected);
+    const refs = [...new Set(attached.map(node => node.dataset.fileRef))];
+    for (let start = 0; start < refs.length; start += 256) {
+      try {
+        const response = await fetch(appUrl('/api/session/resolve-files'), {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({...context, refs: refs.slice(start, start + 256)}),
+        });
+        if (!response.ok) continue;
+        const {resolved} = await response.json();
+        for (const node of attached) {
+          const path = resolved?.[node.dataset.fileRef];
+          // A response for an old render/session must not modify its replacement.
+          if (!node.isConnected || typeof path !== 'string' || !path.startsWith('/')) continue;
+          const link = document.createElement('a');
+          link.href = node.dataset.fileHref;
+          link.target = '_blank'; link.rel = 'noopener noreferrer';
+          link.title = path;
+          link.append(...node.childNodes);
+          node.replaceWith(link);
+        }
+      } catch { /* Failed checks leave readable, unlinked original text. */ }
+    }
+  }
+}
+
 function referenceLink(ref, label, context, explicit = false) {
   let href = '';
   if (/^(https?:\/\/|www\.)/i.test(ref)) {
@@ -4417,6 +4463,7 @@ function referenceLink(ref, label, context, explicit = false) {
     const query = new URLSearchParams({uid: context.uid, ref});
     if (context.agent) query.set('agent', context.agent);
     href = appUrl('/api/session/file') + '?' + query;
+    return `<span data-file-ref="${esc(ref)}" data-file-href="${esc(href)}">${label}</span>`;
   }
   return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
 }

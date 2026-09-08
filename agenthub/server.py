@@ -590,7 +590,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, b"forbidden", "text/plain")
         if u.path in {"/api/session/star", "/api/audit/browser",
                       "/api/bug-report", "/api/trash/restore",
-                      "/api/trash/purge", "/api/sessions/delete"}:
+                      "/api/trash/purge", "/api/sessions/delete", "/api/session/resolve-files"}:
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 if n > 4 * 1024 * 1024:
@@ -599,6 +599,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self._json({"error": "bad body"}, 400)
             self._audit_body(body)
+            if u.path == "/api/session/resolve-files":
+                return self._resolve_files(body)
             if u.path == "/api/session/star":
                 return self._star_session(body)
             if u.path == "/api/audit/browser":
@@ -923,6 +925,24 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 deleted.append({"uid": uid, "title": title, "trash": dest})
         return self._json({"ok": True, "deleted": deleted, "errors": errors})
+
+    def _resolve_files(self, body):
+        requested = body.get("refs") if isinstance(body, dict) else None
+        if (not isinstance(requested, list) or len(requested) > 256
+                or any(not isinstance(ref, str) or len(ref) > 4096 for ref in requested)):
+            return self._json({"error": "无效的文件引用列表"}, 400)
+        session = index.get(body.get("uid", ""))
+        if not session:
+            return self._json({"error": "会话不存在"}, 404)
+        try:
+            view = index.session_view(session, body.get("agent", ""))
+            messages = index.messages_for(view)["messages"]
+            resolved = files.resolve_many(messages, view.get("cwd", ""), requested)
+        except KeyError:
+            return self._json({"error": "子会话不存在"}, 404)
+        except OSError:
+            return self._json({"error": "无法检查会话文件"}, 403)
+        return self._json({"resolved": resolved})
 
     def _api_get(self, path: str, q: dict):
         if path == "/api/meta":

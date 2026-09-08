@@ -20,6 +20,18 @@ from hub_e2e import MountedHub
 
 
 class FileNode(NodeHandler):
+    def do_POST(self):
+        if urlparse(self.path).path == '/api/session/resolve-files':
+            if (self.headers.get('X-AgentHub-Protocol')
+                    and self.headers.get('X-AgentHub-Node-Token') != self.state['token']):
+                return self._json({'error': 'forbidden'}, 403)
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            self.state.setdefault('file_checks', []).append(body)
+            if self.state.get('fail_checks'):
+                return self._json({'error': 'unavailable'}, 503)
+            return server.Handler._resolve_files(self, body)
+        return super().do_POST()
+
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == '/api/session/file':
@@ -55,6 +67,7 @@ def main():
         reply = {'role': 'assistant', 'phase': 'final', 'ts': '2026-09-01T00:01:00Z',
                  'text': '曲线已出（`curve.png`，上图）。\n\n'
                          '源码：[`source.py`](source.py:12)，目录：`./output`。\n\n'
+                         '门/筛选臂同期还在缓慢爬升。`missing.png` [缺失](missing.txt)\n\n'
                          '链接：https://example.com/a?q=1&x=2。 [文档](https://example.com/a_(b))'}
         registry = hub.Registry(root / 'nodes.json', ['127.0.0.0/8'])
         registry.register({'name': 'FileNode', 'url': f'http://127.0.0.1:{node.server_port}',
@@ -92,6 +105,9 @@ def main():
                     node.state['messages'].append(reply)
                     link = page.locator('.msg[data-role=assistant] a').filter(has_text='curve.png')
                     link.wait_for()
+                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='筛选臂').count() == 0
+                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='missing').count() == 0
+                    assert link.get_attribute('title') == str(image)
                     href = link.get_attribute('href')
                     query = parse_qs(urlparse(href).query)
                     assert ('~' in query['uid'][0]) == scoped, href
@@ -125,7 +141,8 @@ def main():
                         + '`print("curve.png")` ![image](https://example.com/img.png)', true, [], {uid:S.sel, agent:'child'});
                       return {
                         text:host.textContent,
-                        refs:[...host.querySelectorAll('a')].map(a=>({text:a.textContent,href:a.href})),
+                        refs:[...host.querySelectorAll('a, span[data-file-ref]')].map(a=>({text:a.textContent,href:a.href || a.dataset.fileHref})),
+                        premature:host.querySelectorAll('a[href*="/api/session/file?"]').length,
                         nested:host.querySelectorAll('a a').length,
                         codeLinks:host.querySelectorAll('pre a').length,
                         code:host.querySelector('pre').textContent,
@@ -134,6 +151,7 @@ def main():
                       };
                     }''')
                     assert not checks['nested'] and not checks['codeLinks'] and not checks['unsafe'], checks
+                    assert not checks['premature'], checks
                     assert checks['images'] == 1 and checks['code'] == 'cat /private/file.txt', checks
                     refs = checks['refs']
                     assert any(r['text'] == '[源码](source.py:12)' for r in refs), refs
@@ -151,6 +169,20 @@ def main():
                     # An unfinished Markdown target must not trigger exponential
                     # backtracking while an assistant is still streaming it.
                     page.evaluate("md('[unfinished](' + 'a'.repeat(10000), true)")
+                    # A failed check must never create a clickable local link.
+                    node.state['fail_checks'] = True
+                    page.reload()
+                    page.wait_for_selector('span[data-file-ref="curve.png"]')
+                    page.wait_for_timeout(300)
+                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='curve.png').count() == 0
+                    node.state['fail_checks'] = False
+                    # Existence is checked again on a fresh render, not cached
+                    # indefinitely from a previous successful response.
+                    image.unlink()
+                    page.reload()
+                    page.locator('.msg[data-role=assistant] a').filter(has_text='source.py').wait_for()
+                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='curve.png').count() == 0
+                    image.write_bytes(PNG)
                     assert not errors, errors
                     print(('Hub' if scoped else 'Node') + ': SSE, reload, image click, text, directory, URL and safety checks passed')
                     ctx.close()
