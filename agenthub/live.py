@@ -219,10 +219,11 @@ def is_live(session: dict, force: bool = False) -> bool:
                 or _bare_claude_pids(session))
 
 
-def started_at(session: dict, force: bool = False) -> float | None:
+def started_at(session: dict, force: bool = False,
+               pids: list[int] | None = None) -> float | None:
     """当前会话最早的 CLI 主进程启动时间；没有可确认主进程时返回 None。"""
     starts = []
-    for pid in pids_of(session, force=force):
+    for pid in pids_of(session, force=force) if pids is None else pids:
         if pid <= 0:
             continue
         try:
@@ -238,8 +239,63 @@ def started_at(session: dict, force: bool = False) -> float | None:
     return min(starts) if starts else None
 
 
-def live_uids(sessions: list[dict], force: bool = False) -> list[str]:
-    """在已知会话里挑出还活着的。"""
+def _codex_ancestor_sids(session: dict, by_sid: dict[str, dict]) -> set[str]:
+    """返回一个 Codex 回滚分支在当前列表中可确认的祖先。"""
+    if session.get("source") != "codex":
+        return set()
+    ancestors: set[str] = set()
+    parent = str(session.get("forked_from_id") or "")
+    while parent and parent not in ancestors:
+        ancestors.add(parent)
+        row = by_sid.get(parent)
+        if not row:
+            break
+        parent = str(row.get("forked_from_id") or "")
+    return ancestors
+
+
+def active_processes(sessions: list[dict], force: bool = False,
+                     ) -> tuple[list[str], dict[str, list[int]]]:
+    """把每个运行进程只归给当前 Codex 回滚叶子。
+
+    Codex 双 Esc 会在同一个 CLI 进程和 tmux pane 内换一个 rollout 文件。进程会
+    继续持有祖先 JSONL，因此单纯按 fd 判活会把父、子多行都标成同一个运行实例。
+    这里逐 pid 消掉同一分叉链上的祖先归属；若祖先另有独立 pid，它仍保持活跃。
+    """
     if force:
         snapshot(True)
-    return [s["uid"] for s in sessions if is_live(s)]
+    raw = {str(s["uid"]): set(pids_of(s)) for s in sessions}
+    rows = {str(s["uid"]): s for s in sessions}
+    by_sid = {str(s.get("sid") or ""): s for s in sessions
+              if s.get("source") == "codex" and s.get("sid")}
+    ancestors = {uid: _codex_ancestor_sids(row, by_sid)
+                 for uid, row in rows.items()}
+    candidates: dict[int, set[str]] = {}
+    for uid, pids in raw.items():
+        for pid in pids:
+            candidates.setdefault(pid, set()).add(uid)
+
+    owned = {uid: set() for uid in rows}
+    for pid, uids in candidates.items():
+        # A descendant holding the same process supersedes only its ancestors.
+        # Unrelated sessions sharing a helper signal are left untouched.
+        keep = {uid for uid in uids if not any(
+            uid != other
+            and str(rows[uid].get("sid") or "") in ancestors.get(other, set())
+            for other in uids
+        )}
+        for uid in keep:
+            owned[uid].add(pid)
+
+    active = []
+    for session in sessions:
+        uid = str(session["uid"])
+        # Grok's native active list can be authoritative without exposing a pid.
+        if owned[uid] or (not raw[uid] and is_live(session)):
+            active.append(uid)
+    return active, {uid: sorted(pids) for uid, pids in owned.items()}
+
+
+def live_uids(sessions: list[dict], force: bool = False) -> list[str]:
+    """在已知会话里挑出还活着的，并折叠共享进程的 Codex 回滚祖先。"""
+    return active_processes(sessions, force=force)[0]

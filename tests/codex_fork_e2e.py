@@ -9,7 +9,7 @@ from unittest.mock import patch
 from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agenthub import adapters, hub, server
+from agenthub import adapters, hub, live, server
 from hub_fixture import NodeHandler, start_node, stop
 from playwright.sync_api import expect, sync_playwright
 
@@ -39,6 +39,10 @@ def main():
                 path = urlparse(self.path).path
                 if path == '/api/sessions':
                     return self._json(dict(sessions=rows, sig=str(len(rows))))
+                if path == '/api/live':
+                    uids, _owned = live.active_processes(rows)
+                    return self._json(dict(uids=uids, tmux_uids=uids,
+                                           started_at={}))
                 if path.startswith('/api/messages/'):
                     row = next(r for r in rows if r['uid'] == unquote(path.rsplit('/', 1)[1]))
                     self.state['row'] = row
@@ -60,7 +64,9 @@ def main():
         threading.Thread(target=central.serve_forever, daemon=True).start()
         try:
             with patch.object(adapters, 'CODEX_ROOT', root), \
-                    patch.object(adapters, 'CODEX_INDEX', root / 'index'), sync_playwright() as pw:
+                    patch.object(adapters, 'CODEX_INDEX', root / 'index'), \
+                    patch.object(live, 'pids_of', return_value=[123]), \
+                    sync_playwright() as pw:
                 browser = pw.chromium.launch(headless=True)
                 for target in (node, central):
                     for choice in ('keep', 'hide', 'escape'):
@@ -81,6 +87,14 @@ def main():
                         dialog.wait_for(state='visible')
                         assert page.locator('#side .item').count() == 2  # No hiding before consent.
                         assert parent in dialog.inner_text()
+                        page.evaluate('pollLive()')
+                        states = page.evaluate('''(sids) => Object.fromEntries(sids.map(sid => {
+                          const session = S.sessions.find(s => s.sid === sid);
+                          const row = document.querySelector(`.item[data-uid="${session.uid}"]`);
+                          return [sid, {live:S.live.has(session.uid), tmux:row.classList.contains('live-tmux')}];
+                        }))''', [parent, child])
+                        assert states[parent] == {'live': False, 'tmux': False}
+                        assert states[child] == {'live': True, 'tmux': True}
                         if choice == 'escape':
                             page.keyboard.press('Escape')
                         else:

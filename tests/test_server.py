@@ -290,8 +290,12 @@ class StopSessionTests(unittest.TestCase):
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.live, "pids_of", return_value=[123]), \
+                patch.object(server.index, "cached", return_value=[session]), \
+                patch.object(server.live, "active_processes",
+                             return_value=([session["uid"]], {session["uid"]: [123]})), \
                 patch.object(server.term, "session_name_for", return_value=pane["name"]), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server.term, "process_belongs_to", return_value=True), \
                 patch.object(server.term, "graceful_stop",
                              side_effect=lambda name, pids:
                              events.append(("graceful", name, pids)) or [123]), \
@@ -306,6 +310,66 @@ class StopSessionTests(unittest.TestCase):
         ])
         self.assertEqual(result, {"ok": True, "stopped": True, "tmux": True})
         self.assertEqual(replies, [({"ok": True, "stopped": True, "tmux": True}, 200)])
+
+    def test_stop_rejects_parent_whose_process_belongs_to_child(self):
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._json = lambda payload, status=200: replies.append((payload, status)) or payload
+        parent = {"uid": "codex:parent", "source": "codex", "sid": "parent",
+                  "path": "/tmp/parent"}
+        child = {"uid": "codex:child", "source": "codex", "sid": "child",
+                 "path": "/tmp/child", "forked_from_id": "parent"}
+
+        with patch.object(server.index, "get", return_value=parent), \
+                patch.object(server.index, "cached", return_value=[parent, child]), \
+                patch.object(server.live, "pids_of", return_value=[123]), \
+                patch.object(server.term, "list_sessions") as panes, \
+                patch.object(server.term, "graceful_stop") as stop, \
+                patch.object(server.term, "kill_pids") as kill:
+            handler._stop_session({"uid": parent["uid"]})
+
+        panes.assert_not_called()
+        stop.assert_not_called()
+        kill.assert_not_called()
+        self.assertEqual(replies[0][1], 409)
+        self.assertIn("未停止共享的子会话", replies[0][0]["error"])
+
+
+class PaneOwnershipTests(unittest.TestCase):
+    def test_exact_parent_name_does_not_override_owned_child_process(self):
+        session = {"source": "codex", "sid": "child"}
+        stale = {"name": "agenthub-codex-child", "owned": True, "pid": 100}
+        actual = {"name": "agenthub-codex-parent", "owned": True, "pid": 200}
+
+        with patch.object(server.term, "session_name_for", return_value=stale["name"]), \
+                patch.object(server.term, "process_belongs_to",
+                             side_effect=lambda _pid, root: root == actual["pid"]):
+            pane = server._pane_for_session(session, [stale, actual], [123])
+
+        self.assertIs(pane, actual)
+
+
+class TakeoverForkTests(unittest.TestCase):
+    def test_takeover_rejects_parent_whose_process_belongs_to_child(self):
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._json = lambda payload, status=200: replies.append((payload, status)) or payload
+        parent = {"uid": "codex:parent", "source": "codex", "sid": "parent",
+                  "path": "/tmp/parent", "cwd": "/tmp"}
+        child = {"uid": "codex:child", "source": "codex", "sid": "child",
+                 "path": "/tmp/child", "forked_from_id": "parent"}
+
+        with patch.object(server.index, "get", return_value=parent), \
+                patch.object(server.index, "cached", return_value=[parent, child]), \
+                patch.object(server.live, "pids_of", return_value=[123]), \
+                patch.object(server.term, "list_sessions") as panes, \
+                patch.object(server.term, "new_session") as start:
+            handler._takeover({"uid": parent["uid"]})
+
+        panes.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(replies[0][1], 409)
+        self.assertIn("更新的子会话", replies[0][0]["error"])
 
 
 class DeleteSessionTests(unittest.TestCase):

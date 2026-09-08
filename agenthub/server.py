@@ -353,7 +353,9 @@ def _pane_for_session(session: dict, panes: list[dict],
     """
     name = term.session_name_for(session["source"], session["sid"])
     exact = next((pane for pane in panes if pane["name"] == name), None)
-    if exact:
+    if exact and (pids is None or any(
+            pid != 0 and term.process_belongs_to(pid, exact["pid"])
+            for pid in pids)):
         return exact
     pids = live.pids_of(session) if pids is None else pids
     return next((pane for pane in panes if pane.get("owned") and any(
@@ -1025,15 +1027,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/live":
             force = q.get("force", ["0"])[0] == "1"
             sessions = debug_runs.filter_rows(index.cached(), _debug_run(q))
-            uids = live.live_uids(sessions, force=force)
+            uids, owned_pids = live.active_processes(sessions, force=force)
             live_set = set(uids)
             tmux_uids = [s["uid"] for s in sessions
-                         if s["uid"] in live_set and term.in_tmux(live.pids_of(s))]
+                         if s["uid"] in live_set
+                         and term.in_tmux(owned_pids.get(s["uid"], []))]
             started_at = {}
             for s in sessions:
                 if s["uid"] not in live_set:
                     continue
-                value = live.started_at(s)
+                value = live.started_at(s, pids=owned_pids.get(s["uid"], []))
                 if value is not None:
                     started_at[s["uid"]] = value
             return self._json({"uids": uids, "tmux_uids": tmux_uids,
@@ -1854,9 +1857,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "会话不存在"}, 404)
 
         name = term.session_name_for(s["source"], s["sid"])
-        pids = live.pids_of(s, force=True)
+        raw_pids = live.pids_of(s, force=True)
+        sessions = index.cached()
+        if not any(row.get("uid") == s["uid"] for row in sessions):
+            sessions = [*sessions, s]
+        _uids, owned = live.active_processes(sessions)
+        pids = owned.get(s["uid"], [])
+        if raw_pids and not pids:
+            return self._json({
+                "error": "该回滚分支的运行实例已转移到更新的子会话，请先处理当前子会话"
+            }, 409)
         panes = term.list_sessions()
-        pane = _pane_for_session(s, panes, pids)
+        pane = _pane_for_session(s, panes, pids if raw_pids else None)
         if pane:
             return self._json({"name": pane["name"], "action": "reused"})
 
@@ -1880,9 +1892,18 @@ class Handler(BaseHTTPRequestHandler):
         if not s:
             return self._json({"error": "会话不存在"}, 404)
 
-        pids = live.pids_of(s, force=True)
+        raw_pids = live.pids_of(s, force=True)
+        sessions = index.cached()
+        if not any(row.get("uid") == s["uid"] for row in sessions):
+            sessions = [*sessions, s]
+        _uids, owned = live.active_processes(sessions)
+        pids = owned.get(s["uid"], [])
+        if raw_pids and not pids:
+            return self._json({
+                "error": "该回滚分支已不是当前运行分支，未停止共享的子会话"
+            }, 409)
         panes = term.list_sessions()
-        pane = _pane_for_session(s, panes, pids)
+        pane = _pane_for_session(s, panes, pids if raw_pids else None)
 
         if pane:
             # 先退出最里面的 CLI；它是 pane 的前台命令，退出后 tmux 会自然收掉。

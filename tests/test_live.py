@@ -92,5 +92,46 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(all(result == results[0] for result in results))
 
 
+class CodexForkOwnershipTests(unittest.TestCase):
+    @staticmethod
+    def session(uid, sid, path, parent=""):
+        return {
+            "uid": f"codex:{uid}", "source": "codex", "sid": sid,
+            "path": path, "forked_from_id": parent,
+        }
+
+    def test_shared_process_belongs_only_to_deepest_fork(self):
+        parent = self.session("parent", "sid-parent", "/tmp/parent.jsonl")
+        child = self.session("child", "sid-child", "/tmp/child.jsonl", "sid-parent")
+        leaf = self.session("leaf", "sid-leaf", "/tmp/leaf.jsonl", "sid-child")
+        cache = {
+            "at": time.monotonic(), "sids": {},
+            "paths": {row["path"]: {123} for row in (parent, child, leaf)},
+            "bare_claude": {},
+        }
+        with patch.dict(live._cache, cache, clear=True):
+            uids, owned = live.active_processes([parent, child, leaf])
+
+        self.assertEqual(uids, [leaf["uid"]])
+        self.assertEqual(owned, {
+            parent["uid"]: [], child["uid"]: [], leaf["uid"]: [123],
+        })
+
+    def test_ancestor_keeps_a_separate_process(self):
+        parent = self.session("parent", "sid-parent", "/tmp/parent.jsonl")
+        child = self.session("child", "sid-child", "/tmp/child.jsonl", "sid-parent")
+        cache = {
+            "at": time.monotonic(), "sids": {},
+            "paths": {parent["path"]: {111, 222}, child["path"]: {222}},
+            "bare_claude": {},
+        }
+        with patch.dict(live._cache, cache, clear=True):
+            uids, owned = live.active_processes([parent, child])
+
+        self.assertEqual(uids, [parent["uid"], child["uid"]])
+        self.assertEqual(owned[parent["uid"]], [111])
+        self.assertEqual(owned[child["uid"]], [222])
+
+
 if __name__ == "__main__":
     unittest.main()
