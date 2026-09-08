@@ -211,8 +211,8 @@ class IsolatedIndexTests(unittest.TestCase):
         with patch.object(index, "_scan_raw",
                           side_effect=AssertionError("fork topology is in-memory")):
             forked = index.load()
-            self.assertEqual([row["sid"] for row in forked], [child_sid])
-            leaf = forked[0]
+            self.assertEqual({row["sid"] for row in forked}, {parent_sid, child_sid})
+            leaf = next(row for row in forked if row["sid"] == child_sid)
             self.assertEqual(leaf["root_sid"], parent_sid)
             self.assertEqual(leaf["fork_depth"], 1)
             self.assertEqual(leaf["title"], "父会话标题")
@@ -221,7 +221,7 @@ class IsolatedIndexTests(unittest.TestCase):
             with child.open("a") as fh:
                 fh.write(json.dumps({"type": "event_msg",
                                      "payload": {"type": "task_started"}}) + "\n")
-            appended = index.load()[0]
+            appended = next(row for row in index.load() if row["sid"] == child_sid)
             self.assertEqual(appended["size"], cutoff + child.stat().st_size)
             self.assertEqual(appended["root_sid"], parent_sid)
 

@@ -51,7 +51,7 @@ function renderNodes() {
     if (S.results !== null) void runSearch();
   };
   for (const n of Nodes.list) {
-    const count = S.sessions.filter(s => s.node_id === n.id).length;
+    const count = S.sessions.filter(s => s.node_id === n.id && !sessionHidden(s.uid)).length;
     const item = button(`${n.name} ${count}`,
       !Nodes.off.has(n.id), e => { Nodes.off.has(n.id) ? Nodes.off.delete(n.id) : Nodes.off.add(n.id); change(); },
       n.online === false ? '离线；列表可能是缓存，运行状态未知' : '点击选择或取消；双击只选这台机器');

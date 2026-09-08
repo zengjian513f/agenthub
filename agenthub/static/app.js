@@ -1539,7 +1539,62 @@ function pendingTmuxSessions() {
   });
 }
 
-const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions];
+const forkParentChoices = new Map(store.get('forkParentChoices', []));
+const forkPromptQueue = new Map();
+let forkPromptParent = null;
+const sessionHidden = uid => forkParentChoices.get(uid) === true;
+const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions]
+  .filter(s => !sessionHidden(s.uid));
+
+function offerForkParentChoice(child) {
+  if (child?.source !== 'codex' || !child.forked_from_id) return;
+  const parent = S.sessions.find(s => s.source === 'codex'
+    && s.sid === child.forked_from_id && (s.node_id || '') === (child.node_id || ''));
+  if (!parent || parent.uid === child.uid || forkParentChoices.has(parent.uid)) return;
+  forkPromptQueue.set(parent.uid, parent);
+  showForkParentPrompt();
+}
+
+function showForkParentPrompt() {
+  if (forkPromptParent || document.hidden) return;
+  const parent = forkPromptQueue.values().next().value;
+  if (!parent) return;
+  forkPromptQueue.delete(parent.uid);
+  forkPromptParent = parent;
+  $('#fork-parent-dialog').returnValue = 'keep';
+  $('#fork-parent-name').textContent = `父会话：${parent.title}（${parent.sid}）`;
+  $('#fork-parent-dialog').showModal();
+}
+
+function noticeSessionForks(previous) {
+  const known = new Set(previous.map(s => s.uid));
+  for (const child of S.sessions) {
+    if (known.has(child.uid)) continue;
+    const parent = previous.find(s => s.source === 'codex'
+      && s.sid === child.forked_from_id && (s.node_id || '') === (child.node_id || ''));
+    if (parent) offerForkParentChoice(child);
+  }
+  // 首次打开或断线重连后，也能为正在查看的已有分支提供选择。
+  offerForkParentChoice(S.sessions.find(s => s.uid === S.sel));
+}
+
+$('#fork-parent-dialog').addEventListener('close', () => {
+  if (!forkPromptParent) return;
+  const parentUid = forkPromptParent.uid;
+  forkParentChoices.set(parentUid, $('#fork-parent-dialog').returnValue === 'hide');
+  store.set('forkParentChoices', [...forkParentChoices]);
+  forkPromptQueue.delete(parentUid);
+  forkPromptParent = null;
+  renderNodes();
+  renderChips();
+  renderSide();
+  showSessionCount();
+  showForkParentPrompt();
+});
+$('#fork-parent-dialog').addEventListener('cancel', () => {
+  $('#fork-parent-dialog').returnValue = 'keep';
+});
+document.addEventListener('visibilitychange', showForkParentPrompt);
 
 function cursorViews(sessions) {
   const rows = [];
@@ -1708,8 +1763,10 @@ async function loadSessions(force) {
   if (run !== sessionLoadRun) return false;
   $('#stat').classList.remove('err');
   const seedCursors = S.cursors.size === 0;
+  const previous = S.sessions;
   S.sig = d.sig;
   S.sessions = d.sessions;
+  noticeSessionForks(previous);
   applyNodeState(d, 'sessions');
   refreshSessionMeta();
   renderChips();
@@ -1726,8 +1783,10 @@ async function pollSessions() {
     const d = await (await fetch(appUrl('api/sessions?sig=' + encodeURIComponent(S.sig)))).json();
     applyNodeState(d, 'sessions');
     if (d.unchanged || !d.sessions) return;
+    const previous = S.sessions;
     S.sig = d.sig;
     S.sessions = d.sessions;
+    noticeSessionForks(previous);
     renderNodes();
     refreshSessionMeta();
     renderChips();
@@ -1753,7 +1812,8 @@ setInterval(pollSessions, LIST_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSessions(); });
 
 function visible() {
-  let pool = (S.results || sidebarSessions()).filter(s => !S.off.has(s.source) && nodeSelected(s));
+  let pool = (S.results || sidebarSessions()).filter(s => !sessionHidden(s.uid)
+    && !S.off.has(s.source) && nodeSelected(s));
   if (S.activeOnly) pool = pool.filter(s => s.pending || S.live.has(s.uid));
   if (!S.term || S.results) return pool;          // 搜索态下服务端已经筛过
   return pool.filter(s => hasTerm(s.title) || hasTerm(s.cwd) || hasTerm(s.node_name || ''));
@@ -2371,6 +2431,7 @@ async function openSession(uid, agent = null) {
   }
   S.sel = uid;
   S.agent = selectedAgent;
+  if (!selectedAgent) offerForkParentChoice(S.sessions.find(s => s.uid === uid));
   clearUnread(uid);
   store.set('sel', uid);
   store.set('agent', S.agent ? { uid, id: S.agent } : null);
@@ -5014,6 +5075,16 @@ function openSettings() {
 }
 
 $('#settings').onclick = openSettings;
+$('#restore-fork-parents').onclick = () => {
+  for (const [uid, hidden] of forkParentChoices) {
+    if (hidden) forkParentChoices.set(uid, false);
+  }
+  store.set('forkParentChoices', [...forkParentChoices]);
+  renderNodes();
+  renderChips();
+  renderSide();
+  showSessionCount();
+};
 $('#settings-dialog').addEventListener('click', e => {
   if (e.target === $('#settings-dialog')) $('#settings-dialog').close();
 });

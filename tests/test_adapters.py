@@ -722,7 +722,7 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertIn("idle", [m["state"] for m in full if m["role"] == "status"])
         self.assertTrue(extends)
 
-    def test_escape_fork_replaces_parent_and_inherits_history_prefix(self):
+    def test_escape_fork_preserves_parent_and_inherits_history_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"
             day = root / "2026" / "08" / "08"
@@ -777,8 +777,10 @@ class ClaudeProtocolTests(unittest.TestCase):
                     patch.object(adapters, "CODEX_INDEX", session_index):
                 adapter = adapters.CodexAdapter()
                 sessions = adapter.list_sessions()
-                self.assertEqual([s["sid"] for s in sessions], [child_id])
-                session = sessions[0]
+                self.assertEqual({s["sid"] for s in sessions}, {parent_id, child_id})
+                session = next(s for s in sessions if s["sid"] == child_id)
+                parent_messages, _ = adapter.read(parent)
+                self.assertIn("被回退的旧尾部", [m["text"] for m in parent_messages])
                 self.assertEqual(session["root_sid"], parent_id)
                 self.assertEqual(session["created"], adapters._norm_ts("2026-08-08T10:00:00Z"))
                 self.assertEqual(session["size"], cutoff + child.stat().st_size)

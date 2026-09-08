@@ -1565,7 +1565,7 @@ class CodexAdapter:
         return out
 
     def finalize_sessions(self, sessions: list[dict]) -> list[dict]:
-        """只在内存中套用 rename、分叉继承、逻辑大小和父项隐藏。"""
+        """套用 rename、分叉继承和逻辑大小；父项留给用户决定是否隐藏。"""
         names = self._thread_names()
         # 协作 agent rollout 是父线程的内部执行记录，不是用户的回滚分支。
         # 暂留在 raw cache 供将来做 agent 视图，但不参与公开列表、fork 替代
@@ -1582,11 +1582,8 @@ class CodexAdapter:
             s["renamed_to"] = name_event.get("name") if name_event else None
 
         by_sid = {str(s["sid"]): s for s in out}
-        superseded = {s["forked_from_id"] for s in out
-                      if s.get("forked_from_id") in by_sid}
-
         # 双 Esc 回退会创建一个新 UUID，但新 rollout 只保存分叉点之后的增量，
-        # history_base 指向父文件的有效前缀。列表里用当前叶子替代被回退的父项；
+        # history_base 指向父文件的有效前缀。父子会话都保留供用户查看；
         # 历史仍由 read() 按链补齐，不能把两个分支的尾部直接拼在一起。
         for s in out:
             chain, seen = [], {str(s["sid"])}
@@ -1622,7 +1619,7 @@ class CodexAdapter:
             s.pop("_named", None)
             s.pop("_local_size", None)
             s.pop("_is_subagent", None)
-        return [s for s in out if str(s["sid"]) not in superseded]
+        return out
 
     def list_sessions(self):
         return self.finalize_sessions(self.scan_sessions())

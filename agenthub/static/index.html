@@ -279,6 +279,17 @@
     </div>
   </div>
 </dialog>
+<dialog id="fork-parent-dialog" class="app-dialog" aria-labelledby="fork-parent-title" aria-describedby="fork-parent-description fork-parent-name">
+  <form method="dialog" class="settings-form">
+    <div class="modal-head"><h2 id="fork-parent-title">是否隐藏父会话？</h2></div>
+    <p id="fork-parent-description">Codex 回退已生成一个子会话。隐藏父会话只影响当前浏览器的列表，不会删除会话记录。可在设置中恢复显示。</p>
+    <p id="fork-parent-name"></p>
+    <div class="modal-actions">
+      <button class="btn" value="keep" autofocus>保留父会话</button>
+      <button class="btn go" value="hide">隐藏父会话</button>
+    </div>
+  </form>
+</dialog>
 <dialog id="settings-dialog" class="app-dialog" aria-labelledby="settings-title">
   <form method="dialog" class="settings-form">
     <div class="modal-head">
@@ -321,6 +332,10 @@
         <option value="0">不限制</option>
       </select>
     </label>
+    <div class="setting-row">
+      <span><b>回退父会话</b><small>恢复在当前浏览器中隐藏的父会话</small></span>
+      <button type="button" class="btn" id="restore-fork-parents">恢复显示</button>
+    </div>
     <div class="modal-actions"><button type="submit" class="btn go">完成</button></div>
   </form>
 </dialog>

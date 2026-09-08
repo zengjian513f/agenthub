@@ -955,11 +955,11 @@ def delete(uid: str) -> str:
         except Exception as e:
             # 文件移动已经完成，不能因随后一次瞬时元数据读错把成功删除误报
             # 成 500。先从公开快照移除目标，保留 dirty 让下一轮恢复 Codex
-            # 隐藏祖先等拓扑；源文件不会因用户重试而进一步受损。
+            # 分叉继承等拓扑；源文件不会因用户重试而进一步受损。
             sessions = [row for row in _state["sessions"] if row.get("uid") != uid]
             print(f"[agenthub] 删除后的索引协调失败，稍后重试: {e}")
         # 不用移动后的新 inventory 给尚未协调的其他变化背书；下一次 load
-        # 会从旧 files 做完整 diff。Codex 叶子删除后这里已能立即恢复父项。
+        # 会从旧 files 做完整 diff，保留其他 Codex 分支和父项。
         _publish(raw, sessions, _state["files"], None, time.time(), 0.0, True)
         with _search_text_lock:
             _search_text_cache.pop(uid, None)
