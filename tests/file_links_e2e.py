@@ -279,18 +279,18 @@ def main():
                     menu = page.locator('#file-menu')
                     assert menu.locator('#file-menu-target').inner_text() == str(source)
                     assert menu.get_by_role('menuitem').all_text_contents() == [
-                        '复制绝对路径', '复制路径', '下载']
-                    menu.get_by_role('menuitem', name='复制绝对路径', exact=True).click()
+                        '复制完整路径', '复制所在目录路径', '下载']
+                    menu.get_by_role('menuitem', name='复制完整路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(source)
                     text_link.click(button='right')
-                    menu.get_by_role('menuitem', name='复制路径', exact=True).click()
+                    menu.get_by_role('menuitem', name='复制所在目录路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(root)
                     link.click(button='right')
-                    menu.get_by_role('menuitem', name='复制路径', exact=True).click()
+                    menu.get_by_role('menuitem', name='复制所在目录路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(output)
                     directory.click(button='right')
-                    assert menu.get_by_role('menuitem').all_text_contents() == ['复制绝对路径', '下载']
-                    menu.get_by_role('menuitem', name='复制绝对路径', exact=True).click()
+                    assert menu.get_by_role('menuitem').all_text_contents() == ['复制完整路径', '下载']
+                    menu.get_by_role('menuitem', name='复制完整路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(output)
                     text_link.click(button='right')
                     with page.expect_download() as downloaded:

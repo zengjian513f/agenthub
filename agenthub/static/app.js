@@ -4486,8 +4486,8 @@ fileMenuTargetText.id = 'file-menu-target'; fileMenuTargetText.className = 'ctx-
 fileMenuTargetText.dir = 'auto';
 fileMenu.appendChild(fileMenuTargetText);
 fileMenu.setAttribute('aria-describedby', fileMenuTargetText.id);
-for (const [action, label] of [['copy-path', '复制绝对路径'],
-  ['copy-directory', '复制路径'], ['download', '下载'],
+for (const [action, label] of [['copy-path', '复制完整路径'],
+  ['copy-directory', '复制所在目录路径'], ['download', '下载'],
   ['copy-url', '复制链接地址'], ['open-web', '在新标签页打开']]) {
   const button = document.createElement('button');
   button.type = 'button'; button.dataset.action = action; button.textContent = label;
