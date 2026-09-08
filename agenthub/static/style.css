@@ -515,6 +515,7 @@ main { display: flex; flex: 1; min-height: 0; }
 .ctx-menu button[hidden] { display: none; }   /* display:block 会盖掉 hidden */
 .ctx-menu button:hover { background: var(--hover); }
 .ctx-menu button:disabled { opacity: .45; cursor: default; }
+.ctx-menu button[hidden] { display: none; }
 .desktop-target, .desktop-command { white-space: pre-wrap; overflow-wrap: anywhere; }
 .desktop-dialog h2 { margin: 0; font-size: 18px; }
 .desktop-dialog p { margin: 6px 0; }

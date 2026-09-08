@@ -145,8 +145,9 @@ def main():
                     assert response.status == 200 and response.body() == PNG
                     assert 'sandbox' in response.headers['content-security-policy']
                     text_link = page.locator('.msg[data-role=assistant] a').filter(has_text='source.py')
-                    assert text_link.inner_text() == 'source.py:12'
-                    assert '[source.py](source.py:12)' in page.locator('.msg[data-role=assistant]').inner_text()
+                    assert text_link.inner_text() == 'source.py'
+                    assert '源码：source.py，目录' in page.locator('.msg[data-role=assistant]').inner_text()
+                    assert 'source.py:12' not in page.locator('.msg[data-role=assistant]').inner_text()
                     response = ctx.request.get(text_link.get_attribute('href'))
                     assert response.status == 200 and response.text() == source.read_text()
                     directory = page.locator('.msg[data-role=assistant] a').filter(has_text='./output')
@@ -184,10 +185,10 @@ def main():
                     assert not checks['premature'], checks
                     assert checks['images'] == 1 and checks['code'] == 'cat /private/file.txt', checks
                     refs = checks['refs']
-                    assert '[源码](source.py:12)' in checks['text'], checks
-                    assert '[文档](<https://example.com/help> "说明")' in checks['text'], checks
-                    assert '[坏](javascript:alert(1))' in checks['text'], checks
-                    assert len([r for r in refs if r['text'] == 'source.py:12']) == 1, refs
+                    assert '源码 文档 坏' in checks['text'], checks
+                    assert 'https://example.com/help' not in checks['text'], checks
+                    assert '[坏]' not in checks['text'], checks
+                    assert len([r for r in refs if r['text'] == '源码']) == 1, refs
                     assert len([r for r in refs if r['text'] == 'curve.png']) == 1, refs
                     assert any(r['href'] == 'https://example.com/inside' for r in refs), refs
                     assert any(r['href'] == 'https://example.com/a_(b)' for r in refs), refs
@@ -200,11 +201,8 @@ def main():
                     unchanged = page.evaluate(r'''() => {
                       const samples = [
                         '弯腰动作：单干净参考 v5 (experiments/test/compare_v5.mp4)',
-                        '[设计说明](docs/file-links.md)',
-                        '[标题](<output/report.pdf> "原有标题")',
                         '保持  两个空格（ ./output ）和括号。',
                         '原始网址 (https://example.com/a_(b)?q=1&x=2)',
-                        '[不可用](javascript:alert(1))',
                         '标题外部 example.com，文件 source.py，不生成链接。',
                       ];
                       return samples.map(text => {
@@ -218,12 +216,50 @@ def main():
                         assert item['text'] == item['rendered'], item
                         assert not any(label in ['设计说明', '标题', '弯腰动作：单干净参考 v5']
                                        for label in item['labels']), item
+                    standard = page.evaluate(r'''() => {
+                      const cases = [
+                        ['[保留目录](/project/experiments/run)', '保留目录', '/project/experiments/run'],
+                        ['[设计说明](docs/file-links.md)', '设计说明', 'docs/file-links.md'],
+                        ['[**说明**](<output/report.pdf> "原有标题")', '说明', 'output/report.pdf'],
+                        ['[文档](https://example.com/help "提示")', '文档', 'https://example.com/help'],
+                        ['[缺失](missing.txt)', '缺失', 'missing.txt'],
+                        ['[不可用](javascript:alert(1))', '不可用', null],
+                      ];
+                      return cases.map(([raw, expected, target]) => {
+                        const host=document.createElement('div');
+                        host.innerHTML=inline(raw, [], {uid:S.sel});
+                        const link=host.querySelector('a,span[data-file-ref]');
+                        return {raw,expected,target,text:host.textContent,
+                          destination:link?.dataset.fileRef || link?.getAttribute('href') || null};
+                      });
+                    }''')
+                    for item in standard:
+                        assert item['text'] == item['expected'], item
+                        assert item['destination'] == item['target'], item
+                    web_link = page.locator('.msg[data-role=assistant] a').filter(has_text='文档')
+                    web_link.click(button='right')
+                    web_menu = page.locator('#file-menu')
+                    assert web_menu.get_by_role('menuitem').all_text_contents() == [
+                        '复制文本', '复制链接地址', '在新标签页打开']
+                    web_menu.get_by_role('menuitem', name='复制文本', exact=True).click()
+                    assert page.evaluate('navigator.clipboard.readText()') == '文档'
+                    web_link.click(button='right')
+                    web_menu.get_by_role('menuitem', name='复制链接地址', exact=True).click()
+                    assert page.evaluate('navigator.clipboard.readText()') == 'https://example.com/a_(b)'
+                    ctx.route('https://example.com/**', lambda route: route.fulfill(body='fixture'))
+                    web_link.click(button='right')
+                    with ctx.expect_page() as new_page:
+                        web_menu.get_by_role('menuitem', name='在新标签页打开', exact=True).click()
+                    popup = new_page.value
+                    popup.wait_for_load_state()
+                    assert popup.url == 'https://example.com/a_(b)'
+                    popup.close()
                     text_link.click(button='right')
                     menu = page.locator('#file-menu')
                     assert menu.get_by_role('menuitem').all_text_contents() == [
                         '复制文本', '复制绝对路径', '本地打开', '本地打开目录', '下载']
                     menu.get_by_role('menuitem', name='复制文本', exact=True).click()
-                    assert page.evaluate('navigator.clipboard.readText()') == 'source.py:12'
+                    assert page.evaluate('navigator.clipboard.readText()') == 'source.py'
                     text_link.click(button='right')
                     menu.get_by_role('menuitem', name='复制绝对路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(source)

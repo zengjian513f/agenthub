@@ -4476,14 +4476,15 @@ function referenceLink(ref, label, context, explicit = false) {
     href = appUrl('/api/session/file') + '?' + query;
     return `<span data-file-ref="${esc(ref)}" data-file-href="${esc(href)}">${label}</span>`;
   }
-  return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  return `<a href="${esc(href)}" data-reference-kind="web" target="_blank" rel="noopener noreferrer">${label}</a>`;
 }
 
 const fileMenu = document.createElement('div');
 fileMenu.id = 'file-menu'; fileMenu.className = 'ctx-menu'; fileMenu.hidden = true;
 fileMenu.setAttribute('role', 'menu'); fileMenu.setAttribute('aria-label', '文件操作');
 for (const [action, label] of [['copy-text', '复制文本'], ['copy-path', '复制绝对路径'],
-  ['open-local', '本地打开'], ['open-directory', '本地打开目录'], ['download', '下载']]) {
+  ['open-local', '本地打开'], ['open-directory', '本地打开目录'], ['download', '下载'],
+  ['copy-url', '复制链接地址'], ['open-web', '在新标签页打开']]) {
   const button = document.createElement('button');
   button.type = 'button'; button.dataset.action = action; button.textContent = label;
   button.setAttribute('role', 'menuitem'); fileMenu.appendChild(button);
@@ -4565,11 +4566,16 @@ async function copyFileText(text) {
 }
 
 document.addEventListener('contextmenu', event => {
-  const link = event.target.closest('.mb a[data-local-path]');
+  const link = event.target.closest('.mb a[data-local-path], .mb a[data-reference-kind="web"]');
   if (!link) return;
   event.preventDefault(); closeItemMenu();
   fileMenuTarget = {text: link.textContent, path: link.dataset.localPath, href: link.href,
-    kind: link.dataset.fileKind, node: link.dataset.fileNode};
+    kind: link.dataset.referenceKind === 'web' ? 'web' : link.dataset.fileKind, node: link.dataset.fileNode};
+  const actions = fileMenuTarget.kind === 'web'
+    ? ['copy-text', 'copy-url', 'open-web']
+    : ['copy-text', 'copy-path', 'open-local', 'open-directory', 'download'];
+  fileMenu.setAttribute('aria-label', fileMenuTarget.kind === 'web' ? '链接操作' : '文件操作');
+  for (const button of fileMenu.querySelectorAll('button')) button.hidden = !actions.includes(button.dataset.action);
   const download = fileMenu.querySelector('[data-action="download"]');
   download.disabled = fileMenuTarget.kind !== 'file';
   download.title = fileMenuTarget.kind === 'directory' ? '目录不作为文件下载' :
@@ -4591,7 +4597,7 @@ document.addEventListener('pointerdown', event => {
 addEventListener('resize', closeFileMenu);
 document.addEventListener('scroll', closeFileMenu, true);
 fileMenu.addEventListener('keydown', event => {
-  const buttons = [...fileMenu.querySelectorAll('button:not(:disabled)')];
+  const buttons = [...fileMenu.querySelectorAll('button:not(:disabled):not([hidden])')];
   const index = buttons.indexOf(document.activeElement);
   if (event.key === 'Escape') { event.preventDefault(); closeFileMenu(); }
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -4607,6 +4613,8 @@ fileMenu.addEventListener('click', async event => {
   try {
     if (action === 'copy-text') await copyFileText(target.text);
     else if (action === 'copy-path') await copyFileText(target.path);
+    else if (action === 'copy-url') await copyFileText(target.href);
+    else if (action === 'open-web') window.open(target.href, '_blank', 'noopener,noreferrer');
     else if (action === 'open-local' || action === 'open-directory') {
       if (!desktopPairing) desktopSetup(target, action);
       else {
@@ -4651,6 +4659,20 @@ function inline(s, media = [], context = {}) {
     links.push(html);
     return `\u0000LINK${links.length - 1}\u0000`;
   };
+  const emphasis = text => text
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>');
+  // Standard Markdown links display their label only. Keep the destination
+  // in link metadata for navigation/menu actions, never append it to the label.
+  s = s.replace(/\[([^\]\n]+)\]\(\s*(<[^>\n]+>|(?:[^\s()]|\([^\s()]*\))+)(?:\s+["']([^"']*)["'])?\s*\)/g,
+    (_raw, label, target, title) => {
+      const content = emphasis(esc(label)).replace(/\u0000CODE(\d+)\u0000/g,
+        (_, i) => codeLabels[+i] || '');
+      const ref = target.replace(/^<|>$/g, '');
+      let html = referenceLink(ref, content, context, true) || content;
+      if (title !== undefined && html.startsWith('<a ')) html = html.replace('<a ', `<a title="${esc(title)}" `);
+      return keepLink(html);
+    });
   const linkCandidate = (raw, offset, source) => {
     // Do not link a suffix of a scheme, identifier or email address.
     if (offset && /[\w@/:.-]/.test(source[offset - 1])) return raw;
@@ -4693,9 +4715,7 @@ function inline(s, media = [], context = {}) {
   }
   parts.push(s.slice(start));
   s = parts.join('');
-  return esc(s)
-    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
-    .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>')
+  return emphasis(esc(s))
     .replace(/\u0000LINK(\d+)\u0000/g, (_, i) => links[+i] || '')
     .replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeSpans[+i] || '')
     .replace(/\u0000IMG(\d+)\u0000/g, (_, i) => images[+i] || '');
