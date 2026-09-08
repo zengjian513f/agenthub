@@ -18,7 +18,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
                debug_runs, index, live, media, pending as pending_store,
@@ -926,6 +926,45 @@ class Handler(BaseHTTPRequestHandler):
                 deleted.append({"uid": uid, "title": title, "trash": dest})
         return self._json({"ok": True, "deleted": deleted, "errors": errors})
 
+    def _download_file(self, path):
+        if not path.is_file():
+            return self._json({"error": "请选择文件下载"}, 400)
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", path.name)
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             f"attachment; filename=\"{name}\"; filename*=UTF-8''{quote(path.name)}")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            sent = 0
+            try:
+                while sent < size:
+                    chunk = stream.read(min(1024 * 1024, size - sent))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            audit.record("file.download", category="http", uid=getattr(self, "_audit_uid", ""),
+                         data={"bytes": sent, "size": size, "complete": sent == size})
+
+    def _file_messages(self, view, requested):
+        # File links in the current window must not require rereading multi-GB
+        # native histories. Fall back only for a reference from older loaded UI.
+        messages = index.messages_for(view, windowed=True)["messages"]
+        known = files.references(messages)
+        # Basenames need the whole branch to detect earlier paths/collisions.
+        # Explicit paths in the current window have only one filesystem meaning.
+        if any(files.clean_ref(ref) not in known or '/' not in files.clean_ref(ref)
+               for ref in requested):
+            return index.messages_for(view)["messages"]
+        return messages
+
     def _resolve_files(self, body):
         requested = body.get("refs") if isinstance(body, dict) else None
         if (not isinstance(requested, list) or len(requested) > 256
@@ -936,13 +975,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "会话不存在"}, 404)
         try:
             view = index.session_view(session, body.get("agent", ""))
-            messages = index.messages_for(view)["messages"]
+            messages = self._file_messages(view, requested)
             resolved = files.resolve_many(messages, view.get("cwd", ""), requested)
         except KeyError:
             return self._json({"error": "子会话不存在"}, 404)
         except OSError:
             return self._json({"error": "无法检查会话文件"}, 403)
-        return self._json({"resolved": resolved})
+        targets = []
+        for ref, path in resolved.items():
+            target = Path(path)
+            # A directory and a file have different actions. Do not make the
+            # browser guess the type from a suffix or from the original text.
+            kind = "directory" if target.is_dir() else "file" if target.is_file() else None
+            if kind:
+                targets.append({"ref": ref, "path": path, "kind": kind})
+        # Keep resolved for already open tabs during rolling deployments.
+        return self._json({"resolved": resolved, "targets": targets,
+                           "node_id": NODE_ID or federation.identity()})
 
     def _api_get(self, path: str, q: dict):
         if path == "/api/meta":
@@ -1059,8 +1108,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "会话不存在"}, 404)
             try:
                 view = index.session_view(session, q.get("agent", [""])[0])
-                messages = index.messages_for(view)["messages"]
-                target = files.resolve(messages, view.get("cwd", ""), q.get("ref", [""])[0])
+                ref = q.get("ref", [""])[0]
+                messages = self._file_messages(view, [ref])
+                target = files.resolve(messages, view.get("cwd", ""), ref)
+                if q.get("download", [""])[0] == "1":
+                    return self._download_file(target)
                 data, mime, headers = files.read(target)
             except KeyError:
                 return self._json({"error": "子会话不存在"}, 404)

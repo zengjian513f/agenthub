@@ -26,6 +26,41 @@ class SessionFileTests(unittest.TestCase):
     def test_short_image_name_resolves_prior_tool_path(self):
         self.assertEqual(self.resolve("curve.png"), self.image)
 
+    def test_file_lookup_uses_current_window_before_full_native_history(self):
+        handler = object.__new__(server.Handler)
+        view = {"uid": "claude:fixture"}
+        with patch.object(server.index, "messages_for", return_value={"messages": self.messages}) as read:
+            self.assertEqual(handler._file_messages(view, [str(self.image)]), self.messages)
+            read.assert_called_once_with(view, windowed=True)
+        with patch.object(server.index, "messages_for", return_value={"messages": self.messages}) as read:
+            handler._file_messages(view, ['curve.png'])
+            self.assertEqual(read.call_count, 2)  # Earlier basename collisions must be checked.
+        with patch.object(server.index, "messages_for", side_effect=[
+                {"messages": []}, {"messages": self.messages}]) as read:
+            self.assertEqual(handler._file_messages(view, ['curve.png']), self.messages)
+            self.assertEqual(read.call_count, 2)
+
+    def test_download_streams_large_files_with_original_unicode_name(self):
+        large = self.cwd / '视频.mp4'
+        size = files.MAX_BYTES + 7
+        with large.open('wb') as stream:
+            stream.truncate(size)
+        handler = object.__new__(server.Handler)
+        headers, chunks = {}, []
+        handler.send_response = lambda status: self.assertEqual(status, 200)
+        handler.send_header = headers.__setitem__
+        handler.end_headers = lambda: None
+        class Sink:
+            def write(self, chunk):
+                chunks.append(len(chunk))
+        handler.wfile = Sink()
+        with patch.object(server.audit, 'record'):
+            handler._download_file(large)
+        self.assertEqual(sum(chunks), size)
+        self.assertLessEqual(max(chunks), 1024 * 1024)
+        self.assertIn("filename*=UTF-8''%E8%A7%86%E9%A2%91.mp4", headers['Content-Disposition'])
+        self.assertEqual(headers['Content-Length'], str(size))
+
     def test_batch_only_returns_existing_unambiguous_session_references(self):
         self.messages.append({"role": "assistant", "text":
                               "门/筛选臂同期还在缓慢爬升，missing.png，`./output`"})
@@ -49,7 +84,16 @@ class SessionFileTests(unittest.TestCase):
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.index, "messages_for", return_value={"messages": self.messages}):
             handler._resolve_files({"uid": session["uid"], "refs": ["curve.png", "missing.txt"]})
-            self.assertEqual(replies[-1], (200, {"resolved": {"curve.png": str(self.image)}}))
+            self.assertEqual(replies[-1][0], 200)
+            self.assertEqual(replies[-1][1]['resolved'], {"curve.png": str(self.image)})
+            self.assertEqual(replies[-1][1]['targets'], [
+                {'ref': 'curve.png', 'path': str(self.image), 'kind': 'file'}])
+            handler._resolve_files({'uid': session['uid'], 'refs': ['./output']})
+            self.assertEqual(replies[-1][1]['targets'], [])  # Not mentioned yet.
+            self.messages.append({'role': 'assistant', 'text': '目录 (`./output`)'})
+            handler._resolve_files({'uid': session['uid'], 'refs': ['./output']})
+            self.assertEqual(replies[-1][1]['targets'], [
+                {'ref': './output', 'path': str(self.image.parent), 'kind': 'directory'}])
             for refs in (None, "curve.png", [None], ["x"] * 257, ["x" * 4097]):
                 handler._resolve_files({"refs": refs})
                 self.assertEqual(replies[-1][0], 400)

@@ -69,7 +69,7 @@ def public_payload(data, node: dict, path: str):
                 result[k] = f"/api/nodes/{nid}{v}"
             elif k == "epoch" and isinstance(v, str):
                 result[k] = qualify(nid, v)
-            elif k in {"data", "content", "input", "arguments", "raw"}:
+            elif k in {"data", "content", "input", "arguments", "raw", "resolved"}:
                 result[k] = v
             else:
                 result[k] = walk(v, k)

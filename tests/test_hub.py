@@ -13,6 +13,13 @@ from hub_fixture import start_node, stop
 
 
 class FederationTests(unittest.TestCase):
+    def test_file_metadata_does_not_rewrite_reference_names(self):
+        payload = {'resolved': {'uid': '/project/uid', 'epoch': '/project/epoch'},
+                   'targets': [{'ref': 'uid', 'path': '/project/uid', 'kind': 'file'}],
+                   'node_id': 'a' * 32}
+        self.assertEqual(federation.public_payload(payload, {'id': 'a' * 32, 'name': 'A'},
+                                                  '/api/session/resolve-files'), payload)
+
     def test_scope_roundtrip_and_payload_boundaries(self):
         node = {'id': 'a' * 32, 'name': 'A'}
         self.assertEqual(federation.split(federation.qualify(node['id'], 'codex:abc', True), True),

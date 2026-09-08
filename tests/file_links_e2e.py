@@ -17,6 +17,7 @@ from playwright.sync_api import sync_playwright
 from agenthub import hub, server
 from hub_fixture import NodeHandler, PNG, start_node, stop
 from hub_e2e import MountedHub
+from test_desktop_helper import desktop
 
 
 class FileNode(NodeHandler):
@@ -56,6 +57,18 @@ def main():
         image.write_bytes(PNG)
         source = root / 'source.py'
         source.write_text('print("fixture")\n')
+        client = root / 'browser-computer'
+        client.mkdir()
+        (client / 'source.py').write_text(source.read_text())
+        (client / 'output/placeholder').parent.mkdir(exist_ok=True)
+        (client / 'output/curve.png').write_bytes(PNG)
+        (client / 'output').mkdir(exist_ok=True)
+        desktop_server = ThreadingHTTPServer(('127.0.0.1', 0), desktop.Handler)
+        desktop_server.config = {'token': 'fixture-pairing', 'origins': [], 'mappings': [
+            {'node': server.NODE_ID or server.federation.identity(), 'remote': str(root), 'local': str(client)}]}
+        opened = []
+        desktop_server.open_target = opened.append
+        threading.Thread(target=desktop_server.serve_forever, daemon=True).start()
         node = start_node('a' * 32, 'FileNode')
         node.RequestHandlerClass = FileNode
         node.state['row']['cwd'] = str(root)
@@ -66,7 +79,7 @@ def main():
         ]
         reply = {'role': 'assistant', 'phase': 'final', 'ts': '2026-09-01T00:01:00Z',
                  'text': '曲线已出（`curve.png`，上图）。\n\n'
-                         '源码：[`source.py`](source.py:12)，目录：`./output`。\n\n'
+                         '源码：[`source.py`](source.py:12)，目录：(`./output`)。\n\n'
                          '门/筛选臂同期还在缓慢爬升。`missing.png` [缺失](missing.txt)\n\n'
                          '链接：https://example.com/a?q=1&x=2。 [文档](https://example.com/a_(b))'}
         registry = hub.Registry(root / 'nodes.json', ['127.0.0.0/8'])
@@ -81,7 +94,7 @@ def main():
         try:
             with patch.object(server.index, 'get', side_effect=lambda uid:
                               node.state['row'] if uid == node.state['row']['uid'] else None), \
-                    patch.object(server.index, 'messages_for', side_effect=lambda view:
+                    patch.object(server.index, 'messages_for', side_effect=lambda view, **kwargs:
                                  {'messages': node.state['messages']}), sync_playwright() as pw:
                 browser = pw.chromium.launch(headless=True, args=['--disable-gpu', '--disable-software-rasterizer'])
                 for base, scoped in [(f'http://127.0.0.1:{node.server_port}/', False),
@@ -89,7 +102,15 @@ def main():
                     node.state['messages'] = list(initial)
                     node.state['gets'].clear()
                     ctx = browser.new_context()
+                    ctx.grant_permissions(['clipboard-read', 'clipboard-write'], origin=base)
                     page = ctx.new_page()
+                    desktop_server.config['origins'].append(base.rstrip('/').replace('/agenthub', ''))
+                    # Use a random loopback port for the real client helper so
+                    # this free test cannot contact any installed user helper.
+                    app_js = (server.STATIC / 'app.js').read_text().replace(
+                        '127.0.0.1:18711', f'127.0.0.1:{desktop_server.server_port}')
+                    page.route('**/app.js*', lambda route: route.fulfill(
+                        body=app_js, content_type='application/javascript'))
                     errors = []
                     page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(base)
@@ -124,19 +145,28 @@ def main():
                     assert response.status == 200 and response.body() == PNG
                     assert 'sandbox' in response.headers['content-security-policy']
                     text_link = page.locator('.msg[data-role=assistant] a').filter(has_text='source.py')
-                    assert text_link.inner_text() == '[source.py](source.py:12)'
+                    assert text_link.inner_text() == 'source.py:12'
+                    assert '[source.py](source.py:12)' in page.locator('.msg[data-role=assistant]').inner_text()
                     response = ctx.request.get(text_link.get_attribute('href'))
                     assert response.status == 200 and response.text() == source.read_text()
                     directory = page.locator('.msg[data-role=assistant] a').filter(has_text='./output')
                     assert 'curve.png' in ctx.request.get(directory.get_attribute('href')).text()
+                    assert text_link.get_attribute('data-file-kind') == 'file'
+                    assert directory.get_attribute('data-file-kind') == 'directory'
+                    directory.click(button='right')
+                    assert page.locator('#file-menu [data-action="download"]').is_disabled()
+                    page.keyboard.press('Escape')
                     assert any(path == '/api/session/file' and q['uid'] == [node.state['row']['uid']]
                                for path, q in node.state['gets'])
                     checks = page.evaluate(r'''() => {
                       const host = document.createElement('div');
                       host.innerHTML = md('已存curve.png，路径/source.py。 `source.py:12`\n\n'
                         + '[`源码`](source.py:12) [文档](<https://example.com/help> "说明") '
-                        + '[坏](javascript:alert(1)) [坏](data:text/html,hi)\n\n'
-                        + 'https://example.com/a_(b)。 www.example.com。 <HTTPS://example.com/auto> A/D\n\n'
+                        + '[坏](javascript:alert(1))\n\n'
+                        + '外部 https://example.com/outside 和 www.example.com 不链接。'
+                        + '（`curve.png`，上图） (https://example.com/inside)\n\n'
+                        + '(https://example.com/a_(b)) (output/curve(final).png) '
+                        + '(file:///tmp/private) (javascript:alert(1)) (mailto:a@example.com)\n\n'
                         + '```sh\ncat /private/file.txt\n```\n\n'
                         + '`print("curve.png")` ![image](https://example.com/img.png)', true, [], {uid:S.sel, agent:'child'});
                       return {
@@ -154,18 +184,75 @@ def main():
                     assert not checks['premature'], checks
                     assert checks['images'] == 1 and checks['code'] == 'cat /private/file.txt', checks
                     refs = checks['refs']
-                    assert any(r['text'] == '[源码](source.py:12)' for r in refs), refs
-                    assert any(r['text'] == '[文档](<https://example.com/help> "说明")'
-                               and r['href'] == 'https://example.com/help' for r in refs), refs
+                    assert '[源码](source.py:12)' in checks['text'], checks
+                    assert '[文档](<https://example.com/help> "说明")' in checks['text'], checks
                     assert '[坏](javascript:alert(1))' in checks['text'], checks
-                    assert any(r['text'] == 'curve.png' and 'agent=child' in r['href'] for r in refs), refs
-                    assert any(r['text'] == 'source.py:12' for r in refs), refs
+                    assert len([r for r in refs if r['text'] == 'source.py:12']) == 1, refs
+                    assert len([r for r in refs if r['text'] == 'curve.png']) == 1, refs
+                    assert any(r['href'] == 'https://example.com/inside' for r in refs), refs
                     assert any(r['href'] == 'https://example.com/a_(b)' for r in refs), refs
-                    assert any(r['href'] == 'https://www.example.com/' for r in refs), refs
-                    assert any(r['href'] == 'https://example.com/auto' for r in refs), refs
-                    assert any(r['text'] == '<HTTPS://example.com/auto>' for r in refs), refs
-                    assert not any(r['text'] == 'A/D' for r in refs), refs
+                    assert any(r['text'] == 'output/curve(final).png' for r in refs), refs
+                    assert not any('private' in r['href'] or 'mailto:' in r['href'] for r in refs), refs
+                    assert not any(r['text'] == '/source.py' or 'outside' in r['href'] or 'www.' in r['href'] for r in refs), refs
                     assert not any('print' in r['text'] for r in refs), refs
+                    # The bug contract is text preservation, not merely a
+                    # visually similar reconstruction of a Markdown link.
+                    unchanged = page.evaluate(r'''() => {
+                      const samples = [
+                        '弯腰动作：单干净参考 v5 (experiments/test/compare_v5.mp4)',
+                        '[设计说明](docs/file-links.md)',
+                        '[标题](<output/report.pdf> "原有标题")',
+                        '保持  两个空格（ ./output ）和括号。',
+                        '原始网址 (https://example.com/a_(b)?q=1&x=2)',
+                        '[不可用](javascript:alert(1))',
+                        '标题外部 example.com，文件 source.py，不生成链接。',
+                      ];
+                      return samples.map(text => {
+                        const host = document.createElement('div');
+                        host.innerHTML = inline(text, [], {uid:S.sel});
+                        return {text, rendered:host.textContent,
+                          labels:[...host.querySelectorAll('a,span[data-file-ref]')].map(a=>a.textContent)};
+                      });
+                    }''')
+                    for item in unchanged:
+                        assert item['text'] == item['rendered'], item
+                        assert not any(label in ['设计说明', '标题', '弯腰动作：单干净参考 v5']
+                                       for label in item['labels']), item
+                    text_link.click(button='right')
+                    menu = page.locator('#file-menu')
+                    assert menu.get_by_role('menuitem').all_text_contents() == [
+                        '复制文本', '复制绝对路径', '本地打开', '本地打开目录', '下载']
+                    menu.get_by_role('menuitem', name='复制文本', exact=True).click()
+                    assert page.evaluate('navigator.clipboard.readText()') == 'source.py:12'
+                    text_link.click(button='right')
+                    menu.get_by_role('menuitem', name='复制绝对路径', exact=True).click()
+                    assert page.evaluate('navigator.clipboard.readText()') == str(source)
+                    link.click(button='right')
+                    menu.get_by_role('menuitem', name='本地打开', exact=True).click()
+                    dialog = page.locator('.desktop-dialog')
+                    dialog.locator('.desktop-pairing').fill('wrong-key')
+                    dialog.get_by_role('button', name='连接并打开').click()
+                    page.wait_for_function("document.querySelector('.desktop-error')?.textContent.includes('配对码')")
+                    assert not opened or opened[-1] != client / 'output/curve.png'
+                    dialog.locator('.desktop-pairing').fill('fixture-pairing')
+                    dialog.get_by_role('button', name='连接并打开').click()
+                    dialog.wait_for(state='detached')
+                    assert opened[-1] == client / 'output/curve.png'
+                    text_link.click(button='right')
+                    menu.get_by_role('menuitem', name='本地打开目录', exact=True).click()
+                    page.wait_for_timeout(250)
+                    assert opened[-1] == client
+                    directory.click(button='right')
+                    menu.get_by_role('menuitem', name='本地打开目录', exact=True).click()
+                    page.wait_for_timeout(250)
+                    assert opened[-1] == client / 'output'
+                    text_link.click(button='right')
+                    with page.expect_download() as downloaded:
+                        menu.get_by_role('menuitem', name='下载', exact=True).click()
+                    download = downloaded.value
+                    assert download.suggested_filename == 'source.py'
+                    download.save_as(root / 'downloaded.py')
+                    assert (root / 'downloaded.py').read_bytes() == source.read_bytes()
                     # An unfinished Markdown target must not trigger exponential
                     # backtracking while an assistant is still streaming it.
                     page.evaluate("md('[unfinished](' + 'a'.repeat(10000), true)")
@@ -188,6 +275,8 @@ def main():
                     ctx.close()
                 browser.close()
         finally:
+            desktop_server.shutdown()
+            desktop_server.server_close()
             stop(central)
             stop(node)
 

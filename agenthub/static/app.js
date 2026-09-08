@@ -4418,22 +4418,33 @@ async function flushFileChecks() {
   for (const {context, nodes} of groups) {
     const attached = nodes.filter(node => node.isConnected);
     const refs = [...new Set(attached.map(node => node.dataset.fileRef))];
-    for (let start = 0; start < refs.length; start += 256) {
+    // Basenames may need an expensive history lookup. Resolve explicit paths
+    // first so a short name cannot hold an entire video/image batch hostage.
+    const batches = [];
+    for (const list of [refs.filter(ref => ref.includes('/')), refs.filter(ref => !ref.includes('/'))]) {
+      for (let start = 0; start < list.length; start += 256) batches.push(list.slice(start, start + 256));
+    }
+    for (const batch of batches) {
       try {
         const response = await fetch(appUrl('/api/session/resolve-files'), {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({...context, refs: refs.slice(start, start + 256)}),
+          body: JSON.stringify({...context, refs: batch}),
         });
         if (!response.ok) continue;
-        const {resolved} = await response.json();
+        const {resolved, targets = [], node_id = ''} = await response.json();
+        const details = new Map(targets.map(target => [target.ref, target]));
         for (const node of attached) {
-          const path = resolved?.[node.dataset.fileRef];
+          const detail = details.get(node.dataset.fileRef);
+          const path = detail?.path || resolved?.[node.dataset.fileRef];
           // A response for an old render/session must not modify its replacement.
           if (!node.isConnected || typeof path !== 'string' || !path.startsWith('/')) continue;
           const link = document.createElement('a');
           link.href = node.dataset.fileHref;
           link.target = '_blank'; link.rel = 'noopener noreferrer';
           link.title = path;
+          link.dataset.localPath = path;
+          link.dataset.fileKind = ['file', 'directory'].includes(detail?.kind) ? detail.kind : 'unknown';
+          link.dataset.fileNode = node_id;
           link.append(...node.childNodes);
           node.replaceWith(link);
         }
@@ -4468,17 +4479,161 @@ function referenceLink(ref, label, context, explicit = false) {
   return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
 }
 
+const fileMenu = document.createElement('div');
+fileMenu.id = 'file-menu'; fileMenu.className = 'ctx-menu'; fileMenu.hidden = true;
+fileMenu.setAttribute('role', 'menu'); fileMenu.setAttribute('aria-label', '文件操作');
+for (const [action, label] of [['copy-text', '复制文本'], ['copy-path', '复制绝对路径'],
+  ['open-local', '本地打开'], ['open-directory', '本地打开目录'], ['download', '下载']]) {
+  const button = document.createElement('button');
+  button.type = 'button'; button.dataset.action = action; button.textContent = label;
+  button.setAttribute('role', 'menuitem'); fileMenu.appendChild(button);
+}
+document.body.appendChild(fileMenu);
+let fileMenuTarget = null;
+let desktopPairing = ''; // Page memory only: never include the key in diagnostics/storage.
+
+async function desktopRequest(target, action, pairing) {
+  if (!window.isSecureContext) throw new Error('本地打开需要 HTTPS 页面或 localhost 页面');
+  let response;
+  try {
+    response = await fetch('http://127.0.0.1:18711/open', {
+      method: 'POST', mode: 'cors', credentials: 'omit', redirect: 'error',
+      targetAddressSpace: 'loopback', signal: AbortSignal.timeout(20000),
+      headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + pairing},
+      body: JSON.stringify({node: target.node, path: target.path, kind: target.kind, action}),
+    });
+  } catch { throw new Error('未能连接本机助手。请在浏览器电脑上启动助手，并允许此网页访问本地网络。'); }
+  const data = await response.json();
+  if (!response.ok || !data.ok) throw new Error(data.error || '本地打开失败');
+}
+
+function desktopSetup(target, action, error = '') {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'app-dialog desktop-dialog';
+  dialog.innerHTML = `<form class="settings-form">
+    <h2>在这台电脑上打开</h2>
+    <p>需要在浏览器所在电脑运行本机助手，并配置节点目录到本机挂载或同步目录的对应关系。</p>
+    <p class="desktop-target"></p>
+    <button type="button" class="btn desktop-download">下载本机助手</button>
+    <details><summary>首次配置方法（Python 3.10 或更新版本）</summary>
+      <p>在这台电脑的终端运行下面的命令。替换两个目录占位符，启动后输入助手显示的配对码。没有本地副本时，请使用“下载”。</p>
+      <pre class="desktop-command"></pre>
+    </details>
+    <label>配对码 <input class="desktop-pairing" type="password" autocomplete="off" required></label>
+    <p class="desktop-error" role="alert"></p>
+    <div class="modal-actions"><button type="button" class="btn desktop-cancel">取消</button>
+      <button type="submit" class="btn go">连接并打开</button></div>
+  </form>`;
+  dialog.querySelector('.desktop-target').textContent = `节点：${target.node}\n路径：${target.path}`;
+  // Example uses JSON double-quoted literals only for display, never execution.
+  dialog.querySelector('.desktop-command').textContent =
+    `python desktop-helper.py --origin "${location.origin}" --node "${target.node}" `
+    + '--remote-root "节点目录绝对路径" --local-root "本机对应目录绝对路径"';
+  dialog.querySelector('.desktop-error').textContent = error;
+  dialog.querySelector('.desktop-download').onclick = () => {
+    const link = document.createElement('a'); link.href = appUrl('/desktop-helper.py');
+    link.download = 'desktop-helper.py'; document.body.appendChild(link); link.click(); link.remove();
+  };
+  dialog.querySelector('.desktop-cancel').onclick = () => dialog.close();
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.querySelector('form').onsubmit = async event => {
+    event.preventDefault();
+    const button = dialog.querySelector('[type="submit"]');
+    const pairing = dialog.querySelector('.desktop-pairing').value.trim();
+    button.disabled = true;
+    try {
+      await desktopRequest(target, action, pairing);
+      desktopPairing = pairing;
+      dialog.close();
+    } catch (err) { dialog.querySelector('.desktop-error').textContent = err.message; }
+    finally { button.disabled = false; }
+  };
+  document.body.appendChild(dialog); dialog.showModal();
+}
+
+function closeFileMenu() { fileMenu.hidden = true; fileMenuTarget = null; }
+
+async function copyFileText(text) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(text); return; } catch { /* HTTP fallback */ }
+  }
+  const input = document.createElement('textarea');
+  input.value = text; input.style.cssText = 'position:fixed;left:-10000px;top:0';
+  document.body.appendChild(input); input.select();
+  try { if (!document.execCommand('copy')) throw new Error('复制失败'); }
+  finally { input.remove(); }
+}
+
+document.addEventListener('contextmenu', event => {
+  const link = event.target.closest('.mb a[data-local-path]');
+  if (!link) return;
+  event.preventDefault(); closeItemMenu();
+  fileMenuTarget = {text: link.textContent, path: link.dataset.localPath, href: link.href,
+    kind: link.dataset.fileKind, node: link.dataset.fileNode};
+  const download = fileMenu.querySelector('[data-action="download"]');
+  download.disabled = fileMenuTarget.kind !== 'file';
+  download.title = fileMenuTarget.kind === 'directory' ? '目录不作为文件下载' :
+    fileMenuTarget.kind !== 'file' ? '文件类型尚未确认，请刷新后重试' : '';
+  for (const action of ['open-local', 'open-directory']) {
+    const button = fileMenu.querySelector(`[data-action="${action}"]`);
+    button.disabled = !['file', 'directory'].includes(fileMenuTarget.kind) || !fileMenuTarget.node;
+    button.title = button.disabled ? '目标信息尚未确认，请刷新后重试' : '在浏览器所在电脑打开';
+  }
+  fileMenu.hidden = false;
+  const box = fileMenu.getBoundingClientRect();
+  fileMenu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - box.width - 8))}px`;
+  fileMenu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - box.height - 8))}px`;
+  fileMenu.querySelector('button').focus({preventScroll: true});
+});
+document.addEventListener('pointerdown', event => {
+  if (!fileMenu.contains(event.target)) closeFileMenu();
+}, true);
+addEventListener('resize', closeFileMenu);
+document.addEventListener('scroll', closeFileMenu, true);
+fileMenu.addEventListener('keydown', event => {
+  const buttons = [...fileMenu.querySelectorAll('button:not(:disabled)')];
+  const index = buttons.indexOf(document.activeElement);
+  if (event.key === 'Escape') { event.preventDefault(); closeFileMenu(); }
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    buttons[(index + (event.key === 'ArrowDown' ? 1 : buttons.length - 1)) % buttons.length].focus();
+  }
+});
+fileMenu.addEventListener('click', async event => {
+  const action = event.target.closest('button')?.dataset.action;
+  const target = fileMenuTarget;
+  if (!action || !target) return;
+  closeFileMenu();
+  try {
+    if (action === 'copy-text') await copyFileText(target.text);
+    else if (action === 'copy-path') await copyFileText(target.path);
+    else if (action === 'open-local' || action === 'open-directory') {
+      if (!desktopPairing) desktopSetup(target, action);
+      else {
+        try { await desktopRequest(target, action, desktopPairing); }
+        catch (error) { desktopSetup(target, action, error.message); }
+      }
+    }
+    else if (action === 'download') {
+      const url = new URL(target.href); url.searchParams.set('download', '1');
+      const link = document.createElement('a'); link.href = url.href;
+      link.download = ''; document.body.appendChild(link); link.click(); link.remove();
+    }
+  } catch (error) { alert(error.message || '文件操作失败'); }
+});
+
 function inline(s, media = [], context = {}) {
   s = String(s).replace(/\u0000/g, '');
-  const codeSpans = [], codeLabels = [];
+  const codeSpans = [], codeLabels = [], codeText = [];
   s = s.replace(RE_CODE_SPAN, (_, prefix, _ticks, raw) => {
     // Markdown 代码跨度允许内容中出现更长的反引号串，例如用单反引号
     // 包住 ```python。先占位再处理图片/粗体，避免代码内容被二次解析。
     const content = raw.startsWith(' ') && raw.endsWith(' ') && /\S/.test(raw)
       ? raw.slice(1, -1) : raw;
     const code = `<code>${esc(content)}</code>`;
+    codeText.push(content);
     codeLabels.push(code);
-    codeSpans.push(referenceLink(content, code, context) || code);
+    codeSpans.push(code);
     return `${prefix}\u0000CODE${codeSpans.length - 1}\u0000`;
   });
   const images = [];
@@ -4496,25 +4651,48 @@ function inline(s, media = [], context = {}) {
     links.push(html);
     return `\u0000LINK${links.length - 1}\u0000`;
   };
-  // Keep the original link text visible, including its path/URL. Replacing it
-  // with only the label hides useful CLI output behind a remote file endpoint.
-  // One balanced parenthesis pair covers common URL and filename forms.
-  s = s.replace(/\[([^\]\n]+)\]\(\s*(<[^>\n]+>|(?:[^\s()]|\([^\s()]*\))+)(?:\s+["'][^"']*["'])?\s*\)/g,
-    (raw, _label, target) => {
-      const content = esc(raw).replace(/\u0000CODE(\d+)\u0000/g,
-        (_, i) => codeLabels[+i] || '');
-      const html = referenceLink(target.replace(/^<|>$/g, ''), content, context, true);
-      return keepLink(html || content);
-    });
-  s = s.replace(/<(https?:\/\/[^<>\s]+)>/gi,
-    (raw, ref) => keepLink(referenceLink(ref, esc(raw), context) || esc(raw)));
-  s = s.replace(RE_REFERENCE, (raw, offset, source) => {
+  const linkCandidate = (raw, offset, source) => {
     // Do not link a suffix of a scheme, identifier or email address.
     if (offset && /[\w@/:.-]/.test(source[offset - 1])) return raw;
     const ref = trimReference(raw);
     const html = referenceLink(ref, esc(ref), context);
     return html ? keepLink(html) + raw.slice(ref.length) : raw;
-  });
+  };
+  // Only parentheses opt prose into linkification. In particular a label or
+  // a path-looking phrase outside them must remain exactly ordinary text.
+  const parenthesized = (part, explicit) => {
+    // A complete target may itself contain balanced parentheses. Do not split
+    // a URL or a filename such as report(final).pdf into several links.
+    // Preserve every delimiter, space and optional Markdown title. Only wrap
+    // the existing target substring; never synthesize a label or new text.
+    const match = part.match(/^(\s*)(<([^<>\n]+)>|(?:[^\s()]|\([^\s()]*\))+)(\s+(?:["'][^"']*["'])\s*|\s*)$/);
+    if (match && !match[2].includes('\u0000')) {
+      const ref = match[3] || match[2];
+      const html = referenceLink(ref, esc(ref), context, explicit);
+      if (html) return match[1] + (match[3] ? '<' : '') + keepLink(html)
+        + (match[3] ? '>' : '') + match[4];
+    }
+    return part.replace(/\u0000CODE(\d+)\u0000/g, (raw, i) => {
+      const code = codeLabels[+i];
+      return keepLink(referenceLink(codeText[+i], code, context) || code);
+    }).replace(RE_REFERENCE, linkCandidate);
+  };
+  const parts = [], stack = [];
+  let start = 0, open = -1;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '(' || s[i] === '（') {
+      if (!stack.length) open = i;
+      stack.push(s[i] === '(' ? ')' : '）');
+    } else if (stack.length && s[i] === stack[stack.length - 1]) {
+      stack.pop();
+      if (!stack.length) {
+        parts.push(s.slice(start, open + 1), parenthesized(s.slice(open + 1, i), s[open - 1] === ']'), s[i]);
+        start = i + 1;
+      }
+    }
+  }
+  parts.push(s.slice(start));
+  s = parts.join('');
   return esc(s)
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<i>$2</i>')
