@@ -4580,8 +4580,19 @@ document.addEventListener('contextmenu', event => {
   const actions = fileMenuTarget.kind === 'web'
     ? ['copy-text', 'copy-url', 'open-web']
     : ['copy-text', 'copy-path', 'open-local', 'open-directory', 'download'];
+  const displayed = fileMenuTarget.text.trim();
+  const destination = fileMenuTarget.kind === 'web' ? fileMenuTarget.href : fileMenuTarget.path;
+  let duplicateCopy = !displayed || displayed === destination;
+  if (fileMenuTarget.kind === 'web' && /^(https?:\/\/|www\.)/i.test(displayed)) {
+    try {
+      // A browser may add the trailing slash or encode Unicode in a bare URL.
+      duplicateCopy = new URL(/^www\./i.test(displayed) ? 'https://' + displayed : displayed).href === destination;
+    } catch { /* A descriptive label still has its own copy operation. */ }
+  }
   fileMenu.setAttribute('aria-label', fileMenuTarget.kind === 'web' ? '链接操作' : '文件操作');
-  for (const button of fileMenu.querySelectorAll('button')) button.hidden = !actions.includes(button.dataset.action);
+  for (const button of fileMenu.querySelectorAll('button')) {
+    button.hidden = !actions.includes(button.dataset.action) || (button.dataset.action === 'copy-text' && duplicateCopy);
+  }
   const download = fileMenu.querySelector('[data-action="download"]');
   download.disabled = fileMenuTarget.kind !== 'file';
   download.title = fileMenuTarget.kind === 'directory' ? '目录不作为文件下载' :
@@ -4595,7 +4606,7 @@ document.addEventListener('contextmenu', event => {
   const box = fileMenu.getBoundingClientRect();
   fileMenu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - box.width - 8))}px`;
   fileMenu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - box.height - 8))}px`;
-  fileMenu.querySelector('button').focus({preventScroll: true});
+  fileMenu.querySelector('button:not([hidden]):not(:disabled)').focus({preventScroll: true});
 });
 document.addEventListener('pointerdown', event => {
   if (!fileMenu.contains(event.target)) closeFileMenu();

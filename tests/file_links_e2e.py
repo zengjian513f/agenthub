@@ -237,6 +237,32 @@ def main():
                     for item in standard:
                         assert item['text'] == item['expected'], item
                         assert item['destination'] == item['target'], item
+                    for raw, destination in [
+                        ('(https://example.com/report)', 'https://example.com/report'),
+                        ('(https://example.com)', 'https://example.com/'),
+                        ('(www.example.com)', 'https://www.example.com/'),
+                        ('[https://example.com](https://example.com/)', 'https://example.com/'),
+                    ]:
+                        page.evaluate('''raw => {
+                          const d=document.createElement('div');d.className='mb';d.id='copy-menu-probe';
+                          d.innerHTML=inline(raw);document.querySelector('#msgs').appendChild(d);
+                        }''', raw)
+                        page.locator('#copy-menu-probe a').click(button='right')
+                        copy_menu = page.locator('#file-menu')
+                        assert copy_menu.get_by_role('menuitem').all_text_contents() == [
+                            '复制链接地址', '在新标签页打开']
+                        assert page.evaluate('document.activeElement.dataset.action') == 'copy-url'
+                        copy_menu.get_by_role('menuitem', name='复制链接地址', exact=True).click()
+                        assert page.evaluate('navigator.clipboard.readText()') == destination
+                        page.locator('#copy-menu-probe').evaluate('(el) => el.remove()')
+                    # An absolute file path also has only one copy value. A
+                    # relative display path still differs from the absolute one.
+                    text_link.evaluate('el => {el.dataset.savedLabel=el.textContent;el.textContent=el.dataset.localPath}')
+                    text_link.click(button='right')
+                    assert page.locator('#file-menu').get_by_role('menuitem', name='复制文本', exact=True).count() == 0
+                    assert page.locator('#file-menu').get_by_role('menuitem', name='复制绝对路径', exact=True).count() == 1
+                    page.keyboard.press('Escape')
+                    text_link.evaluate('el => {el.textContent=el.dataset.savedLabel;delete el.dataset.savedLabel}')
                     web_link = page.locator('.msg[data-role=assistant] a').filter(has_text='文档')
                     web_link.click(button='right')
                     web_menu = page.locator('#file-menu')
