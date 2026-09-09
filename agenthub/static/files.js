@@ -143,6 +143,7 @@
     status(result.total ? `共 ${result.total} 项${preferences.hidden ? '，包含隐藏文件' : ''}` : '此目录为空');
   }
   async function load() {
+    if (new URLSearchParams(location.search).get('open') === '1') return openReference();
     controller?.abort(); const request = controller = new AbortController(); loading = true;
     $('address-form').hidden = true; $('context-menu').hidden = true;
     status('正在加载…'); $('entries').replaceChildren(); $('empty').hidden = true;
@@ -478,5 +479,28 @@
   };
   addEventListener('storage',event => { if (event.key === 'agenthub-files-clipboard') { clipboard = restore(event.key,null); selectionChanged(); } });
   addEventListener('beforeunload',event => { if (uploading.size) { event.preventDefault(); event.returnValue = ''; } });
+  async function openReference() {
+    controller?.abort(); const request = controller = new AbortController();
+    status('正在打开…');
+    try {
+      const ref = context.get('ref');
+      const result = await responseJSON(await fetch(new URL('api/session/resolve-files', base), {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({uid:context.get('uid'), agent:context.get('agent') || '', refs:[ref]}),
+        signal: request.signal,
+      }));
+      if (controller !== request) return;
+      const target = result.targets?.find(item => item.ref === ref);
+      if (!target && !result.resolved?.[ref]) throw new Error('文件不存在、未在会话中提及，或有多个同名文件；请使用完整路径。');
+      if (result.file_browser && target?.kind === 'directory') {
+        history.replaceState(history.state, '', pageURL(''));
+        await load();
+      } else {
+        const url = new URL('api/session/file', base);
+        url.search = context.toString();
+        location.replace(url.href);
+      }
+    } catch (error) { if (controller === request) status(error.message || '无法打开文件', true); }
+  }
   load();
 })();

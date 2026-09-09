@@ -31,6 +31,16 @@ class SessionFileTests(unittest.TestCase):
     def test_short_image_name_resolves_prior_tool_path(self):
         self.assertEqual(self.resolve("curve.png"), self.image)
 
+    def test_large_batch_indexes_each_reference_basename_once(self):
+        refs = {f'./missing/{i}/result.txt' for i in range(1500)}
+        names = [f'result{i}.txt' for i in range(64)]
+        refs.update(names)
+        with patch.object(files, 'references', return_value=refs), \
+                patch.object(files, 'Path', wraps=Path) as paths, \
+                patch.object(files, '_existing', return_value=None):
+            self.assertEqual(files.resolve_many([], str(self.cwd), names), {})
+            self.assertLess(paths.call_count, len(refs) + 128)
+
     def test_basenames_in_mentioned_directory_without_changing_cwd(self):
         project = self.cwd / 'checkout'
         project.mkdir()

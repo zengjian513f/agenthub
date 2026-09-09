@@ -1412,8 +1412,19 @@ async function refreshLive(force = false) {
   }
 }
 
-async function pollLive(force = false) {
-  if (document.hidden) return;
+let livePollRequest = null;
+function pollLive(force = false) {
+  if (document.hidden) return Promise.resolve();
+  if (livePollRequest) {
+    // Timer ticks share the current cycle; explicit refreshes still get a
+    // fresh snapshot after it, and awaiters never observe a half-finished poll.
+    return force ? livePollRequest.then(() => pollLive(true)) : livePollRequest;
+  }
+  livePollRequest = runLivePoll(force).finally(() => { livePollRequest = null; });
+  return livePollRequest;
+}
+
+async function runLivePoll(force) {
   try {
     await refreshLive(force);
     if (typeof loadTermList === 'function') {   // tmux 会话可能在外部被结束
@@ -3962,7 +3973,6 @@ function msgNode(m) {
   const render = full => md(m.text, full, m.media, linkContext) + mediaGallery(m.media);
   const paint = full => {
     body.innerHTML = render(full); renderFormulae(body); paintSyntax(body);
-    checkFileReferences(body, linkContext);
   };
   paint(hit);
   n.appendChild(body);
@@ -4463,64 +4473,6 @@ function trimReference(raw) {
   return ref;
 }
 
-const pendingFileChecks = new Map();
-let fileCheckTimer = 0;
-
-function checkFileReferences(root, context) {
-  const nodes = [...root.querySelectorAll('span[data-file-ref]')];
-  if (!nodes.length || !context.uid) return;
-  const key = JSON.stringify([context.uid, context.agent || '']);
-  if (!pendingFileChecks.has(key)) pendingFileChecks.set(key, {context, nodes: []});
-  pendingFileChecks.get(key).nodes.push(...nodes);
-  if (!fileCheckTimer) fileCheckTimer = setTimeout(flushFileChecks, 50);
-}
-
-async function flushFileChecks() {
-  fileCheckTimer = 0;
-  const groups = [...pendingFileChecks.values()];
-  pendingFileChecks.clear();
-  for (const {context, nodes} of groups) {
-    const attached = nodes.filter(node => node.isConnected);
-    const refs = [...new Set(attached.map(node => node.dataset.fileRef))];
-    // Basenames may need an expensive history lookup. Resolve explicit paths
-    // first so a short name cannot hold an entire video/image batch hostage.
-    const batches = [];
-    for (const list of [refs.filter(ref => ref.includes('/')), refs.filter(ref => !ref.includes('/'))]) {
-      for (let start = 0; start < list.length; start += 256) batches.push(list.slice(start, start + 256));
-    }
-    for (const batch of batches) {
-      try {
-        const response = await fetch(appUrl('/api/session/resolve-files'), {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({...context, refs: batch}),
-        });
-        if (!response.ok) continue;
-        const {resolved, targets = [], file_browser = false} = await response.json();
-        const details = new Map(targets.map(target => [target.ref, target]));
-        for (const node of attached) {
-          const detail = details.get(node.dataset.fileRef);
-          const path = detail?.path || resolved?.[node.dataset.fileRef];
-          // A response for an old render/session must not modify its replacement.
-          if (!node.isConnected || typeof path !== 'string' || !path.startsWith('/')) continue;
-          const link = document.createElement('a');
-          link.href = node.dataset.fileHref;
-          // During a rolling deployment, older nodes still serve text listings.
-          if (file_browser && detail?.kind === 'directory') {
-            const query = new URL(link.href).search;
-            link.href = appUrl('files.html') + query;
-          }
-          link.target = '_blank'; link.rel = 'noopener noreferrer';
-          link.title = path;
-          link.dataset.localPath = path;
-          link.dataset.fileKind = ['file', 'directory'].includes(detail?.kind) ? detail.kind : 'unknown';
-          link.append(...node.childNodes);
-          node.replaceWith(link);
-        }
-      } catch { /* Failed checks leave readable, unlinked original text. */ }
-    }
-  }
-}
-
 function referenceLink(ref, label, context, explicit = false) {
   let href = '';
   if (/^(https?:\/\/|www\.)/i.test(ref)) {
@@ -4535,14 +4487,19 @@ function referenceLink(ref, label, context, explicit = false) {
     const withoutLine = ref.replace(/(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)$/, '');
     if (!context.uid || /^[a-z][a-z0-9+.-]*:/i.test(withoutLine) || ref.startsWith('//')) return '';
     if (/^[A-Z0-9]+(?:\/[A-Z0-9]+)+$/.test(ref)) return '';
-    const path = /^(?:~\/|\.\.?\/|\/)[^\n]+$/.test(ref)
-      || /^[^\s<>]+\/[^\s<>]+$/.test(ref)
-      || /^[\w.-]+\.[a-zA-Z][\w.-]*(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)?$/.test(ref);
+    // Rendering is lexical only. Resolve history, existence and ambiguity on
+    // explicit navigation/menu actions, never once per render or SSE update.
+    const filename = /^[^\s/<>"'`=;|{}\[\]]+\.[a-zA-Z][\w.-]*$/.test(withoutLine);
+    const path = /^(?:~\/|\.\.?\/|\/)[^\n]+$/.test(withoutLine)
+      || (!/[\s<>"'`=;|{}\[\]]/.test(withoutLine) && withoutLine.includes('/')
+          && (withoutLine.endsWith('/') || /^[^/]+\.[a-zA-Z][\w.-]*$/.test(withoutLine.split('/').pop())))
+      || filename;
     if (!path && !explicit) return '';
     const query = new URLSearchParams({uid: context.uid, ref});
     if (context.agent) query.set('agent', context.agent);
     href = appUrl('/api/session/file') + '?' + query;
-    return `<span data-file-ref="${esc(ref)}" data-file-href="${esc(href)}">${label}</span>`;
+    const open = appUrl('files.html') + '?' + query + '&open=1';
+    return `<a href="${esc(open)}" data-file-ref="${esc(ref)}" data-file-href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
   }
   return `<a href="${esc(href)}" data-reference-kind="web" target="_blank" rel="noopener noreferrer">${label}</a>`;
 }
@@ -4577,12 +4534,41 @@ async function copyFileText(text) {
   finally { input.remove(); }
 }
 
-document.addEventListener('contextmenu', event => {
-  const link = event.target.closest('.mb a[data-local-path], .mb a[data-reference-kind="web"]');
+document.addEventListener('contextmenu', async event => {
+  const link = event.target.closest('.mb a[data-file-ref], .mb a[data-local-path], .mb a[data-reference-kind="web"]');
   if (!link) return;
   event.preventDefault(); closeItemMenu();
-  fileMenuTarget = {path: link.dataset.localPath, href: link.href,
+  const target = fileMenuTarget = {path: link.dataset.localPath, href: link.dataset.fileHref || link.href,
     kind: link.dataset.referenceKind === 'web' ? 'web' : link.dataset.fileKind};
+  const place = () => {
+    fileMenu.hidden = false;
+    const box = fileMenu.getBoundingClientRect();
+    fileMenu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - box.width - 8))}px`;
+    fileMenu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - box.height - 8))}px`;
+  };
+  if (link.dataset.fileRef) {
+    fileMenuTargetText.textContent = '正在读取文件信息…';
+    for (const button of fileMenu.querySelectorAll('button')) button.hidden = true;
+    place();
+    try {
+      const query = new URL(target.href).searchParams, ref = query.get('ref');
+      const response = await fetch(appUrl('/api/session/resolve-files'), {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({uid:query.get('uid'), agent:query.get('agent') || '', refs:[ref]}),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '无法读取文件信息');
+      const detail = data.targets?.find(item => item.ref === ref);
+      const path = detail?.path || data.resolved?.[ref];
+      if (typeof path !== 'string' || !path.startsWith('/')) throw new Error('文件不存在或有多个同名文件，请使用完整路径。');
+      if (fileMenuTarget !== target || !link.isConnected) return;
+      target.path = path;
+      target.kind = ['file', 'directory'].includes(detail?.kind) ? detail.kind : 'unknown';
+    } catch (error) {
+      if (fileMenuTarget === target) { fileMenuTargetText.textContent = error.message || '无法读取文件信息'; place(); }
+      return;
+    }
+  }
   fileMenuTargetText.textContent = fileMenuTarget.kind === 'web' ? fileMenuTarget.href : fileMenuTarget.path;
   const actions = fileMenuTarget.kind === 'web'
     ? ['copy-url', 'open-web']
@@ -4596,10 +4582,7 @@ document.addEventListener('contextmenu', event => {
   download.disabled = fileMenuTarget.kind !== 'file';
   download.title = fileMenuTarget.kind === 'directory' ? '目录不作为文件下载' :
     fileMenuTarget.kind !== 'file' ? '文件类型尚未确认，请刷新后重试' : '';
-  fileMenu.hidden = false;
-  const box = fileMenu.getBoundingClientRect();
-  fileMenu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - box.width - 8))}px`;
-  fileMenu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - box.height - 8))}px`;
+  place();
   fileMenu.querySelector('button:not([hidden]):not(:disabled)').focus({preventScroll: true});
 });
 document.addEventListener('pointerdown', event => {

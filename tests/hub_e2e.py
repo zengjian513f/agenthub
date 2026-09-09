@@ -153,6 +153,16 @@ def main():
                 deep.reload()
                 deep.wait_for_function('S.sel === "claude:' + 'b' * 32 + '~same-file-hash"')
                 deep.close()
+                # A successful term response slower than the 3s poll interval
+                # must eventually apply, not be superseded forever by new polls.
+                nodes[0].state['term_delay'] = 3.6
+                slow = context.new_page()
+                slow.goto(base + '?node=' + 'a' * 32 + '&sid=claude:same-native-id')
+                slow.wait_for_function('Nodes.capabilities["' + 'a' * 32 + '"]?.enabled',
+                                       timeout=12000)
+                assert slow.locator('#a-term').is_visible()
+                slow.close()
+                nodes[0].state['term_delay'] = 0
                 # Offline machine doesn't hide healthy results; local UI stays independent.
                 nodes[2].state['offline'] = True
                 for button in page.locator('#node-chips button[aria-pressed="false"]').all():

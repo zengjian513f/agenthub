@@ -71,11 +71,17 @@ def resolve_many(messages: list[dict], cwd: str, requested: list[str]) -> dict[s
     refs = references(messages)
     resolved = {}
     directories = None
+    # Build this once per batch, not once per basename. Long sessions can have
+    # tens of thousands of references and the UI submits up to 256 names.
+    basenames: dict[str, set[str]] = {}
+    if any('/' not in clean_ref(ref) and clean_ref(ref) in refs for ref in requested):
+        for raw in refs:
+            basenames.setdefault(Path(raw).name, set()).add(raw)
     for ref in dict.fromkeys(requested):
         try:
             if clean_ref(ref) in refs and '/' not in clean_ref(ref) and directories is None:
                 directories = _referenced_directories(refs, cwd)
-            resolved[ref] = str(_resolve(refs, cwd, ref, directories))
+            resolved[ref] = str(_resolve(refs, cwd, ref, directories, basenames))
         except (ValueError, FileNotFoundError):
             pass  # Missing/ambiguous references stay ordinary text in the UI.
     return resolved
@@ -90,6 +96,11 @@ def _existing(raw: str, cwd: str) -> Path | None:
             if not cwd or not Path(cwd).is_absolute():
                 return None
             path = Path(cwd) / path
+        # Most prose-derived candidates do not exist. A single stat rejects
+        # them without resolving every ancestor (and issuing an lstat for each).
+        mode = path.stat().st_mode
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            return None
         path = path.resolve(strict=True)
         return path if path.is_file() or path.is_dir() else None
     except (OSError, ValueError, RuntimeError):
@@ -102,7 +113,8 @@ def _referenced_directories(refs: set[str], cwd: str) -> set[Path]:
 
 
 def _resolve(refs: set[str], cwd: str, ref: str,
-             directories: set[Path] | None = None) -> Path:
+             directories: set[Path] | None = None,
+             basenames: dict[str, set[str]] | None = None) -> Path:
     if not ref or len(ref) > 4096 or "\x00" in ref:
         raise ValueError("无效的文件引用")
     ref = clean_ref(ref)
@@ -111,7 +123,12 @@ def _resolve(refs: set[str], cwd: str, ref: str,
 
     # Explicit paths have one meaning. Short names may refer to tool output in
     # a subdirectory; refuse collisions instead of opening an unrelated file.
-    candidates = {ref} if "/" in ref else {r for r in refs if Path(r).name == ref}
+    if '/' in ref:
+        candidates = {ref}
+    elif basenames is not None:
+        candidates = basenames.get(ref, set())
+    else:
+        candidates = {r for r in refs if Path(r).name == ref}
     paths = {p for raw in candidates if (p := _existing(raw, cwd)) is not None}
     if '/' not in ref and Path(ref).name == ref:
         # A reply may name files inside a newly cloned/output directory while

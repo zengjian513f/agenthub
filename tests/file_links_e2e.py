@@ -114,6 +114,7 @@ def main():
                                      (f'http://127.0.0.1:{central.server_port}/agenthub/', True)]:
                     node.state['messages'] = list(initial)
                     node.state['gets'].clear()
+                    node.state['file_checks'] = []
                     ctx = browser.new_context()
                     ctx.grant_permissions(['clipboard-read', 'clipboard-write'], origin=base)
                     page = ctx.new_page()
@@ -132,24 +133,30 @@ def main():
                     node.state['messages'].append(reply)
                     link = page.locator('.msg[data-role=assistant] a').filter(has_text='curve.png')
                     link.wait_for()
+                    def menu_for(target):
+                        target.click(button='right')
+                        page.wait_for_function('!document.querySelector("#file-menu").hidden && !document.querySelector("#file-menu-target").textContent.includes("正在读取")')
+
                     def check_checkout_links():
                         reply_dom = page.locator('.msg[data-role=assistant]')
                         for ref in [str(checkout), 'Example.sln', 'README.md', 'AGENTS.md']:
-                            target = reply_dom.locator('a[data-local-path]').filter(has_text=ref)
+                            target = reply_dom.locator('a[data-file-ref]').filter(has_text=ref)
                             target.wait_for()
                             assert target.locator('code').inner_text() == ref
-                            assert target.get_attribute('data-local-path') == str(
-                                checkout if ref == str(checkout) else checkout / ref)
-                            assert ctx.request.get(target.get_attribute('href')).status == 200
-                        for ref in ['CLAUDE.md', '4.1', 'release/3.0', 'cat README.md']:
+                            assert target.get_attribute('data-file-ref') == ref
+                            assert ctx.request.get(target.get_attribute('data-file-href')).status == 200
+                        for ref in ['4.1', 'release/3.0', 'cat README.md']:
                             assert reply_dom.locator('a').filter(has_text=ref).count() == 0
                         assert reply_dom.locator('a[href="https://example.com/repo"] code').inner_text() == 'https://example.com/repo'
-                        assert any('Example.sln' in check['refs'] for check in node.state['file_checks'])
+                        ambiguous = reply_dom.locator('a[data-file-ref="CLAUDE.md"]')
+                        assert ctx.request.get(ambiguous.get_attribute('data-file-href')).status == 400
+                    page.wait_for_timeout(200)
+                    assert not node.state.get('file_checks'), 'Rendering/SSE must not check files'
                     check_checkout_links()
                     assert page.locator('.msg[data-role=assistant] a').filter(has_text='筛选臂').count() == 0
-                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='missing').count() == 0
-                    assert link.get_attribute('title') == str(image)
-                    href = link.get_attribute('href')
+                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='missing').count() == 1
+                    assert link.get_attribute('data-file-ref') == 'curve.png'
+                    href = link.get_attribute('data-file-href')
                     query = parse_qs(urlparse(href).query)
                     assert ('~' in query['uid'][0]) == scoped, href
                     assert urlparse(href).path == ('/agenthub' if scoped else '') + '/api/session/file'
@@ -162,14 +169,14 @@ def main():
                     page.reload()
                     link.wait_for()
                     check_checkout_links()
-                    response = ctx.request.get(link.get_attribute('href'))
+                    response = ctx.request.get(link.get_attribute('data-file-href'))
                     assert response.status == 200 and response.body() == PNG
                     assert 'sandbox' in response.headers['content-security-policy']
                     text_link = page.locator('.msg[data-role=assistant] a').filter(has_text='source.py')
                     assert text_link.inner_text() == 'source.py'
                     assert '源码：source.py，目录' in page.locator('.msg[data-role=assistant]').inner_text()
                     assert 'source.py:12' not in page.locator('.msg[data-role=assistant]').inner_text()
-                    response = ctx.request.get(text_link.get_attribute('href'))
+                    response = ctx.request.get(text_link.get_attribute('data-file-href'))
                     assert response.status == 200 and response.text() == source.read_text()
                     directory = page.locator('.msg[data-role=assistant] a').filter(has_text='./output')
                     with page.expect_popup() as opened:
@@ -222,9 +229,7 @@ def main():
                     browser_page.get_by_role('button', name='刷新', exact=True).click()
                     browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
                     browser_page.close()
-                    assert text_link.get_attribute('data-file-kind') == 'file'
-                    assert directory.get_attribute('data-file-kind') == 'directory'
-                    directory.click(button='right')
+                    menu_for(directory)
                     assert page.locator('#file-menu-target').inner_text() == str(output)
                     assert page.locator('#file-menu [data-action="download"]').is_disabled()
                     page.keyboard.press('Escape')
@@ -318,7 +323,7 @@ def main():
                           const d=document.createElement('div');d.className='mb';d.id='copy-menu-probe';
                           d.innerHTML=inline(raw);document.querySelector('#msgs').appendChild(d);
                         }''', raw)
-                        page.locator('#copy-menu-probe a').click(button='right')
+                        menu_for(page.locator('#copy-menu-probe a'))
                         copy_menu = page.locator('#file-menu')
                         assert copy_menu.get_by_role('menuitem').all_text_contents() == [
                             '复制链接地址', '在新标签页打开']
@@ -327,7 +332,7 @@ def main():
                         assert page.evaluate('navigator.clipboard.readText()') == destination
                         page.locator('#copy-menu-probe').evaluate('(el) => el.remove()')
                     web_link = page.locator('.msg[data-role=assistant] a').filter(has_text='文档')
-                    web_link.click(button='right')
+                    menu_for(web_link)
                     web_menu = page.locator('#file-menu')
                     assert web_menu.locator('#file-menu-target').inner_text() == 'https://example.com/a_(b)'
                     assert web_menu.get_by_role('menuitem').all_text_contents() == [
@@ -335,31 +340,31 @@ def main():
                     web_menu.get_by_role('menuitem', name='复制链接地址', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == 'https://example.com/a_(b)'
                     ctx.route('https://example.com/**', lambda route: route.fulfill(body='fixture'))
-                    web_link.click(button='right')
+                    menu_for(web_link)
                     with ctx.expect_page() as new_page:
                         web_menu.get_by_role('menuitem', name='在新标签页打开', exact=True).click()
                     popup = new_page.value
                     popup.wait_for_load_state()
                     assert popup.url == 'https://example.com/a_(b)'
                     popup.close()
-                    text_link.click(button='right')
+                    menu_for(text_link)
                     menu = page.locator('#file-menu')
                     assert menu.locator('#file-menu-target').inner_text() == str(source)
                     assert menu.get_by_role('menuitem').all_text_contents() == [
                         '复制完整路径', '复制所在目录路径', '下载']
                     menu.get_by_role('menuitem', name='复制完整路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(source)
-                    text_link.click(button='right')
+                    menu_for(text_link)
                     menu.get_by_role('menuitem', name='复制所在目录路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(root)
-                    link.click(button='right')
+                    menu_for(link)
                     menu.get_by_role('menuitem', name='复制所在目录路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(output)
-                    directory.click(button='right')
+                    menu_for(directory)
                     assert menu.get_by_role('menuitem').all_text_contents() == ['复制完整路径', '下载']
                     menu.get_by_role('menuitem', name='复制完整路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(output)
-                    text_link.click(button='right')
+                    menu_for(text_link)
                     with page.expect_download() as downloaded:
                         menu.get_by_role('menuitem', name='下载', exact=True).click()
                     download = downloaded.value
@@ -375,7 +380,7 @@ def main():
                       const host=document.createElement('div');host.id='long-link-fixture';host.className='mb';
                       host.innerHTML=inline('[长链接]('+url+')');document.querySelector('#msgs').appendChild(host);
                     }''', long_url)
-                    page.locator('#long-link-fixture a').click(button='right')
+                    menu_for(page.locator('#long-link-fixture a'))
                     assert menu.locator('#file-menu-target').inner_text() == long_url
                     box = menu.bounding_box()
                     assert box['x'] >= 0 and box['x'] + box['width'] <= 360
@@ -390,32 +395,49 @@ def main():
                     # An unfinished Markdown target must not trigger exponential
                     # backtracking while an assistant is still streaming it.
                     page.evaluate("md('[unfinished](' + 'a'.repeat(10000), true)")
-                    # A new Hub must remain usable with nodes awaiting upgrade.
+                    # Opening a link works with older nodes too; no background
+                    # checks are sent on initial render or reload.
                     def legacy_node(route):
                         response = route.fetch()
                         data = response.json()
                         data.pop('file_browser', None)
                         route.fulfill(response=response, json=data)
-                    page.route('**/api/session/resolve-files', legacy_node)
+                    ctx.route('**/api/session/resolve-files', legacy_node)
                     page.reload()
                     directory.wait_for()
-                    assert urlparse(directory.get_attribute('href')).path.endswith('/api/session/file')
-                    assert 'curve.png' in ctx.request.get(directory.get_attribute('href')).text()
-                    page.unroute('**/api/session/resolve-files', legacy_node)
-                    # A failed check must never create a clickable local link.
+                    with page.expect_popup() as opened:
+                        directory.click()
+                    legacy_page = opened.value
+                    legacy_page.wait_for_url('**/api/session/file?*')
+                    assert 'curve.png' in legacy_page.locator('body').inner_text()
+                    legacy_page.close()
+                    ctx.unroute('**/api/session/resolve-files', legacy_node)
+                    node.state['file_checks'] = []
                     node.state['fail_checks'] = True
                     page.reload()
-                    page.wait_for_selector('span[data-file-ref="curve.png"]')
-                    page.wait_for_timeout(300)
-                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='curve.png').count() == 0
+                    link.wait_for()
+                    page.wait_for_timeout(500)
+                    assert not node.state['file_checks']
+                    with page.expect_popup() as opened:
+                        link.click()
+                    failed = opened.value
+                    failed.locator('#status.error').wait_for()
+                    assert 'unavailable' in failed.locator('#status').inner_text()
+                    failed.close()
                     node.state['fail_checks'] = False
-                    # Existence is checked again on a fresh render, not cached
-                    # indefinitely from a previous successful response.
+                    # Missing targets remain candidates, with errors on demand.
                     image.unlink()
                     page.reload()
-                    page.locator('.msg[data-role=assistant] a').filter(has_text='source.py').wait_for()
-                    assert page.locator('.msg[data-role=assistant] a').filter(has_text='curve.png').count() == 0
+                    link.wait_for()
+                    with page.expect_popup() as opened:
+                        link.click()
+                    missing = opened.value
+                    missing.locator('#status.error').wait_for()
+                    assert '文件不存在' in missing.locator('#status').inner_text()
                     image.write_bytes(PNG)
+                    missing.get_by_role('button', name='刷新', exact=True).click()
+                    missing.wait_for_function('document.querySelector("img")?.naturalWidth === 1')
+                    missing.close()
                     assert not errors, errors
                     print(('Hub' if scoped else 'Node') + ': SSE, reload, image click, text, directory, URL and safety checks passed')
                     ctx.close()
