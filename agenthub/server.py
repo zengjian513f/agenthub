@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
+               codex_queue,
                debug_runs, index, live, media, pending as pending_store,
                send_protocol, send_queue,
                session_meta, term, term_ownership, trash, wsock)
@@ -223,6 +224,48 @@ def _poll_outbox() -> None:
             continue
 
 
+def _transfer_native_codex_item(item: dict, session: dict | None = None) -> bool:
+    """Move a busy-session row into Codex's real queue with crash recovery."""
+    uid = str(item.get("uid") or "")
+    session = session or index.get(uid)
+    if not session or session.get("source") != "codex" or not session.get("sid"):
+        return False
+    recovering = item.get("state") == "native_queuing"
+    claimed = send_queue.claim_native(str(item.get("id") or ""), uid)
+    if not claimed:
+        return False
+    try:
+        if recovering:
+            native = codex_queue.find_submission(
+                str(session["sid"]), str(claimed["id"]))
+            if native:
+                send_queue.mark_native_queued(
+                    claimed["id"], str(native["id"]), uid)
+                return True
+            # Once the original turn has ended, a missing native row must fall
+            # back to immediate idle-composer delivery.  Adding it to an idle
+            # native queue would leave it waiting for another unrelated turn.
+            if claimed.get("activity_state") not in {"working", "waiting"}:
+                send_queue.release_native_claim(
+                    claimed["id"], "Codex 原生队列未确认接收，已切回安全发送", uid)
+                return False
+        native = codex_queue.enqueue_idempotent(
+            str(session["sid"]), str(claimed["id"]), str(claimed.get("text") or ""))
+    except codex_queue.QueueError as error:
+        # An add with a lost response is intentionally left native_queuing.  A
+        # later list-by-client-ID can settle it without submitting a duplicate.
+        if not recovering and not error.ambiguous:
+            send_queue.release_native_claim(claimed["id"], str(error), uid)
+        return False
+    send_queue.mark_native_queued(claimed["id"], str(native["id"]), uid)
+    return True
+
+
+def _transfer_native_codex_items() -> None:
+    for item in send_queue.native_candidates():
+        _transfer_native_codex_item(item)
+
+
 def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
     """Safely deliver one ready Codex item into a genuinely empty composer."""
     s = index.get(str(item.get("uid") or ""))
@@ -309,6 +352,7 @@ def _outbox_loop() -> None:
     """交付可证明安全的 Claude persisted 项和 Codex 队首消息。"""
     while True:
         _poll_outbox()
+        _transfer_native_codex_items()
         send_queue.expire_deliveries()
         claude_ready = claude_queue.ready()
         codex_ready = send_queue.ready()
@@ -1700,6 +1744,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "会话发送协议不可用"}, 400)
         if s.get("source") == "claude":
             return self._queue_claude_message(body, s, pane)
+        request_id = str(body.get("request_id") or "")
+        existing = send_queue.lookup(
+            request_id, uid, str(body.get("text") or "")) if request_id else None
+        if existing:
+            # Network replay is a status read.  In particular it must not clear
+            # a draft the user typed after the first request was accepted.
+            if (existing.get("state") == "queued"
+                    and str((body.get("activity") or {}).get("state") or "")
+                    in {"working", "waiting"}):
+                _transfer_native_codex_item(existing, s)
+            return self._json({"ok": True, "item": existing,
+                               **send_queue.snapshot(uid)})
         failed = next((item for item in send_queue.list_for(uid)
                        if item.get("state") == "failed"), None)
         if failed:
@@ -1719,6 +1775,10 @@ class Handler(BaseHTTPRequestHandler):
             uid, pane["name"], str(body.get("text") or ""), body.get("media"),
             body.get("activity"), str(body.get("request_id") or ""),
             body.get("cursor"))
+        if str((body.get("activity") or {}).get("state") or "") in {
+                "working", "waiting"}:
+            _transfer_native_codex_item(item, s)
+            item = send_queue.lookup(item["id"], uid) or item
         OUTBOX_WAKE.set()
         return self._json({"ok": True, "item": item,
                            **send_queue.snapshot(uid)})
@@ -1836,6 +1896,27 @@ class Handler(BaseHTTPRequestHandler):
         # durable row while this tab still retains its in-memory placeholder;
         # the authoritative snapshot lets that tab clear it too.
         if not existing:
+            return self._json({"ok": True, "uid": uid,
+                               **send_queue.snapshot(uid)})
+        if existing.get("state") == "native_queued":
+            private = send_queue.get(item_id, uid) or {}
+            try:
+                deleted = bool(s and s.get("source") == "codex"
+                               and private.get("native_id")
+                               and codex_queue.delete_submission(
+                                   str(s.get("sid") or ""),
+                                   str(private.get("native_id") or "")))
+            except codex_queue.QueueError as error:
+                return self._json({
+                    "error": f"无法确认 Codex 是否撤销: {error}",
+                    **send_queue.snapshot(uid),
+                }, 409)
+            if not deleted:
+                return self._json({
+                    "error": "消息已离开 Codex 队列，可能已经开始处理",
+                    **send_queue.snapshot(uid),
+                }, 409)
+            send_queue.discard(item_id, uid, {"native_queued"})
             return self._json({"ok": True, "uid": uid,
                                **send_queue.snapshot(uid)})
         if not send_queue.discard(

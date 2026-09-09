@@ -4190,7 +4190,7 @@ function renderQueuedMessages(uid = S.sel) {
       }
       footer.appendChild(actions);
     } else if ((item.server
-                && ['queued', 'failed', 'aborted', 'restored'].includes(item.state))
+                && ['queued', 'native_queued', 'failed', 'aborted', 'restored'].includes(item.state))
                || (!item.server && item.state === 'failed')) {
       const actions = el('span', 'client-pending-actions');
       if (item.state === 'failed') {
@@ -4202,7 +4202,8 @@ function renderQueuedMessages(uid = S.sel) {
           : retryClientQueuedMessage(uid, item.id);
         actions.append(retry);
       }
-      const discard = el('button', '', item.state === 'queued' ? '撤销' : '移除');
+      const discard = el('button', '', ['queued', 'native_queued'].includes(item.state)
+        ? '撤销' : '移除');
       discard.type = 'button';
       discard.onclick = () => item.server
         ? discardServerQueuedMessage(uid, item.id)

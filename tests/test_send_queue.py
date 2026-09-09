@@ -58,6 +58,91 @@ class SendQueueTests(unittest.TestCase):
                            {"state": "working"}, now=1002)
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
+    def test_busy_row_is_claimed_once_and_accepted_by_native_queue(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "下一条", [], {"state": "working"}, "native")
+        candidate = send_queue.native_candidates(now=1000)[0]
+
+        claimed = send_queue.claim_native("native", "codex:u", now=1000)
+        self.assertEqual(claimed["state"], "native_queuing")
+        self.assertIsNone(send_queue.claim_native("native", "codex:u", now=1001))
+        send_queue.mark_native_queued("native", "codex-native-id", "codex:u")
+
+        row = send_queue.list_for("codex:u")[0]
+        self.assertEqual(row["state"], "native_queued")
+        self.assertEqual(send_queue.ready(10**12), [])
+        self.assertEqual(send_queue.native_candidates(10**12), [])
+        self.assertEqual(candidate["id"], "native")
+
+    def test_native_accepted_head_allows_following_row_into_codex_fifo(self):
+        activity = {"state": "working"}
+        send_queue.enqueue("codex:u", "pane", "一", [], activity, "one")
+        send_queue.enqueue("codex:u", "pane", "二", [], activity, "two")
+        send_queue.claim_native("one", "codex:u", now=10)
+        send_queue.mark_native_queued("one", "native-one", "codex:u")
+
+        self.assertEqual(
+            [row["id"] for row in send_queue.native_candidates(10**12)], ["two"])
+
+    def test_ambiguous_native_claim_recovers_after_timeout(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "恢复", [], {"state": "working"}, "recover")
+        send_queue.claim_native("recover", "codex:u", now=100)
+
+        self.assertEqual(send_queue.native_candidates(
+            100 + send_queue.NATIVE_CLAIM_TIMEOUT - 0.01), [])
+        recovered = send_queue.native_candidates(
+            100 + send_queue.NATIVE_CLAIM_TIMEOUT)[0]
+        self.assertEqual(recovered["state"], "native_queuing")
+
+    def test_native_queue_failure_falls_back_without_racing_immediate_retry(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "降级", [], {"state": "working"}, "fallback")
+        send_queue.claim_native("fallback", "codex:u", now=100)
+        with patch.object(send_queue.time, "time", return_value=101):
+            send_queue.release_native_claim("fallback", "旧版 Codex", "codex:u")
+
+        row = send_queue.list_for("codex:u")[0]
+        self.assertEqual(row["state"], "queued")
+        self.assertIn("旧版 Codex", row["error"])
+        self.assertEqual(send_queue.native_candidates(110.99), [])
+        self.assertEqual(send_queue.native_candidates(111)[0]["id"], "fallback")
+
+    def test_ambiguous_native_add_recovers_existing_codex_row(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "恢复", [], {"state": "working"}, "recover-existing")
+        send_queue.claim_native("recover-existing", "codex:u", now=10)
+        stale = send_queue.get("recover-existing", "codex:u")
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+
+        with patch.object(server.codex_queue, "find_submission", return_value={
+                "id": "native-existing", "clientUserMessageId": "recover-existing",
+                }), patch.object(server.codex_queue, "enqueue_idempotent") as enqueue:
+            self.assertTrue(server._transfer_native_codex_item(stale, session))
+
+        enqueue.assert_not_called()
+        self.assertEqual(
+            send_queue.list_for("codex:u")[0]["state"], "native_queued")
+
+    def test_ambiguous_native_add_missing_after_turn_ends_uses_idle_fallback(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "恢复", [], {"state": "working"}, "recover-idle")
+        send_queue.claim_native("recover-idle", "codex:u", now=10)
+        send_queue.observe(
+            "codex:u", [], {"state": "idle", "ts": "2099-01-01T00:00:00Z"},
+            now=20)
+        stale = send_queue.get("recover-idle", "codex:u")
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+
+        with patch.object(server.codex_queue, "find_submission", return_value=None), \
+                patch.object(server.codex_queue, "enqueue_idempotent") as enqueue:
+            self.assertFalse(server._transfer_native_codex_item(stale, session))
+
+        enqueue.assert_not_called()
+        row = send_queue.list_for("codex:u")[0]
+        self.assertEqual(row["state"], "queued")
+        self.assertTrue(send_queue.get("recover-idle", "codex:u").get("ready_at"))
+
     def test_unknown_or_stale_idle_never_makes_message_ready(self):
         send_queue.enqueue("codex:u", "pane", "消息", [], None, "unknown")
         self.assertEqual(send_queue.ready(10**12), [])
@@ -368,6 +453,95 @@ class SendQueueTests(unittest.TestCase):
 
         keys.assert_not_called()
         submit.assert_not_called()
+
+    def test_working_web_send_enters_codex_native_queue_immediately(self):
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+        pane = {"name": "agenthub-codex-u"}
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        native = {"id": "native-id", "clientUserMessageId": "request-id"}
+        driver = server.send_protocol.driver_for("codex")
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(driver, "overwrite_draft", return_value=None), \
+                patch.object(server.codex_queue, "enqueue_idempotent",
+                             return_value=native) as enqueue:
+            result = handler._queue_message({
+                "uid": "codex:u", "name": pane["name"], "text": "/rename x",
+                "request_id": "request-id", "activity": {"state": "working"},
+            })
+
+        self.assertEqual(result["_status"], 200)
+        self.assertEqual(result["outbox"][0]["state"], "native_queued")
+        enqueue.assert_called_once_with("thread-u", "request-id", "/rename x")
+
+    def test_replayed_working_send_does_not_clear_new_draft_or_duplicate_native(self):
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+        pane = {"name": "agenthub-codex-u"}
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        driver = server.send_protocol.driver_for("codex")
+        body = {
+            "uid": "codex:u", "name": pane["name"], "text": "下一条",
+            "request_id": "same-request", "activity": {"state": "working"},
+        }
+        native = {"id": "native-id", "clientUserMessageId": "same-request"}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(driver, "overwrite_draft", return_value=None) as overwrite, \
+                patch.object(server.codex_queue, "enqueue_idempotent",
+                             return_value=native) as enqueue:
+            first = handler._queue_message(body)
+            second = handler._queue_message({**body, "overwrite_draft": "later"})
+
+        self.assertEqual(first["outbox"][0]["state"], "native_queued")
+        self.assertEqual(second["outbox"][0]["state"], "native_queued")
+        overwrite.assert_called_once_with(pane["name"], "")
+        enqueue.assert_called_once()
+
+    def test_native_queued_item_is_cancelled_in_codex_before_ledger_removal(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "撤掉", [], {"state": "working"}, "cancel-native")
+        send_queue.claim_native("cancel-native", "codex:u", now=10)
+        send_queue.mark_native_queued(
+            "cancel-native", "native-id", "codex:u")
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.codex_queue, "delete_submission",
+                             return_value=True) as delete:
+            result = handler._discard_message({
+                "uid": "codex:u", "id": "cancel-native",
+            })
+
+        self.assertEqual(result["_status"], 200)
+        self.assertEqual(result["outbox"], [])
+        delete.assert_called_once_with("thread-u", "native-id")
+
+    def test_native_cancel_refusal_keeps_browser_ledger_for_confirmation(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "已开始", [], {"state": "working"}, "started")
+        send_queue.claim_native("started", "codex:u", now=10)
+        send_queue.mark_native_queued("started", "native-id", "codex:u")
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.codex_queue, "delete_submission", return_value=False):
+            result = handler._discard_message({
+                "uid": "codex:u", "id": "started",
+            })
+
+        self.assertEqual(result["_status"], 409)
+        self.assertEqual(result["outbox"][0]["state"], "native_queued")
+        self.assertIn("可能已经开始处理", result["error"])
 
     def test_new_message_is_rejected_while_failed_head_blocks_fifo(self):
         send_queue.enqueue(

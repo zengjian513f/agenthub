@@ -1,8 +1,9 @@
-"""AgentHub 托管的 Codex 网页发送队列。
+"""AgentHub's durable bridge into Codex's native follow-up queue.
 
-Codex 忙时不会把排队输入写进 rollout，tmux send-keys 成功也不等于 CLI
-已经接收。这里先持久化网页消息，只在原生回合结束且终端画面稳定后交付，
-最终仍以 rollout 中出现同文 user 消息作为确认。
+Busy sessions receive messages through Codex's own per-thread queue.  The
+AgentHub ledger supplies crash recovery and browser reconciliation until the
+native user record appears.  Older Codex builds fall back to safe idle-composer
+delivery.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ CONFIRM_TIMEOUT = 8.0
 COMPOSER_RETRY_DELAY = 0.50
 COMPOSER_RETRY_LIMIT = 12
 COMPOSER_EDITING_RETRY_LIMIT = 4
+NATIVE_CLAIM_TIMEOUT = 5.0
+NATIVE_RETRY_DELAY = 10.0
 _lock = threading.RLock()
 _revision = 0
 _epoch = uuid.uuid4().hex
@@ -74,6 +77,24 @@ def list_for(uid: str) -> list[dict]:
         rows = [x for x in _read() if x.get("uid") == uid]
     rows.sort(key=lambda x: (float(x.get("created") or 0), str(x.get("id") or "")))
     return [_public(x) for x in rows]
+
+
+def lookup(item_id: str, uid: str = "", text: str | None = None) -> dict | None:
+    """Return an existing public request without mutating a later TUI draft."""
+    with _lock:
+        row = next((x for x in _read() if x.get("id") == str(item_id or "")
+                    and (not uid or x.get("uid") == uid)), None)
+        if row and text is not None and row.get("text") != text:
+            raise ValueError("重复发送 ID 对应了不同消息")
+        return _public(row) if row else None
+
+
+def get(item_id: str, uid: str = "") -> dict | None:
+    """Return one private ledger row for server-side native queue operations."""
+    with _lock:
+        row = next((x for x in _read() if x.get("id") == str(item_id or "")
+                    and (not uid or x.get("uid") == uid)), None)
+        return dict(row) if row else None
 
 
 def snapshot(uid: str) -> dict:
@@ -209,6 +230,93 @@ def ready(now: float | None = None) -> list[dict]:
     return [dict(row) for row in first.values()
             if row.get("state") == "queued"
             and float(row.get("ready_at") or float("inf")) <= now]
+
+
+def native_candidates(now: float | None = None) -> list[dict]:
+    """Return one recoverable native-queue transfer per session.
+
+    Rows already accepted by Codex do not block later rows: Codex itself now
+    owns their FIFO order.  Ambiguous claims are retried only after enough time
+    for the original app-server process to finish and become list-visible.
+    """
+    now = time.time() if now is None else now
+    with _lock:
+        rows = sorted(_read(), key=lambda x: float(x.get("created") or 0))
+    selected: dict[str, dict] = {}
+    blocked: set[str] = set()
+    for row in rows:
+        uid = str(row.get("uid") or "")
+        if uid in selected or uid in blocked:
+            continue
+        state = str(row.get("state") or "")
+        if state in {"aborted", "native_queued"}:
+            continue
+        if state == "native_queuing":
+            if now - float(row.get("native_claimed_at") or 0) >= NATIVE_CLAIM_TIMEOUT:
+                selected[uid] = dict(row)
+            else:
+                blocked.add(uid)
+            continue
+        if state == "queued":
+            if (row.get("activity_state") in {"working", "waiting"}
+                    and float(row.get("native_retry_at") or 0) <= now):
+                selected[uid] = dict(row)
+            else:
+                blocked.add(uid)
+            continue
+        blocked.add(uid)
+    return list(selected.values())
+
+
+def claim_native(item_id: str, uid: str = "",
+                 now: float | None = None) -> dict | None:
+    """Atomically claim a row before the non-idempotent Codex queue add RPC."""
+    now = time.time() if now is None else now
+    with _lock:
+        rows = _read()
+        row = next((x for x in rows if x.get("id") == item_id
+                    and (not uid or x.get("uid") == uid)), None)
+        if not row:
+            return None
+        state = row.get("state")
+        recoverable = (state == "native_queuing"
+                       and now - float(row.get("native_claimed_at") or 0)
+                       >= NATIVE_CLAIM_TIMEOUT)
+        if state != "queued" and not recoverable:
+            return None
+        if state == "queued" and float(row.get("native_retry_at") or 0) > now:
+            return None
+        row.update(state="native_queuing", native_claimed_at=now)
+        row.pop("ready_at", None)
+        row.pop("error", None)
+        _write(rows)
+        return dict(row)
+
+
+def mark_native_queued(item_id: str, native_id: str, uid: str = "") -> dict | None:
+    """Record the durable Codex queue ID used for cancellation and recovery."""
+    def change(row):
+        if row.get("state") != "native_queuing":
+            return
+        row.update(state="native_queued", native_id=str(native_id or ""),
+                   native_queued_at=time.time())
+        row.pop("native_claimed_at", None)
+        row.pop("native_retry_at", None)
+        row.pop("error", None)
+    return _update(item_id, change, uid)
+
+
+def release_native_claim(item_id: str, error: str, uid: str = "") -> dict | None:
+    """Fall back to idle-composer delivery after a proven pre-add failure."""
+    def change(row):
+        if row.get("state") != "native_queuing":
+            return
+        row.update(state="queued", native_retry_at=time.time() + NATIVE_RETRY_DELAY,
+                   error=str(error or "Codex 原生队列暂不可用"))
+        row.pop("native_claimed_at", None)
+        if row.get("activity_state") in {"idle", "aborted", "failed"}:
+            row["ready_at"] = time.time() + READY_DELAY
+    return _update(item_id, change, uid)
 
 
 def defer(item_id: str, delay: float = READY_DELAY) -> None:

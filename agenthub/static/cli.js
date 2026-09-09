@@ -201,6 +201,8 @@ class CodexCli extends AgentHubCli {
 
   queuedMessageLabel(item) {
     if (item?.state === 'aborted') return '已中断';
+    if (item?.state === 'native_queuing') return '正在交给 Codex';
+    if (item?.state === 'native_queued') return 'Codex 已排队';
     if (item?.state === 'delivering') return '发送中';
     if (item?.state === 'confirming') return '已送达，等待确认';
     if (item?.state === 'failed' && +item?.attempts > 0) return '状态待核对';
