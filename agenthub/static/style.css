@@ -220,6 +220,29 @@ header {
 .seg button.on:hover { background: color-mix(in srgb, var(--accent) 20%, var(--panel-2)); }
 .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .seg b { font-weight: 400; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+[data-node-color="orion"] { --node-color: light-dark(#1d4ed8, #93c5fd); }
+[data-node-color="lyra"] { --node-color: light-dark(#7e22ce, #d8b4fe); }
+[data-node-color="cygnus"] { --node-color: light-dark(#a14408, #fdba74); }
+.node-badge {
+  display: inline-block; padding: 1px 6px; border-radius: 4px;
+  color: var(--node-color, var(--muted)); font-weight: 600;
+  background: color-mix(in srgb, var(--node-color, var(--muted)) 12%, var(--panel));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--node-color, var(--muted)) 25%, transparent);
+}
+#node-chips button[data-node-color]:not([data-node-color=""]) {
+  box-shadow: inset 0 -3px var(--node-color);
+}
+#node-chips button[data-node-color]:not([data-node-color=""]).on {
+  color: var(--node-color); font-weight: 600;
+  background: color-mix(in srgb, var(--node-color) 16%, var(--panel-2));
+}
+#node-chips button[data-node-color]:not([data-node-color=""]).on:hover {
+  background: color-mix(in srgb, var(--node-color) 24%, var(--panel-2));
+}
+#node-chips button[data-node-color]:not([data-node-color=""]):not(.on) {
+  box-shadow: inset 0 -3px color-mix(in srgb, var(--node-color) 25%, transparent);
+}
+#node-chips button[data-node-color]:not([data-node-color=""]).on b { color: inherit; }
 .chip.off .ico { opacity: .45; }
 #session-scope button { width: 48px; padding-inline: 7px; font-variant-numeric: tabular-nums; }
 #session-scope b { font-size: 12px; font-weight: 500; color: var(--text); }

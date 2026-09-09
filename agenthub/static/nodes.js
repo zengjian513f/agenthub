@@ -13,6 +13,16 @@ function selectedNodeIds() { return Nodes.list.filter(n => !Nodes.off.has(n.id))
 function nodeDirectory(row, length = 999) {
   return (row.node_name ? row.node_name + ' · ' : '') + shortCwd(row.cwd || '(未知)', length);
 }
+function nodeColor(name) {
+  const key = String(name || '').trim().toLowerCase();
+  return ['orion', 'lyra', 'cygnus'].includes(key) ? key : '';
+}
+function nodeBadge(name) {
+  return `<span class="node-badge" data-node-color="${nodeColor(name)}">${esc(name)}</span>`;
+}
+function nodeDirectoryMarkup(row, length = 999) {
+  return (row.node_name ? nodeBadge(row.node_name) + ' · ' : '') + esc(shortCwd(row.cwd || '(未知)', length));
+}
 function newNodeId() { return HUB_MODE ? document.querySelector('#new-node')?.value || '' : ''; }
 function newDirsKey() { return HUB_MODE ? 'newDirs.' + newNodeId() : 'newDirs'; }
 function newNodeCapabilities() { return HUB_MODE ? Nodes.capabilities[newNodeId()] || {} : T; }
@@ -59,6 +69,7 @@ function renderNodes() {
     countLabel.className = 'node-count'; countLabel.textContent = count;
     item.replaceChildren(document.createTextNode(`${n.name} `), countLabel);
     item.dataset.node = n.id;
+    item.dataset.nodeColor = nodeColor(n.name);
     item.ondblclick = () => {
       Nodes.off = new Set(Nodes.list.filter(x => x.id !== n.id).map(x => x.id)); change();
     };

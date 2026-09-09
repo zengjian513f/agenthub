@@ -2256,7 +2256,7 @@ function renderSide() {
     const head = el('div', 'ghead',
       `${S.picking ? `<input type="checkbox" class="ghead-pick"
          aria-label="选中「${esc(label)}」下的全部会话">` : ''}
-       <span class="caret">▼</span><span class="gname" title="${esc(key)}">${esc(label)}</span>
+       <span class="caret">▼</span><span class="gname" title="${esc(key)}">${S.view === 'tree' ? nodeDirectoryMarkup(items[0]) : esc(label)}</span>
        <span class="gcount">${items.length}</span>`);
     head.onclick = () => {
       S.closed.has(key) ? S.closed.delete(key) : S.closed.add(key);
@@ -2287,7 +2287,7 @@ function renderSide() {
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
            <div class="m">${esc(meta)}</div>
            ${S.view === 'date'
-             ? `<div class="cwd" title="${esc(s.cwd)}">${esc(nodeDirectory(s, 60))}</div>` : ''}
+             ? `<div class="cwd" title="${esc(s.cwd)}">${nodeDirectoryMarkup(s, 60)}</div>` : ''}
            ${s.snippet ? `<div class="snip">${hl(s.snippet)}</div>` : ''}
          </div>
          ${s.pending ? '' : starButtonMarkup(s.uid, !!s.starred, 'item-star')}`);
@@ -2772,7 +2772,7 @@ function head(m, total) {
       <span class="meta-secondary">${fmtSize(m.size)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
-      ${m.node_name ? `<span class="meta-node">${esc(m.node_name)}</span>` : ''}
+      ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
