@@ -34,7 +34,7 @@ class FileNode(NodeHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
-        if url.path == '/api/session/file':
+        if url.path in {'/api/session/file', '/api/session/files'}:
             # Exercise the production endpoint; index lookup is isolated below.
             self.state['gets'].append((url.path, parse_qs(url.query)))
             return server.Handler._api_get(self, url.path, parse_qs(url.query))
@@ -56,6 +56,18 @@ def main():
         image.write_bytes(PNG)
         source = root / 'source.py'
         source.write_text('print("fixture")\n')
+        nested = output / '中文 子目录'
+        nested.mkdir()
+        special = nested / '报告 # & (final).txt'
+        special.write_text('中文下载内容\n')
+        hostile = nested / '<img onerror=alert(1)>.txt'
+        hostile.touch()
+        (nested / '.hidden').write_text('hidden')
+        (nested / 'empty').mkdir()
+        many = output / 'many'
+        many.mkdir()
+        for i in range(502):
+            (many / f'item-{i:04}.txt').touch()
         checkout = root / 'checkout'
         checkout.mkdir()
         for name in ['Example.sln', 'README.md', 'AGENTS.md', 'CLAUDE.md']:
@@ -154,7 +166,55 @@ def main():
                     response = ctx.request.get(text_link.get_attribute('href'))
                     assert response.status == 200 and response.text() == source.read_text()
                     directory = page.locator('.msg[data-role=assistant] a').filter(has_text='./output')
-                    assert 'curve.png' in ctx.request.get(directory.get_attribute('href')).text()
+                    with page.expect_popup() as opened:
+                        directory.click()
+                    browser_page = opened.value
+                    browser_page.on('pageerror', lambda error: errors.append(str(error)))
+                    browser_page.get_by_role('link', name='curve.png', exact=True).wait_for()
+                    assert urlparse(browser_page.url).path == ('/agenthub' if scoped else '') + '/files.html'
+                    browser_page.get_by_role('link', name='中文 子目录', exact=True).click()
+                    browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
+                    assert browser_page.locator('#entries img').count() == 0
+                    assert browser_page.get_by_role('link', name=hostile.name, exact=True).is_visible()
+                    assert browser_page.get_by_role('link', name='.hidden', exact=True).is_visible()
+                    with browser_page.expect_download() as downloaded:
+                        browser_page.get_by_role('link', name=special.name, exact=True).click()
+                    download = downloaded.value
+                    assert download.suggested_filename == special.name
+                    download.save_as(root / 'browser-download.txt')
+                    assert (root / 'browser-download.txt').read_bytes() == special.read_bytes()
+                    browser_page.reload()
+                    browser_page.get_by_role('link', name='empty', exact=True).click()
+                    browser_page.get_by_text('此目录为空', exact=True).wait_for()
+                    browser_page.go_back()
+                    browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
+                    browser_page.go_forward()
+                    browser_page.get_by_text('此目录为空', exact=True).wait_for()
+                    browser_page.locator('#breadcrumbs a').filter(has_text='output').click()
+                    browser_page.get_by_role('link', name='many', exact=True).click()
+                    browser_page.get_by_text('共 502 项，包含隐藏文件', exact=True).wait_for()
+                    assert browser_page.locator('#entries tr').count() == 500
+                    browser_page.get_by_role('link', name='下一页', exact=True).click()
+                    browser_page.get_by_text('501–502 / 502', exact=True).wait_for()
+                    assert browser_page.locator('#entries tr').count() == 2
+                    browser_page.get_by_role('link', name='上一页', exact=True).click()
+                    browser_page.get_by_text('1–500 / 502', exact=True).wait_for()
+                    browser_page.get_by_role('link', name='↑ 上级目录', exact=True).click()
+                    browser_page.get_by_role('link', name='curve.png', exact=True).wait_for()
+                    browser_page.get_by_role('link', name='↑ 上级目录', exact=True).click()
+                    browser_page.get_by_role('link', name='source.py', exact=True).wait_for()
+                    browser_page.set_viewport_size({'width': 360, 'height': 640})
+                    browser_page.get_by_role('link', name='output', exact=True).click()
+                    browser_page.get_by_role('link', name='中文 子目录', exact=True).click()
+                    browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
+                    assert browser_page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                    # Errors are rendered inside the browser, with refresh/back recovery.
+                    with patch.object(server.files, 'list_directory', side_effect=PermissionError):
+                        browser_page.get_by_role('button', name='刷新', exact=True).click()
+                        browser_page.locator('#status.error').wait_for()
+                    browser_page.get_by_role('button', name='刷新', exact=True).click()
+                    browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
+                    browser_page.close()
                     assert text_link.get_attribute('data-file-kind') == 'file'
                     assert directory.get_attribute('data-file-kind') == 'directory'
                     directory.click(button='right')
@@ -323,6 +383,18 @@ def main():
                     # An unfinished Markdown target must not trigger exponential
                     # backtracking while an assistant is still streaming it.
                     page.evaluate("md('[unfinished](' + 'a'.repeat(10000), true)")
+                    # A new Hub must remain usable with nodes awaiting upgrade.
+                    def legacy_node(route):
+                        response = route.fetch()
+                        data = response.json()
+                        data.pop('file_browser', None)
+                        route.fulfill(response=response, json=data)
+                    page.route('**/api/session/resolve-files', legacy_node)
+                    page.reload()
+                    directory.wait_for()
+                    assert urlparse(directory.get_attribute('href')).path.endswith('/api/session/file')
+                    assert 'curve.png' in ctx.request.get(directory.get_attribute('href')).text()
+                    page.unroute('**/api/session/resolve-files', legacy_node)
                     # A failed check must never create a clickable local link.
                     node.state['fail_checks'] = True
                     page.reload()

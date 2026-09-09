@@ -1,8 +1,10 @@
-"""Read files explicitly referenced by a session, without a browser path API."""
+"""Session file references and authenticated, read-only directory browsing."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from pathlib import Path
 
 from . import media
@@ -157,3 +159,58 @@ def read(path: Path) -> tuple[bytes, str, dict]:
     name = re.sub(r"[^A-Za-z0-9._-]", "_", path.name)
     headers["Content-Disposition"] = f'attachment; filename="{name}"'
     return data, "application/octet-stream", headers
+
+
+def browse_target(anchor: Path, raw: str) -> Path:
+    """Navigation intentionally permits parents up to the filesystem root.
+
+    The caller must first resolve a directory reference in the selected session.
+    This browser shares the node's authenticated operator access, not a jailed
+    share link. OS permissions still apply, and special files cannot be read.
+    """
+    if not anchor.is_dir():
+        raise ValueError("文件浏览入口必须是目录")
+    if not raw:
+        return anchor
+    if len(raw) > 4096 or "\x00" in raw or not Path(raw).is_absolute():
+        raise ValueError("无效的目录路径")
+    try:
+        target = Path(raw).resolve(strict=True)
+    except RuntimeError as exc:
+        raise ValueError("无法解析循环符号链接") from exc
+    if not target.is_dir() and not target.is_file():
+        raise ValueError("仅支持普通文件和目录")
+    return target
+
+
+def list_directory(path: Path, offset: int = 0, limit: int = 500) -> dict:
+    if offset < 0 or not 1 <= limit <= 500:
+        raise ValueError("无效的分页参数")
+    if not path.is_dir():
+        raise ValueError("请选择目录浏览")
+    entries = []
+    with os.scandir(path) as scan:
+        for item in scan:
+            try:
+                kind = "directory" if item.is_dir() else "file" if item.is_file() else "unavailable"
+            except OSError:
+                kind = "unavailable"
+            entries.append((kind, item.name))
+    entries.sort(key=lambda row: (row[0] != "directory", row[1].casefold(), row[1]))
+    page = []
+    for kind, name in entries[offset:offset + limit]:
+        item = path / name
+        size = modified = None
+        try:
+            info = item.stat()
+            modified = info.st_mtime
+            if stat.S_ISREG(info.st_mode):
+                size = info.st_size
+        except OSError:
+            kind = "unavailable"
+        page.append({"name": name, "path": str(item), "kind": kind,
+                     "size": size, "modified": modified})
+    end = offset + len(page)
+    return {"path": str(path), "parent": str(path.parent) if path.parent != path else None,
+            "entries": page, "total": len(entries), "offset": offset,
+            "next_offset": end if end < len(entries) else None}

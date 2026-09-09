@@ -110,6 +110,7 @@ class SessionFileTests(unittest.TestCase):
                 patch.object(server.index, "messages_for", return_value={"messages": self.messages}):
             handler._resolve_files({"uid": session["uid"], "refs": ["curve.png", "missing.txt"]})
             self.assertEqual(replies[-1][0], 200)
+            self.assertTrue(replies[-1][1]['file_browser'])
             self.assertEqual(replies[-1][1]['resolved'], {"curve.png": str(self.image)})
             self.assertEqual(replies[-1][1]['targets'], [
                 {'ref': 'curve.png', 'path': str(self.image), 'kind': 'file'}])
@@ -197,6 +198,57 @@ class SessionFileTests(unittest.TestCase):
         with patch.object(server.index, "get", return_value=None):
             handler._api_get("/api/session/file", {"ref": ["curve.png"]})
             self.assertEqual(replies[-1][0], 404)
+
+    def test_browser_lists_all_pages_and_hidden_and_special_entries(self):
+        for i in range(503):
+            (self.cwd / f'item-{i:04}.txt').touch()
+        (self.cwd / '.hidden').touch()
+        (self.cwd / 'broken').symlink_to(self.cwd / 'missing')
+        first = files.list_directory(self.cwd)
+        second = files.list_directory(self.cwd, first['next_offset'])
+        self.assertEqual(first['total'], 506)
+        self.assertEqual(first['entries'][0]['kind'], 'directory')
+        entries = first['entries'] + second['entries']
+        self.assertEqual(len(entries), 506)
+        self.assertEqual(len({entry['name'] for entry in entries}), 506)
+        self.assertIn('.hidden', {entry['name'] for entry in entries})
+        self.assertEqual(next(e['kind'] for e in entries if e['name'] == 'broken'), 'unavailable')
+        self.assertIsNone(second['next_offset'])
+        self.assertIsNone(files.list_directory(Path('/'))['parent'])
+        with self.assertRaises(ValueError):
+            files.list_directory(self.cwd, -1)
+
+    def test_browser_requires_session_directory_and_allows_parent_and_download(self):
+        handler = object.__new__(server.Handler)
+        replies, downloads = [], []
+        handler._json = lambda body, status=200: replies.append((status, body))
+        handler._download_file = downloads.append
+        session = {'uid': 'claude:fixture', 'cwd': str(self.cwd)}
+        self.messages.append({'role': 'assistant', 'text': '`./output`'})
+        params = {'uid': [session['uid']], 'ref': ['./output']}
+        with patch.object(server.index, 'get', side_effect=lambda uid: session if uid == session['uid'] else None), \
+                patch.object(server.index, 'messages_for', return_value={'messages': self.messages}):
+            handler._api_get('/api/session/files', params)
+            self.assertEqual(replies[-1][1]['path'], str(self.image.parent))
+            handler._api_get('/api/session/files', {**params, 'path': [str(self.cwd)]})
+            self.assertEqual(replies[-1][1]['path'], str(self.cwd))
+            child = self.image.parent / '中文 # report:12.txt'
+            child.write_text('download me')
+            handler._api_get('/api/session/files', {**params, 'path': [str(child)], 'download': ['1']})
+            self.assertEqual(downloads, [child])
+            for changed, expected in [
+                ({'uid': ['missing']}, 404), ({'agent': ['missing']}, 404),
+                ({'ref': ['unmentioned']}, 404), ({'ref': ['curve.png']}, 400),
+                ({'path': ['../']}, 400), ({'path': [str(child) + '\x00']}, 400),
+                ({'path': [str(self.cwd / 'missing')]}, 404), ({'offset': ['invalid']}, 400),
+                ({'offset': ['-1']}, 400),
+            ]:
+                with self.subTest(changed=changed):
+                    handler._api_get('/api/session/files', {**params, **changed})
+                    self.assertEqual(replies[-1][0], expected)
+            with patch.object(files, 'list_directory', side_effect=PermissionError):
+                handler._api_get('/api/session/files', params)
+                self.assertEqual(replies[-1][0], 403)
 
 
 if __name__ == "__main__":

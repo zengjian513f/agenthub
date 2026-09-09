@@ -29,7 +29,8 @@ from . import federation, create_requests, files
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
     (STATIC / name).read_bytes()
-    for name in ("style.css", "cli.js", "nodes.js", "app.js", "term.js")
+    for name in ("style.css", "cli.js", "nodes.js", "app.js", "term.js",
+                 "files.html", "files.js", "files.css")
 )).hexdigest()[:12]
 HOSTNAME = socket.gethostname().strip() or "localhost"
 HUB_MODE = False
@@ -965,7 +966,7 @@ class Handler(BaseHTTPRequestHandler):
             if kind:
                 targets.append({"ref": ref, "path": path, "kind": kind})
         # Keep resolved for already open tabs during rolling deployments.
-        return self._json({"resolved": resolved, "targets": targets,
+        return self._json({"resolved": resolved, "targets": targets, "file_browser": True,
                            "node_id": NODE_ID or federation.identity()})
 
     def _api_get(self, path: str, q: dict):
@@ -1078,7 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
                                "version": result["version"],
                                "anchor": result.get("anchor", "")})
 
-        if path == "/api/session/file":
+        if path in {"/api/session/file", "/api/session/files"}:
             session = index.get(q.get("uid", [""])[0])
             if not session:
                 return self._json({"error": "会话不存在"}, 404)
@@ -1087,6 +1088,13 @@ class Handler(BaseHTTPRequestHandler):
                 ref = q.get("ref", [""])[0]
                 messages = self._file_messages(view, [ref])
                 target = files.resolve(messages, view.get("cwd", ""), ref)
+                if path == "/api/session/files":
+                    target = files.browse_target(target, q.get("path", [""])[0])
+                    if q.get("download", [""])[0] == "1":
+                        return self._download_file(target)
+                    listing = files.list_directory(target, int(q.get("offset", ["0"])[0]))
+                    return self._json({**listing, "hostname": HOSTNAME,
+                                       "node_id": NODE_ID or federation.identity()})
                 if q.get("download", [""])[0] == "1":
                     return self._download_file(target)
                 data, mime, headers = files.read(target)
@@ -2188,14 +2196,14 @@ class Handler(BaseHTTPRequestHandler):
         if ctype.startswith(("text/", "application/javascript")):
             ctype += "; charset=utf-8"
         data = f.read_bytes()
-        if f.name == "index.html":
+        if f.name in {"index.html", "files.html"}:
             hub_mode = getattr(getattr(self, "server", None), "hub_mode", HUB_MODE)
             data = data.replace(b"__AGENTHUB_MODE__", b"hub" if hub_mode else b"local")
             data = data.replace(b"__AGENTHUB_HOSTNAME__",
                                 html.escape("AgentHub" if hub_mode else HOSTNAME).encode("utf-8"))
             data = data.replace(b"__AGENTHUB_ASSET_VERSION__",
                                 ASSET_VERSION.encode("ascii"))
-        cache = "no-store" if f.name == "index.html" else "no-cache"
+        cache = "no-store" if f.name in {"index.html", "files.html"} else "no-cache"
         self._send(200, data, ctype, {"Cache-Control": cache})
 
 

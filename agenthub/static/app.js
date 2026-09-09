@@ -4495,7 +4495,7 @@ async function flushFileChecks() {
           body: JSON.stringify({...context, refs: batch}),
         });
         if (!response.ok) continue;
-        const {resolved, targets = []} = await response.json();
+        const {resolved, targets = [], file_browser = false} = await response.json();
         const details = new Map(targets.map(target => [target.ref, target]));
         for (const node of attached) {
           const detail = details.get(node.dataset.fileRef);
@@ -4504,6 +4504,11 @@ async function flushFileChecks() {
           if (!node.isConnected || typeof path !== 'string' || !path.startsWith('/')) continue;
           const link = document.createElement('a');
           link.href = node.dataset.fileHref;
+          // During a rolling deployment, older nodes still serve text listings.
+          if (file_browser && detail?.kind === 'directory') {
+            const query = new URL(link.href).search;
+            link.href = appUrl('files.html') + query;
+          }
           link.target = '_blank'; link.rel = 'noopener noreferrer';
           link.title = path;
           link.dataset.localPath = path;

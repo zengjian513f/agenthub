@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="agenthub-build" content="__AGENTHUB_ASSET_VERSION__">
+  <title>文件浏览 · AgentHub</title>
+  <link rel="stylesheet" href="files.css?v=__AGENTHUB_ASSET_VERSION__">
+  <script src="files.js?v=__AGENTHUB_ASSET_VERSION__" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><p class="brand">AgentHub · 文件浏览</p><h1>正在打开目录…</h1></div><span id="machine"></span></header>
+    <div class="toolbar"><a id="parent" aria-disabled="true">↑ 上级目录</a><button id="refresh" type="button">刷新</button><span class="hint">点击文件即可下载</span></div>
+    <nav id="breadcrumbs" aria-label="目录路径"></nav>
+    <p id="status" role="status" aria-live="polite">正在加载…</p>
+    <div class="table-wrap"><table aria-label="目录内容"><thead><tr><th>名称</th><th>大小</th><th>修改时间</th></tr></thead><tbody id="entries"></tbody></table></div>
+    <nav class="pagination" aria-label="分页"><a id="previous" aria-disabled="true">上一页</a><span id="page-info"></span><a id="next" aria-disabled="true">下一页</a></nav>
+  </main>
+</body>
+</html>

@@ -1,0 +1,44 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; color: #202937; background: #f4f6f9; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 1120px; margin: 36px auto; padding: 28px; background: #fff; border: 1px solid #e0e5ed; border-radius: 16px; }
+header, .toolbar, .pagination { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+header { justify-content: space-between; margin-bottom: 24px; }
+.brand, .hint, #machine, #status, #page-info { color: #677386; font-size: 14px; }
+.brand { margin: 0 0 6px; }
+h1 { font-size: 25px; margin: 0; overflow-wrap: anywhere; }
+#machine { overflow-wrap: anywhere; }
+a { color: #285dc1; text-decoration: none; cursor: pointer; }
+a:hover { text-decoration: underline; }
+a:focus-visible, button:focus-visible { outline: 2px solid #285dc1; outline-offset: 4px; }
+button, .toolbar > a, .pagination a { font: inherit; padding: 8px 12px; border: 1px solid #d8dfeb; border-radius: 7px; background: transparent; color: inherit; cursor: pointer; }
+a[aria-disabled="true"] { opacity: .4; cursor: default; text-decoration: none; }
+#breadcrumbs { display: flex; flex-wrap: wrap; gap: 8px; padding: 16px; margin-top: 20px; background: #f4f6f9; border-radius: 8px; overflow-wrap: anywhere; }
+#breadcrumbs a { min-width: 0; }
+#status.error { color: #b52a38; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; color: #677386; font-weight: 500; }
+th, td { padding: 12px 10px; border-bottom: 1px solid #e9edf3; }
+td:first-child { width: 65%; overflow-wrap: anywhere; }
+td:first-child a { display: flex; align-items: baseline; gap: 10px; }
+.icon { flex: 0 0 auto; }
+td:not(:first-child) { white-space: nowrap; color: #677386; }
+tbody tr:hover { background: #f7f9fc; }
+.pagination { justify-content: center; margin-top: 24px; }
+@media (max-width: 600px) {
+  main { margin: 0; padding: 20px 12px; border: 0; border-radius: 0; min-height: 100vh; }
+  th:last-child, td:last-child { display: none; }
+  .hint { width: 100%; }
+  th, td { padding: 12px 6px; }
+}
+@media (prefers-color-scheme: dark) {
+  :root { background: #141820; color: #e2e7ee; }
+  main { background: #1c222c; border-color: #343e4e; }
+  .brand, .hint, #machine, #status, #page-info, th, td:not(:first-child) { color: #a1aec1; }
+  a { color: #8ab4ff; }
+  #breadcrumbs, tbody tr:hover { background: #252d3a; }
+  th, td { border-color: #343e4e; }
+  button, .toolbar > a, .pagination a { border-color: #465268; }
+  #status.error { color: #ff9aa4; }
+}
