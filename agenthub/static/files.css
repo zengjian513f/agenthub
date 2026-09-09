@@ -53,9 +53,8 @@ dialog::backdrop { background:#15203655; } dialog h2 { font-size:18px; margin:0 
 .properties { display:grid; grid-template-columns:90px 1fr; gap:12px; font-size:13px; } .properties dt { color:var(--muted); } .properties dd { margin:0; overflow-wrap:anywhere; user-select:text; }
 .drawer { position:fixed; inset:0 0 0 auto; margin:0; width:430px; height:100dvh; max-height:none; border-radius:0; padding:22px; }
 .task { padding:16px 0; border-bottom:1px solid var(--line); } .task-title { display:flex; justify-content:space-between; gap:12px; overflow-wrap:anywhere; } .task small { display:block; color:var(--muted); margin:7px 0; overflow-wrap:anywhere; }
-.task progress { width:100%; height:6px; accent-color:var(--accent); } .task-actions { display:flex; gap:8px; justify-content:flex-end; } .task-actions button,.trash-actions button { border-color:var(--line); font-size:12px; }
-.task-errors { font-size:12px; white-space:pre-wrap; color:var(--danger); overflow-wrap:anywhere; } #trash-dialog { width:850px; } .trash-actions { display:flex; gap:8px; margin:15px 0; }
-#trash-list label { display:flex; gap:12px; padding:12px 0; border-bottom:1px solid var(--line); align-items:flex-start; } #trash-list small { color:var(--muted); display:block; margin-top:5px; overflow-wrap:anywhere; } #trash-list strong { font-weight:500; overflow-wrap:anywhere; }
+.task progress { width:100%; height:6px; accent-color:var(--accent); } .task-actions { display:flex; gap:8px; justify-content:flex-end; } .task-actions button { border-color:var(--line); font-size:12px; }
+.task-errors { font-size:12px; white-space:pre-wrap; color:var(--danger); overflow-wrap:anywhere; }
 .hljs-keyword,.hljs-selector-tag { color:#a025a0; } .hljs-string,.hljs-attr { color:#197c59; } .hljs-comment { color:#758298; } .hljs-number,.hljs-literal { color:#a66a15; } .hljs-title,.hljs-built_in { color:#2866ba; }
 @media(max-width:700px) {
   header { padding:0 12px; } .navigation { gap:6px; padding:8px; } .nav-buttons { gap:0; } .nav-buttons button,.nav-buttons a { width:30px; } .commandbar { padding:6px; gap:0; } .commandbar button { padding:8px; }

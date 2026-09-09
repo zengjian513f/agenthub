@@ -9,11 +9,11 @@
   const restore = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } };
   const preferences = {...{sort:'name', order:'asc', view:'list', hidden:true}, ...restore('agenthub-files-view', {})};
   const states = {queued:'等待中', running:'处理中', uploading:'上传中', completed:'已完成', failed:'失败', cancelled:'已取消', interrupted:'已中断'};
-  const labels = {mkdir:'新建文件夹', 'new-file':'新建文件', rename:'重命名', copy:'复制', move:'移动', trash:'移入回收站', restore:'还原', purge:'永久删除', compress:'压缩', extract:'解压', bundle:'打包下载', upload:'上传'};
+  const labels = {mkdir:'新建文件夹', 'new-file':'新建文件', rename:'重命名', copy:'复制', move:'移动', delete:'永久删除', trash:'历史删除', restore:'历史还原', purge:'历史清理', compress:'压缩', extract:'解压', bundle:'打包下载', upload:'上传'};
   let data = null, controller, selected = new Set(), anchor = -1, loading = false;
   let clipboard = restore('agenthub-files-clipboard', null);
   let knownJobs = new Map(), lastJobs = [], pollTimer, polling = false, taskSignature = '';
-  let uploadDestination = '', resumeJob = null, previewController, trashController;
+  let uploadDestination = '', resumeJob = null, previewController;
   const uploads = new Map(), uploading = new Set(), xhrs = new Map(), bundleDownloads = new Set();
   const historyKey = 'agenthub-files-history:' + context.toString();
   if (!history.state?.files) history.replaceState({files:0}, '', location.href);
@@ -70,7 +70,7 @@
     if (action === 'paste') return writable && clipboard?.node === data.node_id && !!clipboard.paths?.length;
     if (action === 'rename') return writable && count === 1;
     if (action === 'extract') return writable && count === 1 && chosen()[0]?.name.toLowerCase().endsWith('.zip');
-    if (['cut','trash','compress'].includes(action)) return writable && !!count;
+    if (['cut','delete','compress'].includes(action)) return writable && !!count;
     return writable;
   }
   function selectionChanged() {
@@ -189,7 +189,7 @@
       const input = dialog.querySelector('input'); if (input) { input.focus(); input.select(); }
     });
   }
-  const conflictField = () => ({name:'conflict', label:'遇到同名项目', value:'error', options:[['error','停止该项并提示'],['keep','保留两份（自动编号）'],['skip','跳过'],['replace','覆盖（原项目移入回收站）']]});
+  const conflictField = () => ({name:'conflict', label:'遇到同名项目', value:'error', options:[['error','停止该项并提示'],['keep','保留两份（自动编号）'],['skip','跳过'],['replace','覆盖原项目']]});
   async function submit(spec, showTasks = true) {
     const {job} = await post(spec); knownJobs.set(job.id,'queued');
     if (spec.action === 'bundle') bundleDownloads.add(job.id);
@@ -226,8 +226,8 @@
         const answer = await ask('重命名',items[0].name,[{name:'name',label:'新名称',value:items[0].name},conflictField()]);
         if (answer) await submit({action,paths,...answer}); return;
       }
-      if (action === 'trash') {
-        if (await ask('移入回收站',`删除选中的 ${paths.length} 个项目？可以从文件回收站还原。`,[],'移入回收站')) await submit({action,paths}); return;
+      if (action === 'delete') {
+        if (await ask('永久删除',`永久删除选中的 ${paths.length} 个项目？此操作无法撤销，文件夹内的所有内容也会删除。\n${paths.join('\n')}`,[],'永久删除')) await submit({action,paths}); return;
       }
       if (action === 'compress') {
         const answer = await ask('压缩为 ZIP',`打包 ${paths.length} 个项目`,[{name:'name',label:'压缩文件名',value:(items.length === 1 ? items[0].name : 'files') + '.zip'},conflictField()]);
@@ -306,7 +306,7 @@
       const count = result.jobs.filter(j => ['queued','running','uploading'].includes(j.state)).length;
       $('task-count').textContent = count ? `(${count})` : '';
       renderTasks(result.jobs);
-      if (refresh) { await load(); if ($('trash-dialog').open) await loadTrash(); }
+      if (refresh) await load();
     } catch (error) { if ($('tasks-dialog').open) $('tasks-list').textContent = error.message; }
     finally { polling = false; pollTimer = setTimeout(poll, document.hidden ? 6000 : 1500); }
   }
@@ -328,8 +328,8 @@
       const button = (label,fn) => { const node = element('button',label); node.onclick = async () => { try { await fn(); } catch (e) { status(e.message,true); } }; actions.append(node); };
       if (active) button('取消',async () => { xhrs.get(job.id)?.abort(); await post({action:'cancel',job:job.id}); await poll(); });
       if (job.action === 'upload' && job.state === 'uploading' && !uploading.has(job.id)) button('继续上传',() => resumeUpload(job));
-      if (['failed','cancelled','interrupted'].includes(job.state)) button('重试',async () => {
-        const answer = await ask('重试任务','已完成的项目不会重复处理。',[conflictField()]); if (!answer) return;
+      if (['failed','cancelled','interrupted'].includes(job.state) && !['trash','restore','purge'].includes(job.action)) button('重试',async () => {
+        const answer = await ask(job.action === 'delete' ? '重试永久删除' : '重试任务',job.action === 'delete' ? '继续永久删除尚未完成的项目，此操作无法撤销。' : '已完成的项目不会重复处理。',job.action === 'delete' ? [] : [conflictField()]); if (!answer) return;
         const result = await post({action:'retry',job:job.id,...answer});
         if (job.action === 'upload') resumeUpload(result.job);
         await poll();
@@ -382,29 +382,6 @@
       }
     } catch (error) { status(error.message,true); }
   }
-  async function loadTrash(fresh = false) {
-    trashController?.abort(); const request = trashController = new AbortController();
-    if (fresh === true) $('trash-list').textContent = '正在加载…';
-    try {
-      const {items} = await get({mode:'trash'},request.signal);
-      if (request !== trashController) return;
-      const checked = new Set([...$('trash-list').querySelectorAll('input:checked')].map(input => input.value));
-      const fragment = document.createDocumentFragment();
-      for (const item of items) {
-        const label = element('label'), check = element('input'); check.type = 'checkbox'; check.value = item.id; check.setAttribute('aria-label','选择 ' + item.name);
-        check.checked = checked.has(item.id);
-        const text = element('span'); text.append(element('strong',item.name),element('small',item.path),element('small',new Date(item.deleted*1000).toLocaleString()));
-        label.append(check,text); fragment.append(label);
-      }
-      $('trash-list').replaceChildren(fragment); if (!items.length) $('trash-list').textContent = '回收站为空';
-    } catch (error) { if (request === trashController) $('trash-list').textContent = error.message; }
-  }
-  async function trashAction(action) {
-    const paths = [...$('trash-list').querySelectorAll('input:checked')].map(i => i.value); if (!paths.length) return;
-    const answer = await ask(action === 'restore' ? '还原项目' : '永久删除',action === 'restore' ? `将 ${paths.length} 个项目恢复到原路径。` : `永久删除 ${paths.length} 个项目，此操作不能撤销。`,action === 'restore' ? [conflictField()] : [],action === 'restore' ? '还原' : '永久删除');
-    if (answer) { try { await submit({action,paths,...answer}); } catch (error) { status(error.message,true); } }
-  }
-
   $('entries').addEventListener('click',event => {
     const row = event.target.closest('.entry'); if (!row) return;
     event.preventDefault(); selectEntry(Number(row.dataset.index),event); row.focus({preventScroll:true});
@@ -424,7 +401,7 @@
     if (row && !selected.has(row.dataset.path)) selectEntry(Number(row.dataset.index));
     if (!row) { selected.clear(); selectionChanged(); }
     const menu = $('context-menu'); menu.replaceChildren();
-    const actions = row ? [['open','打开'],['download','下载'],['cut','剪切'],['copy','复制'],['paste','粘贴'],['rename','重命名'],['trash','移入回收站'],['compress','压缩为 ZIP'],['extract','解压 ZIP'],['info','属性']] : [['new','新建'],['upload','上传'],['paste','粘贴']];
+    const actions = row ? [['open','打开'],['download','下载'],['cut','剪切'],['copy','复制'],['paste','粘贴'],['rename','重命名'],['delete','永久删除'],['compress','压缩为 ZIP'],['extract','解压 ZIP'],['info','属性']] : [['new','新建'],['upload','上传文件'],['paste','粘贴']];
     for (const [action,label] of actions) { const button = element('button',label); button.dataset.action = action; button.disabled = !actionEnabled(action); button.setAttribute('role','menuitem'); menu.append(button); }
     menu.hidden = false; menu.style.left = Math.min(event.clientX,innerWidth-menu.offsetWidth-8)+'px'; menu.style.top = Math.max(8,Math.min(event.clientY,innerHeight-menu.offsetHeight-8))+'px'; menu.querySelector('button:not(:disabled)')?.focus();
   }
@@ -485,7 +462,7 @@
     const ctrl = event.ctrlKey || event.metaKey, key = event.key.toLowerCase();
     if ((ctrl && key === 'l') || key === 'f4') { event.preventDefault(); editAddress(); return; }
     if (ctrl && key === 'a') { event.preventDefault(); selected = new Set(data?.entries.map(e=>e.path) || []); selectionChanged(); return; }
-    const action = ctrl ? ({c:'copy',x:'cut',v:'paste'}[key]) : ({f2:'rename',delete:'trash',enter:'open'}[key]);
+    const action = ctrl ? ({c:'copy',x:'cut',v:'paste'}[key]) : ({f2:'rename',delete:'delete',enter:'open'}[key]);
     if (action) { event.preventDefault(); perform(action); return; }
     if (key === 'f5') { event.preventDefault(); load(); }
     if (event.altKey && key === 'arrowup' && data?.parent) { event.preventDefault(); navigate(data.parent); }
@@ -500,8 +477,6 @@
   $('action-cancel').onclick = () => $('action-dialog').close();
   $('preview-dialog').addEventListener('close',() => { previewController?.abort(); $('preview-content').replaceChildren(); });
   $('tasks-open').onclick = () => { $('tasks-dialog').showModal(); poll(); };
-  $('trash-open').onclick = () => { $('trash-dialog').showModal(); loadTrash(true); };
-  $('trash-refresh').onclick = () => loadTrash(); $('trash-restore').onclick = () => trashAction('restore'); $('trash-purge').onclick = () => trashAction('purge');
   $('upload-input').onchange = () => startUploads([...$('upload-input').files],uploadDestination);
   $('resume-input').onchange = () => {
     const file = $('resume-input').files[0]; if (!file || !resumeJob) return;

@@ -84,14 +84,52 @@ class FileManagerTests(unittest.TestCase):
         self.good('rename', paths=[str(broken)], name='renamed-link')
         self.assertTrue((self.work/'renamed-link').is_symlink())
 
+    def test_permanent_delete_does_not_add_trash_or_follow_links(self):
+        legacy = self.work/'legacy.txt'
+        legacy.write_text('retain old trash')
+        self.good('trash', paths=[str(legacy)])
+        old_trash = self.manager.trash_list(self.scope)
+        outside = self.work/'outside.txt'
+        outside.write_text('keep link target')
+        directory = self.work/'delete-directory'
+        directory.mkdir()
+        (directory/'child.txt').write_text('delete contents')
+        (directory/'link').symlink_to(outside)
+        link = self.work/'directory-link'
+        link.symlink_to(directory)
+        self.good('delete', paths=[str(link)])
+        self.assertTrue((directory/'child.txt').exists())
+        self.assertFalse(os.path.lexists(link))
+        self.good('delete', paths=[str(directory), str(directory/'child.txt')])
+        self.assertFalse(directory.exists())
+        self.assertEqual(outside.read_text(), 'keep link target')
+        self.assertEqual(self.manager.trash_list(self.scope), old_trash)
+        self.good('restore', paths=[old_trash[0]['id']])
+        self.assertEqual(legacy.read_text(), 'retain old trash')
+
+    def test_permanent_delete_cancel_and_changed_source(self):
+        source = self.work/'selected.txt'
+        source.write_text('original')
+        with patch.object(self.manager, 'launch'):
+            pending = self.manager.start(self.scope, {'action':'delete', 'paths':[str(source)]})
+        self.manager.control(self.scope, pending['id'], 'cancel')
+        self.manager.run(self.manager.get(self.scope, pending['id']))
+        self.assertEqual(self.manager.get(self.scope, pending['id'])['state'], 'cancelled')
+        self.assertEqual(source.read_text(), 'original')
+        source.write_text('changed after selection')
+        result = self.manager.control(self.scope, pending['id'], 'retry')
+        self.assertEqual(self.wait(result['id'])['state'], 'failed')
+        self.assertTrue(source.exists())
+
     def test_root_self_descendant_special_paths_rejected(self):
         directory = self.work/'directory'
         directory.mkdir()
         child = directory/'child'
         child.mkdir()
-        for path in ['/', str(Path.home()), str(self.root/'state'), str(self.root)]:
-            with self.subTest(path=path), self.assertRaises(ValueError):
-                self.manager.start(self.scope, {'action':'trash','paths':[path]})
+        for action in ['trash', 'delete']:
+            for path in ['/', str(Path.home()), str(self.root/'state'), str(self.root)]:
+                with self.subTest(action=action, path=path), self.assertRaises(ValueError):
+                    self.manager.start(self.scope, {'action':action,'paths':[path]})
         for action in ['copy','move']:
             with self.assertRaises(ValueError):
                 self.manager.start(self.scope, {'action':action,'paths':[str(directory)],'destination':str(child)})

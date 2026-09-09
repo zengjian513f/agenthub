@@ -66,6 +66,12 @@ def main():
                         page.locator('#file-table[aria-busy="false"]').wait_for()
                     item('alpha.txt').wait_for()
                     assert page.locator('aside,input[type=search],[role=tab]').count() == 0
+                    assert page.locator('#trash-open, #trash-dialog').count() == 0
+                    assert page.locator('.nav-buttons').inner_text().split() == ['←', '→', '↑', '↻']
+                    assert page.locator('#parent').get_attribute('aria-label') == '上级目录'
+                    assert page.locator('.commandbar [data-action="new"]').inner_text() == '新建'
+                    assert page.locator('.commandbar [data-action="new"] *, .commandbar [data-action="upload"] *').count() == 0
+                    assert page.locator('.commandbar [data-action="upload"]').inner_text() == '上传文件'
                     item('alpha.txt').click()
                     assert page.locator('#entries .selected').count() == 1
                     item('beta.txt').click(modifiers=['Control'])
@@ -164,6 +170,7 @@ def main():
                     # Upload a real file and check the backend filesystem.
                     with page.expect_file_chooser() as chooser:
                         command('upload')
+                    assert page.locator('#address').input_value() == str(work)
                     chooser.value.set_files({'name':'上传.txt','mimeType':'text/plain','buffer':'上传内容'.encode()})
                     confirm(); finish('上传.txt')
                     assert (work/'上传.txt').read_text() == '上传内容'
@@ -183,30 +190,28 @@ def main():
                     item('package.zip').click(); command('extract')
                     confirm(); finish('package.zip')
                     assert (work/'package/alpha.txt').read_text() == 'alpha contents'
-                    # Trash, restore, delete again and purge from the toolbar dialog.
-                    item('beta.txt').click(); command('trash'); confirm(); finish('beta.txt')
+                    # Delete is permanent, with confirmation; cancelling does nothing.
+                    scope = file_manager.scope_for(node.state['row'])
+                    previous_trash = file_manager.manager().trash_list(scope)
+                    item('beta.txt').click(); command('delete')
+                    assert page.locator('#action-title').inner_text() == '永久删除'
+                    assert '无法撤销' in page.locator('#action-description').inner_text()
+                    assert str(work/'beta.txt') in page.locator('#action-description').inner_text()
+                    assert (work/'beta.txt').exists()
+                    page.locator('#action-cancel').click()
+                    assert (work/'beta.txt').exists()
+                    item('beta.txt').click(); page.keyboard.press('Delete')
+                    confirm(); finish('beta.txt')
                     assert not (work/'beta.txt').exists()
-                    page.locator('#trash-open').click()
-                    page.locator('#trash-list').get_by_role('checkbox',name='选择 beta.txt',exact=True).check()
-                    page.locator('#trash-restore').click(); confirm()
-                    finish('beta.txt')
-                    page.get_by_role('button',name='关闭回收站',exact=True).click()
+                    item('package').click(button='right')
+                    page.get_by_role('menuitem',name='永久删除',exact=True).click()
+                    confirm(); finish('package')
+                    assert not (work/'package').exists()
+                    assert file_manager.manager().trash_list(scope) == previous_trash
                     media_response = context.request.get(base+'api/session/files?'+query+'&'+urlencode({'path':str(work/'image.png'),'mode':'preview'}),headers={'Range':'bytes=2-9'})
                     assert media_response.status == 206
                     assert media_response.headers['content-range'] == f'bytes 2-9/{len(PNG)}'
                     assert media_response.body() == PNG[2:10]
-                    item('beta.txt').wait_for()
-                    item('beta.txt').click(); command('trash'); confirm(); finish('beta.txt')
-                    page.locator('#trash-open').click()
-                    page.locator('#trash-list').get_by_role('checkbox',name='选择 beta.txt',exact=True).check()
-                    with page.expect_response(lambda response: 'mode=trash' in response.url):
-                        page.locator('#trash-refresh').click()
-                    assert page.locator('#trash-list').get_by_role('checkbox',name='选择 beta.txt',exact=True).is_checked()
-                    page.locator('#trash-purge').click(); confirm()
-                    page.wait_for_function('document.querySelector(".task .task-title span")?.textContent==="已完成"')
-                    page.get_by_role('button',name='关闭任务',exact=True).click()
-                    page.get_by_text('回收站为空',exact=True).wait_for()
-                    page.get_by_role('button',name='关闭回收站',exact=True).click()
                     # A stale task list survives reload and a narrow viewport.
                     page.reload(); item('alpha.txt').wait_for()
                     page.locator('#tasks-open').click()
@@ -222,7 +227,7 @@ def main():
                     assert response.status == 403
                     assert not (work/'forbidden').exists()
                     assert not errors, errors
-                    print(('Hub' if scoped else 'Node')+': Explorer selection, navigation, clipboard, new/rename, upload/download, ZIP, preview, trash and origin protection passed',flush=True)
+                    print(('Hub' if scoped else 'Node')+': Explorer selection, navigation, clipboard, new/rename, upload/download, ZIP, preview, permanent delete and origin protection passed',flush=True)
                     context.close()
                 browser.close()
         finally:

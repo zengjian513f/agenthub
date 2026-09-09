@@ -18,11 +18,10 @@
       <div class="location"><nav id="breadcrumbs" aria-label="目录路径"></nav><button id="edit-address" title="编辑路径 · F4" aria-label="编辑路径">✎</button><form id="address-form" hidden><input id="address" aria-label="目录地址" spellcheck="false" placeholder="输入绝对路径后按 Enter"></form></div>
     </div>
     <div class="commandbar" role="toolbar" aria-label="文件操作">
-      <button data-action="new"><span>＋</span>新建</button><button data-action="upload"><span>↑</span>上传</button><span class="divider"></span>
+      <button data-action="new">新建</button><button data-action="upload" title="从本机选择文件，上传到当前目录">上传文件</button><span class="divider"></span>
       <button data-action="cut" title="剪切 · Ctrl+X">剪切</button><button data-action="copy" title="复制 · Ctrl+C">复制</button><button data-action="paste" title="粘贴 · Ctrl+V">粘贴</button>
-      <button data-action="rename" title="重命名 · F2">重命名</button><button data-action="trash" title="移入回收站 · Delete">删除</button><span class="divider"></span>
+      <button data-action="rename" title="重命名 · F2">重命名</button><button data-action="delete" title="永久删除 · Delete">删除</button><span class="divider"></span>
       <button data-action="download">下载</button><button data-action="compress">压缩</button><button data-action="extract">解压</button><button data-action="info">属性</button>
-      <span class="spacer"></span><button id="trash-open">回收站</button>
     </div>
     <div class="viewbar"><span id="status" role="status" aria-live="polite">正在加载…</span><div class="view-options"><label>排序 <select id="sort"><option value="name">名称</option><option value="type">类型</option><option value="size">大小</option><option value="modified">修改时间</option></select></label><button id="order" title="切换排序方向">升序 ↑</button><label>视图 <select id="view"><option value="list">详细信息</option><option value="grid">大图标</option><option value="small">小图标</option></select></label><label class="hidden-toggle"><input id="hidden" type="checkbox">隐藏文件</label></div></div>
     <div id="workspace" tabindex="0" aria-label="文件区域">
@@ -36,6 +35,5 @@
   <dialog id="action-dialog"><form id="action-form"><h2 id="action-title"></h2><p id="action-description"></p><div id="action-fields"></div><p id="action-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" id="action-cancel">取消</button><button type="submit" class="primary" id="action-submit">确定</button></div></form></dialog>
   <dialog id="preview-dialog"><div class="dialog-heading"><h2 id="preview-title"></h2><button data-close="preview-dialog" aria-label="关闭预览">×</button></div><div id="preview-content"></div><div class="dialog-actions"><a id="preview-download">下载文件</a><button data-close="preview-dialog">关闭</button></div></dialog>
   <dialog id="tasks-dialog" class="drawer"><div class="dialog-heading"><h2>传输任务</h2><button data-close="tasks-dialog" aria-label="关闭任务">×</button></div><p class="muted">任务保存在所属机器，关闭页面不影响文件操作。</p><div id="tasks-list"></div></dialog>
-  <dialog id="trash-dialog"><div class="dialog-heading"><h2>文件回收站</h2><button data-close="trash-dialog" aria-label="关闭回收站">×</button></div><p class="muted">此会话删除及覆盖的项目可以在这里恢复。</p><div class="trash-actions"><button id="trash-restore">还原选中</button><button id="trash-purge">永久删除选中</button><button id="trash-refresh">刷新</button></div><div id="trash-list"></div></dialog>
 </body>
 </html>

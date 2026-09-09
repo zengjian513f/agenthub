@@ -286,7 +286,7 @@ class Manager:
     def start(self, scope, spec):
         spec = dict(spec)
         action = spec.get('action')
-        if action not in {'mkdir', 'new-file', 'rename', 'copy', 'move', 'trash', 'restore',
+        if action not in {'mkdir', 'new-file', 'rename', 'copy', 'move', 'delete', 'trash', 'restore',
                           'purge', 'compress', 'extract', 'bundle', 'upload'}:
             raise ValueError('未知文件操作')
         if spec.get('conflict', 'error') not in {'error', 'skip', 'keep', 'replace'}:
@@ -518,6 +518,9 @@ class Manager:
                                         rename_noreplace(temp, target)
                                         # Keep the original recoverable for cross-device moves.
                                         self.trash(source, job['scope'], job)
+                        elif action == 'delete':
+                            self.guard(source)
+                            remove(source)
                         elif action == 'trash':
                             self.trash(source, job['scope'], job)
                         elif action in {'restore', 'purge'}:
