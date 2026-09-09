@@ -634,7 +634,8 @@ class Handler(BaseHTTPRequestHandler):
         self._audit_begin("POST", u.path)
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
-        if u.path in {"/api/session/star", "/api/audit/browser",
+        if u.path in {"/api/session/star", "/api/sessions/fork-visibility",
+                      "/api/audit/browser",
                       "/api/bug-report", "/api/trash/restore",
                       "/api/trash/purge", "/api/sessions/delete", "/api/session/resolve-files"}:
             try:
@@ -649,6 +650,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._resolve_files(body)
             if u.path == "/api/session/star":
                 return self._star_session(body)
+            if u.path == "/api/sessions/fork-visibility":
+                return self._set_fork_parent_visibility(body)
             if u.path == "/api/audit/browser":
                 return self._browser_audit(body)
             if u.path == "/api/sessions/delete":
@@ -933,10 +936,13 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _trash_session(uid: str) -> str:
-        """把一个会话移入回收站; 运行中的会话以 RuntimeError 回报。"""
-        s = index.get(uid)
+        """把一个会话移入回收站；父会话只能隐藏，不能删除。"""
+        sessions = index.load(force=True)
+        s = next((row for row in sessions if row.get("uid") == uid), None)
         if not s:
             raise KeyError(uid)
+        if session_meta.is_fork_parent(uid, sessions):
+            raise RuntimeError("父会话只能隐藏，不能删除")
         name = term.session_name_for(s["source"], s["sid"])
         if live.is_live(s, force=True) or term.has_session(name):
             raise RuntimeError("请先停止会话")
@@ -959,9 +965,16 @@ class Handler(BaseHTTPRequestHandler):
                 uids.append(uid)
         if not uids:
             return self._json({"error": "没有选中任何会话"}, 400)
+        # 固定请求开始时的父会话集合。否则同一批若先删子会话，后删父会话，
+        # 后一次重扫会让父会话失去身份，从而绕过“只能隐藏”的约束。
+        protected = session_meta.fork_parent_uids(index.load(force=True))
         deleted, errors = [], []
         for uid in uids:
             title = str((index.get(uid) or {}).get("title") or "")
+            if uid in protected:
+                errors.append({"uid": uid, "title": title,
+                               "error": "父会话只能隐藏，不能删除"})
+                continue
             try:
                 dest = self._trash_session(uid)
             except KeyError:
@@ -1061,7 +1074,7 @@ class Handler(BaseHTTPRequestHandler):
             sessions, index_sig, built_at = index.load_snapshot(force=force)
             run_id = _debug_run(q)
             sessions = debug_runs.filter_rows(sessions, run_id)
-            rows = session_meta.enrich(index.with_cursors(sessions))
+            rows = session_meta.enrich(index.with_cursors(sessions), sessions)
             current_sig = _view_signature(rows, run_id)
             if known and not force and known == current_sig:
                 return self._json({"unchanged": True, "sig": known})
@@ -1195,9 +1208,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = index.search(
                     query, srcs, word=on("word"), case=on("case"), regex=on("regex"))
                 run_id = _debug_run(q)
+                topology = debug_runs.filter_rows(index.cached(), run_id)
                 result["results"] = session_meta.enrich(
-                    debug_runs.filter_rows(result["results"], run_id))
-                result["total_pool"] = len(debug_runs.filter_rows(index.cached(), run_id))
+                    debug_runs.filter_rows(result["results"], run_id), topology)
+                result["total_pool"] = len(topology)
                 return self._json(result)
             except re.error as e:
                 return self._json({"error": f"正则无效: {e}"}, 400)
@@ -1229,7 +1243,8 @@ class Handler(BaseHTTPRequestHandler):
                         OUTBOX_WAKE.set()
                     result.update(driver.snapshot(uid))
                 result["prompt"] = _session_prompt(session, result["messages"])
-            result["meta"] = session_meta.enrich_one(result["meta"])
+            topology = debug_runs.filter_rows(index.cached(), _debug_run(q))
+            result["meta"] = session_meta.enrich_one(result["meta"], topology)
             return self._json(result)
 
         raise KeyError(path)
@@ -1255,9 +1270,10 @@ class Handler(BaseHTTPRequestHandler):
                 progress=lambda done, total: emit(
                     {"type": "progress", "done": done, "total": total}),
             )
+            topology = debug_runs.filter_rows(index.cached(), run_id)
             result["results"] = session_meta.enrich(
-                debug_runs.filter_rows(result["results"], run_id))
-            result["total_pool"] = len(debug_runs.filter_rows(index.cached(), run_id))
+                debug_runs.filter_rows(result["results"], run_id), topology)
+            result["total_pool"] = len(topology)
             emit({"type": "result", "data": result})
         except re.error as e:
             emit({"type": "error", "error": f"正则无效: {e}"})
@@ -1585,6 +1601,39 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             return self._json({"error": str(e)}, 500)
         return self._json({"ok": True, "uid": uid, **meta})
+
+    def _set_fork_parent_visibility(self, body: dict):
+        """父会话默认隐藏；这里只保存显式的“显示”例外。"""
+        visible = body.get("visible")
+        if not isinstance(visible, bool):
+            return self._json({"error": "需要布尔值 visible"}, 400)
+        uids, seen = [], set()
+        for raw in body.get("uids") or []:
+            uid = str(raw or "").strip()
+            if uid and uid not in seen:
+                seen.add(uid)
+                uids.append(uid)
+        if not uids:
+            return self._json({"error": "没有选中任何父会话"}, 400)
+
+        sessions = index.load(force=True)
+        by_uid = {str(row.get("uid") or ""): row for row in sessions}
+        parents = session_meta.fork_parent_uids(sessions)
+        updated, errors = [], []
+        for uid in uids:
+            if uid not in by_uid:
+                errors.append({"uid": uid, "error": "会话不存在"})
+                continue
+            if uid not in parents:
+                errors.append({"uid": uid, "error": "会话不是父会话"})
+                continue
+            try:
+                meta = session_meta.set_fork_parent_visible(uid, visible)
+            except OSError as error:
+                errors.append({"uid": uid, "error": str(error)})
+            else:
+                updated.append({"uid": uid, **meta})
+        return self._json({"ok": True, "updated": updated, "errors": errors})
 
     def _browser_audit(self, body: dict):
         """Accept a bounded browser-side receipt batch.

@@ -1539,61 +1539,9 @@ function pendingTmuxSessions() {
   });
 }
 
-const forkParentChoices = new Map(store.get('forkParentChoices', []));
-const forkPromptQueue = new Map();
-let forkPromptParent = null;
-const sessionHidden = uid => forkParentChoices.get(uid) === true;
+const sessionHidden = session => !!session?.fork_parent && !session.fork_parent_visible;
 const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions]
-  .filter(s => !sessionHidden(s.uid));
-
-function offerForkParentChoice(child) {
-  if (child?.source !== 'codex' || !child.forked_from_id) return;
-  const parent = S.sessions.find(s => s.source === 'codex'
-    && s.sid === child.forked_from_id && (s.node_id || '') === (child.node_id || ''));
-  if (!parent || parent.uid === child.uid || forkParentChoices.has(parent.uid)) return;
-  forkPromptQueue.set(parent.uid, parent);
-  showForkParentPrompt();
-}
-
-function showForkParentPrompt() {
-  if (forkPromptParent || document.hidden) return;
-  const parent = forkPromptQueue.values().next().value;
-  if (!parent) return;
-  forkPromptQueue.delete(parent.uid);
-  forkPromptParent = parent;
-  $('#fork-parent-dialog').returnValue = 'keep';
-  $('#fork-parent-name').textContent = `父会话：${parent.title}（${parent.sid}）`;
-  $('#fork-parent-dialog').showModal();
-}
-
-function noticeSessionForks(previous) {
-  // 父子关系是持久元数据；只有列表新增分支才提示，打开历史分支不代表刚发生回退。
-  const known = new Set(previous.map(s => s.uid));
-  for (const child of S.sessions) {
-    if (known.has(child.uid)) continue;
-    const parent = previous.find(s => s.source === 'codex'
-      && s.sid === child.forked_from_id && (s.node_id || '') === (child.node_id || ''));
-    if (parent) offerForkParentChoice(child);
-  }
-}
-
-$('#fork-parent-dialog').addEventListener('close', () => {
-  if (!forkPromptParent) return;
-  const parentUid = forkPromptParent.uid;
-  forkParentChoices.set(parentUid, $('#fork-parent-dialog').returnValue === 'hide');
-  store.set('forkParentChoices', [...forkParentChoices]);
-  forkPromptQueue.delete(parentUid);
-  forkPromptParent = null;
-  renderNodes();
-  renderChips();
-  renderSide();
-  showSessionCount();
-  showForkParentPrompt();
-});
-$('#fork-parent-dialog').addEventListener('cancel', () => {
-  $('#fork-parent-dialog').returnValue = 'keep';
-});
-document.addEventListener('visibilitychange', showForkParentPrompt);
+  .filter(s => !sessionHidden(s));
 
 function cursorViews(sessions) {
   const rows = [];
@@ -1762,10 +1710,8 @@ async function loadSessions(force) {
   if (run !== sessionLoadRun) return false;
   $('#stat').classList.remove('err');
   const seedCursors = S.cursors.size === 0;
-  const previous = S.sessions;
   S.sig = d.sig;
   S.sessions = d.sessions;
-  noticeSessionForks(previous);
   applyNodeState(d, 'sessions');
   refreshSessionMeta();
   renderChips();
@@ -1782,10 +1728,8 @@ async function pollSessions() {
     const d = await (await fetch(appUrl('api/sessions?sig=' + encodeURIComponent(S.sig)))).json();
     applyNodeState(d, 'sessions');
     if (d.unchanged || !d.sessions) return;
-    const previous = S.sessions;
     S.sig = d.sig;
     S.sessions = d.sessions;
-    noticeSessionForks(previous);
     renderNodes();
     refreshSessionMeta();
     renderChips();
@@ -1811,7 +1755,7 @@ setInterval(pollSessions, LIST_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) pollSessions(); });
 
 function visible() {
-  let pool = (S.results || sidebarSessions()).filter(s => !sessionHidden(s.uid)
+  let pool = (S.results || sidebarSessions()).filter(s => !sessionHidden(s)
     && !S.off.has(s.source) && nodeSelected(s));
   if (S.activeOnly) pool = pool.filter(s => s.pending || S.live.has(s.uid));
   if (!S.term || S.results) return pool;          // 搜索态下服务端已经筛过
@@ -1831,7 +1775,7 @@ function syncPickedSessions() {
     pickedSessions.clear();
     return pickedSessions;
   }
-  const alive = new Set(S.sessions.filter(s => !s.pending).map(s => s.uid));
+  const alive = new Set(S.sessions.filter(s => !s.pending && !s.fork_parent).map(s => s.uid));
   for (const uid of [...pickedSessions]) if (!alive.has(uid)) pickedSessions.delete(uid);
   return pickedSessions;
 }
@@ -1874,14 +1818,15 @@ function paintItemPick(row) {
 function paintGroupPick(group) {
   const box = group?.querySelector('.ghead-pick');
   if (!box) return;
-  const rows = [...group.querySelectorAll('.item:not(.pending)[data-uid]')];
+  const rows = [...group.querySelectorAll('.item[data-uid]')]
+    .filter(row => row.querySelector('.item-pick'));
   const picked = rows.filter(row => pickedSessions.has(row.dataset.uid)).length;
   box.checked = !!rows.length && picked === rows.length;
   box.indeterminate = picked > 0 && picked < rows.length;
 }
 
 function pickAllVisible() {
-  const rows = visible().filter(s => !s.pending);
+  const rows = visible().filter(s => !s.pending && !s.fork_parent);
   const all = rows.length && rows.every(s => pickedSessions.has(s.uid));
   pickedSessions.clear();
   if (!all) rows.forEach(s => pickedSessions.add(s.uid));
@@ -1898,7 +1843,7 @@ function renderPickBar() {
   $('#side-picked').textContent = picked ? `已选 ${picked} 项` : '点会话行勾选';
   $('#side-pick-delete').textContent = picked ? `删除 (${picked})` : '删除';
   $('#side-pick-delete').disabled = !picked;
-  const rows = S.picking ? visible().filter(s => !s.pending) : [];
+  const rows = S.picking ? visible().filter(s => !s.pending && !s.fork_parent) : [];
   $('#side-pick-all').disabled = !rows.length;
   $('#side-pick-all').textContent =
     rows.length && rows.every(s => pickedSessions.has(s.uid)) ? '全不选' : '全选';
@@ -1985,15 +1930,18 @@ let suppressItemClick = false;
 function openItemMenu(uid, x, y) {
   const menu = $('#item-menu');
   menuUid = uid;
-  // 运行中的会话删不掉，菜单直接给出它此刻唯一能做的事：先停下来。
+  const row = S.sessions.find(session => session.uid === uid);
+  const parent = !!row?.fork_parent;
   const running = S.live.has(uid);
-  menu.querySelector('[data-act="stop"]').hidden = !running;
-  menu.querySelector('[data-act="delete"]').hidden = running;
+  menu.querySelector('[data-act="stop"]').hidden = parent || !running;
+  menu.querySelector('[data-act="hide"]').hidden = !parent;
+  menu.querySelector('[data-act="delete"]').hidden = parent || running;
+  menu.querySelector('[data-act="pick"]').hidden = parent;
   menu.hidden = false;
   const box = menu.getBoundingClientRect();
   menu.style.left = `${Math.max(8, Math.min(x, innerWidth - box.width - 8))}px`;
   menu.style.top = `${Math.max(8, Math.min(y, innerHeight - box.height - 8))}px`;
-  menu.querySelector('button')?.focus({ preventScroll: true });
+  menu.querySelector('button:not([hidden])')?.focus({ preventScroll: true });
 }
 
 function closeItemMenu() {
@@ -2052,6 +2000,10 @@ $('#item-menu').onclick = async e => {
   const uid = menuUid;
   closeItemMenu();
   if (!uid) return;
+  if (button.dataset.act === 'hide') {
+    await setForkParentVisibility([uid], false);
+    return;
+  }
   if (button.dataset.act === 'pick') {
     pickedSessions.add(uid);       // 从哪条进入多选，就先勾上哪条
     setPicking(true);
@@ -2101,6 +2053,50 @@ function applySessionStar(uid, starred, starredAt = null) {
     entry.meta.starred = starred;
     if (starredAt) entry.meta.starred_at = starredAt;
     else delete entry.meta.starred_at;
+  }
+}
+
+function applyForkParentVisibility(uid, visible) {
+  for (const rows of [S.sessions, S.results || []]) {
+    const row = rows.find(session => session.uid === uid);
+    if (row?.fork_parent) row.fork_parent_visible = visible;
+  }
+  for (const entry of cache.values()) {
+    if (entry.meta?.uid === uid && entry.meta.fork_parent) {
+      entry.meta.fork_parent_visible = visible;
+    }
+  }
+}
+
+async function setForkParentVisibility(uids, visible, button = null) {
+  const unique = [...new Set(uids)].filter(Boolean);
+  if (!unique.length) return {updated: [], errors: []};
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch(appUrl('api/sessions/fork-visibility'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uids: unique, visible}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    for (const row of data.updated || []) {
+      applyForkParentVisibility(row.uid, !!row.fork_parent_visible);
+    }
+    renderNodes();
+    renderChips();
+    renderSide();
+    showSessionCount();
+    const selected = S.sessions.find(session => session.uid === S.sel);
+    if (selected) renderSessionAction(selected);
+    if (data.errors?.length) {
+      alert(`父会话显示状态有 ${data.errors.length} 项未保存：${data.errors[0].error}`);
+    }
+    return data;
+  } catch (error) {
+    alert('父会话显示状态保存失败: ' + error.message);
+    return null;
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -2256,7 +2252,7 @@ function renderSide() {
     const g = el('div', 'group' + (S.closed.has(key) ? ' closed' : ''));
     g.dataset.key = key;
     const label = S.view === 'tree' ? nodeDirectory(items[0]) : key;   // 分组标题不缩写, 只换 ~
-    const groupUids = items.filter(x => !x.pending).map(x => x.uid);
+    const groupUids = items.filter(x => !x.pending && !x.fork_parent).map(x => x.uid);
     const head = el('div', 'ghead',
       `${S.picking ? `<input type="checkbox" class="ghead-pick"
          aria-label="选中「${esc(label)}」下的全部会话">` : ''}
@@ -2278,7 +2274,7 @@ function renderSide() {
     const ul = el('div', 'glist');
     for (const s of items) {
       const meta = itemMeta(s);
-      const pickable = S.picking && !s.pending;
+      const pickable = S.picking && !s.pending && !s.fork_parent;
       const it = el('div', 'item' + (S.sel === s.uid ? ' sel' : '')
                               + (s.pending ? (s.stale ? ' pending' : ' pending live live-tmux') : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
@@ -2832,6 +2828,14 @@ function head(m, total) {
 
 function renderSessionAction(m, button = $('#a-session-action')) {
   if (!button || m.uid !== S.sel) return;
+  if (m.fork_parent) {
+    const shown = !!m.fork_parent_visible;
+    const label = shown ? '隐藏父会话' : '显示父会话';
+    button.innerHTML = uiIcon('eye-off');
+    button.title = button.ariaLabel = label;
+    button.onclick = () => setForkParentVisibility([m.uid], !shown, button);
+    return;
+  }
   const running = S.live.has(m.uid);
   const label = running ? '停止会话' : '删除会话';
   button.innerHTML = uiIcon(running ? 'power' : 'trash');
@@ -5071,19 +5075,16 @@ function openSettings() {
   $('#setting-theme').value = store.get('theme', 'system');
   $('#setting-tool-icons').value = document.documentElement.dataset.toolIcons;
   $('#setting-cache').value = String(cacheLimitMb);
+  $('#restore-fork-parents').disabled = !S.sessions.some(sessionHidden);
   $('#settings-dialog').showModal();
 }
 
 $('#settings').onclick = openSettings;
-$('#restore-fork-parents').onclick = () => {
-  for (const [uid, hidden] of forkParentChoices) {
-    if (hidden) forkParentChoices.set(uid, false);
-  }
-  store.set('forkParentChoices', [...forkParentChoices]);
-  renderNodes();
-  renderChips();
-  renderSide();
-  showSessionCount();
+$('#restore-fork-parents').onclick = async event => {
+  const button = event.currentTarget;
+  const hidden = S.sessions.filter(sessionHidden).map(session => session.uid);
+  const data = await setForkParentVisibility(hidden, true, button);
+  if (data && !(data.errors || []).length) button.disabled = true;
 };
 $('#settings-dialog').addEventListener('click', e => {
   if (e.target === $('#settings-dialog')) $('#settings-dialog').close();

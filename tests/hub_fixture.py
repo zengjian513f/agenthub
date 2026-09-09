@@ -133,6 +133,10 @@ class NodeHandler(server.Handler):
         if u.path == '/api/sessions/delete':
             self.state['deleted'] = True
             return self._json({'ok': True, 'deleted': [{'uid': uid} for uid in body['uids']], 'errors': []})
+        if u.path == '/api/sessions/fork-visibility':
+            return self._json({'ok': True, 'updated': [
+                {'uid': uid, 'fork_parent_visible': body['visible']} for uid in body['uids']
+            ], 'errors': []})
         if u.path == '/api/session/star':
             self.state['row']['starred'] = body['starred']
         return self._json({'ok': True, 'uid': body.get('uid', ''), 'path': '/same/file', 'removed': 1, 'freed': 10})

@@ -1,4 +1,4 @@
-"""Free browser regression for Codex rewind visibility using native JSONL fixtures."""
+"""Free browser regression for server-owned Codex fork-parent visibility."""
 import json
 import os
 import sys
@@ -10,7 +10,7 @@ from unittest.mock import patch
 from urllib.parse import unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agenthub import adapters, hub, live, server
+from agenthub import adapters, hub, index, live, server, session_meta
 from hub_fixture import NodeHandler, start_node, stop
 from playwright.sync_api import expect, sync_playwright
 
@@ -29,39 +29,62 @@ def main():
             meta = dict(id=sid, timestamp='2026-09-08T00:00:00Z', cwd='/tmp/fork-test')
             if ancestor:
                 meta.update(forked_from_id=ancestor, history_base=dict(
-                    thread_id=ancestor, end_byte_offset=(root / f'rollout-{ancestor}.jsonl').stat().st_size))
-            records = [dict(type='session_meta', payload=meta), dict(type='response_item',
-                payload=dict(type='message', role='user', content=[dict(type='input_text', text=sid)]))]
+                    thread_id=ancestor,
+                    end_byte_offset=(root / f'rollout-{ancestor}.jsonl').stat().st_size))
+            records = [
+                dict(type='session_meta', payload=meta),
+                dict(type='response_item', payload=dict(
+                    type='message', role='user',
+                    content=[dict(type='input_text', text=sid)])),
+            ]
             (root / f'rollout-{sid}.jsonl').write_text(
-                ''.join(json.dumps(r) + '\n' for r in records))
+                ''.join(json.dumps(record) + '\n' for record in records))
             rows[:] = adapter.list_sessions()
 
         class Handler(NodeHandler):
             def do_GET(self):
                 path = urlparse(self.path).path
                 if path == '/api/sessions':
-                    return self._json(dict(sessions=rows, sig=str(len(rows))))
+                    return self._json(dict(
+                        sessions=session_meta.enrich(rows),
+                        sig=session_meta.signature() + '-' + str(len(rows))))
                 if path == '/api/live':
                     uids, _owned = live.active_processes(rows)
-                    return self._json(dict(uids=uids, tmux_uids=uids,
-                                           started_at={}))
+                    return self._json(dict(uids=uids, tmux_uids=uids, started_at={}))
                 if path == '/api/term/list':
-                    return self._json(dict(enabled=True,
-                        sources=dict(claude=True, codex=True), home='/tmp/fork-test',
-                        sessions=term_sessions, pending=[]))
+                    return self._json(dict(
+                        enabled=True, sources=dict(claude=True, codex=True),
+                        home='/tmp/fork-test', sessions=term_sessions, pending=[]))
                 if path.startswith('/api/messages/'):
-                    row = next(r for r in rows if r['uid'] == unquote(path.rsplit('/', 1)[1]))
+                    row = next(item for item in rows
+                               if item['uid'] == unquote(path.rsplit('/', 1)[1]))
                     self.state['row'] = row
                     messages, end = adapter.read(row['path'])
-                    return self._json(dict(meta=row, messages=messages, start=0, end=end,
-                        reset=True, version=dict(head='fixed', size=end, mtime=1), anchor='fixed',
+                    return self._json(dict(
+                        meta=session_meta.enrich_one(row, rows), messages=messages,
+                        start=0, end=end, reset=True,
+                        version=dict(head='fixed', size=end, mtime=1), anchor='fixed',
                         message_total=len(messages), activity=None, partial=None))
                 return super().do_GET()
+
+            def do_POST(self):
+                path = urlparse(self.path).path
+                if path != '/api/sessions/fork-visibility':
+                    return super().do_POST()
+                raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                if (self.headers.get('X-AgentHub-Protocol')
+                        and self.headers.get('X-AgentHub-Node-Token') != self.state['token']):
+                    return self._json({'error': 'forbidden'}, 403)
+                body = json.loads(raw or b'{}')
+                self.state['writes'].append((path, body))
+                return server.Handler._set_fork_parent_visibility(self, body)
 
         node = start_node('a' * 32, 'Test')
         node.RequestHandlerClass = Handler
         registry = hub.Registry(root / 'registry.json', ['127.0.0.0/8'])
-        registry.register(dict(name='Test', url=f'http://127.0.0.1:{node.server_port}', token=node.state['token']))
+        registry.register(dict(
+            name='Test', url=f'http://127.0.0.1:{node.server_port}',
+            token=node.state['token']))
         central = ThreadingHTTPServer(('127.0.0.1', 0), hub.HubHandler)
         central.daemon_threads = True
         central.registry = registry
@@ -71,117 +94,96 @@ def main():
         try:
             with patch.object(adapters, 'CODEX_ROOT', root), \
                     patch.object(adapters, 'CODEX_INDEX', root / 'index'), \
+                    patch.object(session_meta, 'DATA_DIR', root / 'meta'), \
+                    patch.object(session_meta, 'META_FILE', root / 'meta' / 'session-meta.json'), \
+                    patch.object(index, 'load', side_effect=lambda force=False: rows), \
                     patch.object(live, 'pids_of', return_value=[123]), \
                     sync_playwright() as pw:
                 launch = dict(headless=True)
                 if executable := os.environ.get('PLAYWRIGHT_CHROMIUM_EXECUTABLE'):
                     launch['executable_path'] = executable
                 browser = pw.chromium.launch(**launch)
+
                 for target in (node, central):
-                    for choice in ('keep', 'hide', 'escape'):
-                        for f in root.glob('rollout-*.jsonl'):
-                            f.unlink()
-                        write(parent)
-                        context = browser.new_context(viewport=dict(width=1100, height=850))
-                        page = context.new_page()
-                        errors = []
-                        page.on('pageerror', lambda e: errors.append(str(e)))
-                        page.goto(f'http://127.0.0.1:{target.server_port}/')
-                        page.wait_for_selector('#side .item')
-                        assert page.locator('#side .item').count() == 1
-                        assert page.locator('dialog[open]').count() == 0
-                        write(child, parent)
-                        page.evaluate('pollSessions()')
-                        dialog = page.locator('#fork-parent-dialog')
-                        dialog.wait_for(state='visible')
-                        assert page.locator('#side .item').count() == 2  # No hiding before consent.
-                        assert parent in dialog.inner_text()
-                        page.evaluate('pollLive()')
-                        states = page.evaluate('''(sids) => Object.fromEntries(sids.map(sid => {
-                          const session = S.sessions.find(s => s.sid === sid);
-                          const row = document.querySelector(`.item[data-uid="${session.uid}"]`);
-                          return [sid, {live:S.live.has(session.uid), tmux:row.classList.contains('live-tmux')}];
-                        }))''', [parent, child])
-                        assert states[parent] == {'live': False, 'tmux': False}
-                        assert states[child] == {'live': True, 'tmux': True}
-                        if choice == 'escape':
-                            page.keyboard.press('Escape')
-                        else:
-                            dialog.locator(f'button[value="{choice}"]').click()
-                        dialog.wait_for(state='hidden')
-                        expected = 1 if choice == 'hide' else 2
-                        expect(page.locator('#side .item')).to_have_count(expected)
-                        assert page.evaluate('S.sessions.length') == 2  # API retains both branches.
-                        assert page.locator('#session-total').inner_text() == str(expected)
-                        assert page.evaluate('''() => {
-                          S.results = S.sessions.map(s => ({...s, hits:1}));
-                          const n = visible().length;
-                          S.results = null;
-                          return n;
-                        }''') == expected
-                        if target is central:
-                            assert page.locator('.node-count').inner_text() == str(expected)
-                        page.evaluate('loadSessions(true)')
-                        assert page.locator('dialog[open]').count() == 0
-                        page.reload()
-                        page.wait_for_selector('#side .item')
-                        expect(page.locator('#side .item')).to_have_count(expected)
-                        assert page.locator('dialog[open]').count() == 0
-                        # Opening a decided branch must not ask again.
-                        child_uid = page.evaluate('(sid) => S.sessions.find(s => s.sid === sid).uid', child)
-                        page.evaluate('(uid) => openSession(uid)', child_uid)
-                        assert page.locator('dialog[open]').count() == 0
-                        # A successive rewind asks only about its immediate parent.
-                        write(grandchild, child)
-                        page.evaluate('pollSessions()')
-                        dialog.wait_for(state='visible')
-                        assert child in dialog.inner_text()
-                        page.keyboard.press('Escape')
-                        dialog.wait_for(state='hidden')
-                        expect(page.locator('#side .item')).to_have_count(expected + 1)
-                        if choice == 'hide':
-                            page.locator('#settings').click()
-                            page.locator('#restore-fork-parents').click()
-                            assert page.locator('#side .item').count() == 3
-                            page.locator('#settings-dialog button[type="submit"]').last.click()
-                        assert not errors, errors
-                        context.close()
-                        print(f'PASS {"hub" if target is central else "node"}: {choice}, reload, repeated rewind, restore')
-                # A historical fork is not a new rewind, even without a saved choice.
-                for target in (node, central):
-                    context = browser.new_context(viewport=dict(width=375, height=620))
+                    for file in root.glob('rollout-*.jsonl'):
+                        file.unlink()
+                    session_meta.META_FILE.unlink(missing_ok=True)
+                    rows.clear()
+                    write(parent)
+                    base = f'http://127.0.0.1:{target.server_port}/'
+                    context = browser.new_context(viewport=dict(width=1100, height=850))
                     page = context.new_page()
                     errors = []
-                    page.on('pageerror', lambda e: errors.append(str(e)))
-                    base = f'http://127.0.0.1:{target.server_port}/'
+                    page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(base)
-                    page.wait_for_selector('#side .item')
-                    child_uid = page.evaluate('(sid) => S.sessions.find(s => s.sid === sid).uid', child)
-                    assert page.evaluate('[...forkParentChoices]') == []
-                    page.locator(f'.item[data-uid="{child_uid}"]').click()
-                    page.wait_for_selector('#detail .msg')
-                    assert page.locator('dialog[open]').count() == 0
-                    page.evaluate('loadSessions(true)')
+                    expect(page.locator('#side .item')).to_have_count(1)
+
+                    # A child turns the old row into a parent. The server marks
+                    # it hidden by default; no browser-local consent exists.
+                    write(child, parent)
                     page.evaluate('pollSessions()')
+                    expect(page.locator('#side .item')).to_have_count(1)
+                    state = page.evaluate('''(sids) => Object.fromEntries(sids.map(sid => {
+                      const row = S.sessions.find(session => session.sid === sid);
+                      return [sid, {parent:!!row.fork_parent,
+                        shown:row.fork_parent_visible, hidden:sessionHidden(row)}];
+                    }))''', [parent, child])
+                    assert state[parent] == {'parent': True, 'shown': False, 'hidden': True}
+                    assert state[child] == {'parent': False, 'shown': None, 'hidden': False}
+                    assert page.locator('#session-total').inner_text() == '1'
                     assert page.locator('dialog[open]').count() == 0
-                    # Refresh restores the selected historical branch on mobile.
+
+                    # Settings writes a server flag. A brand-new browser sees it,
+                    # proving this is not localStorage state.
+                    page.locator('#settings').click()
+                    page.locator('#restore-fork-parents').click()
+                    expect(page.locator('#side .item')).to_have_count(2)
+                    page.locator('#settings-dialog button[type="submit"]').last.click()
+                    local_parent_uid = next(row['uid'] for row in rows if row['sid'] == parent)
+                    assert session_meta.snapshot(local_parent_uid)['fork_parent_visible'] is True
+                    fresh = browser.new_context(viewport=dict(width=1100, height=850))
+                    fresh_page = fresh.new_page()
+                    fresh_page.goto(base)
+                    expect(fresh_page.locator('#side .item')).to_have_count(2)
+                    fresh.close()
+
+                    parent_uid = page.evaluate(
+                        '(sid) => S.sessions.find(row => row.sid === sid).uid', parent)
+                    parent_row = page.locator(f'.item[data-uid="{parent_uid}"]')
+                    parent_row.click()
+                    expect(page.locator('#a-session-action')).to_have_attribute(
+                        'title', '隐藏父会话')
+                    parent_row.click(button='right')
+                    expect(page.locator('#item-menu [data-act="hide"]')).to_be_visible()
+                    expect(page.locator('#item-menu [data-act="delete"]')).to_be_hidden()
+                    expect(page.locator('#item-menu [data-act="pick"]')).to_be_hidden()
+                    page.keyboard.press('Escape')
+
+                    page.locator('#a-session-action').click()
+                    expect(page.locator('#side .item')).to_have_count(1)
+                    assert not session_meta.snapshot(local_parent_uid).get('fork_parent_visible')
                     page.reload()
-                    page.wait_for_selector('#detail .msg')
-                    assert page.evaluate('S.sel') == child_uid
-                    assert page.locator('dialog[open]').count() == 0
-                    page.goto(base + '?sid=' + child)
-                    page.wait_for_selector('#detail .msg')
-                    assert page.evaluate('S.sel') == child_uid
-                    assert page.locator('dialog[open]').count() == 0
-                    assert page.evaluate('[...forkParentChoices]') == []
-                    assert page.evaluate('sidebarSessions().length') == 3
+                    expect(page.locator('#side .item')).to_have_count(1)
+
+                    # A further rewind hides its immediate parent too. Showing
+                    # all creates one durable flag per current parent.
+                    write(grandchild, child)
+                    page.evaluate('pollSessions()')
+                    expect(page.locator('#side .item')).to_have_count(1)
+                    page.locator('#settings').click()
+                    page.locator('#restore-fork-parents').click()
+                    expect(page.locator('#side .item')).to_have_count(3)
+                    page.locator('#settings-dialog button[type="submit"]').last.click()
+                    page.evaluate("localStorage.setItem('forkParentChoices', JSON.stringify([['ignored',true]]))")
+                    page.reload()
+                    expect(page.locator('#side .item')).to_have_count(3)
                     assert not errors, errors
                     context.close()
-                    print(f'PASS {"hub" if target is central else "node"}: historical branch open, rescan, poll, restore, deep link')
+                    print(f'PASS {"hub" if target is central else "node"}: server default, persist, hide-only actions, repeated rewind')
 
-                # The root-stable tmux name belongs to the current child only. Opening that
-                # terminal and then clicking its visible historical parent must not let the
-                # next term/list poll rebound the explicit history view to the child.
+                # The root-stable tmux name belongs to the current child only.
+                # With parents explicitly visible, selecting history must not
+                # bounce back to that replacement leaf on the next terminal poll.
                 child_row = next(row for row in rows if row['sid'] == child)
                 term_sessions[:] = [dict(
                     name=f'agenthub-codex-{parent[:8]}', uid=child_row['uid'])]
@@ -189,9 +191,9 @@ def main():
                     context = browser.new_context(viewport=dict(width=1100, height=850))
                     page = context.new_page()
                     errors = []
-                    page.on('pageerror', lambda e: errors.append(str(e)))
+                    page.on('pageerror', lambda error: errors.append(str(error)))
                     page.goto(f'http://127.0.0.1:{target.server_port}/')
-                    page.wait_for_selector('#side .item')
+                    expect(page.locator('#side .item')).to_have_count(3)
                     ids = page.evaluate('''(sids) => Object.fromEntries(sids.map(sid => {
                       const row = S.sessions.find(session => session.sid === sid);
                       return [sid, row.uid];
@@ -203,7 +205,6 @@ def main():
                     page.locator('#a-term').click()
                     page.wait_for_function(
                         '(uid) => S.sel === uid && T.uid === uid && !!T.name', arg=child_uid)
-
                     page.locator(f'.item[data-uid="{parent_uid}"]').click()
                     page.wait_for_function('(uid) => S.sel === uid', arg=parent_uid)
                     page.evaluate('loadTermList()')
@@ -212,47 +213,18 @@ def main():
                       replacement:linkedTermSession(parentUid, {followReplacement:true})?.uid,
                       composerHidden:document.querySelector('#composer').classList.contains('hidden'),
                     })''', [parent_uid, child_uid])
-                    assert state == dict(selected=parent_uid, termUid=child_uid, exact=None,
-                                         replacement=child_uid, composerHidden=True), state
+                    assert state == dict(
+                        selected=parent_uid, termUid=child_uid, exact=None,
+                        replacement=child_uid, composerHidden=True), state
+                    expect(page.locator('#a-session-action')).to_have_attribute(
+                        'title', '隐藏父会话')
                     expect(page.locator('#a-term')).to_have_attribute(
                         'title', '切换到当前会话终端')
-                    page.locator('#a-term').click()
-                    page.wait_for_function('(uid) => S.sel === uid', arg=child_uid)
                     assert not errors, errors
                     context.close()
-                    print(f'PASS {"hub" if target is central else "node"}: historical parent remains selected across terminal poll')
-                term_sessions.clear()
+                    print(f'PASS {"hub" if target is central else "node"}: visible historical parent remains selected across terminal poll')
 
-                # A new branch still prompts on mobile; matching SIDs on other nodes stay visible.
-                context = browser.new_context(viewport=dict(width=375, height=620))
-                page = context.new_page()
-
-                def with_other_node(route):
-                    response = route.fetch()
-                    data = response.json()
-                    original = next(r for r in data['sessions'] if r['sid'] == grandchild)
-                    data['sessions'].insert(0, dict(original, uid='other-node-parent', node_id='other-node'))
-                    route.fulfill(response=response, json=data)
-
-                page.route('**/api/sessions*', with_other_node)
-                page.goto(f'http://127.0.0.1:{central.server_port}/')
-                page.wait_for_selector('#side .item')
-                assert page.locator('dialog[open]').count() == 0
-                write('44444444-4444-4444-4444-444444444444', grandchild)
-                page.evaluate('pollSessions()')
-                dialog = page.locator('#fork-parent-dialog')
-                dialog.wait_for(state='visible')
-                assert grandchild in dialog.inner_text()
-                box = dialog.bounding_box()
-                assert box['x'] >= 0 and box['x'] + box['width'] <= 375
-                dialog.locator('button[value="hide"]').click()
-                dialog.wait_for(state='hidden')
-                page.wait_for_function('forkParentChoices.size === 1')
-                assert page.evaluate("visible().some(s => s.uid === 'other-node-parent')")
-                assert page.evaluate('sidebarSessions().length') == 4
-                context.close()
                 browser.close()
-                print('PASS new branch mobile dialog, node identity isolation')
         finally:
             stop(central)
             stop(node)

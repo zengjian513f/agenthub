@@ -218,6 +218,8 @@ class HubHandler(server.Handler):
             body = self.read_body() if self.command == "POST" and not attachment else None
             if path == "/api/sessions/delete" and not explicit:
                 return self.bulk_delete(body)
+            if path == "/api/sessions/fork-visibility" and not explicit:
+                return self.bulk_fork_visibility(body)
             if path == "/api/trash/purge" and body and body.get("all") and not explicit:
                 return self.purge_all(body, query)
             if path == "/api/audit/browser" and not explicit:
@@ -375,6 +377,38 @@ class HubHandler(server.Handler):
             except (OSError, ValueError, http.client.HTTPException):
                 result["errors"].extend({"uid": fed.qualify(nid, uid, True),
                                          "error": "机器请求失败，请核对结果"} for uid in uids)
+        return self._json(result)
+
+    def bulk_fork_visibility(self, body):
+        visible = body.get("visible")
+        if not isinstance(visible, bool):
+            raise ValueError("需要布尔值 visible")
+        groups = {}
+        for uid in body.get("uids", []):
+            nid, local = fed.split(uid, True)
+            groups.setdefault(nid, []).append(local)
+        if not groups:
+            raise ValueError("没有选中任何父会话")
+        result = {"ok": True, "updated": [], "errors": []}
+        for nid, uids in groups.items():
+            node = self.registry.get(nid)
+            try:
+                if not node:
+                    raise ValueError("机器未注册")
+                status, data = self.registry.request(
+                    node, "/api/sessions/fork-visibility", "POST",
+                    {"uids": uids, "visible": visible})
+                if status != 200:
+                    raise ValueError("更新失败")
+                data = fed.public_payload(
+                    data, node, "/api/sessions/fork-visibility")
+                result["updated"].extend(data.get("updated", []))
+                result["errors"].extend(data.get("errors", []))
+            except (OSError, ValueError, http.client.HTTPException):
+                result["errors"].extend({
+                    "uid": fed.qualify(nid, uid, True),
+                    "error": "机器请求失败，请核对结果",
+                } for uid in uids)
         return self._json(result)
 
     def purge_all(self, body, query):

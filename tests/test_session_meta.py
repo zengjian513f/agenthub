@@ -47,6 +47,45 @@ class SessionMetaTests(unittest.TestCase):
             self.assertTrue(rows[1]["starred"])
             self.assertEqual(session_meta.activity_revision("claude:a"), 0)
 
+    def test_fork_parent_is_hidden_by_default_and_only_visible_with_server_flag(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
+            parent = {"uid": "codex:parent", "source": "codex", "sid": "p"}
+            child = {"uid": "codex:child", "source": "codex", "sid": "c",
+                     "forked_from_id": "p"}
+            same_sid_other_source = {
+                "uid": "claude:parent", "source": "claude", "sid": "p"}
+            topology = [parent, child, same_sid_other_source]
+
+            rows = session_meta.enrich(topology)
+            self.assertTrue(rows[0]["fork_parent"])
+            self.assertFalse(rows[0]["fork_parent_visible"])
+            self.assertNotIn("fork_parent", rows[1])
+            self.assertNotIn("fork_parent", rows[2])
+            self.assertEqual(session_meta.fork_parent_uids(topology), {"codex:parent"})
+
+            session_meta.set_fork_parent_visible(parent["uid"], True)
+            self.assertTrue(session_meta.enrich_one(parent, topology)["fork_parent_visible"])
+            saved = json.loads(session_meta.META_FILE.read_text())
+            self.assertTrue(saved["sessions"][parent["uid"]]["fork_parent_visible"])
+
+            session_meta.set_fork_parent_visible(parent["uid"], False)
+            self.assertFalse(session_meta.enrich(topology)[0]["fork_parent_visible"])
+            self.assertEqual(json.loads(session_meta.META_FILE.read_text()),
+                             {"version": 1, "sessions": {}})
+
+    def test_search_subset_uses_full_topology_to_mark_parent(self):
+        parent = {"uid": "codex:parent", "source": "codex", "sid": "p"}
+        child = {"uid": "codex:child", "source": "codex", "sid": "c",
+                 "forked_from_id": "p"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
+            row = session_meta.enrich([parent], [parent, child])[0]
+        self.assertTrue(row["fork_parent"])
+        self.assertFalse(row["fork_parent_visible"])
+
     def test_escape_persistently_ends_only_older_busy_activity(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(session_meta, "DATA_DIR", Path(tmp)), \

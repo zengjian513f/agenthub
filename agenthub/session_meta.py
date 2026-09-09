@@ -253,6 +253,44 @@ def set_starred(uid: str, starred: bool) -> dict:
         return dict(row)
 
 
+def set_fork_parent_visible(uid: str, visible: bool) -> dict:
+    """持久化父会话的显式显示选择；没有标志时一律默认隐藏。"""
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("缺少会话 uid")
+    with _lock:
+        rows = _read()
+        previous = dict(rows.get(uid)) if isinstance(rows.get(uid), dict) else {}
+        if visible:
+            previous["fork_parent_visible"] = True
+            rows[uid] = previous
+        else:
+            previous.pop("fork_parent_visible", None)
+            if previous:
+                rows[uid] = previous
+            else:
+                rows.pop(uid, None)
+        _write(rows)
+    return {"fork_parent_visible": bool(visible)}
+
+
+def fork_parent_uids(sessions: list[dict]) -> set[str]:
+    """从同一来源的原生 sid 关系计算父会话，绝不把跨来源同名 sid 串起来。"""
+    ancestors = {
+        (str(row.get("source") or ""), str(row.get("forked_from_id") or ""))
+        for row in sessions if row.get("forked_from_id")
+    }
+    return {
+        str(row.get("uid") or "") for row in sessions
+        if row.get("uid") and (str(row.get("source") or ""),
+                               str(row.get("sid") or "")) in ancestors
+    }
+
+
+def is_fork_parent(uid: str, sessions: list[dict]) -> bool:
+    return str(uid or "") in fork_parent_uids(sessions)
+
+
 def snapshot(uid: str) -> dict:
     """取会话当前的自有元数据, 供删除前留档。"""
     with _lock:
@@ -284,19 +322,24 @@ def discard(uid: str) -> None:
         _timeline_revisions.pop(uid, None)
 
 
-def enrich_one(session: dict) -> dict:
+def enrich_one(session: dict, topology: list[dict] | None = None) -> dict:
     row = dict(session)
     with _lock:
         meta = _read().get(str(session.get("uid") or ""), {})
     if isinstance(meta, dict) and meta.get("starred"):
         row["starred"] = True
         row["starred_at"] = meta.get("starred_at")
+    if topology is not None and str(session.get("uid") or "") in fork_parent_uids(topology):
+        row["fork_parent"] = True
+        row["fork_parent_visible"] = bool(
+            isinstance(meta, dict) and meta.get("fork_parent_visible"))
     return row
 
 
-def enrich(sessions: list[dict]) -> list[dict]:
+def enrich(sessions: list[dict], topology: list[dict] | None = None) -> list[dict]:
     with _lock:
         metadata = _read()
+    parents = fork_parent_uids(sessions if topology is None else topology)
     out = []
     for session in sessions:
         row = dict(session)
@@ -304,5 +347,9 @@ def enrich(sessions: list[dict]) -> list[dict]:
         if isinstance(meta, dict) and meta.get("starred"):
             row["starred"] = True
             row["starred_at"] = meta.get("starred_at")
+        if str(session.get("uid") or "") in parents:
+            row["fork_parent"] = True
+            row["fork_parent_visible"] = bool(
+                isinstance(meta, dict) and meta.get("fork_parent_visible"))
         out.append(row)
     return out

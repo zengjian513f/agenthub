@@ -56,7 +56,8 @@ class BulkSessionDeleteTests(unittest.TestCase):
             return f"/trash/{uid}"
 
         with patch.object(server.Handler, "_trash_session", staticmethod(fake_trash)), \
-                patch.object(server.index, "get", rows.get):
+                patch.object(server.index, "get", rows.get), \
+                patch.object(server.index, "load", return_value=list(rows.values())):
             handler._delete_sessions({"uids": ["a", "b", "c", "missing", "a"]})
 
         code, body = replies[0]
@@ -77,6 +78,27 @@ class BulkSessionDeleteTests(unittest.TestCase):
 
         self.assertEqual([code for code, _ in replies], [400, 400])
         self.assertEqual(replies[0][1]["error"], "没有选中任何会话")
+
+    def test_parent_is_protected_for_whole_batch_even_if_child_is_deleted_first(self):
+        handler, replies = self._handler()
+        parent = {"uid": "codex:parent", "source": "codex", "sid": "parent",
+                  "title": "父"}
+        child = {"uid": "codex:child", "source": "codex", "sid": "child",
+                 "forked_from_id": "parent", "title": "子"}
+        deleted = []
+
+        with patch.object(server.index, "load", return_value=[parent, child]), \
+                patch.object(server.index, "get",
+                             side_effect=lambda uid: {parent["uid"]: parent,
+                                                      child["uid"]: child}.get(uid)), \
+                patch.object(server.Handler, "_trash_session",
+                             side_effect=lambda uid: deleted.append(uid) or f"/trash/{uid}"):
+            handler._delete_sessions({"uids": [child["uid"], parent["uid"]]})
+
+        self.assertEqual(deleted, [child["uid"]])
+        self.assertEqual(replies[0][1]["errors"], [{
+            "uid": parent["uid"], "title": "父",
+            "error": "父会话只能隐藏，不能删除"}])
 
 
 class StaticIdentityTests(unittest.TestCase):
@@ -383,7 +405,7 @@ class DeleteSessionTests(unittest.TestCase):
             replies.append((payload, status)) or payload)
         parent = {"uid": "codex:old", "source": "codex", "sid": "old-sid"}
 
-        with patch.object(server.index, "get", return_value=parent), \
+        with patch.object(server.index, "load", return_value=[parent]), \
                 patch.object(server.term, "session_name_for",
                              return_value="agenthub-codex-old"), \
                 patch.object(server.term, "has_session", return_value=True), \
@@ -393,6 +415,22 @@ class DeleteSessionTests(unittest.TestCase):
 
         delete.assert_not_called()
         self.assertEqual(replies[-1], ({"error": "请先停止会话"}, 409))
+
+    def test_fork_parent_cannot_be_deleted_even_when_idle(self):
+        parent = {"uid": "codex:parent", "source": "codex", "sid": "parent"}
+        child = {"uid": "codex:child", "source": "codex", "sid": "child",
+                 "forked_from_id": "parent"}
+        with patch.object(server.index, "load", return_value=[parent, child]) as load, \
+                patch.object(server.live, "is_live") as is_live, \
+                patch.object(server.term, "has_session") as has_session, \
+                patch.object(server.index, "delete") as delete:
+            with self.assertRaisesRegex(RuntimeError, "父会话只能隐藏"):
+                server.Handler._trash_session(parent["uid"])
+
+        load.assert_called_once_with(force=True)
+        is_live.assert_not_called()
+        has_session.assert_not_called()
+        delete.assert_not_called()
 
 
 class StarSessionTests(unittest.TestCase):
@@ -421,6 +459,46 @@ class StarSessionTests(unittest.TestCase):
         self.assertEqual([status for _, status in replies], [400, 404])
 
 
+class ForkParentVisibilityTests(unittest.TestCase):
+    @staticmethod
+    def _handler():
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._json = lambda payload, status=200: (
+            replies.append((payload, status)) or payload)
+        return handler, replies
+
+    def test_only_real_parents_receive_persistent_visibility_flag(self):
+        handler, replies = self._handler()
+        parent = {"uid": "codex:parent", "source": "codex", "sid": "parent"}
+        child = {"uid": "codex:child", "source": "codex", "sid": "child",
+                 "forked_from_id": "parent"}
+
+        with patch.object(server.index, "load", return_value=[parent, child]) as load, \
+                patch.object(server.session_meta, "set_fork_parent_visible",
+                             return_value={"fork_parent_visible": True}) as save:
+            result = handler._set_fork_parent_visibility({
+                "uids": [parent["uid"], child["uid"], "missing"], "visible": True})
+
+        load.assert_called_once_with(force=True)
+        save.assert_called_once_with(parent["uid"], True)
+        self.assertEqual(result["updated"], [{
+            "uid": parent["uid"], "fork_parent_visible": True}])
+        self.assertEqual(result["errors"], [
+            {"uid": child["uid"], "error": "会话不是父会话"},
+            {"uid": "missing", "error": "会话不存在"},
+        ])
+        self.assertEqual(replies[-1][1], 200)
+
+    def test_bad_visibility_body_is_rejected_without_scanning(self):
+        handler, replies = self._handler()
+        with patch.object(server.index, "load") as load:
+            handler._set_fork_parent_visibility({"uids": ["codex:a"]})
+            handler._set_fork_parent_visibility({"uids": [], "visible": False})
+        load.assert_not_called()
+        self.assertEqual([status for _, status in replies], [400, 400])
+
+
 class MessagesRouteTests(unittest.TestCase):
     def test_messages_route_reuses_resolved_session(self):
         handler = object.__new__(server.Handler)
@@ -438,7 +516,8 @@ class MessagesRouteTests(unittest.TestCase):
                 patch.object(server, "_resolve_activity", side_effect=lambda uid, result: result), \
                 patch.object(server.send_queue, "observe", return_value=False), \
                 patch.object(server.send_queue, "list_for", return_value=[]), \
-                patch.object(server.session_meta, "enrich_one", side_effect=lambda value: value):
+                patch.object(server.session_meta, "enrich_one",
+                             side_effect=lambda value, *_: value):
             result = handler._api_get("/api/messages/grok%3Atest", {})
 
         get.assert_called_once_with("grok:test")

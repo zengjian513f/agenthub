@@ -46,6 +46,10 @@
   <symbol id="i-power" viewBox="0 0 16 16">
     <path d="M8 1.5v6M4.2 3.8a5.5 5.5 0 107.6 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
   </symbol>
+  <symbol id="i-eye-off" viewBox="0 0 16 16">
+    <path d="M1.5 8s2.3-4 6.5-4 6.5 4 6.5 4-2.3 4-6.5 4-6.5-4-6.5-4Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+    <path d="m2 2 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </symbol>
   <symbol id="i-plus" viewBox="0 0 16 16">
     <path d="M8 2.5v11M2.5 8h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
   </symbol>
@@ -205,6 +209,7 @@
 
 <div id="item-menu" class="ctx-menu" hidden role="menu" aria-label="会话操作">
   <button type="button" role="menuitem" data-act="stop" hidden>停止会话</button>
+  <button type="button" role="menuitem" data-act="hide" hidden>隐藏父会话</button>
   <button type="button" role="menuitem" data-act="delete">删除会话</button>
   <button type="button" role="menuitem" data-act="pick">多选…</button>
 </div>
@@ -279,21 +284,10 @@
     </div>
   </div>
 </dialog>
-<dialog id="fork-parent-dialog" class="app-dialog" aria-labelledby="fork-parent-title" aria-describedby="fork-parent-description fork-parent-name">
-  <form method="dialog" class="settings-form">
-    <div class="modal-head"><h2 id="fork-parent-title">是否隐藏父会话？</h2></div>
-    <p id="fork-parent-description">Codex 回退已生成一个子会话。隐藏父会话只影响当前浏览器的列表，不会删除会话记录。可在设置中恢复显示。</p>
-    <p id="fork-parent-name"></p>
-    <div class="modal-actions">
-      <button class="btn" value="keep" autofocus>保留父会话</button>
-      <button class="btn go" value="hide">隐藏父会话</button>
-    </div>
-  </form>
-</dialog>
 <dialog id="settings-dialog" class="app-dialog" aria-labelledby="settings-title">
   <form method="dialog" class="settings-form">
     <div class="modal-head">
-      <div><h2 id="settings-title">设置</h2><p>这些选项只保存在当前浏览器</p></div>
+      <div><h2 id="settings-title">设置</h2><p>界面偏好保存在浏览器，父会话状态保存在服务端</p></div>
       <button type="submit" class="modal-close" title="关闭" aria-label="关闭">×</button>
     </div>
     <label class="setting-row" for="setting-font">
@@ -333,8 +327,8 @@
       </select>
     </label>
     <div class="setting-row">
-      <span><b>回退父会话</b><small>恢复在当前浏览器中隐藏的父会话</small></span>
-      <button type="button" class="btn" id="restore-fork-parents">恢复显示</button>
+      <span><b>回退父会话</b><small>为服务端默认隐藏的父会话添加显示标志</small></span>
+      <button type="button" class="btn" id="restore-fork-parents">显示全部</button>
     </div>
     <div class="modal-actions"><button type="submit" class="btn go">完成</button></div>
   </form>

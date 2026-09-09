@@ -161,6 +161,20 @@ class HubHTTPTests(unittest.TestCase):
         self.assertEqual(self.call('/api/trash/restore', {'id': item['id']})[0], 200)
         self.assertEqual(self.b.state['writes'][-1][1]['id'], 'claude/same-trash')
 
+    def test_fork_visibility_is_grouped_by_machine_and_requalified(self):
+        uids = [federation.qualify(c * 32, 'codex:parent', True) for c in 'ab']
+        status, data = self.call('/api/sessions/fork-visibility', {
+            'uids': uids, 'visible': True,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual({row['uid'] for row in data['updated']}, set(uids))
+        self.assertTrue(all(row['fork_parent_visible'] for row in data['updated']))
+        self.assertEqual(self.a.state['writes'][-1], (
+            '/api/sessions/fork-visibility',
+            {'uids': ['codex:parent'], 'visible': True}))
+        self.assertEqual(self.b.state['writes'][-1][0],
+                         '/api/sessions/fork-visibility')
+
     def test_cross_origin_post_and_websocket_are_rejected(self):
         for headers, method in [({'Origin': 'https://other.invalid'}, 'POST'),
                                 ({'Origin': 'https://other.invalid', 'Upgrade': 'websocket'}, 'GET')]:
