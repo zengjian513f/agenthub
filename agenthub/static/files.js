@@ -77,12 +77,8 @@
     for (const row of $('entries').children) {
       const on = selected.has(row.dataset.path);
       row.classList.toggle('selected', on); row.setAttribute('aria-selected', String(on));
-      row.querySelector('input').checked = on;
       row.classList.toggle('cut', clipboard?.node === data?.node_id && clipboard.action === 'move' && clipboard.paths.includes(row.dataset.path));
     }
-    const count = data?.entries.length || 0;
-    $('select-all').checked = count > 0 && selected.size === count;
-    $('select-all').indeterminate = selected.size > 0 && selected.size < count;
     const items = chosen(), total = items.reduce((sum, item) => sum + (item.size || 0), 0);
     $('selection-status').textContent = selected.size ? `已选 ${selected.size} 项${items.every(i => i.kind === 'file') ? ' · ' + sizeText(total) : ''}` : `${data?.total || 0} 个项目`;
     for (const button of document.querySelectorAll('[data-action]')) button.disabled = !actionEnabled(button.dataset.action);
@@ -93,7 +89,7 @@
     if (event.shiftKey && anchor >= 0) {
       if (!event.ctrlKey && !event.metaKey) selected.clear();
       for (let i = Math.min(anchor,index); i <= Math.max(anchor,index); i++) selected.add(data.entries[i].path);
-    } else if (event.ctrlKey || event.metaKey || event.target?.matches('input')) {
+    } else if (event.ctrlKey || event.metaKey) {
       selected.has(entry.path) ? selected.delete(entry.path) : selected.add(entry.path); anchor = index;
     } else { selected = new Set([entry.path]); anchor = index; }
     selectionChanged();
@@ -103,8 +99,6 @@
     const fragment = document.createDocumentFragment();
     for (const [index, entry] of data.entries.entries()) {
       const row = element('tr', undefined, 'entry'); row.dataset.path = entry.path; row.dataset.index = index; row.tabIndex = -1; row.draggable = true;
-      const check = element('input'); check.type = 'checkbox'; check.setAttribute('aria-label', '选择 ' + entry.name);
-      const checkCell = element('td'); checkCell.append(check);
       const cell = element('td'), link = element('a', undefined, 'entry-link');
       link.href = entry.kind === 'directory' ? pageURL(entry.path) : apiURL({path:entry.path, download:1});
       link.title = entry.name; link.tabIndex = -1;
@@ -121,7 +115,7 @@
       }
       if (entry.symlink) icon.append(element('span', '↗', 'link-badge'));
       link.append(icon, element('span', entry.name, 'entry-name')); cell.append(link);
-      row.append(checkCell, cell, element('td', entry.kind === 'directory' ? '文件夹' : entry.type || '文件'), element('td', sizeText(entry.size)), element('td', entry.modified === null ? '—' : new Date(entry.modified*1000).toLocaleString()));
+      row.append(cell, element('td', entry.kind === 'directory' ? '文件夹' : entry.type || '文件'), element('td', sizeText(entry.size)), element('td', entry.modified === null ? '—' : new Date(entry.modified*1000).toLocaleString()));
       fragment.append(row);
     }
     $('entries').replaceChildren(fragment); selectionChanged();
@@ -386,8 +380,7 @@
     const row = event.target.closest('.entry'); if (!row) return;
     event.preventDefault(); selectEntry(Number(row.dataset.index),event); row.focus({preventScroll:true});
   });
-  $('entries').addEventListener('dblclick',event => { const row = event.target.closest('.entry'); if (row && !event.target.matches('input')) { event.preventDefault(); openEntry(data.entries[Number(row.dataset.index)]); } });
-  $('select-all').onchange = () => { selected = new Set($('select-all').checked ? data.entries.map(e=>e.path) : []); selectionChanged(); };
+  $('entries').addEventListener('dblclick',event => { const row = event.target.closest('.entry'); if (row) { event.preventDefault(); openEntry(data.entries[Number(row.dataset.index)]); } });
   document.addEventListener('click',event => {
     const close = event.target.closest('[data-close]'); if (close) $(close.dataset.close).close();
     const action = event.target.closest('[data-action]'); if (action) { $('context-menu').hidden = true; perform(action.dataset.action); }

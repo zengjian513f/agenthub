@@ -25,7 +25,7 @@
     </div>
     <div class="viewbar"><span id="status" role="status" aria-live="polite">正在加载…</span><div class="view-options"><label>排序 <select id="sort"><option value="name">名称</option><option value="type">类型</option><option value="size">大小</option><option value="modified">修改时间</option></select></label><button id="order" title="切换排序方向">升序 ↑</button><label>视图 <select id="view"><option value="list">详细信息</option><option value="grid">大图标</option><option value="small">小图标</option></select></label><label class="hidden-toggle"><input id="hidden" type="checkbox">隐藏文件</label></div></div>
     <div id="workspace" tabindex="0" aria-label="文件区域">
-      <table id="file-table" aria-label="目录内容"><thead><tr><th><input id="select-all" type="checkbox" aria-label="选择本页全部"></th><th data-sort="name">名称</th><th data-sort="type">类型</th><th data-sort="size">大小</th><th data-sort="modified">修改时间</th></tr></thead><tbody id="entries"></tbody></table>
+      <table id="file-table" aria-label="目录内容"><thead><tr><th data-sort="name">名称</th><th data-sort="type">类型</th><th data-sort="size">大小</th><th data-sort="modified">修改时间</th></tr></thead><tbody id="entries"></tbody></table>
       <div id="empty" hidden>此目录为空<br><small>可以上传文件，或新建文件夹</small></div>
     </div>
     <footer><span id="selection-status"></span><nav class="pagination" aria-label="分页"><a id="previous" aria-disabled="true">上一页</a><span id="page-info"></span><a id="next" aria-disabled="true">下一页</a></nav><button id="tasks-open">传输任务 <span id="task-count"></span></button></footer>

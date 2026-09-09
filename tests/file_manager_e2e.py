@@ -72,6 +72,36 @@ def main():
                     assert page.locator('.commandbar [data-action="new"]').inner_text() == '新建'
                     assert page.locator('.commandbar [data-action="new"] *, .commandbar [data-action="upload"] *').count() == 0
                     assert page.locator('.commandbar [data-action="upload"]').inner_text() == '上传'
+                    # Explorer selection has no checkbox column in any view.
+                    for view in ['list', 'grid', 'small']:
+                        page.locator('#view').select_option(view)
+                        assert page.locator('#file-table input[type=checkbox]').count() == 0
+                        assert page.locator('#file-table thead th').count() == 4
+                        row = item('alpha.txt').locator('xpath=ancestor::tr')
+                        item('alpha.txt').click()
+                        assert row.get_attribute('aria-selected') == 'true'
+                        assert row.evaluate('(e)=>getComputedStyle(e).backgroundColor') == 'rgb(219, 234, 255)'
+                        item('beta.txt').click(modifiers=['Control'])
+                        assert page.locator('#entries .selected').count() == 2
+                        item('alpha.txt').click(button='right')
+                        assert page.locator('#entries .selected').count() == 2
+                        page.locator('#context-menu').press('Escape')
+                        item('beta.txt').click(modifiers=['Control'])
+                        assert page.locator('#entries .selected').count() == 1
+                        item('unsafe.html').click(modifiers=['Shift'])
+                        # Ctrl-click moved the range anchor to beta.txt.
+                        assert page.locator('#entries .selected').count() == 3
+                        box = page.locator('#workspace').bounding_box()
+                        page.mouse.click(box['x']+box['width']-3, box['y']+box['height']-3)
+                        assert page.locator('#entries .selected').count() == 0
+                        target = row.bounding_box()
+                        page.mouse.move(box['x']+box['width']-3, box['y']+box['height']-3)
+                        page.mouse.down()
+                        page.mouse.move(target['x']+2, target['y']+2, steps=8)
+                        page.mouse.up()
+                        assert row.get_attribute('aria-selected') == 'true'
+                        page.keyboard.press('Escape')
+                    page.locator('#view').select_option('list')
                     item('alpha.txt').click()
                     assert page.locator('#entries .selected').count() == 1
                     item('beta.txt').click(modifiers=['Control'])
@@ -219,6 +249,15 @@ def main():
                     page.get_by_role('button',name='关闭任务',exact=True).click()
                     page.set_viewport_size({'width':390,'height':740})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                    for view in ['list', 'grid', 'small']:
+                        page.locator('#view').select_option(view)
+                        item('alpha.txt').click()
+                        assert page.locator('#file-table input[type=checkbox]').count() == 0
+                        assert page.locator('#entries .selected').count() == 1
+                        assert item('alpha.txt').is_visible()
+                        if view == 'list':
+                            assert page.locator('#file-table th:visible').all_text_contents() == ['名称', '大小']
+                    page.locator('#view').select_option('list')
                     page.screenshot(path='/tmp/agenthub-explorer-mobile-'+('hub' if scoped else 'node')+'.png')
                     page.set_viewport_size({'width':1280,'height':850})
                     page.screenshot(path='/tmp/agenthub-explorer-desktop-'+('hub' if scoped else 'node')+'.png')
