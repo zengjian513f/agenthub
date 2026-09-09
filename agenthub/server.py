@@ -21,7 +21,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
-               codex_queue,
                debug_runs, index, live, media, pending as pending_store,
                send_protocol, send_queue,
                session_meta, term, term_ownership, trash, wsock)
@@ -46,6 +45,7 @@ ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 ATTACHMENT_DIR = "agenthub_attachments"
 ATTACHMENT_DIR_LOCK = threading.Lock()
 OUTBOX_WAKE = threading.Event()
+CODEX_SEND_LOCK = threading.Lock()
 TERM_OWNERS = term_ownership.Registry()
 _CLAUDE_CONFIRM_REPLAY_AT: dict[str, float] = {}
 
@@ -126,8 +126,8 @@ def _claude_prompt(session_id: str, messages: list[dict]) -> dict | None:
 
 def _after_terminal_keys(uid: str, keys: list[str]) -> dict | None:
     """特殊键发出后唤醒相关后台工作，但不篡改 CLI 自己的队列语义。"""
-    # Esc 只负责中断当前 Codex 回合。待发送项必须继续留在持久队列；
-    # _poll_outbox 看到原生 aborted/idle 后才会放行队首。
+    # Esc 只负责中断当前 Codex 回合；已经提交的 follow-up 由 TUI 自己管理，
+    # AgentHub 只需继续轮询其原生用户记录。
     if str(uid or "").startswith("codex:") and "Escape" in keys:
         OUTBOX_WAKE.set()
     if str(uid or "").startswith("claude:") and "Escape" in keys:
@@ -224,105 +224,25 @@ def _poll_outbox() -> None:
             continue
 
 
-def _transfer_native_codex_item(item: dict, session: dict | None = None) -> bool:
-    """Move a busy-session row into Codex's real queue with crash recovery."""
+def _submit_codex_item(item: dict, pane: dict) -> dict | None:
+    """Write directly to the live Codex TUI; the TUI owns follow-up queuing."""
+    item_id = str(item.get("id") or "")
     uid = str(item.get("uid") or "")
-    session = session or index.get(uid)
-    if not session or session.get("source") != "codex" or not session.get("sid"):
-        return False
-    recovering = item.get("state") == "native_queuing"
-    claimed = send_queue.claim_native(str(item.get("id") or ""), uid)
-    if not claimed:
-        return False
+    name = str(pane.get("name") or "")
     try:
-        if recovering:
-            native = codex_queue.find_submission(
-                str(session["sid"]), str(claimed["id"]))
-            if native:
-                send_queue.mark_native_queued(
-                    claimed["id"], str(native["id"]), uid)
-                return True
-            # Once the original turn has ended, a missing native row must fall
-            # back to immediate idle-composer delivery.  Adding it to an idle
-            # native queue would leave it waiting for another unrelated turn.
-            if claimed.get("activity_state") not in {"working", "waiting"}:
-                send_queue.release_native_claim(
-                    claimed["id"], "Codex 原生队列未确认接收，已切回安全发送", uid)
-                return False
-        native = codex_queue.enqueue_idempotent(
-            str(session["sid"]), str(claimed["id"]), str(claimed.get("text") or ""))
-    except codex_queue.QueueError as error:
-        # An add with a lost response is intentionally left native_queuing.  A
-        # later list-by-client-ID can settle it without submitting a duplicate.
-        if not recovering and not error.ambiguous:
-            send_queue.release_native_claim(claimed["id"], str(error), uid)
-        return False
-    send_queue.mark_native_queued(claimed["id"], str(native["id"]), uid)
-    return True
-
-
-def _transfer_native_codex_items() -> None:
-    for item in send_queue.native_candidates():
-        _transfer_native_codex_item(item)
-
-
-def _deliver_outbox_item(item: dict, panes: list[dict]) -> None:
-    """Safely deliver one ready Codex item into a genuinely empty composer."""
-    s = index.get(str(item.get("uid") or ""))
-    pane = _pane_for_session(s, panes) if s and s.get("source") == "codex" else None
-    if not pane:
-        send_queue.mark_failed(item["id"], "Codex tmux 会话已断开")
-        return
-    name = pane["name"]
-    claimed = False
-    try:
-        # task_complete 写盘到 TUI 真正回到输入框仍有一个很短的重绘窗口。
-        # 连续两帧终端文本一致才注入，避开本次事故中的 15ms 状态切换。
-        before = term.capture_screen_state(name)
-        time.sleep(0.08)
-        if before != term.capture_screen_state(name):
-            send_queue.defer(item["id"])
-            return
-        screen, cursor = before
-        composer = codex_bridge.composer_state(screen, cursor)
-        if composer == "editing":
-            # 双 Esc 回退失败时 Codex 会把旧 prompt 留在编辑框里。绝不能
-            # 清空用户草稿，也不能把新消息粘到它后面形成一条拼接消息。同时
-            # resize/重连会短暂留下历史 › 行；同一画面连续稳定数帧后才报错。
-            signature = hashlib.sha256(
-                f"{cursor[0]}\0{cursor[1]}\0{screen}".encode("utf-8", "replace")
-            ).hexdigest()
-            send_queue.defer_editing(item["id"], signature)
-            return
-        if composer == "unknown" and str(item.get("activity_state") or "") in {
-                "idle", "aborted", "failed"}:
-            # Never mutate an unrecognised TUI with Ctrl+L: current Codex treats it as
-            # clear-screen, making an existing conversation look like a new one.
-            # resize、切换会话和 TUI 重绘都会短暂产生这种帧；先退避重试，连续
-            # 多次仍无法识别才保留为可人工处理的失败项。
-            if (codex_bridge.busy_screen(screen)
-                    or codex_bridge.approval_prompt(screen)):
-                send_queue.defer(item["id"])
-                return
-            send_queue.defer_unrecognized(item["id"])
-            return
-        if composer != "empty":
-            # 审批、选择题及重绘中的画面都是瞬态状态，等待真正 Ready。
-            send_queue.defer(item["id"])
-            return
-        # 用户可能在 ready() 与这里之间撤销排队项。状态切换失败时
-        # 绝不能继续向 tmux 注入已经撤掉的正文。
-        if not send_queue.mark_delivering(item["id"]):
-            return
-        claimed = True
         term.leave_copy_mode(name)
+        # Persist the ambiguous boundary before paste + Enter.  A crash after
+        # this point must never expose a blind retry that could duplicate input.
+        if not send_queue.mark_delivering(item_id):
+            return send_queue.lookup(item_id, uid)
         term.submit_text(name, str(item.get("text") or ""))
-    except Exception as e:
-        if claimed:
-            send_queue.mark_confirming(
-                item["id"], f"终端写入状态待核对: {e}")
+        send_queue.mark_confirming(item_id)
+    except Exception as error:
+        if int((send_queue.lookup(item_id, uid) or {}).get("attempts") or 0) > 0:
+            send_queue.mark_confirming(item_id, f"终端写入状态待核对: {error}")
         else:
-            send_queue.mark_failed(item["id"], str(e))
+            send_queue.mark_failed(item_id, str(error))
+    return send_queue.lookup(item_id, uid)
 
 
 def _deliver_claude_item(item: dict, panes: list[dict]) -> None:
@@ -349,14 +269,12 @@ def _deliver_claude_item(item: dict, panes: list[dict]) -> None:
 
 
 def _outbox_loop() -> None:
-    """交付可证明安全的 Claude persisted 项和 Codex 队首消息。"""
+    """追踪 Codex 终端回执，并恢复 Claude 的持久交付项。"""
     while True:
         _poll_outbox()
-        _transfer_native_codex_items()
         send_queue.expire_deliveries()
         claude_ready = claude_queue.ready()
-        codex_ready = send_queue.ready()
-        if not claude_ready and not codex_ready:
+        if not claude_ready:
             OUTBOX_WAKE.wait(0.5)
             OUTBOX_WAKE.clear()
             continue
@@ -368,8 +286,6 @@ def _outbox_loop() -> None:
             continue
         for item in claude_ready:
             _deliver_claude_item(item, panes)
-        for item in codex_ready:
-            _deliver_outbox_item(item, panes)
 
 
 def _sessions_signature(index_sig: str | None = None) -> str:
@@ -1794,40 +1710,22 @@ class Handler(BaseHTTPRequestHandler):
         if s.get("source") == "claude":
             return self._queue_claude_message(body, s, pane)
         request_id = str(body.get("request_id") or "")
-        existing = send_queue.lookup(
-            request_id, uid, str(body.get("text") or "")) if request_id else None
-        if existing:
-            # Network replay is a status read.  In particular it must not clear
-            # a draft the user typed after the first request was accepted.
-            if (existing.get("state") == "queued"
-                    and str((body.get("activity") or {}).get("state") or "")
-                    in {"working", "waiting"}):
-                _transfer_native_codex_item(existing, s)
-            return self._json({"ok": True, "item": existing,
-                               **send_queue.snapshot(uid)})
-        failed = next((item for item in send_queue.list_for(uid)
-                       if item.get("state") == "failed"), None)
-        if failed:
-            # 新消息排在失败项后面永远不会投递。拒绝本次请求，让浏览器保留
-            # 编辑框正文，并明确要求先处理真正的阻塞项。
-            retryable = int(failed.get("attempts") or 0) == 0
-            return self._json({
-                "error": ("上一条消息发送失败，请先重试或移除" if retryable
-                          else "上一条消息状态待核对，请检查终端或移除"),
-                **send_queue.snapshot(uid),
-            }, 409)
-        conflict = driver.overwrite_draft(
-            pane["name"], str(body.get("overwrite_draft") or ""))
-        if conflict:
-            return self._json({**conflict, **send_queue.snapshot(uid)}, 409)
-        item = send_queue.enqueue(
-            uid, pane["name"], str(body.get("text") or ""), body.get("media"),
-            body.get("activity"), str(body.get("request_id") or ""),
-            body.get("cursor"))
-        if str((body.get("activity") or {}).get("state") or "") in {
-                "working", "waiting"}:
-            _transfer_native_codex_item(item, s)
-            item = send_queue.lookup(item["id"], uid) or item
+        with CODEX_SEND_LOCK:
+            existing = send_queue.lookup(
+                request_id, uid, str(body.get("text") or "")) if request_id else None
+            if existing:
+                # A replay after a lost HTTP response is only a status read.
+                # The first request already crossed (or approached) tmux.
+                return self._json({"ok": True, "item": existing,
+                                   **send_queue.snapshot(uid)})
+            conflict = driver.overwrite_draft(
+                pane["name"], str(body.get("overwrite_draft") or ""))
+            if conflict:
+                return self._json({**conflict, **send_queue.snapshot(uid)}, 409)
+            item = send_queue.enqueue(
+                uid, pane["name"], str(body.get("text") or ""), body.get("media"),
+                body.get("activity"), request_id, body.get("cursor"))
+            item = _submit_codex_item(item, pane) or item
         OUTBOX_WAKE.set()
         return self._json({"ok": True, "item": item,
                            **send_queue.snapshot(uid)})
@@ -1918,15 +1816,19 @@ class Handler(BaseHTTPRequestHandler):
                 **send_queue.snapshot(uid),
             }, 409)
         pane = _pane_for_session(s, term.list_sessions()) if s else None
-        if pane:
+        if not pane:
+            return self._json({"error": "Codex tmux 会话未连接",
+                               **send_queue.snapshot(uid)}, 409)
+        with CODEX_SEND_LOCK:
             driver = send_protocol.driver_for("codex")
             conflict = driver.overwrite_draft(
                 pane["name"], str(body.get("overwrite_draft") or ""))
             if conflict:
                 return self._json({**conflict, **send_queue.snapshot(uid)}, 409)
-        item = send_queue.retry(item_id, body.get("activity"), uid)
-        if not item:
-            return self._json({"error": "待发送消息不存在"}, 404)
+            item = send_queue.retry(item_id, body.get("activity"), uid)
+            if not item:
+                return self._json({"error": "待发送消息不存在"}, 404)
+            _submit_codex_item(item, pane)
         OUTBOX_WAKE.set()
         return self._json({"ok": True, **send_queue.snapshot(item["uid"])})
 
@@ -1947,29 +1849,8 @@ class Handler(BaseHTTPRequestHandler):
         if not existing:
             return self._json({"ok": True, "uid": uid,
                                **send_queue.snapshot(uid)})
-        if existing.get("state") == "native_queued":
-            private = send_queue.get(item_id, uid) or {}
-            try:
-                deleted = bool(s and s.get("source") == "codex"
-                               and private.get("native_id")
-                               and codex_queue.delete_submission(
-                                   str(s.get("sid") or ""),
-                                   str(private.get("native_id") or "")))
-            except codex_queue.QueueError as error:
-                return self._json({
-                    "error": f"无法确认 Codex 是否撤销: {error}",
-                    **send_queue.snapshot(uid),
-                }, 409)
-            if not deleted:
-                return self._json({
-                    "error": "消息已离开 Codex 队列，可能已经开始处理",
-                    **send_queue.snapshot(uid),
-                }, 409)
-            send_queue.discard(item_id, uid, {"native_queued"})
-            return self._json({"ok": True, "uid": uid,
-                               **send_queue.snapshot(uid)})
         if not send_queue.discard(
-                item_id, uid, {"queued", "failed", "aborted", "restored"}):
+                item_id, uid, {"injecting", "failed", "aborted", "restored"}):
             return self._json({"error": "消息不存在或已经开始发送"}, 409)
         return self._json({"ok": True, "uid": uid,
                            **send_queue.snapshot(uid)})
@@ -2342,6 +2223,7 @@ def main():
         TERMINAL = False
 
     if TERMINAL:
+        send_queue.fail_unsubmitted()
         threading.Thread(target=_outbox_loop, daemon=True, name="agenthub-outbox").start()
 
     ALLOWED_IPS.update({"127.0.0.1", "::1", "localhost"})

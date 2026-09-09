@@ -924,7 +924,7 @@ async function applyDiff(uid, data, bytes = 0, agent = null) {
     if (!agent && Array.isArray(data.outbox)) {
       if (staleServerOutbox(uid, data.outbox_version)) return 0;
       const ids = new Set(data.outbox.map(item => item?.id).filter(Boolean));
-      // 后台确认线程可能先删掉服务端队列项，稍后 watch 才读到对应的
+      // 后台确认线程可能先删掉服务端终端回执，稍后 watch 才读到对应的
       // rollout user 记录。此时直接照空 outbox 清 UI，会让刚发的消息
       // 短暂消失。先从当前浏览器游标补一次正文，再原子完成替换。
       const removesPending = queuedMessages(uid).some(
@@ -4194,7 +4194,7 @@ function renderQueuedMessages(uid = S.sel) {
       }
       footer.appendChild(actions);
     } else if ((item.server
-                && ['queued', 'native_queued', 'failed', 'aborted', 'restored'].includes(item.state))
+                && ['injecting', 'failed', 'aborted', 'restored'].includes(item.state))
                || (!item.server && item.state === 'failed')) {
       const actions = el('span', 'client-pending-actions');
       if (item.state === 'failed') {
@@ -4206,8 +4206,7 @@ function renderQueuedMessages(uid = S.sel) {
           : retryClientQueuedMessage(uid, item.id);
         actions.append(retry);
       }
-      const discard = el('button', '', ['queued', 'native_queued'].includes(item.state)
-        ? '撤销' : '移除');
+      const discard = el('button', '', item.state === 'injecting' ? '撤销' : '移除');
       discard.type = 'button';
       discard.onclick = () => item.server
         ? discardServerQueuedMessage(uid, item.id)
@@ -4221,7 +4220,7 @@ function renderQueuedMessages(uid = S.sel) {
   }
 }
 
-/** Activity 和乐观消息都是时间线尾部状态；每次重画都固定保持排队消息在最下方。 */
+/** Activity 和提交回执都是时间线尾部状态；每次重画都固定保持回执在最下方。 */
 function pendingHistoryQuestion(entry) {
   if (entry?.meta?.source !== 'codex' || entry?.activity?.state !== 'waiting') return null;
   const answered = new Set((entry.msgs || [])

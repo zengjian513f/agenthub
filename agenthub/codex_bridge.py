@@ -179,16 +179,7 @@ def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
             return "unknown"
         if cursor_y < start and cursor_x != marker_col + 2:
             return "unknown"
-        # A working frame can also be too short to show the footer.  Prefer a
-        # conservative retry over injecting while any nearby live busy marker
-        # is visible.
-        if any(_BUSY_STATUS.search(clean_lines[i])
-               for i in range(max(0, start - 6), end + 1)):
-            return "unknown"
     if clean_lines[start].lstrip()[:1] not in _COMPOSER_MARKERS:
-        return "unknown"
-    if any(_BUSY_STATUS.search(clean_lines[i])
-           for i in range(max(0, start - 6), start)):
         return "unknown"
 
     styled = _styled_chars("\n".join(raw_lines[start:end + 1]))

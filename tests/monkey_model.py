@@ -508,8 +508,7 @@ class ConsistencyOracle:
                             expected, observation, pending=pending)
 
             active_outbox = any(row.state in {
-                "queued", "native_queuing", "native_queued", "persisted",
-                "injecting", "submitted", "delivering",
+                "queued", "persisted", "injecting", "submitted", "delivering",
             } for row in outbox_rows)
             idle_outbox = (active and expected.origin == "browser" and active_outbox
                            and observation.terminal_phase == "idle")

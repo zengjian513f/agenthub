@@ -133,7 +133,7 @@ T0 研究台账（`research_catalog` 的 `sessions` 表）和 labdesk 的“关�
 
 输入框左侧的 `＋` 可添加图片、视频、音频、普通文件和文字引用，也可以直接把剪贴板图片/文件粘贴到输入框或拖入输入区。附件先作为可删除的草稿卡显示，发送时才以原始二进制流上传；服务端按会话 uid 查出真实 cwd，以原文件名保存到 `./agenthub_attachments/<id>/`，其中批次 id 在项目目录内从 1 递增，不接受浏览器指定落盘目录。同名且内容相同的文件会复用，同名但内容不同则依次保存为 `文件__1.png`、`文件__2.png`。点击附件卡会在正文插入稳定的 `[附件1]` 引用；删除附件不会重排编号。发送时正文保持原样，末尾另起一段追加 `附件1:./agenthub_attachments/<id>/文件名` 清单。纯文字同样保持原样，因此 `/rename` 等斜杠命令不受影响。单文件上限 512 MB，失败会保留正文和附件供重试。
 
-Codex 忙碌时，后续输入在轮到处理前只存在于 TUI 内存、尚未写入 rollout。agenthub 会立即在时间线底部持久化显示一条“排队中”的用户消息；切换会话或刷新页面不会消失，原生记录出现后会按正文与时间自动消重。
+Codex 忙碌时，agenthub 仍会立即把后续输入写入当前 tmux 中的 TUI，由 TUI 自己排队；不会另建一套等待空闲的本地队列。因为 follow-up 在轮到处理前尚未写入 rollout，时间线底部会暂时保留一条“已送达终端”的提交回执；切换会话或刷新页面不会丢失，原生用户记录出现后会按正文与时间自动消重。
 
 | 情况 | 行为 |
 |---|---|
@@ -325,7 +325,7 @@ agenthub/
   bug_report.py 私有诊断包与自动 Codex 处理会话
   send_audit.py 兼容旧版的紧凑消息交付日志
   send_protocol.py Claude/Codex 交付状态的公共驱动接口
-  send_queue.py Codex 网页输入的服务端持久队列与原生记录确认
+  send_queue.py Codex 网页输入的终端提交回执与原生记录确认
   session_meta.py  星标等 agenthub 自有会话元数据
   server.py     ThreadingHTTPServer 路由与 IP 白名单
   static/       前端 (原生 JS, 无构建步骤；vendor/ 含 KaTeX 与 xterm.js)
@@ -362,11 +362,11 @@ agenthub/
 输入框和附件入口，手机端可以切换终端/对话，并用关机按钮按 tmux 名直接停止。正式会话
 关联后自动退出临时列表，尚未发送的正文、引用和附件草稿会迁移到正式 uid，不会消失。
 
-Codex 忙时不会把尚未轮到的输入写进 rollout，tmux 接受粘贴也不能证明 Codex
-已经接收。因此已有 Codex 会话的网页输入先持久化到权限为 `0600` 的
-`~/.local/share/agenthub/send-queue.json`；观察到原生回合结束且终端画面稳定后才交付，
-服务端会独立续读 rollout，浏览器锁屏或断开也不影响队列推进；最终以其中出现对应的
-`user` 记录确认。
+Codex 忙时仍保留可写 composer。已有 Codex 会话的网页输入会在同一个 HTTP 请求内
+直接粘贴并提交给当前 tmux TUI，由 TUI 自己管理 follow-up；agenthub 不等待 idle，
+也不建立第二套本地待发送队列。权限为 `0600` 的
+`~/.local/share/agenthub/send-queue.json` 只保存终端提交回执和崩溃边界，服务端会独立续读
+rollout，浏览器锁屏或断开也不影响确认；最终以其中出现对应的 `user` 记录消除回执。
 
 Claude 输入同样先写入权限为 `0600` 的
 `~/.local/share/agenthub/claude-send-queue.json`，然后才触碰终端。服务端以请求 ID 幂等，

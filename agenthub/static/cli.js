@@ -189,8 +189,8 @@ class CodexCli extends AgentHubCli {
   }
 
   migrateQueuedMessages(items, fromVersion, _toVersion) {
-    // v4 起 Codex 队列归服务端管理。浏览器旧副本没有交付凭据，全部丢弃；
-    // 真实待发送项会随 /api/messages 或 SSE 重新同步回来。
+    // v4 起 Codex 终端提交回执归服务端管理。浏览器旧副本没有交付凭据，
+    // 全部丢弃；真实回执会随 /api/messages 或 SSE 重新同步回来。
     return fromVersion < 4 ? [] : super.migrateQueuedMessages(items);
   }
 
@@ -201,13 +201,13 @@ class CodexCli extends AgentHubCli {
 
   queuedMessageLabel(item) {
     if (item?.state === 'aborted') return '已中断';
-    if (item?.state === 'native_queuing') return '正在交给 Codex';
-    if (item?.state === 'native_queued') return 'Codex 已排队';
-    if (item?.state === 'delivering') return '发送中';
-    if (item?.state === 'confirming') return '已送达，等待确认';
-    if (item?.state === 'failed' && +item?.attempts > 0) return '状态待核对';
-    if (item?.state === 'failed') return '发送未确认';
-    return '排队中';
+    if (item?.state === 'injecting' || item?.state === 'delivering') {
+      return '正在写入终端';
+    }
+    if (item?.state === 'confirming') return '已送达终端';
+    if (item?.state === 'failed' && +item?.attempts > 0) return '终端写入待核对';
+    if (item?.state === 'failed') return '未写入终端';
+    return '等待终端确认';
   }
 
   questionAnswerKeys(prompt, optionIndex) {
@@ -235,8 +235,8 @@ class CodexCli extends AgentHubCli {
     return { rewind, nextAt: rewind ? -Infinity : now };
   }
 
-  // Codex 的待发送消息由服务端持久队列管理。Esc 只中断当前回合；
-  // 服务端确认原生状态已经结束后，仍要继续交付队首消息。
+  // Codex 的 follow-up 已经写入当前 TUI，由 TUI 自己排队。Esc 只中断
+  // 当前回合；服务端回执继续等待对应的原生用户记录。
 }
 
 class GrokCli extends AgentHubCli {

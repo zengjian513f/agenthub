@@ -431,7 +431,7 @@ def run(pw):
             return {draft_conflict:true, draft_token:'confirmed-draft-v1', outbox:[]};
           }
           return {ok:true, outbox:[{id:'server-1', uid, text:body.text,
-            created:1000, state:'queued', server:true}]};
+            created:1000, state:'confirming', attempts:1, server:true}]};
         }
         return {ok:true};
       };
@@ -458,9 +458,9 @@ def run(pw):
         attempts:queuedRequests.length, confirmations,
         escapeKeys:escapeRequest?.body?.keys};
     }""")
-    check("Codex 网页消息先进入服务端队列且不再写浏览器乐观队列",
+    check("Codex 网页消息以服务端终端回执替代浏览器乐观队列",
           codex_delivery == {"url": "api/session/send", "uid": codex_delivery.get("uid"),
-                             "activity": "working", "shown": "queued",
+                             "activity": "working", "shown": "confirming",
                              "cursor": {"start": 123, "head": "head-token",
                                         "anchor": "anchor-token"},
                              "server": True, "persisted": False,

@@ -130,11 +130,17 @@ class CodexBridgeTests(unittest.TestCase):
                   "  gpt-5.6-sol ultra · /node-a-share/T0Project…")
         self.assertEqual(codex_bridge.composer_state(screen), "empty")
 
-    def test_current_working_screen_is_not_treated_as_ready(self):
+    def test_current_working_screen_still_exposes_writable_composer(self):
         screen = ("\x1b[1m• Working\x1b[0m \x1b[2m(12s • esc to interrupt)\x1b[0m\n\n"
                   "\x1b[1m›\x1b[0m \x1b[2mRun /review on my current changes\x1b[0m\n\n"
-                  "  gpt-5.6-sol xhigh fast · ~/Projects/agenthub")
-        self.assertEqual(codex_bridge.composer_state(screen), "unknown")
+                  "  gpt-5.6-sol xhigh fast · ~/Projects/agenthub · Working")
+        self.assertEqual(codex_bridge.composer_state(screen), "empty")
+
+        draft = screen.replace(
+            "\x1b[1m›\x1b[0m \x1b[2mRun /review on my current changes\x1b[0m",
+            "\x1b[1m›\x1b[0m 下一条消息",
+        )
+        self.assertEqual(codex_bridge.composer_state(draft), "editing")
 
     def test_resize_frame_does_not_treat_historic_prompt_as_composer(self):
         screen = ("\x1b[1m›\x1b[0m 历史用户消息\n\n"

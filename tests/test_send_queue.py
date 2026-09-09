@@ -19,6 +19,12 @@ class SendQueueTests(unittest.TestCase):
         self.file_patch.stop()
         self.tmp.cleanup()
 
+    @staticmethod
+    def handler():
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        return handler
+
     def test_snapshot_carries_atomic_process_epoch_and_revision(self):
         before = send_queue.snapshot("codex:u")
         self.assertEqual(before["outbox"], [])
@@ -34,137 +40,152 @@ class SendQueueTests(unittest.TestCase):
         self.assertGreater(after["outbox_version"]["revision"],
                            before["outbox_version"]["revision"])
 
-    def test_busy_codex_waits_for_native_turn_end_then_confirms(self):
-        item = send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "下一条", [],
-            {"state": "working", "ts": "2026-08-09T10:00:00Z"}, "req-1",
+    def test_working_web_send_is_submitted_to_live_tmux_immediately(self):
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+        pane = {"name": "agenthub-codex-u"}
+        driver = server.send_protocol.driver_for("codex")
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(driver, "overwrite_draft", return_value=None), \
+                patch.object(server.term, "leave_copy_mode") as leave, \
+                patch.object(server.term, "submit_text") as submit:
+            result = self.handler()._queue_message({
+                "uid": "codex:u", "name": pane["name"], "text": "下一条",
+                "request_id": "request-id", "activity": {"state": "working"},
+            })
+
+        self.assertEqual(result["_status"], 200)
+        self.assertEqual(result["outbox"][0]["state"], "confirming")
+        self.assertEqual(result["outbox"][0]["attempts"], 1)
+        leave.assert_called_once_with(pane["name"])
+        submit.assert_called_once_with(pane["name"], "下一条")
+
+    def test_replayed_working_send_does_not_touch_tmux_or_later_draft(self):
+        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
+        pane = {"name": "agenthub-codex-u"}
+        driver = server.send_protocol.driver_for("codex")
+        body = {
+            "uid": "codex:u", "name": pane["name"], "text": "下一条",
+            "request_id": "same-request", "activity": {"state": "working"},
+        }
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(driver, "overwrite_draft", return_value=None) as overwrite, \
+                patch.object(server.term, "leave_copy_mode"), \
+                patch.object(server.term, "submit_text") as submit:
+            first = self.handler()._queue_message(body)
+            second = self.handler()._queue_message({**body, "overwrite_draft": "later"})
+
+        self.assertEqual(first["outbox"][0]["state"], "confirming")
+        self.assertEqual(second["outbox"][0]["state"], "confirming")
+        overwrite.assert_called_once_with(pane["name"], "")
+        submit.assert_called_once_with(pane["name"], "下一条")
+
+    def test_native_user_record_retires_terminal_receipt(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "下一条", [], {"state": "working"}, "req-1",
             {"start": 100, "head": "head", "anchor": "anchor"})
-        self.assertEqual(item["state"], "queued")
-        self.assertEqual(send_queue.ready(1000), [])
-
-        send_queue.observe(
-            "codex:u", [], {"state": "idle", "ts": "2099-08-09T10:01:00Z"}, now=1000)
-        self.assertEqual(send_queue.ready(1000.29), [])
-        ready = send_queue.ready(1000.31)
-        self.assertEqual([x["id"] for x in ready], ["req-1"])
-
         send_queue.mark_delivering("req-1", now=1001)
-        self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "delivering")
-        send_queue.observe("codex:u", [{"role": "user", "text": "下一条",
-                                        "ts": "2000-08-09T09:59:00Z"}],
-                           {"state": "working"}, now=1001.5)
+        send_queue.mark_confirming("req-1")
+
+        row = send_queue.tracked()[0]
+        boundary = datetime.fromisoformat(row["after_ts"])
+        old = (boundary - timedelta(milliseconds=1)).isoformat()
+        new = (boundary + timedelta(milliseconds=1)).isoformat()
+        send_queue.observe("codex:u", [
+            {"role": "user", "text": "下一条", "ts": old},
+        ], {"state": "working"})
         self.assertEqual(len(send_queue.list_for("codex:u")), 1)
-        send_queue.observe("codex:u", [{"role": "user", "text": "下一条"}],
-                           {"state": "working"}, now=1002)
+        send_queue.observe("codex:u", [
+            {"role": "user", "text": "下一条", "ts": new},
+        ], {"state": "working"})
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
-    def test_busy_row_is_claimed_once_and_accepted_by_native_queue(self):
+    def test_codex_native_trim_does_not_leave_duplicate_receipt(self):
         send_queue.enqueue(
-            "codex:u", "pane", "下一条", [], {"state": "working"}, "native")
-        candidate = send_queue.native_candidates(now=1000)[0]
+            "codex:u", "pane", " 2016年到底怎么了\n", [],
+            {"state": "working"}, "trimmed")
+        send_queue.mark_delivering("trimmed")
+        send_queue.mark_confirming("trimmed")
+        send_queue.observe("codex:u", [{
+            "role": "user", "text": "2016年到底怎么了",
+        }], {"state": "working"})
+        self.assertEqual(send_queue.list_for("codex:u"), [])
 
-        claimed = send_queue.claim_native("native", "codex:u", now=1000)
-        self.assertEqual(claimed["state"], "native_queuing")
-        self.assertIsNone(send_queue.claim_native("native", "codex:u", now=1001))
-        send_queue.mark_native_queued("native", "codex-native-id", "codex:u")
+    def test_confirmation_keeps_internal_whitespace_significant(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "echo  one", [], {"state": "working"}, "spaces")
+        send_queue.mark_delivering("spaces")
+        send_queue.mark_confirming("spaces")
+        send_queue.observe("codex:u", [{
+            "role": "user", "text": "echo one",
+        }], {"state": "working"})
+        self.assertEqual(len(send_queue.list_for("codex:u")), 1)
+
+    def test_slow_native_confirmation_never_becomes_retryable(self):
+        first = send_queue.enqueue(
+            "codex:u", "pane", "消息", [{"src": "token"}],
+            {"state": "working"}, "same-id")
+        again = send_queue.enqueue(
+            "codex:u", "pane", "消息", [{"src": "token"}],
+            {"state": "working"}, "same-id")
+        self.assertEqual(first, again)
+
+        send_queue.mark_delivering("same-id", now=10)
+        self.assertEqual(send_queue.expire_deliveries(now=18.01), 1)
+        confirming = send_queue.list_for("codex:u")[0]
+        self.assertEqual(confirming["state"], "confirming")
+        self.assertIsNone(send_queue.retry(
+            "same-id", {"state": "working"}, "codex:u"))
+        send_queue.observe("codex:u", [{"role": "user", "text": "消息"}],
+                           {"state": "working"}, now=40)
+        self.assertEqual(send_queue.list_for("codex:u"), [])
+
+    def test_abort_of_current_turn_does_not_cancel_tui_owned_followup(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "中断后的下一条", [],
+            {"state": "working"}, "followup")
+        send_queue.mark_delivering("followup", now=10)
+        send_queue.mark_confirming("followup")
+
+        send_queue.observe("codex:u", [], {
+            "state": "aborted", "ts": "2099-01-01T00:00:00Z",
+        }, now=11)
 
         row = send_queue.list_for("codex:u")[0]
-        self.assertEqual(row["state"], "native_queued")
-        self.assertEqual(send_queue.ready(10**12), [])
-        self.assertEqual(send_queue.native_candidates(10**12), [])
-        self.assertEqual(candidate["id"], "native")
+        self.assertEqual(row["state"], "confirming")
+        self.assertFalse(send_queue.mark_interrupted("codex:u", now=12))
 
-    def test_native_accepted_head_allows_following_row_into_codex_fifo(self):
-        activity = {"state": "working"}
-        send_queue.enqueue("codex:u", "pane", "一", [], activity, "one")
-        send_queue.enqueue("codex:u", "pane", "二", [], activity, "two")
-        send_queue.claim_native("one", "codex:u", now=10)
-        send_queue.mark_native_queued("one", "native-one", "codex:u")
+    def test_restart_marks_all_pre_terminal_states_as_not_sent(self):
+        send_queue._write([
+            {"id": "local", "uid": "codex:u", "state": "queued", "attempts": 0},
+            {"id": "crash", "uid": "codex:u", "state": "injecting", "attempts": 0},
+            {"id": "claim", "uid": "codex:u", "state": "native_queuing",
+             "native_claimed_at": 1, "attempts": 0},
+            {"id": "phantom", "uid": "codex:u", "state": "native_queued",
+             "native_id": "app-server-only", "attempts": 0},
+        ])
 
-        self.assertEqual(
-            [row["id"] for row in send_queue.native_candidates(10**12)], ["two"])
+        self.assertEqual(send_queue.fail_unsubmitted(), 4)
+        rows = send_queue.list_for("codex:u")
+        self.assertEqual([row["state"] for row in rows], ["failed"] * 4)
+        self.assertTrue(all("未写入 Codex 终端" in row["error"] for row in rows))
+        self.assertEqual(send_queue.fail_unsubmitted(), 0)
 
-    def test_ambiguous_native_claim_recovers_after_timeout(self):
+    def test_server_poll_advances_receipt_cursor_without_browser(self):
         send_queue.enqueue(
-            "codex:u", "pane", "恢复", [], {"state": "working"}, "recover")
-        send_queue.claim_native("recover", "codex:u", now=100)
-
-        self.assertEqual(send_queue.native_candidates(
-            100 + send_queue.NATIVE_CLAIM_TIMEOUT - 0.01), [])
-        recovered = send_queue.native_candidates(
-            100 + send_queue.NATIVE_CLAIM_TIMEOUT)[0]
-        self.assertEqual(recovered["state"], "native_queuing")
-
-    def test_native_queue_failure_falls_back_without_racing_immediate_retry(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "降级", [], {"state": "working"}, "fallback")
-        send_queue.claim_native("fallback", "codex:u", now=100)
-        with patch.object(send_queue.time, "time", return_value=101):
-            send_queue.release_native_claim("fallback", "旧版 Codex", "codex:u")
-
-        row = send_queue.list_for("codex:u")[0]
-        self.assertEqual(row["state"], "queued")
-        self.assertIn("旧版 Codex", row["error"])
-        self.assertEqual(send_queue.native_candidates(110.99), [])
-        self.assertEqual(send_queue.native_candidates(111)[0]["id"], "fallback")
-
-    def test_ambiguous_native_add_recovers_existing_codex_row(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "恢复", [], {"state": "working"}, "recover-existing")
-        send_queue.claim_native("recover-existing", "codex:u", now=10)
-        stale = send_queue.get("recover-existing", "codex:u")
-        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
-
-        with patch.object(server.codex_queue, "find_submission", return_value={
-                "id": "native-existing", "clientUserMessageId": "recover-existing",
-                }), patch.object(server.codex_queue, "enqueue_idempotent") as enqueue:
-            self.assertTrue(server._transfer_native_codex_item(stale, session))
-
-        enqueue.assert_not_called()
-        self.assertEqual(
-            send_queue.list_for("codex:u")[0]["state"], "native_queued")
-
-    def test_ambiguous_native_add_missing_after_turn_ends_uses_idle_fallback(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "恢复", [], {"state": "working"}, "recover-idle")
-        send_queue.claim_native("recover-idle", "codex:u", now=10)
-        send_queue.observe(
-            "codex:u", [], {"state": "idle", "ts": "2099-01-01T00:00:00Z"},
-            now=20)
-        stale = send_queue.get("recover-idle", "codex:u")
-        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
-
-        with patch.object(server.codex_queue, "find_submission", return_value=None), \
-                patch.object(server.codex_queue, "enqueue_idempotent") as enqueue:
-            self.assertFalse(server._transfer_native_codex_item(stale, session))
-
-        enqueue.assert_not_called()
-        row = send_queue.list_for("codex:u")[0]
-        self.assertEqual(row["state"], "queued")
-        self.assertTrue(send_queue.get("recover-idle", "codex:u").get("ready_at"))
-
-    def test_unknown_or_stale_idle_never_makes_message_ready(self):
-        send_queue.enqueue("codex:u", "pane", "消息", [], None, "unknown")
-        self.assertEqual(send_queue.ready(10**12), [])
-        send_queue.observe("codex:u", [],
-                           {"state": "idle", "ts": "2000-01-01T00:00:00Z"},
-                           now=100)
-        self.assertEqual(send_queue.ready(10**12), [])
-        send_queue.observe("codex:u", [],
-                           {"state": "idle", "ts": "2099-01-01T00:00:00Z"},
-                           now=100)
-        self.assertEqual([x["id"] for x in send_queue.ready(100.31)], ["unknown"])
-
-    def test_server_poll_advances_cursor_and_unblocks_without_browser(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "离线后继续", [],
-            {"state": "working", "ts": "2026-08-09T10:00:00Z"}, "offline",
+            "codex:u", "pane", "离线后确认", [], {"state": "working"}, "offline",
             {"start": 100, "head": "old-head", "anchor": "old-anchor"})
+        send_queue.mark_delivering("offline")
+        send_queue.mark_confirming("offline")
         session = {"uid": "codex:u", "source": "codex", "path": "/tmp/fake"}
         result = {
-            "messages": [],
-            "activity": {"state": "idle", "ts": "2099-01-01T00:00:00Z"},
-            "end": 240, "version": {"head": "new-head"}, "anchor": "new-anchor",
+            "messages": [], "activity": {"state": "working"}, "end": 240,
+            "version": {"head": "new-head"}, "anchor": "new-anchor",
         }
         with patch.object(server.index, "get", return_value=session), patch.object(
                 server.index, "messages_for", return_value=result) as read:
@@ -174,19 +195,16 @@ class SendQueueTests(unittest.TestCase):
         row = send_queue.tracked()[0]
         self.assertEqual((row["watch_start"], row["watch_head"], row["watch_anchor"]),
                          (240, "new-head", "new-anchor"))
-        self.assertTrue(row.get("ready_at"))
 
-    def test_timeout_rechecks_from_delivery_cursor_before_failing(self):
+    def test_timeout_rechecks_from_terminal_delivery_cursor(self):
         send_queue.enqueue(
-            "codex:u", "pane", "已经收到", [], {"state": "idle"}, "recheck",
+            "codex:u", "pane", "已经收到", [], {"state": "working"}, "recheck",
             {"start": 100, "head": "old-head", "anchor": "old-anchor"})
         send_queue.mark_delivering("recheck", now=10)
+        send_queue.mark_confirming("recheck")
         send_queue.observe(
             "codex:u", [], {"state": "working"}, now=11,
             cursor={"start": 240, "head": "new-head", "anchor": "new-anchor"})
-        row = send_queue.tracked()[0]
-        self.assertEqual(row["watch_start"], 240)
-        self.assertEqual(row["confirm_start"], 100)
 
         session = {"uid": "codex:u", "source": "codex", "path": "/tmp/fake"}
         result = {
@@ -204,365 +222,47 @@ class SendQueueTests(unittest.TestCase):
             session, start=100, head="old-head", anchor="old-anchor")
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
-    def test_subsecond_native_record_confirms_server_enqueue(self):
+    def test_exception_after_delivery_claim_is_not_retryable(self):
         send_queue.enqueue(
-            "codex:u", "pane", "同一秒", [], {"state": "working"}, "millis")
+            "codex:u", "agenthub-codex-u", "只发一次", [],
+            {"state": "working"}, "ambiguous")
         row = send_queue.tracked()[0]
-        boundary = datetime.fromisoformat(row["after_ts"])
-        accepted = (boundary + timedelta(milliseconds=800)).isoformat(
-            timespec="milliseconds")
-        send_queue.observe(
-            "codex:u", [{"role": "user", "text": "同一秒", "ts": accepted}], None)
-        self.assertEqual(send_queue.list_for("codex:u"), [])
+        pane = {"name": "agenthub-codex-u"}
+        with patch.object(server.term, "leave_copy_mode"), patch.object(
+                server.term, "submit_text", side_effect=OSError("lost ack")):
+            server._submit_codex_item(row, pane)
 
-    def test_codex_native_trim_does_not_leave_a_duplicate_queue_bubble(self):
+        item = send_queue.list_for("codex:u")[0]
+        self.assertEqual(item["state"], "confirming")
+        self.assertEqual(item["attempts"], 1)
+        self.assertIsNone(send_queue.retry(
+            "ambiguous", {"state": "idle"}, "codex:u"))
+
+    def test_failed_receipt_does_not_block_a_new_terminal_submission(self):
         send_queue.enqueue(
-            "codex:u", "pane", " 2016年到底怎么了\n", [],
-            {"state": "idle"}, "trimmed")
-        row = send_queue.tracked()[0]
-        boundary = datetime.fromisoformat(row["after_ts"])
-        accepted = (boundary + timedelta(milliseconds=800)).isoformat(
-            timespec="milliseconds")
-
-        send_queue.observe("codex:u", [{
-            "role": "user", "text": "2016年到底怎么了", "ts": accepted,
-        }], {"state": "working"})
-
-        self.assertEqual(send_queue.list_for("codex:u"), [])
-
-    def test_codex_confirmation_keeps_internal_whitespace_significant(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "echo  one", [], {"state": "idle"}, "spaces")
-        send_queue.observe("codex:u", [{
-            "role": "user", "text": "echo one",
-        }], {"state": "working"})
-
-        self.assertEqual(len(send_queue.list_for("codex:u")), 1)
-
-    def test_slow_native_confirmation_never_becomes_retryable(self):
-        first = send_queue.enqueue("codex:u", "pane", "消息", [{"src": "token"}],
-                                   {"state": "idle"}, "same-id")
-        again = send_queue.enqueue("codex:u", "pane", "消息", [{"src": "token"}],
-                                   {"state": "idle"}, "same-id")
-        self.assertEqual(first, again)
-        self.assertTrue(first["server"])
-        self.assertEqual(len(send_queue.list_for("codex:u")), 1)
-
-        send_queue.mark_delivering("same-id", now=10)
-        self.assertEqual(send_queue.expire_deliveries(now=18.01), 1)
-        confirming = send_queue.list_for("codex:u")[0]
-        self.assertEqual(confirming["state"], "confirming")
-        self.assertIn("等待 Codex 写入", confirming["error"])
-        self.assertIsNone(send_queue.retry("same-id", {"state": "working"}, "codex:u"))
-
-        # Auto-compact may persist the user record tens of seconds after
-        # task_started.  The late native record still retires the placeholder.
-        send_queue.observe("codex:u", [{"role": "user", "text": "消息"}],
-                           {"state": "working"}, now=40)
-        self.assertEqual(send_queue.list_for("codex:u"), [])
-
-    def test_interrupt_before_native_user_record_becomes_aborted_not_pending(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "立刻中断的消息", [],
-            {"state": "idle"}, "interrupted")
-        send_queue.mark_delivering("interrupted", now=10)
-        send_queue.enqueue(
-            "codex:u", "pane", "中断后继续", [],
-            {"state": "working"}, "next")
-
-        send_queue.observe(
-            "codex:u", [],
-            {"state": "aborted", "ts": "2099-01-01T00:00:00Z"}, now=11)
-
-        rows = send_queue.list_for("codex:u")
-        self.assertEqual([(row["id"], row["state"]) for row in rows],
-                         [("interrupted", "aborted"), ("next", "queued")])
-        self.assertNotIn("interrupted", [row["id"] for row in send_queue.tracked()])
-        self.assertEqual(send_queue.ready(11.31)[0]["id"], "next")
-        self.assertEqual(send_queue.expire_deliveries(now=100), 0)
-
-    def test_failed_item_blocks_fifo_until_retry_or_discard(self):
-        send_queue.enqueue("codex:u", "pane", "一", [], {"state": "idle"}, "one")
-        send_queue.enqueue("codex:u", "pane", "二", [], {"state": "idle"}, "two")
-        send_queue.mark_failed("one", "失败")
-        self.assertEqual(send_queue.ready(10**12), [])
-        self.assertTrue(send_queue.discard("one"))
-        self.assertEqual([x["id"] for x in send_queue.ready(10**12)], ["two"])
-
-    def test_delivery_never_appends_to_restored_codex_editor(self):
-        send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "新消息", [],
-            {"state": "idle"}, "restored")
-        row = send_queue.tracked()[0]
+            "codex:u", "agenthub-codex-u", "旧失败", [],
+            {"state": "idle"}, "failed")
+        send_queue.mark_failed("failed", "未写入")
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
         pane = {"name": "agenthub-codex-u"}
-        footer = "gpt-5.6-sol · Context 19% used · Ready"
-        screen = "\x1b[1;2m› \x1b[0m旧消息仍在编辑框\n\n" + footer
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture_screen_state",
-                             return_value=(screen, (2, 0))), \
-                patch.object(server.term, "submit_text") as submit, \
-                patch.object(server.time, "sleep"):
-            server._deliver_outbox_item(row, [pane])
-            self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "queued")
-            for _ in range(send_queue.COMPOSER_EDITING_RETRY_LIMIT - 1):
-                server._deliver_outbox_item(send_queue.tracked()[0], [pane])
-
-        submit.assert_not_called()
-        failed = send_queue.list_for("codex:u")[0]
-        self.assertEqual(failed["state"], "failed")
-        self.assertIn("终端草稿中有内容", failed["error"])
-
-    def test_idle_unknown_screen_retries_then_fails_without_mutating_terminal(self):
-        send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "继续消息", [],
-            {"state": "idle"}, "unknown")
-        row = send_queue.tracked()[0]
-        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "agenthub-codex-u"}
-        stale_screen = "• 已完成并上线。\n\n  - 最后一条回答。\n"
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture_screen_state",
-                             return_value=(stale_screen, (0, 0))), \
-                patch.object(server.term, "leave_copy_mode") as leave, \
-                patch.object(server.term, "send_keys") as keys, \
-                patch.object(server.term, "submit_text") as submit, \
-                patch.object(server.time, "sleep"):
-            server._deliver_outbox_item(row, [pane])
-            self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "queued")
-            for _ in range(send_queue.COMPOSER_RETRY_LIMIT - 1):
-                server._deliver_outbox_item(send_queue.tracked()[0], [pane])
-
-        leave.assert_not_called()
-        keys.assert_not_called()
-        submit.assert_not_called()
-        failed = send_queue.list_for("codex:u")[0]
-        self.assertEqual(failed["state"], "failed")
-        self.assertIn("输入框不可识别", failed["error"])
-
-    def test_short_footerless_codex_composer_is_delivered_from_live_cursor(self):
-        send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "短窗口继续", [],
-            {"state": "idle"}, "short-footerless")
-        row = send_queue.tracked()[0]
-        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "agenthub-codex-u"}
-        lines = [
-            "• 已完成上一回合。", "", "  这是最后一条回答。", "",
-            "─ Worked for 1m 01s " + "─" * 24, "", "", "", "", "", "",
-            "", "", "", "", "",
-            "\x1b[1m\x1b[38;5;215m›\x1b[0m "
-            "\x1b[2mAsk Codex to do anything\x1b[0m",
-        ]
-        screen = "\n".join(lines)
-        snapshot = (screen, (2, 16))
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture_screen_state",
-                             return_value=snapshot), \
-                patch.object(server.term, "leave_copy_mode") as leave, \
-                patch.object(server.term, "submit_text") as submit, \
-                patch.object(server.time, "sleep"):
-            server._deliver_outbox_item(row, [pane])
-
-        leave.assert_called_once_with(pane["name"])
-        submit.assert_called_once_with(pane["name"], "短窗口继续")
-        delivered = send_queue.list_for("codex:u")[0]
-        self.assertEqual((delivered["state"], delivered["attempts"]),
-                         ("delivering", 1))
-
-    def test_bottom_codex_composer_delivers_with_parked_cursor(self):
-        send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "底边输入框继续", [],
-            {"state": "idle"}, "bottom-parked-cursor")
-        row = send_queue.tracked()[0]
-        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "agenthub-codex-u"}
-        lines = ["old output", *([""] * 28), "", "",
-                 "\x1b[1m\x1b[38;5;215m›\x1b[0m "
-                 "\x1b[2mAsk Codex to do anything\x1b[0m"]
-        snapshot = ("\n".join(lines), (2, 29))
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture_screen_state",
-                             return_value=snapshot), \
-                patch.object(server.term, "leave_copy_mode") as leave, \
-                patch.object(server.term, "submit_text") as submit, \
-                patch.object(server.time, "sleep"):
-            server._deliver_outbox_item(row, [pane])
-
-        leave.assert_called_once_with(pane["name"])
-        submit.assert_called_once_with(pane["name"], "底边输入框继续")
-        delivered = send_queue.list_for("codex:u")[0]
-        self.assertEqual((delivered["state"], delivered["attempts"]),
-                         ("delivering", 1))
-
-    def test_retry_delivers_from_codex_interrupt_rewind_composer(self):
-        send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "中断后重试", [],
-            {"state": "aborted"}, "retry-after-abort")
-        send_queue.mark_failed("retry-after-abort", "Codex 输入框不可识别")
-        send_queue.retry(
-            "retry-after-abort",
-            {"state": "aborted", "ts": "2099-01-01T00:00:00Z"}, "codex:u")
-        row = send_queue.ready(10**12)[0]
-        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "agenthub-codex-u"}
-        screen = (
-            "\x1b[38;5;1m■ Conversation interrupted - tell the model\x1b[0m\n\n"
-            "\x1b[1m\x1b[38;5;215m›\x1b[0m "
-            "\x1b[2mUse /skills to list available skills\x1b[0m\n\n"
-            "\x1b[2m  esc again to edit previous message\x1b[0m")
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture_screen_state",
-                             return_value=(screen, (2, 2))), \
-                patch.object(server.term, "leave_copy_mode") as leave, \
-                patch.object(server.term, "submit_text") as submit, \
-                patch.object(server.time, "sleep"):
-            server._deliver_outbox_item(row, [pane])
-
-        leave.assert_called_once_with(pane["name"])
-        submit.assert_called_once_with(pane["name"], "中断后重试")
-        self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "delivering")
-
-    def test_unknown_busy_screen_is_deferred_from_stale_idle(self):
-        send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "下一条", [],
-            {"state": "idle"}, "busy-redraw")
-        row = send_queue.tracked()[0]
-        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "agenthub-codex-u"}
-        screen = "• Working (2s • esc to interrupt)\n› placeholder\n"
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture_screen_state",
-                             return_value=(screen, (2, 1))), \
-                patch.object(server.term, "send_keys") as keys, \
-                patch.object(server.term, "submit_text") as submit, \
-                patch.object(server.time, "sleep"):
-            server._deliver_outbox_item(row, [pane])
-
-        keys.assert_not_called()
-        submit.assert_not_called()
-
-    def test_working_web_send_enters_codex_native_queue_immediately(self):
-        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
-        pane = {"name": "agenthub-codex-u"}
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
-        native = {"id": "native-id", "clientUserMessageId": "request-id"}
         driver = server.send_protocol.driver_for("codex")
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
                 patch.object(driver, "overwrite_draft", return_value=None), \
-                patch.object(server.codex_queue, "enqueue_idempotent",
-                             return_value=native) as enqueue:
-            result = handler._queue_message({
-                "uid": "codex:u", "name": pane["name"], "text": "/rename x",
-                "request_id": "request-id", "activity": {"state": "working"},
-            })
-
-        self.assertEqual(result["_status"], 200)
-        self.assertEqual(result["outbox"][0]["state"], "native_queued")
-        enqueue.assert_called_once_with("thread-u", "request-id", "/rename x")
-
-    def test_replayed_working_send_does_not_clear_new_draft_or_duplicate_native(self):
-        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
-        pane = {"name": "agenthub-codex-u"}
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
-        driver = server.send_protocol.driver_for("codex")
-        body = {
-            "uid": "codex:u", "name": pane["name"], "text": "下一条",
-            "request_id": "same-request", "activity": {"state": "working"},
-        }
-        native = {"id": "native-id", "clientUserMessageId": "same-request"}
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server.term, "list_sessions", return_value=[pane]), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(driver, "overwrite_draft", return_value=None) as overwrite, \
-                patch.object(server.codex_queue, "enqueue_idempotent",
-                             return_value=native) as enqueue:
-            first = handler._queue_message(body)
-            second = handler._queue_message({**body, "overwrite_draft": "later"})
-
-        self.assertEqual(first["outbox"][0]["state"], "native_queued")
-        self.assertEqual(second["outbox"][0]["state"], "native_queued")
-        overwrite.assert_called_once_with(pane["name"], "")
-        enqueue.assert_called_once()
-
-    def test_native_queued_item_is_cancelled_in_codex_before_ledger_removal(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "撤掉", [], {"state": "working"}, "cancel-native")
-        send_queue.claim_native("cancel-native", "codex:u", now=10)
-        send_queue.mark_native_queued(
-            "cancel-native", "native-id", "codex:u")
-        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server.codex_queue, "delete_submission",
-                             return_value=True) as delete:
-            result = handler._discard_message({
-                "uid": "codex:u", "id": "cancel-native",
-            })
-
-        self.assertEqual(result["_status"], 200)
-        self.assertEqual(result["outbox"], [])
-        delete.assert_called_once_with("thread-u", "native-id")
-
-    def test_native_cancel_refusal_keeps_browser_ledger_for_confirmation(self):
-        send_queue.enqueue(
-            "codex:u", "pane", "已开始", [], {"state": "working"}, "started")
-        send_queue.claim_native("started", "codex:u", now=10)
-        send_queue.mark_native_queued("started", "native-id", "codex:u")
-        session = {"uid": "codex:u", "source": "codex", "sid": "thread-u"}
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server.codex_queue, "delete_submission", return_value=False):
-            result = handler._discard_message({
-                "uid": "codex:u", "id": "started",
-            })
-
-        self.assertEqual(result["_status"], 409)
-        self.assertEqual(result["outbox"][0]["state"], "native_queued")
-        self.assertIn("可能已经开始处理", result["error"])
-
-    def test_new_message_is_rejected_while_failed_head_blocks_fifo(self):
-        send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "失败消息", [],
-            {"state": "idle"}, "failed")
-        send_queue.mark_failed("failed", "未确认")
-        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "agenthub-codex-u"}
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
-
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server.term, "list_sessions", return_value=[pane]), \
-                patch.object(server, "_pane_for_session", return_value=pane):
-            result = handler._queue_message({
+                patch.object(server.term, "leave_copy_mode"), \
+                patch.object(server.term, "submit_text") as submit:
+            result = self.handler()._queue_message({
                 "uid": "codex:u", "name": pane["name"], "text": "后一条",
+                "request_id": "later", "activity": {"state": "working"},
             })
 
-        self.assertEqual(result["_status"], 409)
-        self.assertIn("先重试或移除", result["error"])
-        self.assertEqual(len(send_queue.list_for("codex:u")), 1)
+        self.assertEqual(result["_status"], 200)
+        submit.assert_called_once_with(pane["name"], "后一条")
+        self.assertEqual(
+            [(row["id"], row["state"]) for row in result["outbox"]],
+            [("failed", "failed"), ("later", "confirming")])
 
     def test_web_send_requests_confirmation_for_nonempty_codex_composer(self):
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
@@ -570,28 +270,23 @@ class SendQueueTests(unittest.TestCase):
         footer = "gpt-5.6-sol · Context 19% used · Ready"
         screen = "\x1b[1;2m› \x1b[0m尚未提交的草稿\n\n" + footer
         cursor = (2, 0)
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
                 patch.object(server, "_pane_for_session", return_value=pane), \
                 patch.object(server.term, "capture_screen_state",
                              return_value=(screen, cursor)):
-            result = handler._queue_message({
+            result = self.handler()._queue_message({
                 "uid": "codex:u", "name": pane["name"], "text": "网页新消息",
             })
 
         self.assertEqual(result["_status"], 409)
         self.assertTrue(result["draft_conflict"])
-        self.assertEqual(
-            result["draft_token"],
-            hashlib.sha256(
-                f"{cursor[0]}\0{cursor[1]}\0{screen}".encode("utf-8")
-            ).hexdigest())
+        self.assertEqual(result["draft_token"], hashlib.sha256(
+            f"{cursor[0]}\0{cursor[1]}\0{screen}".encode()).hexdigest())
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
-    def test_confirmed_web_send_clears_exact_codex_draft_before_enqueue(self):
+    def test_confirmed_draft_is_cleared_before_immediate_tmux_submission(self):
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
         pane = {"name": "agenthub-codex-u"}
         footer = "gpt-5.6-sol · Context 19% used · Ready"
@@ -599,10 +294,7 @@ class SendQueueTests(unittest.TestCase):
         empty = "\x1b[2m› Ask Codex to do anything\x1b[0m\n\n" + footer
         cursor = (2, 0)
         token = hashlib.sha256(
-            f"{cursor[0]}\0{cursor[1]}\0{screen}".encode("utf-8")
-        ).hexdigest()
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
+            f"{cursor[0]}\0{cursor[1]}\0{screen}".encode()).hexdigest()
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
@@ -611,28 +303,24 @@ class SendQueueTests(unittest.TestCase):
                              side_effect=[(screen, cursor), (empty, cursor)]), \
                 patch.object(server.term, "leave_copy_mode") as leave, \
                 patch.object(server.term, "send_keys") as keys, \
-                patch.object(server.time, "sleep"), \
-                patch.object(server.OUTBOX_WAKE, "set") as wake:
-            result = handler._queue_message({
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.time, "sleep"):
+            result = self.handler()._queue_message({
                 "uid": "codex:u", "name": pane["name"], "text": "网页新消息",
                 "request_id": "confirmed", "overwrite_draft": token,
             })
 
         self.assertEqual(result["_status"], 200)
-        leave.assert_called_once_with(pane["name"])
+        self.assertEqual(leave.call_count, 2)
         keys.assert_called_once_with(pane["name"], "C-u", "C-k")
-        wake.assert_called_once_with()
-        self.assertEqual(
-            [(item["id"], item["text"]) for item in send_queue.list_for("codex:u")],
-            [("confirmed", "网页新消息")])
+        submit.assert_called_once_with(pane["name"], "网页新消息")
+        self.assertEqual(result["outbox"][0]["state"], "confirming")
 
-    def test_changed_codex_draft_is_never_cleared_by_stale_confirmation(self):
+    def test_changed_draft_is_never_cleared_by_stale_confirmation(self):
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
         pane = {"name": "agenthub-codex-u"}
         screen = ("\x1b[1;2m› \x1b[0m确认期间变化的新草稿\n\n"
                   "gpt-5.6-sol · Context 19% used · Ready")
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
 
         with patch.object(server.index, "get", return_value=session), \
                 patch.object(server.term, "list_sessions", return_value=[pane]), \
@@ -640,95 +328,67 @@ class SendQueueTests(unittest.TestCase):
                 patch.object(server.term, "capture_screen_state",
                              return_value=(screen, (2, 0))), \
                 patch.object(server.term, "send_keys") as keys:
-            result = handler._queue_message({
+            result = self.handler()._queue_message({
                 "uid": "codex:u", "name": pane["name"], "text": "网页新消息",
                 "overwrite_draft": "stale-token",
             })
 
         self.assertEqual(result["_status"], 409)
         self.assertTrue(result["draft_conflict"])
-        self.assertNotEqual(result["draft_token"], "stale-token")
         keys.assert_not_called()
         self.assertEqual(send_queue.list_for("codex:u"), [])
 
-    def test_queued_item_can_be_cancelled_before_delivery_claim(self):
-        send_queue.enqueue("codex:u", "pane", "撤掉", [], {"state": "idle"}, "cancel")
-        self.assertTrue(send_queue.discard(
-            "cancel", "codex:u", {"queued", "failed"}))
-        self.assertFalse(send_queue.mark_delivering("cancel"))
-        self.assertEqual(send_queue.list_for("codex:u"), [])
-
-    def test_aborted_item_can_be_removed_from_the_timeline(self):
+    def test_retry_writes_to_tmux_in_same_request(self):
         send_queue.enqueue(
-            "codex:u", "pane", "中断项", [], {"state": "idle"}, "aborted")
-        send_queue.mark_delivering("aborted", now=10)
-        send_queue.mark_interrupted("codex:u", now=11)
-
-        handler = object.__new__(server.Handler)
-        handler._json = lambda payload, status=200: {**payload, "_status": status}
+            "codex:u", "agenthub-codex-u", "重试消息", [],
+            {"state": "working"}, "retry")
+        send_queue.mark_failed("retry", "未写入")
         session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        with patch.object(server.index, "get", return_value=session):
-            result = handler._discard_message({"uid": "codex:u", "id": "aborted"})
+        pane = {"name": "agenthub-codex-u"}
+        driver = server.send_protocol.driver_for("codex")
+
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "list_sessions", return_value=[pane]), \
+                patch.object(server, "_pane_for_session", return_value=pane), \
+                patch.object(driver, "overwrite_draft", return_value=None), \
+                patch.object(server.term, "leave_copy_mode"), \
+                patch.object(server.term, "submit_text") as submit:
+            result = self.handler()._retry_message({
+                "uid": "codex:u", "id": "retry", "activity": {"state": "working"},
+            })
 
         self.assertEqual(result["_status"], 200)
-        self.assertEqual(result["outbox"], [])
+        self.assertEqual(result["outbox"][0]["state"], "confirming")
+        submit.assert_called_once_with(pane["name"], "重试消息")
 
-        # A second browser can still hold the same in-memory bubble after the
-        # first browser removed the durable row. Its dismiss is a successful
-        # no-op carrying the authoritative empty snapshot.
+    def test_failed_item_can_be_removed_idempotently(self):
+        send_queue.enqueue(
+            "codex:u", "pane", "未发送", [], {"state": "working"}, "failed")
+        send_queue.mark_failed("failed", "未写入")
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        handler = self.handler()
         with patch.object(server.index, "get", return_value=session):
-            again = handler._discard_message({"uid": "codex:u", "id": "aborted"})
+            result = handler._discard_message({"uid": "codex:u", "id": "failed"})
+            again = handler._discard_message({"uid": "codex:u", "id": "failed"})
+        self.assertEqual(result["_status"], 200)
         self.assertEqual(again["_status"], 200)
         self.assertEqual(again["outbox"], [])
 
-    def test_exception_after_delivery_claim_is_not_retryable(self):
+    def test_codex_escape_does_not_reclassify_terminal_receipts(self):
         send_queue.enqueue(
-            "codex:u", "agenthub-codex-u", "只发一次", [],
-            {"state": "idle"}, "ambiguous")
-        row = send_queue.tracked()[0]
-        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
-        pane = {"name": "agenthub-codex-u"}
-        screen = ("\x1b[2m› Use /skills to list available skills\x1b[0m\n\n"
-                  "gpt-5.6-sol · ~/Projects/agenthub")
-        with patch.object(server.index, "get", return_value=session), \
-                patch.object(server, "_pane_for_session", return_value=pane), \
-                patch.object(server.term, "capture_screen_state",
-                             return_value=(screen, (2, 0))), \
-                patch.object(server.term, "leave_copy_mode"), \
-                patch.object(server.term, "submit_text", side_effect=OSError("lost ack")), \
-                patch.object(server.time, "sleep"):
-            server._deliver_outbox_item(row, [pane])
-
-        item = send_queue.list_for("codex:u")[0]
-        self.assertEqual(item["state"], "confirming")
-        self.assertEqual(item["attempts"], 1)
-        self.assertIsNone(send_queue.retry(
-            "ambiguous", {"state": "idle"}, "codex:u"))
-
-    def test_codex_escape_keeps_queue_and_abort_releases_only_head(self):
-        activity = {"state": "working", "ts": "2026-08-09T10:00:00Z"}
-        send_queue.enqueue("codex:u", "pane", "第一条", [], activity, "first")
-        send_queue.enqueue("codex:u", "pane", "第二条", [], activity, "second")
+            "codex:u", "pane", "下一条", [], {"state": "working"}, "followup")
+        send_queue.mark_delivering("followup")
+        send_queue.mark_confirming("followup")
 
         with patch.object(server.OUTBOX_WAKE, "set") as wake:
             server._after_terminal_keys("codex:u", ["Escape"])
         wake.assert_called_once_with()
-        self.assertEqual(
-            [x["id"] for x in send_queue.list_for("codex:u")],
-            ["first", "second"])
+        self.assertEqual(send_queue.list_for("codex:u")[0]["state"], "confirming")
 
-        send_queue.observe(
-            "codex:u", [],
-            {"state": "aborted", "ts": "2099-08-09T10:01:00Z"}, now=1000)
-        self.assertEqual(send_queue.ready(1000.29), [])
-        self.assertEqual(
-            [x["id"] for x in send_queue.ready(1000.31)], ["first"])
-
-    def test_claude_escape_persists_activity_stop_without_touching_codex_worker(self):
+    def test_claude_escape_persists_activity_stop_without_codex_wake(self):
         stopped = {"state": "aborted", "ts": "2099-01-01T00:00:00Z"}
-        with patch.object(server.OUTBOX_WAKE, "set") as wake, \
-                patch.object(server.session_meta, "stop_activity",
-                             return_value=stopped) as stop:
+        with patch.object(server.OUTBOX_WAKE, "set") as wake, patch.object(
+                server.session_meta, "stop_activity", return_value=stopped) as stop:
             result = server._after_terminal_keys("claude:u", ["Escape"])
         wake.assert_not_called()
         stop.assert_called_once_with("claude:u")
