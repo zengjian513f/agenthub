@@ -11,6 +11,11 @@ class SessionFileTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        manager_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(manager_tmp.cleanup)
+        manager_patch = patch.object(server.file_manager, '_manager', server.file_manager.Manager(manager_tmp.name))
+        manager_patch.start()
+        self.addCleanup(manager_patch.stop)
         self.cwd = Path(self.tmp.name)
         self.image = self.cwd / "output" / "curve.png"
         self.image.parent.mkdir()

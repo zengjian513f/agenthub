@@ -24,7 +24,7 @@ from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
                debug_runs, index, live, media, pending as pending_store,
                send_protocol, send_queue,
                session_meta, term, term_ownership, trash, wsock)
-from . import federation, create_requests, files
+from . import federation, create_requests, files, file_manager
 
 STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
@@ -551,6 +551,8 @@ class Handler(BaseHTTPRequestHandler):
         self._audit_begin("POST", u.path)
         if not self._allowed():
             return self._send(403, b"forbidden", "text/plain")
+        if u.path in {"/api/session/files/action", "/api/session/files/upload"}:
+            return self._file_post(u)
         if u.path in {"/api/session/star", "/api/sessions/fork-visibility",
                       "/api/audit/browser",
                       "/api/bug-report", "/api/trash/restore",
@@ -902,17 +904,18 @@ class Handler(BaseHTTPRequestHandler):
                 deleted.append({"uid": uid, "title": title, "trash": dest})
         return self._json({"ok": True, "deleted": deleted, "errors": errors})
 
-    def _download_file(self, path):
+    def _download_file(self, path, filename=None):
         if not path.is_file():
             return self._json({"error": "请选择文件下载"}, 400)
-        name = re.sub(r"[^A-Za-z0-9._-]", "_", path.name)
+        filename = filename or path.name
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
         with path.open("rb") as stream:
             size = os.fstat(stream.fileno()).st_size
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(size))
             self.send_header("Content-Disposition",
-                             f"attachment; filename=\"{name}\"; filename*=UTF-8''{quote(path.name)}")
+                             f"attachment; filename=\"{name}\"; filename*=UTF-8''{quote(filename)}")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -940,6 +943,153 @@ class Handler(BaseHTTPRequestHandler):
                for ref in requested):
             return index.messages_for(view)["messages"]
         return messages
+
+    def _file_access(self, body):
+        session = index.get(body.get('uid', ''))
+        if not session:
+            raise FileNotFoundError('会话不存在')
+        view = index.session_view(session, body.get('agent', ''))
+        scope = file_manager.scope_for({**view, 'agent_id': body.get('agent', '')})
+        ref = body.get('ref', '')
+        if not isinstance(ref, str) or not ref or len(ref) > 4096:
+            raise ValueError('无效的目录引用')
+        manager = file_manager.manager()
+        # An already-open browser must be able to restore its renamed/deleted
+        # entry directory. Session validity is still checked on every request.
+        key = (scope, ref)
+        if key not in manager.grants:
+            messages = self._file_messages(view, [ref])
+            anchor = files.resolve(messages, view.get('cwd', ''), ref)
+            if not anchor.is_dir():
+                raise ValueError('文件浏览入口必须是目录')
+            manager.grant(scope, ref)
+        return manager, scope
+
+    def _file_post(self, url):
+        try:
+            origin = self.headers.get('Origin')
+            if origin and urlparse(origin).netloc != self.headers.get('Host'):
+                raise PermissionError('不允许跨站文件操作')
+            if self.headers.get('Sec-Fetch-Site') == 'cross-site':
+                raise PermissionError('不允许跨站文件操作')
+            if not TERMINAL:
+                raise PermissionError('此节点为只读模式')
+            length = int(self.headers.get('Content-Length', '-1'))
+            if self.headers.get('Transfer-Encoding') or not 0 <= length <= file_manager.UPLOAD_CHUNK:
+                raise ValueError('请求过大或长度无效')
+            if url.path.endswith('/upload'):
+                if self.headers.get('Content-Type', '').split(';')[0] != 'application/octet-stream':
+                    raise ValueError('无效的上传格式')
+                body = {key: values[0] for key, values in parse_qs(url.query).items()}
+                manager, scope = self._file_access(body)
+                data = self.rfile.read(length)
+                if len(data) != length:
+                    raise ValueError('上传中断')
+                result = manager.upload(scope, body.get('job', ''), int(body.get('offset', '-1')), data)
+            else:
+                if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
+                    raise ValueError('请求必须使用 JSON')
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError('无效的请求')
+                manager, scope = self._file_access(body)
+                if body.get('action') in {'cancel', 'retry'}:
+                    result = manager.control(scope, body.get('job', ''), body['action'], body.get('conflict'))
+                else:
+                    result = manager.start(scope, body)
+            return self._json({'job': result})
+        except (ValueError, TypeError, KeyError) as exc:
+            self.close_connection = True
+            return self._json({'error': str(exc)}, 400)
+        except FileNotFoundError as exc:
+            self.close_connection = True
+            return self._json({'error': str(exc)}, 404)
+        except OSError as exc:
+            self.close_connection = True
+            return self._json({'error': str(exc)}, 403)
+
+    def _file_stream(self, target):
+        mime = file_manager.MEDIA.get(target.suffix.lower())
+        if not mime or not target.is_file():
+            raise ValueError('此格式请使用文本预览或下载')
+        with target.open('rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            start, end, code = 0, size - 1, 200
+            request = self.headers.get('Range', '')
+            if request:
+                match = re.fullmatch(r'bytes=(\d*)-(\d*)', request)
+                if not match or not any(match.groups()):
+                    return self._send(416, b'', mime, {'Content-Range': f'bytes */{size}'})
+                left, right = match.groups()
+                start = int(left) if left else max(0, size - int(right))
+                end = min(size - 1, int(right)) if left and right else size - 1
+                if start > end or start >= size:
+                    return self._send(416, b'', mime, {'Content-Range': f'bytes */{size}'})
+                code = 206
+            self.send_response(code)
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(max(0, end - start + 1)))
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Security-Policy', "sandbox; default-src 'none'")
+            if code == 206:
+                self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            self.end_headers()
+            stream.seek(start)
+            remaining = end - start + 1
+            try:
+                while remaining > 0:
+                    data = stream.read(min(file_manager.CHUNK, remaining))
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    remaining -= len(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _files_get(self, q):
+        body = {key: values[0] for key, values in q.items()}
+        try:
+            manager, scope = self._file_access(body)
+            mode = body.get('mode', '')
+            if mode == 'jobs':
+                return self._json({'jobs': manager.jobs(scope)})
+            if mode == 'trash':
+                return self._json({'items': manager.trash_list(scope)})
+            if mode == 'artifact':
+                target, name = manager.artifact(scope, body.get('job', ''))
+                return self._download_file(target, name)
+            if body.get('path'):
+                target = file_manager.path_for(body['path'])
+            else:
+                session = index.get(body['uid'])
+                view = index.session_view(session, body.get('agent', ''))
+                target = files.resolve(self._file_messages(view, [body['ref']]), view.get('cwd', ''), body['ref'])
+            if body.get('download') == '1':
+                return self._download_file(target)
+            if mode == 'info':
+                return self._json(file_manager.describe(target))
+            if mode == 'preview':
+                return self._file_stream(target)
+            if mode == 'thumbnail':
+                info = target.stat()
+                data = file_manager.thumbnail(str(target), info.st_mtime_ns, info.st_size)
+                return self._send(200, data, 'image/jpeg', {'Cache-Control': 'no-store',
+                                  'X-Content-Type-Options': 'nosniff'})
+            listing = files.list_directory(target.resolve(), int(body.get('offset', '0')),
+                                           sort=body.get('sort', 'name'), order=body.get('order', 'asc'),
+                                           hidden=body.get('hidden', '1') != '0')
+            return self._json({**listing, 'hostname': HOSTNAME, 'writable': TERMINAL,
+                               'node_id': NODE_ID or federation.identity()})
+        except KeyError:
+            return self._json({'error': '子会话不存在'}, 404)
+        except FileNotFoundError as exc:
+            return self._json({'error': str(exc)}, 404)
+        except (ValueError, RuntimeError) as exc:
+            return self._json({'error': str(exc)}, 400)
+        except OSError:
+            return self._json({'error': '无法访问此路径，请检查权限或刷新目录'}, 403)
 
     def _resolve_files(self, body):
         requested = body.get("refs") if isinstance(body, dict) else None
@@ -1079,7 +1229,10 @@ class Handler(BaseHTTPRequestHandler):
                                "version": result["version"],
                                "anchor": result.get("anchor", "")})
 
-        if path in {"/api/session/file", "/api/session/files"}:
+        if path == '/api/session/files':
+            return self._files_get(q)
+
+        if path == "/api/session/file":
             session = index.get(q.get("uid", [""])[0])
             if not session:
                 return self._json({"error": "会话不存在"}, 404)
@@ -1088,13 +1241,6 @@ class Handler(BaseHTTPRequestHandler):
                 ref = q.get("ref", [""])[0]
                 messages = self._file_messages(view, [ref])
                 target = files.resolve(messages, view.get("cwd", ""), ref)
-                if path == "/api/session/files":
-                    target = files.browse_target(target, q.get("path", [""])[0])
-                    if q.get("download", [""])[0] == "1":
-                        return self._download_file(target)
-                    listing = files.list_directory(target, int(q.get("offset", ["0"])[0]))
-                    return self._json({**listing, "hostname": HOSTNAME,
-                                       "node_id": NODE_ID or federation.identity()})
                 if q.get("download", [""])[0] == "1":
                     return self._download_file(target)
                 data, mime, headers = files.read(target)

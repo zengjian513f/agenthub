@@ -14,13 +14,18 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from playwright.sync_api import sync_playwright
-from agenthub import hub, server
+from agenthub import hub, server, file_manager
 from hub_fixture import NodeHandler, PNG, start_node, stop
 from hub_e2e import MountedHub
 
 
 class FileNode(NodeHandler):
     def do_POST(self):
+        if urlparse(self.path).path in {'/api/session/files/action', '/api/session/files/upload'}:
+            if (self.headers.get('X-AgentHub-Protocol')
+                    and self.headers.get('X-AgentHub-Node-Token') != self.state['token']):
+                return self._json({'error': 'forbidden'}, 403)
+            return self._file_post(urlparse(self.path))
         if urlparse(self.path).path == '/api/session/resolve-files':
             if (self.headers.get('X-AgentHub-Protocol')
                     and self.headers.get('X-AgentHub-Node-Token') != self.state['token']):
@@ -99,7 +104,8 @@ def main():
         server.ALLOWED_IPS.add('127.0.0.1')
         threading.Thread(target=central.serve_forever, daemon=True).start()
         try:
-            with patch.object(server.index, 'get', side_effect=lambda uid:
+            with patch.object(file_manager, '_manager', file_manager.Manager(root / 'manager-state')), \
+                    patch.object(server.index, 'get', side_effect=lambda uid:
                               node.state['row'] if uid == node.state['row']['uid'] else None), \
                     patch.object(server.index, 'messages_for', side_effect=lambda view, **kwargs:
                                  {'messages': node.state['messages']}), sync_playwright() as pw:
@@ -172,26 +178,27 @@ def main():
                     browser_page.on('pageerror', lambda error: errors.append(str(error)))
                     browser_page.get_by_role('link', name='curve.png', exact=True).wait_for()
                     assert urlparse(browser_page.url).path == ('/agenthub' if scoped else '') + '/files.html'
-                    browser_page.get_by_role('link', name='中文 子目录', exact=True).click()
+                    browser_page.get_by_role('link', name='中文 子目录', exact=True).dblclick()
                     browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
                     assert browser_page.locator('#entries img').count() == 0
                     assert browser_page.get_by_role('link', name=hostile.name, exact=True).is_visible()
                     assert browser_page.get_by_role('link', name='.hidden', exact=True).is_visible()
+                    browser_page.get_by_role('link', name=special.name, exact=True).click()
                     with browser_page.expect_download() as downloaded:
-                        browser_page.get_by_role('link', name=special.name, exact=True).click()
+                        browser_page.locator('.commandbar [data-action="download"]').click()
                     download = downloaded.value
                     assert download.suggested_filename == special.name
                     download.save_as(root / 'browser-download.txt')
                     assert (root / 'browser-download.txt').read_bytes() == special.read_bytes()
                     browser_page.reload()
-                    browser_page.get_by_role('link', name='empty', exact=True).click()
+                    browser_page.get_by_role('link', name='empty', exact=True).dblclick()
                     browser_page.get_by_text('此目录为空', exact=True).wait_for()
                     browser_page.go_back()
                     browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
                     browser_page.go_forward()
                     browser_page.get_by_text('此目录为空', exact=True).wait_for()
                     browser_page.locator('#breadcrumbs a').filter(has_text='output').click()
-                    browser_page.get_by_role('link', name='many', exact=True).click()
+                    browser_page.get_by_role('link', name='many', exact=True).dblclick()
                     browser_page.get_by_text('共 502 项，包含隐藏文件', exact=True).wait_for()
                     assert browser_page.locator('#entries tr').count() == 500
                     browser_page.get_by_role('link', name='下一页', exact=True).click()
@@ -199,13 +206,13 @@ def main():
                     assert browser_page.locator('#entries tr').count() == 2
                     browser_page.get_by_role('link', name='上一页', exact=True).click()
                     browser_page.get_by_text('1–500 / 502', exact=True).wait_for()
-                    browser_page.get_by_role('link', name='↑ 上级目录', exact=True).click()
+                    browser_page.get_by_role('link', name='上级目录', exact=True).click()
                     browser_page.get_by_role('link', name='curve.png', exact=True).wait_for()
-                    browser_page.get_by_role('link', name='↑ 上级目录', exact=True).click()
+                    browser_page.get_by_role('link', name='上级目录', exact=True).click()
                     browser_page.get_by_role('link', name='source.py', exact=True).wait_for()
                     browser_page.set_viewport_size({'width': 360, 'height': 640})
-                    browser_page.get_by_role('link', name='output', exact=True).click()
-                    browser_page.get_by_role('link', name='中文 子目录', exact=True).click()
+                    browser_page.get_by_role('link', name='output', exact=True).dblclick()
+                    browser_page.get_by_role('link', name='中文 子目录', exact=True).dblclick()
                     browser_page.get_by_role('link', name=special.name, exact=True).wait_for()
                     assert browser_page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                     # Errors are rendered inside the browser, with refresh/back recovery.

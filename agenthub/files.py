@@ -183,22 +183,36 @@ def browse_target(anchor: Path, raw: str) -> Path:
     return target
 
 
-def list_directory(path: Path, offset: int = 0, limit: int = 500) -> dict:
+def list_directory(path: Path, offset: int = 0, limit: int = 500, *, sort='name', order='asc', hidden=True) -> dict:
     if offset < 0 or not 1 <= limit <= 500:
         raise ValueError("无效的分页参数")
     if not path.is_dir():
         raise ValueError("请选择目录浏览")
+    if sort not in {'name', 'size', 'modified', 'type'} or order not in {'asc', 'desc'}:
+        raise ValueError('无效的排序方式')
     entries = []
     with os.scandir(path) as scan:
         for item in scan:
+            if not hidden and item.name.startswith('.'):
+                continue
             try:
                 kind = "directory" if item.is_dir() else "file" if item.is_file() else "unavailable"
             except OSError:
                 kind = "unavailable"
-            entries.append((kind, item.name))
-    entries.sort(key=lambda row: (row[0] != "directory", row[1].casefold(), row[1]))
+            value = item.name.casefold()
+            if sort == 'type':
+                value = Path(item.name).suffix.casefold()
+            elif sort in {'size', 'modified'}:
+                try:
+                    info = item.stat()
+                    value = info.st_size if sort == 'size' else info.st_mtime
+                except OSError:
+                    value = -1
+            entries.append((kind, item.name, value, item.is_symlink()))
+    entries.sort(key=lambda row: (row[2], row[1]), reverse=order == 'desc')
+    entries.sort(key=lambda row: row[0] != 'directory')
     page = []
-    for kind, name in entries[offset:offset + limit]:
+    for kind, name, _value, symlink in entries[offset:offset + limit]:
         item = path / name
         size = modified = None
         try:
@@ -209,7 +223,8 @@ def list_directory(path: Path, offset: int = 0, limit: int = 500) -> dict:
         except OSError:
             kind = "unavailable"
         page.append({"name": name, "path": str(item), "kind": kind,
-                     "size": size, "modified": modified})
+                     "size": size, "modified": modified, 'symlink': symlink,
+                     'type': item.suffix.lower().lstrip('.') or ('文件夹' if kind == 'directory' else '文件')})
     end = offset + len(page)
     return {"path": str(path), "parent": str(path.parent) if path.parent != path else None,
             "entries": page, "total": len(entries), "offset": offset,

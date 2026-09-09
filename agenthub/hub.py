@@ -214,7 +214,7 @@ class HubHandler(server.Handler):
             if (self.command == "GET" and not explicit and path in
                     {"/api/sessions", "/api/search", "/api/live", "/api/term/list", "/api/trash"}):
                 return self.aggregate(path, query)
-            attachment = path == "/api/session/attachment"
+            attachment = path in {"/api/session/attachment", "/api/session/files/upload"}
             body = self.read_body() if self.command == "POST" and not attachment else None
             if path == "/api/sessions/delete" and not explicit:
                 return self.bulk_delete(body)
@@ -445,7 +445,7 @@ class HubHandler(server.Handler):
 
     def proxy(self, node, path, query, body, attachment=False):
         headers = self.registry.headers(node)
-        for key in ("Content-Type", "X-AgentHub-Page", "X-AgentHub-Trace", "X-AgentHub-Build"):
+        for key in ("Content-Type", "X-AgentHub-Page", "X-AgentHub-Trace", "X-AgentHub-Build", "Range"):
             if self.headers.get(key):
                 headers[key] = self.headers[key]
         headers["X-Real-IP"] = self._display_ip()
@@ -552,7 +552,7 @@ class HubHandler(server.Handler):
             self.send_response(response.status)
             self.send_header("Content-Type", ctype)
             for key in ("Content-Length", "Content-Disposition", "X-Content-Type-Options", "Cache-Control",
-                        "Content-Security-Policy"):
+                        "Content-Security-Policy", "Content-Range", "Accept-Ranges"):
                 if response.getheader(key):
                     self.send_header(key, response.getheader(key))
             self.send_header("Connection", "close")
