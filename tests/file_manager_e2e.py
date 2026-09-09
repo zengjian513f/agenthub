@@ -85,6 +85,10 @@ def main():
                         assert page.locator('#entries .selected').count() == 2
                         item('alpha.txt').click(button='right')
                         assert page.locator('#entries .selected').count() == 2
+                        # Unavailable actions are omitted from the menu instead of greyed out.
+                        assert page.locator('#context-menu button:disabled').count() == 0
+                        assert page.locator('#context-menu').get_by_role('menuitem').all_text_contents() == [
+                            '下载', '剪切', '复制', '永久删除', '压缩为 ZIP']
                         page.locator('#context-menu').press('Escape')
                         item('beta.txt').click(modifiers=['Control'])
                         assert page.locator('#entries .selected').count() == 1

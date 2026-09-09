@@ -81,7 +81,7 @@
     }
     const items = chosen(), total = items.reduce((sum, item) => sum + (item.size || 0), 0);
     $('selection-status').textContent = selected.size ? `已选 ${selected.size} 项${items.every(i => i.kind === 'file') ? ' · ' + sizeText(total) : ''}` : `${data?.total || 0} 个项目`;
-    for (const button of document.querySelectorAll('[data-action]')) button.disabled = !actionEnabled(button.dataset.action);
+    for (const button of document.querySelectorAll('.commandbar [data-action]')) button.disabled = !actionEnabled(button.dataset.action);
   }
   function selectEntry(index, event = {}) {
     const entry = data.entries[index];
@@ -396,14 +396,16 @@
     if (!row) { selected.clear(); selectionChanged(); }
     const menu = $('context-menu'); menu.replaceChildren();
     const actions = row ? [['open','打开'],['download','下载'],['cut','剪切'],['copy','复制'],['paste','粘贴'],['rename','重命名'],['delete','永久删除'],['compress','压缩为 ZIP'],['extract','解压 ZIP'],['info','属性']] : [['new','新建'],['upload','上传'],['paste','粘贴']];
-    for (const [action,label] of actions) { const button = element('button',label); button.dataset.action = action; button.disabled = !actionEnabled(action); button.setAttribute('role','menuitem'); menu.append(button); }
-    menu.hidden = false; menu.style.left = Math.min(event.clientX,innerWidth-menu.offsetWidth-8)+'px'; menu.style.top = Math.max(8,Math.min(event.clientY,innerHeight-menu.offsetHeight-8))+'px'; menu.querySelector('button:not(:disabled)')?.focus();
+    // 不可用的操作直接不出现在菜单里，不显示灰色项。
+    for (const [action,label] of actions.filter(([action]) => actionEnabled(action))) { const button = element('button',label); button.dataset.action = action; button.setAttribute('role','menuitem'); menu.append(button); }
+    if (!menu.childElementCount) { menu.hidden = true; return; }
+    menu.hidden = false; menu.style.left = Math.min(event.clientX,innerWidth-menu.offsetWidth-8)+'px'; menu.style.top = Math.max(8,Math.min(event.clientY,innerHeight-menu.offsetHeight-8))+'px'; menu.querySelector('button')?.focus();
   }
   $('workspace').addEventListener('contextmenu',showMenu);
   document.addEventListener('pointerdown',event => { if (!$('context-menu').contains(event.target)) $('context-menu').hidden = true; });
   $('context-menu').onkeydown = event => {
     if (event.key === 'Escape') { $('context-menu').hidden = true; $('workspace').focus(); }
-    const buttons = [...$('context-menu').querySelectorAll('button:not(:disabled)')], index = buttons.indexOf(document.activeElement);
+    const buttons = [...$('context-menu').querySelectorAll('button')], index = buttons.indexOf(document.activeElement);
     if (['ArrowDown','ArrowUp'].includes(event.key)) { event.preventDefault(); buttons[(index+(event.key === 'ArrowDown' ? 1 : buttons.length-1))%buttons.length]?.focus(); }
   };
   $('workspace').addEventListener('pointerdown',event => {

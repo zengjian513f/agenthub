@@ -231,7 +231,7 @@ def main():
                     browser_page.close()
                     menu_for(directory)
                     assert page.locator('#file-menu-target').inner_text() == str(output)
-                    assert page.locator('#file-menu [data-action="download"]').is_disabled()
+                    assert page.locator('#file-menu [data-action="download"]').is_hidden()
                     page.keyboard.press('Escape')
                     assert any(path == '/api/session/file' and q['uid'] == [node.state['row']['uid']]
                                for path, q in node.state['gets'])
@@ -361,7 +361,7 @@ def main():
                     menu.get_by_role('menuitem', name='复制所在目录路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(output)
                     menu_for(directory)
-                    assert menu.get_by_role('menuitem').all_text_contents() == ['复制完整路径', '下载']
+                    assert menu.get_by_role('menuitem').all_text_contents() == ['复制完整路径']
                     menu.get_by_role('menuitem', name='复制完整路径', exact=True).click()
                     assert page.evaluate('navigator.clipboard.readText()') == str(output)
                     menu_for(text_link)

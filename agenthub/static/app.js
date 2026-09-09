@@ -4570,20 +4570,17 @@ document.addEventListener('contextmenu', async event => {
     }
   }
   fileMenuTargetText.textContent = fileMenuTarget.kind === 'web' ? fileMenuTarget.href : fileMenuTarget.path;
+  // 目录和类型未确认的目标不能下载，直接不显示该项，不留灰色菜单项。
   const actions = fileMenuTarget.kind === 'web'
     ? ['copy-url', 'open-web']
     : fileMenuTarget.kind === 'file' ? ['copy-path', 'copy-directory', 'download']
-    : ['copy-path', 'download'];
+    : ['copy-path'];
   fileMenu.setAttribute('aria-label', fileMenuTarget.kind === 'web' ? '链接操作' : '文件操作');
   for (const button of fileMenu.querySelectorAll('button')) {
     button.hidden = !actions.includes(button.dataset.action);
   }
-  const download = fileMenu.querySelector('[data-action="download"]');
-  download.disabled = fileMenuTarget.kind !== 'file';
-  download.title = fileMenuTarget.kind === 'directory' ? '目录不作为文件下载' :
-    fileMenuTarget.kind !== 'file' ? '文件类型尚未确认，请刷新后重试' : '';
   place();
-  fileMenu.querySelector('button:not([hidden]):not(:disabled)').focus({preventScroll: true});
+  fileMenu.querySelector('button:not([hidden])').focus({preventScroll: true});
 });
 document.addEventListener('pointerdown', event => {
   if (!fileMenu.contains(event.target)) closeFileMenu();
@@ -4593,7 +4590,7 @@ document.addEventListener('scroll', event => {
   if (!fileMenu.contains(event.target)) closeFileMenu();
 }, true);
 fileMenu.addEventListener('keydown', event => {
-  const buttons = [...fileMenu.querySelectorAll('button:not(:disabled):not([hidden])')];
+  const buttons = [...fileMenu.querySelectorAll('button:not([hidden])')];
   const index = buttons.indexOf(document.activeElement);
   if (event.key === 'Escape') { event.preventDefault(); closeFileMenu(); }
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
