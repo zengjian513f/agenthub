@@ -72,3 +72,5 @@
 单元测试：`python3 -m unittest discover -s tests -p 'test_file*.py'`。
 免费浏览器测试：`python3 tests/file_manager_e2e.py`、`python3 tests/file_links_e2e.py`。
 这些测试使用隔离会话与临时文件，覆盖节点和挂载路径下的 Hub，不启动任何付费 CLI。
+PDF 原生浏览器查看器回归测试：`python3 tests/file_pdf_e2e.py`，需要完整 Chromium
+（`python3 -m playwright install chromium`）或已安装的 Chrome，不能仅安装 headless shell。

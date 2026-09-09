@@ -1014,6 +1014,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError('此格式请使用文本预览或下载')
         with target.open('rb') as stream:
             size = os.fstat(stream.fileno()).st_size
+            if mime == 'application/pdf':
+                if b'%PDF-' not in stream.read(1024):
+                    raise ValueError('文件没有有效的 PDF 标识，请下载后检查')
+                stream.seek(0)
             start, end, code = 0, size - 1, 200
             request = self.headers.get('Range', '')
             if request:
@@ -1030,9 +1034,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(max(0, end - start + 1)))
             self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Disposition', f"inline; filename*=UTF-8''{quote(target.name)}")
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('Content-Security-Policy', "sandbox; default-src 'none'")
+            # Chromium's native PDF viewer is an isolated browser extension;
+            # sandboxing its plugin frame prevents the PDF from rendering.
+            self.send_header('Content-Security-Policy', "frame-ancestors 'self'" if mime == 'application/pdf'
+                             else "sandbox; default-src 'none'")
             if code == 206:
                 self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
             self.end_headers()

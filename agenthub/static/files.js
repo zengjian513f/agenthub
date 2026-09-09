@@ -271,7 +271,9 @@
         const media = element(tag); media.src = apiURL({mode:'preview',path:entry.path});
         if (tag === 'img') media.alt = entry.name;
         if (tag === 'video' || tag === 'audio') { media.controls = true; media.preload = 'metadata'; }
-        if (tag === 'iframe') { media.title = entry.name; media.setAttribute('sandbox',''); }
+        // Only the server's validated application/pdf response uses a frame.
+        // The native PDF viewer cannot render in a sandboxed plugin frame.
+        if (tag === 'iframe') media.title = entry.name;
         media.onerror = () => { box.append(element('p','浏览器无法预览此格式，可以下载后打开。','error')); };
         box.append(media);
       }
