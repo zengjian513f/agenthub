@@ -374,7 +374,7 @@
   }
   async function startUploads(files,destination) {
     if (!files.length) return;
-    const answer = await ask('上传文件',`${files.length} 个文件 → ${destination}`,[conflictField()]); if (!answer) return;
+    const answer = await ask('上传',`${files.length} 个文件 → ${destination}`,[conflictField()]); if (!answer) return;
     try {
       for (const file of files) {
         const job = await submit({action:'upload',destination,name:file.name,size:file.size,modified:file.lastModified,...answer});
@@ -401,7 +401,7 @@
     if (row && !selected.has(row.dataset.path)) selectEntry(Number(row.dataset.index));
     if (!row) { selected.clear(); selectionChanged(); }
     const menu = $('context-menu'); menu.replaceChildren();
-    const actions = row ? [['open','打开'],['download','下载'],['cut','剪切'],['copy','复制'],['paste','粘贴'],['rename','重命名'],['delete','永久删除'],['compress','压缩为 ZIP'],['extract','解压 ZIP'],['info','属性']] : [['new','新建'],['upload','上传文件'],['paste','粘贴']];
+    const actions = row ? [['open','打开'],['download','下载'],['cut','剪切'],['copy','复制'],['paste','粘贴'],['rename','重命名'],['delete','永久删除'],['compress','压缩为 ZIP'],['extract','解压 ZIP'],['info','属性']] : [['new','新建'],['upload','上传'],['paste','粘贴']];
     for (const [action,label] of actions) { const button = element('button',label); button.dataset.action = action; button.disabled = !actionEnabled(action); button.setAttribute('role','menuitem'); menu.append(button); }
     menu.hidden = false; menu.style.left = Math.min(event.clientX,innerWidth-menu.offsetWidth-8)+'px'; menu.style.top = Math.max(8,Math.min(event.clientY,innerHeight-menu.offsetHeight-8))+'px'; menu.querySelector('button:not(:disabled)')?.focus();
   }

@@ -71,7 +71,7 @@ def main():
                     assert page.locator('#parent').get_attribute('aria-label') == '上级目录'
                     assert page.locator('.commandbar [data-action="new"]').inner_text() == '新建'
                     assert page.locator('.commandbar [data-action="new"] *, .commandbar [data-action="upload"] *').count() == 0
-                    assert page.locator('.commandbar [data-action="upload"]').inner_text() == '上传文件'
+                    assert page.locator('.commandbar [data-action="upload"]').inner_text() == '上传'
                     item('alpha.txt').click()
                     assert page.locator('#entries .selected').count() == 1
                     item('beta.txt').click(modifiers=['Control'])
