@@ -187,12 +187,13 @@ def main():
                 slow.close()
                 nodes[0].state['term_delay'] = 0
                 # Offline machine doesn't hide healthy results; local UI stays independent.
-                nodes[2].state['offline'] = True
                 for button in page.locator('#node-chips button[aria-pressed="false"]').all():
                     button.click()
+                nodes[2].state['offline'] = True
                 page.evaluate('() => loadSessions()')
                 page.wait_for_function('S.sessions.some(s => s.node_name === "Vega" && s.stale)')
-                assert 'Vega' in page.locator('#node-notice').inner_text()
+                assert not page.locator('#node-notice').is_visible()
+                assert page.locator('#node-chips button.node-offline').is_visible()
                 page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
                 page.wait_for_function('S.results?.length === 2')
                 # Mobile: same machine controls, no horizontal document overflow.

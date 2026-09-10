@@ -29,6 +29,7 @@ def main():
                     context = browser.new_context(viewport={'width': 1280, 'height': 900}, color_scheme=scheme)
                     page = context.new_page(); errors = []
                     page.on('pageerror', lambda e: errors.append(str(e)))
+                    page.on('dialog', lambda dialog: dialog.accept())
                     page.goto(f'http://127.0.0.1:{central.server_port}/agenthub/')
                     page.wait_for_function('S.sessions.length === 2 && Nodes.list.every(n => n.online)')
                     button = page.locator('#node-chips button[data-node="' + 'a' * 32 + '"]')
@@ -40,39 +41,64 @@ def main():
                     assert 'node-offline' in button.get_attribute('class')
                     assert button.evaluate('(e) => getComputedStyle(e).filter') == 'grayscale(1)'
                     page.wait_for_function("(color) => getComputedStyle(document.querySelector('#node-chips button')).color !== color", arg=healthy_color)
-                    button.hover()
-                    toast = page.locator('#node-toast')
-                    assert toast.is_visible()
-                    assert 'Orion 离线' in toast.inner_text() and 'HTTP 503' in toast.inner_text()
+                    appearance = '''e => {
+                      const s = getComputedStyle(e);
+                      return {color: s.color, count: getComputedStyle(e.querySelector('b')).color,
+                        background: s.backgroundColor, shadow: s.boxShadow, cursor: s.cursor};
+                    }'''
+                    for selected in [False, True]:
+                        page.mouse.move(0, 300)
+                        page.evaluate('''selected => {
+                          selected ? Nodes.off.delete('a'.repeat(32)) : Nodes.off.add('a'.repeat(32));
+                          renderNodes();
+                        }''', selected)
+                        page.wait_for_timeout(200)  # Let the selection color transition finish.
+                        before = button.evaluate(appearance)
+                        if scheme == 'light':
+                            assert before['color'] == before['count'] == 'rgb(176, 176, 176)', before
+                        assert before['cursor'] == 'not-allowed'
+                        button.hover()
+                        page.wait_for_timeout(200)
+                        assert button.evaluate(appearance) == before, 'offline hover must not change appearance'
+                        assert not button.get_attribute('title')
+                        assert not page.locator('#node-toast').count()
+                        assert not page.locator('#node-notice').is_visible()
+                        selection = page.evaluate('selectedNodeIds()')
+                        for activate in [button.click, button.dblclick, lambda: button.press('Enter')]:
+                            with page.expect_event('dialog') as popup:
+                                activate()
+                            assert 'Orion 离线' in popup.value.message and 'HTTP 503' in popup.value.message
+                            assert page.evaluate('selectedNodeIds()') == selection
+                            assert button.get_attribute('aria-pressed') == str(selected).lower()
+                        button.dispatch_event('dblclick')
+                        assert page.evaluate('selectedNodeIds()') == selection
                     button.focus()
                     page.evaluate('window.offlineButton = document.activeElement')
                     page.evaluate('loadSessions()')
                     assert page.evaluate('document.activeElement === window.offlineButton')
-                    assert toast.is_visible()
-                    button.click()
-                    assert button.get_attribute('aria-pressed') == 'false'
-                    assert toast.is_visible() and 'HTTP 503' in toast.inner_text()
-                    page.mouse.move(0, 300)
-                    page.locator('#q').focus()
-                    assert toast.is_visible(), 'click diagnostics must remain visible after focus moves'
-                    button.dblclick()
-                    assert page.evaluate('selectedNodeIds()') == ['a' * 32]
-                    assert toast.is_visible()
-                    assert page.locator('#side .item').count() == 1, 'cached offline sessions remain selectable'
                     page.set_viewport_size({'width': 390, 'height': 844})
-                    assert button.is_visible() and toast.is_visible()
+                    assert button.is_visible()
+                    selection = page.evaluate('selectedNodeIds()')
+                    with page.expect_event('dialog') as popup:
+                        button.click()
+                    assert 'HTTP 503' in popup.value.message
+                    assert page.evaluate('selectedNodeIds()') == selection
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                     page.screenshot(path=f'/tmp/agenthub-node-offline-{scheme}.png')
                     nodes[0].state['offline'] = False
                     page.evaluate('loadSessions()')
                     page.wait_for_function('Nodes.list.find(n => n.name === "Orion").online === true')
                     assert 'node-offline' not in button.get_attribute('class')
-                    assert not toast.is_visible()
+                    page.mouse.move(0, 300)
                     page.wait_for_function("(color) => getComputedStyle(document.querySelector('#node-chips button')).color === color", arg=healthy_color)
+                    button.click()
+                    assert button.get_attribute('aria-pressed') == 'false', 'online filters must work again after recovery'
+                    button.dblclick()
+                    assert page.evaluate('selectedNodeIds()') == ['a' * 32]
                     assert not errors, errors
                     context.close()
                 browser.close()
-            print('PASS: offline gray in both themes, hover/focus/click reasons, stable focus, filtering, mobile, recovery')
+            print('PASS: pale offline text in both selection states, inert hover, error dialogs without filtering, no offline banner, stable focus, mobile, recovery')
         finally:
             for srv in [central, *nodes]: stop(srv)
 

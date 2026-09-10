@@ -52,6 +52,11 @@
   click. Keep it clickable; never hide it or use the native disabled attribute
   to prevent access to the explanation.
 
+- Offline machine filters use pale text in the light theme, whether selected or
+  unselected. Hover must not change their appearance or show a toast. Clicking
+  only opens the specific error dialog; neither clicking nor double-clicking
+  may change selection. Do not show a separate offline warning banner.
+
 - Reproduce a reported UI, rendering, queue, or terminal interaction bug with
   Playwright/headless Chromium against the exact session named by the user
   before implementing a fix. Inspect the rendered DOM and relevant browser

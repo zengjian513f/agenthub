@@ -117,32 +117,12 @@ function applyNodeState(data, context = 'nodes') {
   renderNodes();
 }
 
-const NodeToast = {id: null, until: 0, timer: null};
 function nodeOfflineReason(node) {
   if (node?.online !== false) return '';
   const fallback = [...Nodes.errors.values()].flat().find(e => e.node_id === node.id)?.error;
   const path = {'/api/live': '运行状态', '/api/sessions': '会话列表', '/api/term/list': '终端列表'}[node.failed_path];
   return `${node.name} 离线：${node.error || fallback || '中央站未能连接该机器，暂未收到具体错误原因。'}`
-    + (path ? `\n失败请求：${path}。` : '')
-    + '\n仍可选择该机器查看已缓存的会话。';
-}
-function showNodeToast(node, pinned = false) {
-  const toast = document.querySelector('#node-toast');
-  const reason = nodeOfflineReason(node);
-  if (!toast || !reason) return;
-  clearTimeout(NodeToast.timer);
-  NodeToast.id = node.id;
-  NodeToast.until = pinned ? Date.now() + 8000 : 0;
-  toast.textContent = reason;
-  toast.hidden = false;
-  if (pinned) NodeToast.timer = setTimeout(() => hideNodeToast(node.id), 8000);
-}
-function hideNodeToast(id, force = false) {
-  if (NodeToast.id !== id || (!force && Date.now() < NodeToast.until)) return;
-  const toast = document.querySelector('#node-toast');
-  if (toast) toast.hidden = true;
-  clearTimeout(NodeToast.timer);
-  NodeToast.id = null;
+    + (path ? `\n失败请求：${path}。` : '');
 }
 
 function renderNodes() {
@@ -173,9 +153,9 @@ function renderNodes() {
     const count = S.sessions.filter(s => s.node_id === n.id && !sessionHidden(s)).length;
     const item = button(n.id, `${n.name} ${count}`,
       !Nodes.off.has(n.id), e => {
+        if (n.online === false) return alert(nodeOfflineReason(n));
         Nodes.off.has(n.id) ? Nodes.off.delete(n.id) : Nodes.off.add(n.id);
         change();
-        showNodeToast(n, true);
       }, n.online === false ? '' : '点击选择或取消；双击只选这台机器');
     const countLabel = document.createElement('b');
     countLabel.className = 'node-count'; countLabel.textContent = count;
@@ -184,25 +164,19 @@ function renderNodes() {
     item.dataset.nodeColor = nodeColor(n.name);
     item.classList.toggle('node-offline', n.online === false);
     item.ariaLabel = `${n.name} ${count}` + (n.online === false ? `，${nodeOfflineReason(n)}` : '');
-    item.onmouseenter = item.onfocus = () => showNodeToast(n);
-    item.onmouseleave = item.onblur = () => hideNodeToast(n.id);
     item.ondblclick = () => {
+      if (n.online === false) return;
       Nodes.off = new Set(Nodes.list.filter(x => x.id !== n.id).map(x => x.id)); change();
-      showNodeToast(n, true);
     };
   }
   for (const [id, item] of existing) if (!Nodes.list.some(n => n.id === id)) item.remove();
-  if (NodeToast.id) {
-    const reason = nodeOfflineReason(Nodes.list.find(n => n.id === NodeToast.id));
-    if (reason) document.querySelector('#node-toast').textContent = reason;
-    else hideNodeToast(NodeToast.id, true);
-  }
   host.scrollLeft = scroll;
   host.parentElement.scrollLeft = toolbarScroll;
   const notice = document.querySelector('#node-notice');
   const labels = {search: '全文搜索', sessions: '会话列表', live: '运行状态', term: '终端列表'};
   const failures = [...Nodes.errors].flatMap(([context, errors]) => {
-    const names = [...new Set(errors.filter(e => !Nodes.off.has(e.node_id)).map(e => e.name))];
+    const names = [...new Set(errors.filter(e => !Nodes.off.has(e.node_id)
+      && Nodes.list.find(n => n.id === e.node_id)?.online !== false).map(e => e.name))];
     return names.length ? [`${names.join('、')} ${labels[context] || '请求'}失败或超时`] : [];
   });
   notice.hidden = !failures.length && !!Nodes.list.length;
