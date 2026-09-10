@@ -1285,7 +1285,7 @@ def run(pw):
     process_preview.scroll_into_view_if_needed()
     p.wait_for_timeout(100)
     process_top = process_preview.bounding_box()["y"]
-    process_preview.click()
+    process_preview.locator(".fold-toggle").click()
     p.wait_for_function("document.querySelector('.turn-process-body').childElementCount > 0")
     p.wait_for_timeout(500)
     process_top_after = process_preview.bounding_box()["y"]
@@ -1316,7 +1316,7 @@ def run(pw):
           and middle_toolbar["navVisible"]
           and middle_toolbar["collapseButtons"] == 0, middle_toolbar)
     sticky_top = middle_toolbar["top"]
-    process_preview.click()
+    process_preview.locator(".fold-toggle").click()
     p.wait_for_timeout(300)
     collapsed_top = process_preview.bounding_box()["y"]
     check("在过程任意位置收起后摘要仍留在眼前",
@@ -2254,7 +2254,7 @@ def run(pw):
               and folded_hover["previewFilter"] == "none", folded_hover)
         inner = grp.locator("> .tool-entry").count()
         check("组内至少 3 条", inner >= 3, inner)
-        grp.locator("> .fold-preview").click()
+        grp.locator("> .fold-preview > .fold-toggle").click()
         p.wait_for_timeout(200)
         check("点组预览展开", grp.locator("> .tool-entry").first.is_visible())
         check("展开后预览不再占垂直空间", not grp.locator("> .fold-preview").is_visible())
@@ -2282,7 +2282,7 @@ def run(pw):
             outRadius:o.borderRadius};
         }""")
         check("同一次工具调用的命令、状态和输出共用一张外框",
-              tool_card_frame == {"tag": "BUTTON",
+              tool_card_frame == {"tag": "DIV",
                   "outerBorders": ["solid", "solid", "solid", "solid"],
                   "outerRadius": "10px", "outerBackground": single_tool_skin["preBackground"],
                   "headBorders": ["0px", "0px", "0px", "0px"],
@@ -2310,17 +2310,17 @@ def run(pw):
                                    "headRadius": "0px",
                                    "headBorders": ["0px", "0px", "0px", "0px"]},
               standalone_frame)
-        first_entry.locator("> .tool-head").focus()
+        first_entry.locator("> .tool-head > .tool-toggle").focus()
         p.keyboard.press("Enter")
         check("工具调用头可用键盘展开参数",
               first_entry.locator("> .tool-args").is_visible()
-              and first_entry.locator("> .tool-head").get_attribute("aria-expanded") == "true")
+              and first_entry.locator("> .tool-head > .tool-toggle").get_attribute("aria-expanded") == "true")
         first_entry.locator("> .tool-args-close").click()
-        first_entry.locator("> .tool-head").click()
+        first_entry.locator("> .tool-head > .tool-toggle").click()
         args_geometry = first_entry.evaluate("""n => {
           const h = n.querySelector(':scope > .tool-head').getBoundingClientRect();
           const a = n.querySelector(':scope > .tool-args').getBoundingClientRect();
-          return {gap:a.top - h.bottom, expanded:n.querySelector(':scope > .tool-head').ariaExpanded};
+          return {gap:a.top - h.bottom, expanded:n.querySelector(':scope > .tool-head > .tool-toggle').ariaExpanded};
         }""")
         check("原始参数与命令头无缝连成一张卡片",
               first_entry.locator("> .tool-args").is_visible()
@@ -2332,7 +2332,7 @@ def run(pw):
         first_entry.locator("> .tool-args-close").click()
         check("收起参数键关闭展开区",
               not first_entry.locator("> .tool-args").is_visible()
-              and first_entry.locator("> .tool-head").get_attribute("aria-expanded") == "false")
+              and first_entry.locator("> .tool-head > .tool-toggle").get_attribute("aria-expanded") == "false")
         failed_entry = grp.locator("> .tool-entry").filter(has_text="$ echo hi2")
         check("Claude 文本退出码进入工具状态行",
               "exit 2" in failed_entry.locator(".tool-status").inner_text()
@@ -2608,7 +2608,7 @@ def run(pw):
         viewport(1400, 860)
         check("放大窗口后仍停在最新", at_bottom())
         p.evaluate("""() => { const n = [...document.querySelectorAll('#msgs .msg.folded')].pop();
-                              if (n) n.querySelector('.fold-preview').click(); }""")
+                              if (n) n.querySelector('.fold-preview > .fold-toggle').click(); }""")
         p.wait_for_timeout(600)
         check("展开消息后仍停在最新", at_bottom())
         p.mouse.move(700, 400)

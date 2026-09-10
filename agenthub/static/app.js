@@ -3521,14 +3521,15 @@ function flushPendingTurnSeal(box) {
 
 // 折叠工具组只显示语义提纲，不显示角色/时间 header。
 function addFoldPreview(n, text, aria) {
-  const preview = el('button', 'fold-preview');
-  preview.type = 'button';
-  preview.title = '展开';
-  preview.setAttribute('aria-label', `展开${aria}`);
-  preview.setAttribute('aria-expanded', 'false');
+  const preview = el('div', 'fold-preview');
+  const toggle = el('button', 'fold-toggle');
+  toggle.type = 'button';
+  toggle.title = `展开${aria}`;
+  toggle.setAttribute('aria-label', toggle.title);
+  toggle.setAttribute('aria-expanded', 'false');
   const peek = el('span', 'peek');
   peek.textContent = text;
-  preview.appendChild(peek);
+  preview.append(toggle, peek);
   n.appendChild(preview);
   return preview;
 }
@@ -3660,14 +3661,14 @@ function toolEntry(m) {
     if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
     return entry;
   }
-  // 调用头: 一行语义摘要(如 `$ git status`), 点击展开原始参数
-  const head = el('button', 'tool-head');
-  head.type = 'button';
-  head.title = '展开原始参数';
-  head.setAttribute('aria-expanded', 'false');
+  // 摘要是可选文本；只有独立按钮切换参数，拖选/双击不触发折叠。
+  const head = el('div', 'tool-head');
   head.innerHTML = `<code>${esc(m.summary || m.name || 'tool')}</code>`
     + (m.name && m.summary ? `<span class="tool-meta">${esc(m.name)}</span>` : '');
   const headCode = head.querySelector(':scope > code');
+  const toggle = el('button', 'tool-toggle');
+  toggle.type = 'button';
+  head.appendChild(toggle);
   if (/^\s*(?:\$|❯)\s+/.test(m.summary || '')) headCode.classList.add('tool-command');
   paintSyntax(head);
   entry.appendChild(head);
@@ -3683,11 +3684,11 @@ function toolEntry(m) {
     args.hidden = !open;
     closeArgs.hidden = !open;
     entry.classList.toggle('args-open', open);
-    head.setAttribute('aria-expanded', String(open));
-    head.title = open ? '收起原始参数' : '展开原始参数';
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.title = toggle.ariaLabel = open ? '收起原始参数' : '展开原始参数';
   };
   if (!args.hidden) paintArgs();
-  head.onclick = () => setArgsOpen(args.hidden);
+  toggle.onclick = () => setArgsOpen(args.hidden);
   closeArgs.onclick = () => setArgsOpen(false);
   entry.appendChild(args);
   entry.appendChild(closeArgs);
@@ -3925,6 +3926,7 @@ function turnProcessNode(turn, initiallyOpen = false) {
   n.appendChild(toolbar);
   const preview = addFoldPreview(toolbar, '', '本轮过程');
   preview.classList.add('turn-preview');
+  const toggle = preview.querySelector('.fold-toggle');
   const peek = preview.querySelector('.peek');
   peek.classList.add('turn-peek');
   const label = el('b', 'turn-label', uiIcon('process'));
@@ -3965,18 +3967,18 @@ function turnProcessNode(turn, initiallyOpen = false) {
     n.classList.add('folded');
     body.hidden = true;
     nav.hidden = true;
-    preview.setAttribute('aria-expanded', 'false');
-    preview.setAttribute('aria-label', '展开本轮过程');
-    preview.title = expandTitle;
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-label', '展开本轮过程');
+    toggle.title = expandTitle;
   };
   const open = () => {
     const built = materialize();
     n.classList.remove('folded');
     body.hidden = false;
     nav.hidden = false;
-    preview.setAttribute('aria-expanded', 'true');
-    preview.setAttribute('aria-label', '收起本轮过程');
-    preview.title = '收起过程';
+    toggle.setAttribute('aria-expanded', 'true');
+    toggle.setAttribute('aria-label', '收起本轮过程');
+    toggle.title = '收起过程';
     if (built && n.isConnected && S.term) {
       markMatches(body);
       updateMatchNav();
@@ -3988,7 +3990,7 @@ function turnProcessNode(turn, initiallyOpen = false) {
   const openAtAnchor = () => mutateKeepingMessageAnchor(toolbar, open);
   n._foldAtAnchor = foldAtAnchor;
   n._openAtAnchor = openAtAnchor;
-  preview.onclick = () => n.classList.contains('folded') ? openAtAnchor() : foldAtAnchor();
+  toggle.onclick = () => n.classList.contains('folded') ? openAtAnchor() : foldAtAnchor();
   toStart.onclick = () => jumpWithinConversation(n, 'start');
   toConclusion.onclick = () => {
     let target = n.nextElementSibling;
@@ -4014,6 +4016,7 @@ function groupNode(items, initiallyOpen = false) {
   const hasErr = items.some(m => m.result?.error || (m.role === 'tool_result' && m.error));
   const preview = addFoldPreview(n, '', '工具调用组');
   preview.classList.add('group-preview');
+  const toggle = preview.querySelector('.fold-toggle');
   const peek = preview.querySelector('.peek');
   peek.classList.add('group-peek');
   const count = el('span', 'group-count', `🔧 ×${visible.length}${hasErr ? ' ⚠' : ''}`);
@@ -4035,17 +4038,17 @@ function groupNode(items, initiallyOpen = false) {
   const setAction = addAction(n);
   const fold = () => {
     n.classList.add('folded');
-    preview.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-expanded', 'false');
     setAction();
   };
   const open = () => {
     n.classList.remove('folded');
-    preview.setAttribute('aria-expanded', 'true');
+    toggle.setAttribute('aria-expanded', 'true');
     setAction('收起', fold, true);
   };
   n._fold = fold;
   n._open = open;
-  preview.onclick = open;
+  toggle.onclick = open;
   initiallyOpen ? open() : fold();
   return n;
 }

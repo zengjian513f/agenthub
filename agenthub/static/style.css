@@ -767,7 +767,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   display: none; align-items: center; gap: 7px; width: auto; min-width: 0; max-width: 100%;
   padding: 6px 10px; border: 0; color: var(--muted); background: var(--bubble);
   font: inherit; font-size: 12px; line-height: 1.45;
-  text-align: left; cursor: pointer; user-select: none;
+  text-align: left; cursor: text; -webkit-user-select: text; user-select: text;
 }
 .msg.grp.folded > .fold-preview { display: flex; border-radius: inherit; background: transparent; }
 .msg.grp.folded:hover {
@@ -780,8 +780,17 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-family: inherit; font-size: 12px; opacity: .78;
 }
-.msg.grp.folded > .fold-preview::after {
-  content: "›"; flex: none; color: var(--muted); font-size: 15px; line-height: 1;
+.fold-toggle, .tool-toggle {
+  flex: none; align-self: flex-start; min-width: 26px; min-height: 24px;
+  margin: -2px 0; padding: 1px 5px; border: 0; border-radius: 4px;
+  background: transparent; color: var(--muted); font: inherit;
+  cursor: pointer; -webkit-user-select: none; user-select: none;
+}
+.fold-toggle::before, .tool-toggle::before { content: "›"; font-size: 16px; line-height: 1; }
+:is(.fold-toggle, .tool-toggle)[aria-expanded="true"]::before { content: "⌄"; }
+:is(.fold-toggle, .tool-toggle):hover { background: var(--hover); color: var(--text); }
+:is(.fold-toggle, .tool-toggle):focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -1px;
 }
 .msg .mb { padding: 8px 12px; }
 .msg[data-role="user"] {
@@ -857,13 +866,8 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   background: color-mix(in srgb, var(--panel-2) 96%, transparent); color: var(--muted);
   box-shadow: 0 2px 8px color-mix(in srgb, var(--text) 8%, transparent);
   font: inherit; font-size: 12px; line-height: 1.45; text-align: left;
-  cursor: pointer; user-select: none;
+  cursor: text; -webkit-user-select: text; user-select: text;
 }
-.turn-toolbar > .turn-preview::before {
-  content: "⌄"; flex: none; width: 12px; color: var(--muted);
-  font-size: 13px; line-height: 1.35; text-align: center;
-}
-.msg.turn-process.folded > .turn-toolbar > .turn-preview::before { content: "›"; }
 .turn-toolbar > .turn-preview:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   background: var(--hover); color: var(--text);
@@ -1030,8 +1034,10 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .tool-head {
   display: flex; gap: 10px; align-items: baseline; width: 100%; min-width: 0;
   overflow: hidden; white-space: normal; appearance: none; -webkit-appearance: none;
-  text-align: left; cursor: pointer; user-select: none;
+  text-align: left; cursor: text; -webkit-user-select: text; user-select: text;
 }
+.tool-head > .tool-toggle { margin-left: auto; }
+.tool-head > .tool-meta + .tool-toggle { margin-left: 0; }
 .tool-entry[data-role="tool"] > :is(.tool-head, pre) {
   border: 0; border-radius: 0; background: transparent; box-shadow: none;
 }
@@ -1040,8 +1046,6 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
 }
 .tool-head:hover { background: color-mix(in srgb, var(--bubble-tool) 96%, var(--terminal-fg)); }
-.tool-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.tool-entry[data-role="tool"] > .tool-head:focus-visible { outline-offset: -2px; }
 .tool-head > code {
   flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font: inherit;
@@ -1212,6 +1216,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .mb.clip::after {
   content: ""; position: absolute; inset: auto 0 0 0; height: 46px;
   background: linear-gradient(transparent, var(--bubble));
+  pointer-events: none;
 }
 .msg.grp.folded .more { display: none; }
 .more[hidden] { display: none; }
