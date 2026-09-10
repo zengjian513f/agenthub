@@ -11,7 +11,7 @@ function nodeOf(uid) {
 function nodeSelected(row) { return !HUB_MODE || !Nodes.off.has(row.node_id); }
 function selectedNodeIds() { return Nodes.list.filter(n => !Nodes.off.has(n.id)).map(n => n.id); }
 function nodeDirectory(row, length = 999) {
-  return (row.node_name ? row.node_name + ' · ' : '') + shortCwd(row.cwd || '(未知)', length);
+  return (row.node_name ? row.node_name + ' ' : '') + shortCwd(row.cwd || '(未知)', length);
 }
 function nodeColor(name) {
   const key = String(name || '').trim().toLowerCase();
@@ -21,7 +21,7 @@ function nodeBadge(name) {
   return `<span class="node-badge" data-node-color="${nodeColor(name)}">${esc(name)}</span>`;
 }
 function nodeDirectoryMarkup(row, length = 999) {
-  return (row.node_name ? nodeBadge(row.node_name) + ' · ' : '') + esc(shortCwd(row.cwd || '(未知)', length));
+  return (row.node_name ? nodeBadge(row.node_name) + ' ' : '') + esc(shortCwd(row.cwd || '(未知)', length));
 }
 function newNodeId() { return HUB_MODE ? document.querySelector('#new-node')?.value || '' : ''; }
 function newDirsKey() { return HUB_MODE ? 'newDirs.' + newNodeId() : 'newDirs'; }
