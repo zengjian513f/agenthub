@@ -1,4 +1,5 @@
 import json
+import errno
 import tempfile
 import threading
 import unittest
@@ -126,6 +127,32 @@ class HubHTTPTests(unittest.TestCase):
             self.assertEqual([r['node_name'] for r in search['results']], ['NodeA'])
         finally:
             self.b.state['offline'] = False
+
+    def test_node_health_exposes_safe_failure_reason_and_clears_on_recovery(self):
+        node = self.registry.get('b' * 32)
+        cases = [(TimeoutError('private upstream details'), 'timeout', '5 秒'),
+                 (ConnectionRefusedError('private upstream details'), 'connection_refused', '拒绝连接'),
+                 (OSError(errno.EHOSTUNREACH, 'private upstream details'), 'unreachable', '网络不可达'),
+                 (ValueError('private upstream details'), 'invalid_response', '无效')]
+        for error, code, message in cases:
+            with self.subTest(code=code), patch.object(self.registry, 'request', side_effect=error):
+                _, _, failure = self.registry.query(node, '/api/live', {})
+            self.assertEqual(failure['error_code'], code)
+            _, response = self.call('/api/nodes')
+            public = next(n for n in response['nodes'] if n['id'] == node['id'])
+            self.assertFalse(public['online'])
+            self.assertEqual(public['failed_path'], '/api/live')
+            self.assertIn(message, public['error'])
+            self.assertNotIn('private upstream details', json.dumps(response))
+        with patch.object(self.registry, 'request', return_value=(403, {'error': 'private upstream details'})):
+            _, _, failure = self.registry.query(node, '/api/term/list', {})
+        self.assertIn('HTTP 403', failure['error'])
+        self.assertIn('认证', failure['error'])
+        self.registry.query(node, '/api/live', {})
+        healthy = next(n for n in self.registry.public() if n['id'] == node['id'])
+        self.assertTrue(healthy['online'])
+        self.assertNotIn('error', healthy)
+        self.assertNotIn('failed_path', healthy)
 
     def search_events(self, nodes=None):
         path = '/api/search?q=needle&progress=1'

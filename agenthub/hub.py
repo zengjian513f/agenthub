@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import errno
 import hashlib
 import http.client
 import ipaddress
@@ -27,6 +28,26 @@ from . import federation as fed, server
 JSON_LIMIT = 64 * 1024 * 1024
 BODY_LIMIT = 4 * 1024 * 1024
 SEARCH_IDLE_TIMEOUT = 60
+
+
+def request_failure(error, status=None, timeout=5):
+    """Public diagnostics must not contain upstream bodies, URLs or credentials."""
+    if status is not None and status != 200:
+        detail = {401: "节点认证失败", 403: "节点拒绝访问，请检查认证或访问权限",
+                  404: "节点接口不存在", 429: "节点请求过于频繁",
+                  503: "节点服务暂不可用"}.get(status, "节点返回错误响应")
+        return "http_error", f"{detail}（HTTP {status}）"
+    if isinstance(error, TimeoutError):
+        return "timeout", f"节点连接或响应超时（等待超过 {timeout} 秒）"
+    if isinstance(error, ConnectionRefusedError):
+        return "connection_refused", "节点拒绝连接，目标端口未接受请求"
+    if isinstance(error, OSError) and error.errno in {errno.EHOSTUNREACH, errno.ENETUNREACH}:
+        return "unreachable", "节点网络不可达"
+    if isinstance(error, ConnectionError):
+        return "connection_closed", "节点连接中断，未收到完整响应"
+    if isinstance(error, (ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException)):
+        return "invalid_response", "节点返回无效或不完整的响应"
+    return "connection_failed", "无法建立节点连接"
 
 
 class Registry:
@@ -159,6 +180,7 @@ class Registry:
     def query(self, node, path, query, progress=None):
         key = (node["id"], path, urlencode(query, doseq=True))
         stamp = time.time()
+        status = None
         try:
             status, data = (self.search_request(node, query, progress) if path == "/api/search"
                             else self.request(node, path + "?" + key[2]))
@@ -173,13 +195,15 @@ class Registry:
                         self.cache.pop(next(iter(self.cache)))
                 self.health[node["id"]] = {"online": True, "last_seen": stamp}
             return node, data, None
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException) as error:
             # Errors intentionally omit URL / token / upstream exception text.
+            code, reason = request_failure(error, status, SEARCH_IDLE_TIMEOUT if path == "/api/search" else 5)
             with self.lock:
                 prior = self.health.get(node["id"], {})
                 # A failed search says nothing about the node's live/terminal APIs.
                 if path != "/api/search":
-                    self.health[node["id"]] = {**prior, "online": False}
+                    self.health[node["id"]] = {**prior, "online": False,
+                                              "error": reason, "error_code": code, "failed_path": path}
                 cached = self.cache.get(key) if path in {"/api/sessions", "/api/term/list"} else None
             data = copy.deepcopy(cached[1]) if cached else {}
             for row in data.get("sessions", []) + data.get("pending", []):
@@ -189,7 +213,7 @@ class Registry:
                 data["enabled"] = False
                 data["sources"] = {}
             return node, data, {"node_id": node["id"], "name": node["name"],
-                                "error": "连接失败或请求超时", "last_seen": prior.get("last_seen")}
+                                "error": reason, "error_code": code, "last_seen": prior.get("last_seen")}
 
     def public(self):
         with self.lock:
