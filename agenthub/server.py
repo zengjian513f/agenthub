@@ -14,6 +14,7 @@ import re
 import secrets
 import socket
 import threading
+import queue
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1369,31 +1370,56 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        def emit(obj):
-            line = json.dumps(obj, ensure_ascii=False).encode() + b"\n"
-            self.wfile.write(line)
-            self.wfile.flush()
+        events = queue.Queue(maxsize=64)
+        cancelled = threading.Event()
 
-        try:
-            result = index.search(
-                query, sources, **opts,
-                progress=lambda done, total: emit(
-                    {"type": "progress", "done": done, "total": total}),
-            )
+        def enqueue(obj):
+            while not cancelled.is_set():
+                try:
+                    events.put(obj, timeout=.2)
+                    return
+                except queue.Full:
+                    continue
+            raise ConnectionAbortedError("search cancelled")
+
+        def enrich(rows):
             topology = debug_runs.filter_rows(index.cached(), run_id)
-            result["results"] = session_meta.enrich(
-                debug_runs.filter_rows(result["results"], run_id), topology)
-            result["total_pool"] = len(topology)
-            emit({"type": "result", "data": result})
-        except re.error as e:
-            emit({"type": "error", "error": f"正则无效: {e}"})
+            return session_meta.enrich(debug_runs.filter_rows(rows, run_id), topology)
+
+        def scan():
+            try:
+                result = index.search(
+                    query, sources, **opts,
+                    progress=lambda done, total: enqueue(
+                        {"type": "progress", "done": done, "total": total}),
+                    matches=lambda rows: enqueue({"type": "matches", "results": enrich(rows)}),
+                )
+                result["results"] = enrich(result["results"])
+                result["total_pool"] = len(debug_runs.filter_rows(index.cached(), run_id))
+                enqueue({"type": "result", "data": result})
+            except re.error as e:
+                enqueue({"type": "error", "error": f"正则无效: {e}"})
+            except ConnectionAbortedError:
+                pass
+            except Exception as e:
+                if not cancelled.is_set():
+                    enqueue({"type": "error", "error": f"{type(e).__name__}: {e}"})
+
+        threading.Thread(target=scan, name="session-search", daemon=True).start()
+        try:
+            while True:
+                try:
+                    event = events.get(timeout=1)
+                except queue.Empty:
+                    event = {"type": "heartbeat"}
+                self.wfile.write(json.dumps(event, ensure_ascii=False).encode() + b"\n")
+                self.wfile.flush()
+                if event["type"] in {"result", "error"}:
+                    break
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except Exception as e:
-            try:
-                emit({"type": "error", "error": f"{type(e).__name__}: {e}"})
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+        finally:
+            cancelled.set()
 
     def _watch(self, q: dict):
         """SSE: 服务端盯着会话文件, 一有变化立刻把 diff 推过去。

@@ -124,6 +124,102 @@ class IsolatedIndexTests(unittest.TestCase):
         self.assertEqual([str(call.args[0]) for call in parse_meta.call_args_list],
                          [str(first)])
 
+    def test_search_disk_cache_survives_restart_and_tracks_content_changes(self):
+        path = self.codex_session("search-cache", "文件管理 old")
+        row = index.load(force=True)[0]
+        ad = self.fresh_adapters["codex"]
+        self.assertIn("old", index._search_text(row))
+        index._search_text_cache.clear()
+        with patch.object(ad, "read", side_effect=AssertionError("must reuse disk text")):
+            self.assertIn("old", index._search_text(row))
+        path.write_text(path.read_text().replace("old", "new"))
+        self.assertNotIn("old", index._search_text(row))
+        self.assertIn("new", index._search_text(row))
+        cached = list((self.cache_file.parent / "search-text").glob("*.gz"))
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0].stat().st_mode & 0o777, 0o600)
+        cached[0].write_bytes(b"invalid gzip")
+        index._search_text_cache.clear()
+        self.assertIn("new", index._search_text(row))
+
+    def test_search_cache_invalidates_inherited_parent_and_streams_matches(self):
+        parent = self.codex_session("search-parent", "parentneedle")
+        child = self.codex_session("search-child", "child text", parent="search-parent",
+                                   cutoff=parent.stat().st_size)
+        row = next(s for s in index.load(force=True) if s["path"] == str(child))
+        self.assertIn("parentneedle", index._search_text(row))
+        parent.write_text(parent.read_text().replace("parentneedle", "parentupdate"))
+        index._search_text_cache.clear()
+        self.assertNotIn("parentneedle", index._search_text(row))
+        self.assertIn("parentupdate", index._search_text(row))
+        batches = []
+        result = index.search("parentupdate", matches=batches.extend)
+        self.assertEqual({r["uid"] for r in batches}, {r["uid"] for r in result["results"]})
+
+    def test_search_claude_body_matches_reader_and_persisted_rewind(self):
+        path = self.claude_session("search-claude", "visible root")
+        def record(uuid, parent, role, content, **extra):
+            return {"type": role, "uuid": uuid, "parentUuid": parent,
+                    "message": {"content": content}, **extra}
+        with path.open("a") as fh:
+            for row in [
+                record("reply", "search-claude-user", "assistant", [
+                    {"type": "text", "text": "visible reply"},
+                    {"type": "thinking", "thinking": "visible thinking"},
+                    {"type": "tool_use", "name": "Bash", "id": "shell", "input": {"command": "hidden-tool"}},
+                    {"type": "tool_use", "name": "AskUserQuestion", "id": "ask", "input": {
+                        "questions": [{"question": "visible question", "options": []}]}}]),
+                record("answer", "reply", "user", [
+                    {"type": "tool_result", "tool_use_id": "shell", "content": "hidden-output"},
+                    {"type": "tool_result", "tool_use_id": "ask", "content": "visible answer"}]),
+                record("final", "answer", "assistant", "later reply"),
+            ]:
+                fh.write(json.dumps(row) + "\n")
+        row = index.load(force=True)[0]
+        ad = self.fresh_adapters["claude"]
+        full = ad.read(str(path))[0]
+        expected = "\n".join(m["text"] for m in full if m["role"] in index.SEARCH_ROLES and m.get("text"))
+        with patch.object(adapters, "_tool_file_changes", side_effect=AssertionError("no tool rendering")):
+            self.assertEqual(index._search_text(row), expected)
+        self.assertIn("visible answer", expected)
+        self.assertNotIn("hidden-output", expected)
+        # A rewind can change the logical body without changing the JSONL file.
+        rewind = {"tip": "reply", "stale_end": path.stat().st_size}
+        index._search_text_cache.clear()
+        with patch.object(index.session_meta, "timeline", return_value=rewind):
+            text = index._search_text(row)
+        self.assertNotIn("later reply", text)
+        self.assertIn("visible reply", text)
+
+    def test_search_parse_omits_tool_rendering_but_keeps_questions_and_body(self):
+        path = self.codex_session("search-content", "visible user 文件管理")
+        records = [
+            {"type": "function_call", "name": "exec_command", "call_id": "tool",
+             "arguments": '{"cmd":"private-tool-input"}'},
+            {"type": "function_call_output", "call_id": "tool", "output": "private-tool-output"},
+            {"type": "function_call", "name": "request_user_input", "call_id": "question",
+             "arguments": json.dumps({"questions": [{"header": "Pick", "id": "pick",
+                 "question": "visible-question", "options": [{"label": "A", "description": "choice"}]}]})},
+            {"type": "function_call_output", "call_id": "question",
+             "output": '{"answers":{"pick":{"answers":["visible-answer"]}}}'},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "visible-thinking"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "visible-reply"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<INSTRUCTIONS>hidden-injection</INSTRUCTIONS>"}]},
+        ]
+        with path.open("a") as fh:
+            for payload in records:
+                fh.write(json.dumps({"type": "response_item", "payload": payload}) + "\n")
+        ad = self.fresh_adapters["codex"]
+        full = ad.read(str(path))[0]
+        with patch.object(adapters, "_tool_file_changes", side_effect=AssertionError("no tool rendering")):
+            fast = ad.read(str(path), search_only=True)[0]
+        text = lambda msgs: "\n".join(m["text"] for m in msgs if m["role"] in index.SEARCH_ROLES and m.get("text"))
+        self.assertEqual(text(full), text(fast))
+        for term in ("visible-question", "visible-answer", "visible-thinking", "visible-reply"):
+            self.assertIn(term, text(fast))
+        self.assertNotIn("private-tool", text(fast))
+        self.assertNotIn("hidden-injection", text(fast))
+
     def test_claude_mtime_only_change_does_not_reorder_session(self):
         older = self.claude_session("older", "较早会话")
         newer = self.claude_session("newer", "较新会话")

@@ -970,8 +970,11 @@ _ANSI_T = re.compile(r"\x1b\[[0-9;]*m")
 HIT_CAP = 200   # 单会话命中计数上限, 超过只报 "200+"
 SEARCH_ROLES = frozenset({"user", "assistant", "user·subagent",
                           "assistant·subagent", "thinking", "question", "answer"})
-_search_text_cache = {}
+SEARCH_CACHE_VERSION = 1
+SEARCH_CACHE_MEMORY_BYTES = 64 * 1024 * 1024
+_search_text_cache = OrderedDict()
 _search_text_lock = threading.Lock()
+_search_parse_locks = [threading.Lock() for _ in range(16)]
 
 
 def invalidate() -> None:
@@ -1002,39 +1005,70 @@ def _search_text(s: dict) -> str:
     原始 JSONL 还含工具协议、系统注入、compact 摘要和 JSON 包装，直接扫文件会
     产生大量用户在对话正文里看不到的假命中。
     """
-    f = data_file(s)
-    try:
-        st = f.stat()
-        key = (str(f), st.st_size, st.st_mtime_ns,
-               session_meta.timeline_revision(s.get("uid", "")))
-    except OSError:
-        return ""
+    identity = _window_cache_identity(s)
+    # Concurrent searches share parsed text without a global scan lock.
+    with _search_parse_locks[int(identity[:8], 16) % len(_search_parse_locks)]:
+        return _cached_search_text(s, identity)
+
+
+def _cached_search_text(s: dict, identity: str) -> str:
+    ad = ADAPTERS[s["source"]]
+    key = {**_window_cache_stamp(s, ad), "search_schema": SEARCH_CACHE_VERSION}
+    path = CACHE_FILE.parent / "search-text" / f"{identity}.json.gz"
     with _search_text_lock:
         cached = _search_text_cache.get(s["uid"])
         if cached and cached[0] == key:
+            _search_text_cache.move_to_end(s["uid"])
             return cached[1]
+    text = None
     try:
-        ad = ADAPTERS[s["source"]]
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if saved.get("stamp") == key and isinstance(saved.get("text"), str):
+            text = saved["text"]
+    except (OSError, ValueError, EOFError, AttributeError):
+        pass
+    if text is None:
         if isinstance(ad, ClaudeAdapter):
             timeline = (session_meta.timeline(str(s.get("uid") or ""))
                         if not s.get("agent_id") else None)
-            msgs, _ = ad.read(s["path"], agent=s.get("agent_id"),
-                              declared_tip=_claude_effective_tip(s),
-                              abandoned_after=int(
-                                  (timeline or {}).get("stale_end") or 0))
+            msgs, _ = ad.read(s["path"], agent=s.get("agent_id"), search_only=True,
+                             declared_tip=_claude_effective_tip(s),
+                             abandoned_after=int((timeline or {}).get("stale_end") or 0))
         else:
-            msgs, _ = ad.read(s["path"])
-    except Exception:
-        return ""
-    text = "\n".join(m.get("text", "") for m in msgs
-                     if m.get("role") in SEARCH_ROLES and m.get("text"))
+            opts = {"search_only": True} if s["source"] == "codex" else {}
+            msgs, _ = ad.read(s["path"], **opts)
+        text = "\n".join(m.get("text", "") for m in msgs
+                         if m.get("role") in SEARCH_ROLES and m.get("text"))
+        # Do not persist a parse under a version that changed while reading it.
+        if key != {**_window_cache_stamp(s, ad), "search_schema": SEARCH_CACHE_VERSION}:
+            return text
+        temp = None
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd, temp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+            with os.fdopen(fd, "wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1) as fh:
+                    fh.write(json.dumps({"stamp": key, "text": text},
+                                        ensure_ascii=False).encode())
+            os.replace(temp, path)
+        except OSError:
+            pass  # Read-only/full cache storage must not prevent searching.
+        finally:
+            if temp and os.path.exists(temp):
+                os.unlink(temp)
     with _search_text_lock:
         _search_text_cache[s["uid"]] = (key, text)
+        _search_text_cache.move_to_end(s["uid"])
+        size = sum(len(value[1]) * 4 for value in _search_text_cache.values())
+        while size > SEARCH_CACHE_MEMORY_BYTES and _search_text_cache:
+            _, (_, removed) = _search_text_cache.popitem(last=False)
+            size -= len(removed) * 4
     return text
 
 
 def search(query: str, sources=None, limit: int = 60,
-           word=False, case=False, regex=False, progress=None) -> dict:
+           word=False, case=False, regex=False, progress=None, matches=None) -> dict:
     """按解析后的用户/助手/思考正文匹配，返回带命中片段的会话列表。"""
     if not query.strip():
         return {"results": [], "truncated": False, "total_pool": 0}
@@ -1060,6 +1094,8 @@ def search(query: str, sources=None, limit: int = 60,
                 break
         if count:
             hits.append({**s, "hits": count, "hits_capped": capped, "snippet": snippet})
+            if matches:
+                matches([hits[-1]])
         if progress:
             progress(done, len(pool))
     hits.sort(key=lambda x: x["updated"], reverse=True)

@@ -977,9 +977,7 @@ function showNewSessionStage(info) {
   // create 返回后 term/list 可能还没拉完；先把服务端刚确认的新 tmux 放进本地
   // pending，详情页的终端切换、输入框和附件可以立即使用。
   if (!T.pending.some(x => x.name === info.name)) T.pending.push({ ...info, started: Date.now() / 1000 });
-  S.results = null;
-  S.term = '';
-  $('#q').value = '';
+  cancelSearch(true);
   S.sel = pendingUid(info.name);
   S.agent = null;
   store.set('sel', S.sel);

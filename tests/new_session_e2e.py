@@ -59,6 +59,13 @@ def main():
                         assert page.evaluate('!!_es')
                         if mobile:
                             page.evaluate('showMobileList()')
+                        node.state.update(search_steps=20, search_delay=.1)
+                        page.locator('#q').fill('文件管理')
+                        page.locator('#q').press('Enter')
+                        page.wait_for_selector('#search-progress.on')
+                        page.evaluate('window.oldSearch = searchAbort')
+                        assert page.evaluate('''() => document.querySelector('#search-progress')
+                          .getBoundingClientRect().bottom <= document.querySelector('#side').getBoundingClientRect().top''')
                         page.locator('#new-session').click()
                         page.locator('label:has(input[value="codex"])').click()
                         page.locator('#new-cwd').fill('/same/project')
@@ -75,6 +82,10 @@ def main():
                         page.wait_for_function('T.term.buffer.active.getLine(0)?.translateToString().includes("NodeA")')
                         assert page.locator('#a-term').is_visible()
                         assert held
+                        assert page.evaluate('oldSearch.signal.aborted && S.results === null && S.term === ""')
+                        assert not page.locator('#search-progress').is_visible()
+                        page.wait_for_timeout(2200)
+                        assert page.evaluate('S.results === null && visible().some(s => s.uid === S.sel)')
 
                         # Navigating away during the slow refresh must preserve the old
                         # terminal, including its connection and saved split layout.

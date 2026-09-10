@@ -4955,19 +4955,29 @@ MOBILE.addEventListener?.('change', e => {
 });
 
 $('#q').oninput = e => {
-  if (S.results) { S.results = null; }     // 改动输入即退出全文搜索态
-  $('#stat').textContent = ''; $('#stat').classList.remove('err');
-  if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
+  cancelSearch();
   S.term = e.target.value.trim();
   renderSide();
 };
 
 $('#q').onkeydown = async e => {
+  if (e.key === 'Escape') { cancelSearch(true); showSessionCount(); renderSide(); return; }
   if (e.key !== 'Enter') return;
   runSearch();
 };
 
 let searchSeq = 0, searchRun = 0, searchAbort = null;
+
+function cancelSearch(clearQuery = false) {
+  ++searchRun;
+  searchAbort?.abort();
+  searchAbort = null;
+  searchProgressDone();
+  S.results = null;
+  if (clearQuery) { S.term = ''; $('#q').value = ''; }
+  $('#stat').textContent = ''; $('#stat').classList.remove('err');
+  if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
+}
 
 function searchProgress(done, total) {
   const box = $('#search-progress');
@@ -4982,6 +4992,17 @@ function searchProgressDone() {
   const box = $('#search-progress');
   box.classList.remove('on', 'idle');
   box.querySelector('i').style.width = '0%';
+}
+
+$('#search-cancel').onclick = () => { cancelSearch(true); showSessionCount(); renderSide(); };
+
+function showSearchMatches(rows) {
+  const found = new Map((S.results || []).map(row => [row.uid, row]));
+  for (const row of rows) found.set(row.uid, row);
+  S.results = [...found.values()].sort((a, b) => String(b.updated).localeCompare(String(a.updated))
+    || b.uid.localeCompare(a.uid));
+  $('#stat').textContent = ` 已找到 ${S.results.length} 个会话，继续搜索…`;
+  renderSide();
 }
 
 async function fetchSearch(params, signal) {
@@ -5000,7 +5021,9 @@ async function fetchSearch(params, signal) {
     for (const line of lines) {
       if (!line) continue;
       const event = JSON.parse(line);
+      if (signal.aborted) return { ok: false, data: {} };
       if (event.type === 'progress') searchProgress(event.done, event.total);
+      else if (event.type === 'matches') showSearchMatches(event.results || []);
       else if (event.type === 'result') result = event.data;
       else if (event.type === 'error') error = event.error;
     }
@@ -5013,11 +5036,9 @@ async function fetchSearch(params, signal) {
 
 async function runSearch() {
   const q = $('#q').value.trim();
+  cancelSearch();
   S.term = q;
-  const run = ++searchRun;
-  searchAbort?.abort();
-  searchAbort = null;
-  searchProgressDone();
+  const run = searchRun;
   if (!q) { S.results = null; showSessionCount(); renderSide(); return; }
   if (S.opts.regex && !reTerm(false)) {   // 本地先验一次, 省掉一次全盘扫描
     S.results = [];
@@ -5031,6 +5052,9 @@ async function runSearch() {
   if (HUB_MODE) p.set('source', Object.keys(SOURCES).filter(x => !S.off.has(x)).join(','));
   for (const k of ['case', 'word', 'regex']) if (S.opts[k]) p.set(k, '1');
   const ac = searchAbort = new AbortController();
+  S.results = [];
+  $('#stat').textContent = ' 正在搜索…';
+  renderSide();
   if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
   searchProgress(0, 0);
   let response;
@@ -5046,8 +5070,7 @@ async function runSearch() {
   const { ok, data: d } = response;
   applyNodeState(d, 'search');
   if (!ok) {                       // 兜底: 前端漏判的非法模式或网络失败
-    S.results = [];
-    $('#stat').textContent = ' ' + (d.error || '搜索失败');
+    $('#stat').textContent = ` 已找到 ${S.results?.length || 0} 个会话；` + (d.error || '搜索失败');
     $('#stat').classList.add('err');
   } else {
     $('#stat').classList.remove('err');
@@ -5055,7 +5078,12 @@ async function runSearch() {
     $('#stat').textContent = d.truncated
       ? ` 命中超过 ${d.results.length} 个会话（已截断，请细化条件）`
       : ` 全文命中 ${d.results.length} 个会话`;
-    if (d.partial) $('#stat').textContent += '（部分机器搜索失败，结果不完整）';
+    if (d.partial) {
+      const offline = (d.errors || []).filter(e => d.nodes?.some(n => n.id === e.node_id && n.online === false));
+      const failed = (d.errors || []).filter(e => !offline.includes(e));
+      if (offline.length) $('#stat').textContent += `（${offline.map(e => e.name).join('、')} 离线，未搜索）`;
+      if (failed.length) $('#stat').textContent += `（${failed.map(e => e.name).join('、')} 搜索失败，结果不完整）`;
+    }
   }
   renderSide();
   // 全文搜索只筛左侧列表；右侧会话的内容、滚动位置和展开状态保持原样。
@@ -5078,7 +5106,7 @@ function renderOpts() {
                                      : '搜索标题…  Enter 搜索对话正文';
 }
 
-$('#reload').onclick = () => { S.results = null; loadSessions(true); };
+$('#reload').onclick = () => { cancelSearch(true); loadSessions(true); };
 
 /* ---------- 回收站 ---------- */
 // 删除只是把会话文件移进 ~/.local/share/agenthub/trash/，这里是它唯一的出口：
@@ -5186,7 +5214,7 @@ $('#trash-list').onclick = async e => {
     if (await loadTrash({ keepNote: true })) {
       setTrashNote(`已恢复「${item.title}」到 ${d.path}`);
     }
-    S.results = null;
+    cancelSearch(true);
     await loadSessions(true);       // 恢复的会话立即回到左侧列表
     return;
   }

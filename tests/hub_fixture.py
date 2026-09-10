@@ -56,6 +56,8 @@ class NodeHandler(server.Handler):
                 self.wfile.write(json.dumps(event).encode() + b'\n')
                 self.wfile.flush()
             try:
+                if s.get('search_matches'):
+                    emit({'type': 'matches', 'results': data['results']})
                 steps = s.get('search_steps', 1)
                 for i in range(steps):
                     emit({'type': 'progress', 'done': i, 'total': steps})

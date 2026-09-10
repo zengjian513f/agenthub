@@ -261,7 +261,7 @@ class Registry:
         finally:
             conn.close()
 
-    def search_request(self, node, query, progress=None):
+    def search_request(self, node, query, progress=None, matches=None):
         """Keep reading while the node makes progress, including cold scans."""
         conn = self.connection(node, timeout=5)
         try:
@@ -285,6 +285,9 @@ class Registry:
                 event = json.loads(line)
                 if event.get("type") == "progress" and progress:
                     progress(int(event["done"]), int(event["total"]))
+                elif event.get("type") == "matches" and matches:
+                    matches(fed.public_payload({"results": event["results"]},
+                                               node, "/api/search")["results"])
                 elif event.get("type") == "result":
                     return response.status, event["data"]
                 elif event.get("type") == "error":
@@ -292,12 +295,19 @@ class Registry:
         finally:
             conn.close()
 
-    def query(self, node, path, query, progress=None, timeout=5):
+    def query(self, node, path, query, progress=None, timeout=5, matches=None):
         key = (node["id"], path, urlencode(query, doseq=True))
         stamp = time.time()
         status = None
+        found = {}
+
+        def received(rows):
+            found.update((row["uid"], row) for row in rows)
+            if matches:
+                matches(rows)
+
         try:
-            status, data = (self.search_request(node, query, progress) if path == "/api/search"
+            status, data = (self.search_request(node, query, progress, received) if path == "/api/search"
                             else self.request(node, path + "?" + key[2], timeout=timeout))
             if status != 200:
                 raise ValueError(data.get("error") or f"HTTP {status}")
@@ -330,7 +340,10 @@ class Registry:
                 cached = self.cache.get(key) if path in CACHED_PATHS else None
                 if cached is None and path == "/api/sessions":
                     cached = self.cache.get((node["id"], path, ""))
-            return node, self.stale_payload(path, cached), {
+            data = self.stale_payload(path, cached)
+            if path == "/api/search" and found:
+                data["results"] = list(found.values())
+            return node, data, {
                 "node_id": node["id"], "name": node["name"],
                 "error": reason, "error_code": code, "last_seen": prior.get("last_seen")}
 
@@ -345,24 +358,27 @@ class Registry:
             data["sources"] = {}
         return data
 
-    def fetch(self, node, path, query, progress=None):
+    def fetch(self, node, path, query, progress=None, matches=None):
         """Aggregate-side query: a node the monitor knows to be offline is never
         waited on. Its last failure and offline cache are returned instead."""
         nid = node["id"]
         with self.lock:
             health = dict(self.health.get(nid, {}))
-            if health.get("online") is not False:
-                if path == "/api/sessions" and not query and self.sessions_sig(nid):
-                    node, data, failure = self.check(node)
-                    if failure or not data.get("unchanged"):
-                        return node, data, failure
-                    with self.lock:
-                        return node, copy.deepcopy(self.cache[(nid, path, "")][1]), None
-                return self.query(node, path, query, progress)
             key = (nid, path, urlencode(query, doseq=True))
             cached = self.cache.get(key) if path in CACHED_PATHS else None
             if cached is None and path == "/api/sessions":
                 cached = self.cache.get((nid, path, ""))
+        # Never hold registry state while waiting for network I/O. A cold search
+        # otherwise serializes every node, heartbeat, list and creation response.
+        if health.get("online") is not False:
+            if path == "/api/sessions" and not query and cached and cached[1].get("sig"):
+                node, data, failure = self.check(node)
+                if failure or not data.get("unchanged"):
+                    return node, data, failure
+                with self.lock:
+                    latest = self.cache.get((nid, path, ""), cached)
+                    return node, copy.deepcopy(latest[1]), None
+            return self.query(node, path, query, progress, matches=matches)
         return node, self.stale_payload(path, cached), {
             "node_id": nid, "name": node["name"],
             "error": health.get("error", "节点暂时离线"),
@@ -562,7 +578,8 @@ class HubHandler(server.Handler):
         def scan(node):
             try:
                 result = self.registry.fetch(node, "/api/search", upstream,
-                    progress=lambda done, total: put(("progress", node["id"], done, total)))
+                    progress=lambda done, total: put(("progress", node["id"], done, total)),
+                    matches=lambda rows: put(("matches", rows)))
             except Exception:
                 # Always finish this node, even if its payload is malformed.
                 result = (node, {}, {"node_id": node["id"], "name": node["name"],
@@ -573,7 +590,7 @@ class HubHandler(server.Handler):
                 pass
 
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes)) or 1)
-        results, counts = [], {}
+        results, counts = [], {n["id"]: (0, 0) for n in nodes}
         try:
             emit({"type": "progress", "done": 0, "total": 0})
             for node in nodes:
@@ -589,13 +606,16 @@ class HubHandler(server.Handler):
                     _, nid, done, total = event
                     counts[nid] = (done, total)
                     emit({"type": "progress", "done": sum(v[0] for v in counts.values()),
-                          "total": sum(v[1] for v in counts.values())
-                          if len(counts) == len(nodes) else 0})
+                          "total": sum(v[1] for v in counts.values())})
+                elif event[0] == "matches":
+                    emit({"type": "matches", "results": event[1]})
                 else:
                     results.append(event[1])
                     node, data, _ = event[1]
                     total = counts.get(node["id"], (0, data.get("total_pool", 0)))[1]
                     counts[node["id"]] = (total, total)
+                    if data.get("results"):
+                        emit({"type": "matches", "results": data["results"]})
             errors = [err for _, _, err in results if err]
             rows = [row for _, data, _ in results for row in data.get("results", [])]
             rows.sort(key=lambda row: (row.get("updated", ""), row["uid"]), reverse=True)

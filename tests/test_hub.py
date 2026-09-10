@@ -321,6 +321,29 @@ class HubHTTPTests(unittest.TestCase):
         finally:
             self.b.state.pop('search_steps'); self.b.state.pop('search_delay')
 
+    def test_slow_search_does_not_block_registry_or_other_node_results(self):
+        self.b.state.update(search_steps=15, search_delay=.1)
+        try:
+            with urlopen(self.base + '/api/search?q=needle&progress=1', timeout=5) as response:
+                events = []
+                while True:
+                    event = json.loads(response.readline())
+                    events.append(event)
+                    if event['type'] == 'progress' and event['done'] > 0:
+                        break
+                started = time.monotonic()
+                self.assertEqual(self.call('/api/nodes')[0], 200)
+                self.assertLess(time.monotonic() - started, .5)
+                while not any(e['type'] == 'matches' for e in events):
+                    events.append(json.loads(response.readline()))
+                first = next(e for e in events if e['type'] == 'matches')
+                self.assertEqual(first['results'][0]['node_name'], 'NodeA')
+                self.assertLess(time.monotonic() - started, .7)
+                events.extend(json.loads(line) for line in response)
+                self.assertEqual(len(events[-1]['data']['results']), 2)
+        finally:
+            self.b.state.pop('search_steps'); self.b.state.pop('search_delay')
+
     def test_search_failure_keeps_health_and_healthy_results(self):
         self.call('/api/live')
         for option in ('search_error', 'search_incomplete', 'search_delay'):
@@ -335,6 +358,17 @@ class HubHTTPTests(unittest.TestCase):
                 self.assertNotIn('private upstream details', json.dumps(result))
             finally:
                 self.b.state.pop(option)
+
+    def test_search_failure_retains_matches_already_streamed(self):
+        self.b.state.update(search_matches=True, search_error=True)
+        try:
+            result = self.search_events()[-1]['data']
+            self.assertTrue(result['partial'])
+            self.assertEqual({r['node_name'] for r in result['results']}, {'NodeA', 'NodeB'})
+            self.assertTrue(all(federation.split(r['uid'], uid=True)[0] == r['node_id']
+                                for r in result['results']))
+        finally:
+            self.b.state.pop('search_matches'); self.b.state.pop('search_error')
 
     def test_search_stream_empty_selection_and_json_node_compatibility(self):
         self.assertEqual(self.search_events('')[-1]['data']['results'], [])

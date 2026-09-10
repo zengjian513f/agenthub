@@ -660,7 +660,7 @@ def _title_from_text(text: str) -> str:
     return _clip(text) or "(无标题)"
 
 
-def _flatten_content(content) -> list[dict]:
+def _flatten_content(content, search_only: bool = False) -> list[dict]:
     """把 Anthropic/OpenAI 风格的 content 展开成 [{kind, text, ...}]。"""
     if content is None:
         return []
@@ -690,12 +690,12 @@ def _flatten_content(content) -> list[dict]:
             else:
                 parts.append({
                     "kind": "tool", "name": name, "call_id": it.get("id"),
-                    "text": json.dumps(tool_input, ensure_ascii=False, indent=2),
-                    "summary": _tool_summary(name, tool_input),
-                    "changes": _tool_file_changes(name, tool_input),
+                    "text": "[tool]" if search_only else json.dumps(tool_input, ensure_ascii=False, indent=2),
+                    "summary": None if search_only else _tool_summary(name, tool_input),
+                    "changes": None if search_only else _tool_file_changes(name, tool_input),
                 })
         elif t == "tool_result":
-            nested = _flatten_content(it.get("content"))
+            nested = _flatten_content(it.get("content"), search_only=search_only)
             images = [p["media"] for p in nested if p.get("media")]
             texts = [p["text"] for p in nested if p.get("kind") != "image" and p.get("text")]
             parts.append({"kind": "tool_result", "text": "\n".join(texts) or "[图片]",
@@ -1205,14 +1205,15 @@ class ClaudeAdapter:
         }
 
     def read(self, path: str, start: int = 0, agent: str | None = None,
-             declared_tip: str | None = None, abandoned_after: int = 0):
+             declared_tip: str | None = None, abandoned_after: int = 0,
+             search_only: bool = False):
         return self._read_one(path, start=start, agent=agent[:8] if agent else None,
                               declared_tip=declared_tip,
-                              abandoned_after=abandoned_after)
+                              abandoned_after=abandoned_after, search_only=search_only)
 
     def _read_one(self, path: str, agent: str | None = None, start: int = 0,
                   declared_tip: str | None = None,
-                  abandoned_after: int = 0):
+                  abandoned_after: int = 0, search_only: bool = False):
         # 先用轻量父指针表确定当前分支，再做原有消息解析。这样双 Esc 后留在
         # append-only 文件里的旧输入/回答不会继续混入当前时间线。
         active, abandoned, end = self._active_lineage(
@@ -1230,11 +1231,18 @@ class ClaudeAdapter:
                     and not interrupted_branch):
                 continue
             t = rec.get("type")
-            ts = _norm_ts(rec.get("timestamp"))
+            ts = None if search_only else _norm_ts(rec.get("timestamp"))
             tag = agent or (rec.get("agentId", "")[:8] if rec.get("isSidechain") else None)
             if t in ("user", "assistant"):
                 role = f"{t}·subagent" if tag else t
-                parts = _flatten_content((rec.get("message") or {}).get("content"))
+                content = (rec.get("message") or {}).get("content")
+                if search_only and isinstance(content, list):
+                    # Ordinary tool output cannot match conversation text. Keep
+                    # question answers, whose role is part of the search contract.
+                    content = [p for p in content if not isinstance(p, dict)
+                               or p.get("type") != "tool_result"
+                               or _is_question_tool(calls.get(p.get("tool_use_id")))]
+                parts = _flatten_content(content, search_only=search_only)
                 hidden_record = bool(rec.get("isMeta") or rec.get("isCompactSummary"))
                 # Claude 没有 task_started；真实用户输入就是新回合的结构化起点。
                 text_parts = [p["text"] for p in parts if p["kind"] == "text"]
@@ -1665,14 +1673,14 @@ class CodexAdapter:
         return [*self._history_segments(parent, seen), (parent, limit)]
 
     def _read_file(self, path: str | Path, start: int = 0,
-                   stop: int | None = None):
+                   stop: int | None = None, search_only: bool = False):
         msgs, calls, end = [], {}, start
         session_meta = {}
         for rec, off in _iter_records(path, start):
             if stop is not None and off > stop:
                 break
             end = off
-            ts = _norm_ts(rec.get("timestamp"))
+            ts = None if search_only else _norm_ts(rec.get("timestamp"))
             p = rec.get("payload") or {}
             if rec.get("type") == "session_meta" and not session_meta:
                 session_meta = p
@@ -1682,6 +1690,8 @@ class CodexAdapter:
                                  event_kind="compact", event_id=f"compact:{event_id}"))
                 continue
             if rec.get("type") == "event_msg":
+                if search_only:
+                    continue
                 event = p.get("type")
                 if event == "task_started":
                     msgs.append(_status("working", ts, turn_id=p.get("turn_id")))
@@ -1720,7 +1730,7 @@ class CodexAdapter:
                 native_role = p.get("role") or "user"
                 role = native_role
                 role = {"developer": "system", "tool": "tool_result"}.get(role, role)
-                parts = _flatten_content(p.get("content"))
+                parts = _flatten_content(p.get("content"), search_only=search_only)
                 txt = "\n".join(x["text"] for x in parts if x["kind"] == "text")
                 images = [x["media"] for x in parts if x.get("media")]
                 # Codex 会在 event_msg:turn_aborted 前额外写一条 developer XML。
@@ -1740,7 +1750,7 @@ class CodexAdapter:
                     msgs.append(_msg(role, shown, ts, media_parts=images,
                                      **_turn_fields(turn_id, phase)))
             elif k == "reasoning":
-                txt = "\n".join(x["text"] for x in _flatten_content(p.get("summary")) if x["kind"] == "text")
+                txt = "\n".join(x["text"] for x in _flatten_content(p.get("summary"), search_only=search_only) if x["kind"] == "text")
                 if txt.strip():
                     msgs.append(_msg("thinking", txt, ts, **turn_meta))
             elif k in ("function_call", "custom_tool_call", "local_shell_call"):
@@ -1753,7 +1763,7 @@ class CodexAdapter:
                                      call_id=p.get("call_id"),
                                      questions=question["questions"], **turn_meta))
                     msgs.append(_status("waiting", ts, **turn_meta))
-                else:
+                elif not search_only:
                     msgs.append(_msg("tool", _pretty_json(body), ts, name=name,
                                      call_id=p.get("call_id"),
                                      summary=_tool_summary(name, body),
@@ -1762,6 +1772,8 @@ class CodexAdapter:
             elif k in ("function_call_output", "custom_tool_call_output", "local_shell_call_output"):
                 name = calls.get(p.get("call_id"))
                 is_answer = _is_question_tool(name)
+                if search_only and not is_answer:
+                    continue
                 out_text, output_meta = _tool_output(name, p.get("output"))
                 cancelled = False
                 if is_answer:
@@ -1775,28 +1787,28 @@ class CodexAdapter:
                                  **turn_meta, **output_meta))
                 if is_answer:
                     msgs.append(_status("working", ts, **turn_meta))
-            elif k in ("web_search_call", "tool_search_call"):
+            elif k in ("web_search_call", "tool_search_call") and not search_only:
                 msgs.append(_msg("tool", _pretty_json(p.get("arguments") or {}), ts,
                                  name=k, **turn_meta))
 
         return msgs, end, session_meta
 
-    def read(self, path: str, start: int = 0):
+    def read(self, path: str, start: int = 0, search_only: bool = False):
         # 增量偏移始终属于当前叶子文件；父历史是不可变前缀，只在首次整读时补。
         if start:
-            msgs, end, _ = self._read_file(path, start=start)
+            msgs, end, _ = self._read_file(path, start=start, search_only=search_only)
             return msgs, end
 
         msgs = []
         for parent, limit in self._history_segments(path):
-            inherited, _, _ = self._read_file(parent, stop=limit)
+            inherited, _, _ = self._read_file(parent, stop=limit, search_only=search_only)
             msgs.extend(inherited)
-        current, end, session_meta = self._read_file(path)
+        current, end, session_meta = self._read_file(path, search_only=search_only)
         msgs.extend(current)
 
         # /rename 是 TUI 本地命令，不进入 rollout。session_index 只证明名称在此时
         # 被设置过，因此显示成不计数的会话事件，不能伪装成原始 user 消息。
-        if session_meta:
+        if session_meta and not search_only:
             sid = session_meta.get("session_id") or session_meta.get("id")
             name_event = self._name_event(str(sid or ""))
             if name_event:
