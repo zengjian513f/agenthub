@@ -619,10 +619,13 @@ body.dragging { cursor: col-resize; user-select: none; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .item .cwd {
-  font-size: 11px; color: var(--muted); margin-top: 1px; opacity: .9;
+  display: flex; align-items: baseline; gap: 4px;
+  font-size: 11px; color: var(--muted); margin-top: 1px;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.cwd-machine { flex: none; white-space: nowrap; }
+.cwd-path { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.cwd-leaf { color: var(--accent); font-weight: 600; }
 .item .snip {
   font-size: 11.5px; color: var(--muted); margin-top: 3px;
   background: var(--panel-2); border-radius: 4px; padding: 3px 5px;

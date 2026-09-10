@@ -371,6 +371,99 @@ function shortCwd(p, max = 40) {
   const seg = p.split('/');
   return seg.length > 3 ? `${seg[0]}/${seg[1]}/…/${seg.slice(-2).join('/')}` : p;
 }
+
+const timelinePath = cwd => (cwd || '(未知)').replace(/^\/home\/[^/]+/, '~').replace(/\/+$/, '') || '/';
+
+/** Count directories, not sessions: a busy project must not change which parts
+ *  identify a path. Keep the full pool even while filtering the sidebar. */
+function timelinePathPlans(rows) {
+  const paths = [...new Set(rows.map(s => timelinePath(s.cwd)))];
+  const frequency = new Map(), peers = new Map();
+  for (const path of paths) {
+    const parts = path.split('/'), leaf = parts.at(-1);
+    for (const part of new Set(parts)) frequency.set(part, (frequency.get(part) || 0) + 1);
+    if (!peers.has(leaf)) peers.set(leaf, []);
+    peers.get(leaf).push(path);
+  }
+  return new Map(paths.map(path => {
+    const parts = path === '/' ? ['/'] : path.split('/');
+    const leaf = parts.at(-1), hidden = new Set(), labels = [path];
+    // Repeated ancestors carry less information. Ties favor keeping the deeper
+    // context. Never remove the root anchor or any part of the final directory.
+    const order = parts.map((_, i) => i).slice(1, -1).sort((a, b) =>
+      frequency.get(parts[b]) - frequency.get(parts[a]) || a - b);
+    for (const i of order) {
+      hidden.add(i);
+      const tokens = parts.flatMap((part, j) => hidden.has(j)
+        ? (hidden.has(j - 1) ? [] : [null]) : [part]);
+      // An ellipsis represents whole directories. If it could also stand for
+      // another path with the same basename, retain the distinguishing ancestor.
+      const pattern = new RegExp('^' + tokens.map(token => token === null
+        ? '(?:[^/]+/)*[^/]+' : token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('/') + '$');
+      if ((peers.get(leaf) || []).some(other => other !== path && pattern.test(other))) {
+        hidden.delete(i);
+        continue;
+      }
+      const label = tokens.map(token => token === null ? '…' : token).join('/');
+      labels.push(label);
+    }
+    return [path, {leaf, labels}];
+  }));
+}
+
+function timelinePathMarkup(path, leaf) {
+  return esc(path.slice(0, path.length - leaf.length))
+    + `<span class="cwd-leaf">${esc(leaf)}</span>`;
+}
+
+function timelineDirectoryMarkup(row) {
+  const path = timelinePath(row.cwd), leaf = path === '/' ? '/' : path.split('/').at(-1);
+  return (row.node_name ? `<span class="cwd-machine">${nodeBadge(row.node_name)} · </span>` : '')
+    + `<span class="cwd-path" data-path="${esc(path)}">${timelinePathMarkup(path, leaf)}</span>`;
+}
+
+function fitTimelineDirectories() {
+  if (S.view !== 'date') return;
+  const elements = [...document.querySelectorAll('#side .cwd-path')];
+  if (!elements.length) return;
+  const plans = timelinePathPlans([...S.sessions, ...pendingTmuxSessions(), ...(S.results || [])]);
+  const measure = document.createElement('canvas').getContext('2d');
+  const font = getComputedStyle(elements[0]);
+  const normalFont = `${font.fontWeight} ${font.fontSize} ${font.fontFamily}`;
+  const leafFont = `600 ${font.fontSize} ${font.fontFamily}`;
+  const widths = new Map();
+  // Batch layout reads before writes; repeated rows share measured labels.
+  const updates = elements.map(element => {
+    const plan = plans.get(element.dataset.path);
+    if (!plan) return null;
+    const width = element.clientWidth;
+    if (!width) return null; // A closed date group will be fitted when opened.
+    const measured = label => {
+      if (!widths.has(label)) {
+        measure.font = normalFont;
+        const prefix = measure.measureText(label.slice(0, label.length - plan.leaf.length)).width;
+        measure.font = leafFont;
+        widths.set(label, prefix + measure.measureText(plan.leaf).width);
+      }
+      return widths.get(label);
+    };
+    const label = plan.labels.find(label => measured(label) <= width)
+      || plan.labels.reduce((best, label) => measured(label) < measured(best) ? label : best);
+    return {element, markup: timelinePathMarkup(label, plan.leaf)};
+  });
+  for (const update of updates) {
+    if (update && update.element.innerHTML !== update.markup) update.element.innerHTML = update.markup;
+  }
+}
+
+let timelineFitFrame = 0;
+function scheduleTimelineFit() {
+  cancelAnimationFrame(timelineFitFrame);
+  timelineFitFrame = requestAnimationFrame(fitTimelineDirectories);
+}
+new ResizeObserver(scheduleTimelineFit).observe($('#side'));
+document.fonts.ready.then(scheduleTimelineFit);
+
 const dayKey = iso => {
   const d = new Date(iso), p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
@@ -2259,10 +2352,17 @@ function patchSide(list) {
         title.innerHTML = hl(s.title);
       }
       paintStarButton(n.querySelector('.item-star'), !!s.starred, S.starBusy.has(s.uid));
+      const cwd = n.querySelector('.cwd');
+      if (cwd && (cwd.title !== (s.cwd || '') || cwd.dataset.nodeName !== (s.node_name || ''))) {
+        cwd.title = s.cwd || '';
+        cwd.dataset.nodeName = s.node_name || '';
+        cwd.innerHTML = timelineDirectoryMarkup(s);
+      }
     }
     const c = g.querySelector('.gcount');
     if (c && c.textContent !== String(items.length)) c.textContent = items.length;
   }
+  fitTimelineDirectories();
   return true;
 }
 
@@ -2294,6 +2394,7 @@ function renderSide() {
       S.closed.has(key) ? S.closed.delete(key) : S.closed.add(key);
       store.set('closed', [...S.closed]);
       g.classList.toggle('closed');
+      scheduleTimelineFit();
     };
     const groupBox = head.querySelector('.ghead-pick');
     if (groupBox) {
@@ -2319,7 +2420,7 @@ function renderSide() {
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
            <div class="m">${esc(meta)}</div>
            ${S.view === 'date'
-             ? `<div class="cwd" title="${esc(s.cwd)}">${nodeDirectoryMarkup(s, 60)}</div>` : ''}
+             ? `<div class="cwd" title="${esc(s.cwd)}" data-node-name="${esc(s.node_name || '')}">${timelineDirectoryMarkup(s)}</div>` : ''}
            ${s.snippet ? `<div class="snip">${hl(s.snippet)}</div>` : ''}
          </div>
          ${s.pending ? '' : starButtonMarkup(s.uid, !!s.starred, 'item-star')}`);
@@ -2342,6 +2443,7 @@ function renderSide() {
     side.appendChild(g);
     if (groupBox) paintGroupPick(g);
   }
+  fitTimelineDirectories();
 }
 
 // 与后端 build_pattern 保持同一套规则: 全词用环视而非 \b, 中文才能正常匹配
