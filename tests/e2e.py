@@ -3225,7 +3225,7 @@ def run(pw):
               and common_dir_count == p.evaluate("cwdCompletion.common.length"))
         check("新建弹窗只有一个目录选择面板",
               p.locator("#new-cwd-picker").count() == 1
-              and p.locator("#new-session-dialog select").count() == 0)
+              and p.locator("#new-session-dialog select:not(#new-node)").count() == 0)
         check("启动目录可手工输入", p.locator("#new-cwd").input_value().startswith("/"))
         recent_filter = p.evaluate("""() => {
           const common = cwdCompletion.common;

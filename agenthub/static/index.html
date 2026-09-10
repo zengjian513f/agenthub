@@ -219,22 +219,26 @@
 <dialog id="new-session-dialog" aria-labelledby="new-session-title">
   <form id="new-session-form">
     <div class="modal-head">
-      <div><h2 id="new-session-title">新建会话</h2><p>选择会话类型和启动目录</p></div>
+      <div><h2 id="new-session-title">新建会话</h2></div>
       <button type="button" class="modal-close" title="关闭" aria-label="关闭">×</button>
     </div>
-    <label id="new-node-label" hidden>机器<select id="new-node"></select></label>
-    <fieldset class="new-source">
-      <legend>会话类型</legend>
-      <label><input type="radio" name="new-source" value="claude" checked><span><svg class="ico source-icon" data-source="claude" aria-hidden="true"><use href="#i-claude"/></svg>Claude</span></label>
-      <label><input type="radio" name="new-source" value="codex"><span><svg class="ico source-icon" data-source="codex" aria-hidden="true"><use href="#i-codex"/></svg>Codex</span></label>
-      <label><input type="radio" name="new-source" value="grok"><span><svg class="ico source-icon" data-source="grok" aria-hidden="true"><use href="#i-grok"/></svg>Grok</span></label>
-    </fieldset>
-    <label class="new-cwd-label" for="new-cwd">启动目录<span>输入路径或从下方选择</span></label>
+    <div class="new-row">
+      <label id="new-node-label" hidden><span>机器</span><select id="new-node"></select></label>
+      <fieldset class="new-source">
+        <legend class="visually-hidden">会话类型</legend>
+        <label><input type="radio" name="new-source" value="claude" checked><span><svg class="ico source-icon" data-source="claude" aria-hidden="true"><use href="#i-claude"/></svg>Claude</span></label>
+        <label><input type="radio" name="new-source" value="codex"><span><svg class="ico source-icon" data-source="codex" aria-hidden="true"><use href="#i-codex"/></svg>Codex</span></label>
+        <label><input type="radio" name="new-source" value="grok"><span><svg class="ico source-icon" data-source="grok" aria-hidden="true"><use href="#i-grok"/></svg>Grok</span></label>
+      </fieldset>
+    </div>
     <div class="new-cwd-combobox">
-      <input id="new-cwd" name="cwd" autocomplete="off" spellcheck="false"
-        role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
-        aria-controls="new-cwd-options" aria-expanded="true"
-        placeholder="/home/user/Projects/project">
+      <div class="new-cwd-field">
+        <label class="new-cwd-label" for="new-cwd">启动目录</label>
+        <input id="new-cwd" name="cwd" autocomplete="off" spellcheck="false"
+          role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
+          aria-controls="new-cwd-options" aria-expanded="true"
+          placeholder="/home/user/Projects/project">
+      </div>
       <div id="new-cwd-picker">
         <div class="new-cwd-picker-head">
           <span id="new-cwd-options-title">最近使用</span>
@@ -244,8 +248,8 @@
       </div>
       <div id="new-cwd-completion-status" class="visually-hidden" role="status" aria-live="polite"></div>
     </div>
-    <div id="new-session-error" role="alert"></div>
     <div class="modal-actions">
+      <div id="new-session-error" role="alert"></div>
       <button type="button" class="btn modal-cancel">取消</button>
       <button type="submit" class="btn go" id="new-session-go">创建并打开</button>
     </div>

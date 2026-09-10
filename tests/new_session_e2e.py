@@ -67,7 +67,7 @@ def main():
                         assert page.evaluate('''() => document.querySelector('#search-progress')
                           .getBoundingClientRect().bottom <= document.querySelector('#side').getBoundingClientRect().top''')
                         page.locator('#new-session').click()
-                        page.locator('label:has(input[value="codex"])').click()
+                        page.locator('#new-session-form label:has(input[value="codex"])').click()
                         page.locator('#new-cwd').fill('/same/project')
                         held = []
                         page.route('**/api/term/list*', lambda r: held.append(r))
