@@ -35,12 +35,7 @@ function loadQueuedMessages() {
   return valid;
 }
 
-const FONT_CHOICES = {
-  ubuntu: '"AgentHub CJK Sans", "AgentHub Ubuntu Sans Mono", "Ubuntu Sans Mono", "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
-  cascadia: '"AgentHub CJK Sans", "AgentHub Cascadia Mono", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", Consola, Consolas, sans-serif',
-  system: '"AgentHub CJK Sans", ui-monospace, "SFMono-Regular", "Cascadia Mono", "Adwaita Mono", "Ubuntu Mono", "Liberation Mono", Consolas, sans-serif',
-  consolas: '"AgentHub CJK Sans", Consolas, Consola, "Cascadia Mono", "Liberation Mono", sans-serif',
-};
+const FONT_CHOICES = AgentHubTypography.choices;
 const themeMedia = matchMedia('(prefers-color-scheme: dark)');
 
 function applyTheme(choice = store.get('theme', 'system'), persist = false) {

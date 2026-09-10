@@ -270,6 +270,9 @@ class HubHandler(server.Handler):
             match = re.fullmatch(r"/api/nodes/([a-f0-9]{32})(/api/.*)", path)
             if match:
                 explicit, path = match.groups()
+            if (self.command == 'GET' and path == '/api/session/file'
+                    and self._file_navigation(query, explicit)):
+                return
             if (self.command == "GET" and not explicit and path in
                     {"/api/sessions", "/api/search", "/api/live", "/api/term/list", "/api/trash"}):
                 return self.aggregate(path, query)

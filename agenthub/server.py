@@ -18,7 +18,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
                debug_runs, index, live, media, pending as pending_store,
@@ -30,7 +30,9 @@ STATIC = Path(__file__).parent / "static"
 ASSET_VERSION = hashlib.sha256(b"".join(
     (STATIC / name).read_bytes()
     for name in ("style.css", "cli.js", "nodes.js", "app.js", "term.js",
-                 "files.html", "files.js", "files.css")
+                 "files.html", "files.js", "files.css", "typography.css", "typography.js",
+                 "file.html", "file.js", "file-preview.css", "file-preview.js",
+                 "vendor/markdown-it/markdown-it.min.js")
 )).hexdigest()[:12]
 HOSTNAME = socket.gethostname().strip() or "localhost"
 HUB_MODE = False
@@ -1008,6 +1010,21 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return self._json({'error': str(exc)}, 403)
 
+    def _file_navigation(self, query, node=None):
+        """Give browser navigation a reader; API clients retain raw bytes."""
+        if ('text/html' not in getattr(self, 'headers', {}).get('Accept', '')
+                or query.get('raw', [''])[0] == '1'
+                or query.get('download', [''])[0] == '1'
+                or query.get('mode', [''])[0]):
+            return False
+        query = dict(query)
+        if node and query.get('uid'):
+            query['uid'] = [federation.qualify(node, query['uid'][0], uid=True)]
+        location = ('../' * (5 if node else 2)) + 'file.html?' + urlencode(query, doseq=True)
+        self._send(303, b'', 'text/plain', {'Location': location, 'Cache-Control': 'no-store',
+                                         'Vary': 'Accept'})
+        return True
+
     def _file_stream(self, target):
         mime = file_manager.MEDIA.get(target.suffix.lower())
         if not mime or not target.is_file():
@@ -1244,6 +1261,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._files_get(q)
 
         if path == "/api/session/file":
+            if self._file_navigation(q):
+                return
             session = index.get(q.get("uid", [""])[0])
             if not session:
                 return self._json({"error": "会话不存在"}, 404)
@@ -1254,6 +1273,10 @@ class Handler(BaseHTTPRequestHandler):
                 target = files.resolve(messages, view.get("cwd", ""), ref)
                 if q.get("download", [""])[0] == "1":
                     return self._download_file(target)
+                if q.get('mode', [''])[0] == 'info':
+                    return self._json(file_manager.describe(target))
+                if q.get('mode', [''])[0] == 'preview':
+                    return self._file_stream(target)
                 data, mime, headers = files.read(target)
             except KeyError:
                 return self._json({"error": "子会话不存在"}, 404)
@@ -2353,14 +2376,14 @@ class Handler(BaseHTTPRequestHandler):
         if ctype.startswith(("text/", "application/javascript")):
             ctype += "; charset=utf-8"
         data = f.read_bytes()
-        if f.name in {"index.html", "files.html"}:
+        if f.name in {"index.html", "files.html", "file.html"}:
             hub_mode = getattr(getattr(self, "server", None), "hub_mode", HUB_MODE)
             data = data.replace(b"__AGENTHUB_MODE__", b"hub" if hub_mode else b"local")
             data = data.replace(b"__AGENTHUB_HOSTNAME__",
                                 html.escape("AgentHub" if hub_mode else HOSTNAME).encode("utf-8"))
             data = data.replace(b"__AGENTHUB_ASSET_VERSION__",
                                 ASSET_VERSION.encode("ascii"))
-        cache = "no-store" if f.name in {"index.html", "files.html"} else "no-cache"
+        cache = "no-store" if f.name in {"index.html", "files.html", "file.html"} else "no-cache"
         self._send(200, data, ctype, {"Cache-Control": cache})
 
 

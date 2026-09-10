@@ -256,10 +256,12 @@
         }
         box.append(list);
       } else if (info.preview === 'text') {
-        if (info.truncated) box.append(element('p','仅预览前 1 MiB，完整内容请下载。','muted'));
-        const pre = element('pre'), code = element('code'); code.textContent = info.text;
-        const highlighted = window.agenthubHighlight?.(info.text,'',entry.path); if (highlighted?.html) code.innerHTML = highlighted.html;
-        pre.append(code); box.append(pre);
+        AgentHubFilePreview.textPreview(box, info, (ref, image) => AgentHubFilePreview.documentLink(ref, info,
+          (path, media, hash) => {
+            if (media) return apiURL({mode:'preview',path});
+            const url = new URL('file.html', base); url.search = context.toString();
+            url.searchParams.set('path', path); return url.href + hash;
+          }, image));
       } else if (info.preview === 'unsupported' || !info.preview) box.append(element('p','此格式暂不支持预览，请下载后打开。'));
       else {
         const tag = info.preview.startsWith('image/') ? 'img' : info.preview.startsWith('video/') ? 'video' : info.preview.startsWith('audio/') ? 'audio' : 'iframe';
@@ -498,8 +500,9 @@
         history.replaceState(history.state, '', pageURL(''));
         await load();
       } else {
-        const url = new URL('api/session/file', base);
+        const url = new URL(result.file_browser ? 'file.html' : 'api/session/file', base);
         url.search = context.toString();
+        if (!result.file_browser) url.searchParams.set('raw', '1');
         location.replace(url.href);
       }
     } catch (error) { if (controller === request) status(error.message || '无法打开文件', true); }
