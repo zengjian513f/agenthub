@@ -156,6 +156,13 @@ class IsolatedIndexTests(unittest.TestCase):
         result = index.search("parentupdate", matches=batches.extend)
         self.assertEqual({r["uid"] for r in batches}, {r["uid"] for r in result["results"]})
 
+    def test_search_limit_reports_scanned_sessions_without_claiming_entire_pool(self):
+        for name in ("one", "two", "three"):
+            self.codex_session(name, "needle")
+        result = index.search("needle", limit=1)
+        self.assertTrue(result["truncated"])
+        self.assertEqual((result["scanned"], result["total_pool"]), (1, 3))
+
     def test_search_claude_body_matches_reader_and_persisted_rewind(self):
         path = self.claude_session("search-claude", "visible root")
         def record(uuid, parent, role, content, **extra):

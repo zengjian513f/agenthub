@@ -590,9 +590,22 @@ class HubHandler(server.Handler):
                 pass
 
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes)) or 1)
-        results, counts = [], {n["id"]: (0, 0) for n in nodes}
+        results = []
+        states = {n["id"]: {"id": n["id"], "name": n["name"], "done": 0,
+                            "total": None, "state": "preparing"} for n in nodes}
+        for node in nodes:
+            if self.registry.offline(node["id"]):
+                states[node["id"]].update(total=0, state="offline")
+
+        def report_progress():
+            rows = list(states.values())
+            emit({"type": "progress", "done": sum(row["done"] for row in rows),
+                  "total": sum(row["total"] or 0 for row in rows),
+                  "total_known": all(row["total"] is not None for row in rows),
+                  "nodes": rows})
+
         try:
-            emit({"type": "progress", "done": 0, "total": 0})
+            report_progress()
             for node in nodes:
                 pool.submit(scan, node)
             while len(results) < len(nodes):
@@ -604,16 +617,23 @@ class HubHandler(server.Handler):
                     continue
                 if event[0] == "progress":
                     _, nid, done, total = event
-                    counts[nid] = (done, total)
-                    emit({"type": "progress", "done": sum(v[0] for v in counts.values()),
-                          "total": sum(v[1] for v in counts.values())})
+                    states[nid].update(done=done, total=total, state="scanning")
+                    report_progress()
                 elif event[0] == "matches":
                     emit({"type": "matches", "results": event[1]})
                 else:
                     results.append(event[1])
-                    node, data, _ = event[1]
-                    total = counts.get(node["id"], (0, data.get("total_pool", 0)))[1]
-                    counts[node["id"]] = (total, total)
+                    node, data, error = event[1]
+                    state = states[node["id"]]
+                    if error:
+                        state["state"] = "offline" if self.registry.offline(node["id"]) else "error"
+                        if state["state"] == "offline" and state["total"] is None:
+                            state["total"] = 0
+                    else:
+                        total = state["total"] if state["total"] is not None else data.get("total_pool", 0)
+                        state.update(total=total, state="limited" if data.get("truncated") else "done",
+                                     done=data.get("scanned", state["done"] if data.get("truncated") else total))
+                    report_progress()
                     if data.get("results"):
                         emit({"type": "matches", "results": data["results"]})
             errors = [err for _, _, err in results if err]

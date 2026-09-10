@@ -550,19 +550,22 @@ main { display: flex; flex: 1; min-height: 0; }
   pointer-events: none;   /* 整行都是热区，勾选框只做状态显示 */
 }
 .item.picked { background: var(--sel); }
-.search-progress-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 12px; }
+.search-progress-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 12px; }
 .search-progress-head span { color: var(--text); font-weight: 600; }
 .search-progress-head b {
-  flex: 1; color: var(--muted); font-weight: 500; text-align: right;
+  flex: 1; min-width: 110px; color: var(--muted); font-weight: 500; text-align: right;
   font-variant-numeric: tabular-nums;
 }
 .search-progress-track { height: 3px; overflow: hidden; border-radius: 999px; background: var(--border); }
 .search-progress-track i {
-  display: block; width: 12%; height: 100%; border-radius: inherit; background: var(--accent);
+  display: block; width: 0; height: 100%; border-radius: inherit; background: var(--accent);
   transition: width .1s linear;
 }
-#search-progress.idle .search-progress-track i { animation: search-sweep 1.1s ease-in-out infinite; }
-@keyframes search-sweep { 0% { margin-left: 0; } 50% { margin-left: 88%; } 100% { margin-left: 0; } }
+.search-progress-track[hidden] { display: none; }
+.search-progress-nodes { max-height: 108px; overflow-y: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.search-progress-node { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; }
+.search-progress-node > span:first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-progress-node > span:last-child { flex: none; }
 
 #side {
   width: 100%; flex: 1; min-height: 0; overflow-y: auto;

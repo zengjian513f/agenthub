@@ -4979,19 +4979,33 @@ function cancelSearch(clearQuery = false) {
   if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
 }
 
-function searchProgress(done, total) {
+function searchProgress(done, total, nodes = null, totalKnown = total !== null) {
   const box = $('#search-progress');
-  const known = total > 0;
+  const known = totalKnown && total > 0;
+  const percent = known ? Math.min(100, Math.floor(done / total * 100)) : 0;
   box.classList.add('on');
-  box.classList.toggle('idle', !known);
-  box.querySelector('b').textContent = known ? `${done} / ${total}` : '扫描中…';
-  box.querySelector('i').style.width = known ? `${Math.min(100, done / total * 100)}%` : '12%';
+  box.querySelector('b').textContent = known ? `${done} / ${total} 个会话 · ${percent}%`
+    : done ? `已扫描 ${done} 个会话` : totalKnown ? '已扫描 0 个会话' : '正在读取会话数量…';
+  const track = box.querySelector('.search-progress-track');
+  track.hidden = !known;
+  if (known) track.setAttribute('aria-valuenow', String(percent));
+  else track.removeAttribute('aria-valuenow');
+  track.setAttribute('aria-valuetext', box.querySelector('b').textContent);
+  box.querySelector('i').style.width = known ? `${Math.min(100, done / total * 100)}%` : '0%';
+  const rows = box.querySelector('.search-progress-nodes');
+  if (nodes) rows.innerHTML = nodes.map(node => {
+    const count = node.total !== null ? `${node.done} / ${node.total}` : `已扫描 ${node.done}`;
+    const status = {preparing: '准备中', offline: '离线跳过', error: '搜索失败',
+      limited: `${count} · 达到结果上限`, done: `${count} · 已完成`, scanning: `${count} 个会话`}[node.state] || count;
+    return `<div class="search-progress-node" data-state="${esc(node.state)}"><span>${esc(node.name)}</span><span>${esc(status)}</span></div>`;
+  }).join('');
 }
 
 function searchProgressDone() {
   const box = $('#search-progress');
-  box.classList.remove('on', 'idle');
+  box.classList.remove('on');
   box.querySelector('i').style.width = '0%';
+  box.querySelector('.search-progress-nodes').replaceChildren();
 }
 
 $('#search-cancel').onclick = () => { cancelSearch(true); showSessionCount(); renderSide(); };
@@ -5022,7 +5036,8 @@ async function fetchSearch(params, signal) {
       if (!line) continue;
       const event = JSON.parse(line);
       if (signal.aborted) return { ok: false, data: {} };
-      if (event.type === 'progress') searchProgress(event.done, event.total);
+      if (event.type === 'progress') searchProgress(event.done, event.total, event.nodes,
+        event.total_known ?? Number.isFinite(event.total));
       else if (event.type === 'matches') showSearchMatches(event.results || []);
       else if (event.type === 'result') result = event.data;
       else if (event.type === 'error') error = event.error;
@@ -5056,7 +5071,11 @@ async function runSearch() {
   $('#stat').textContent = ' 正在搜索…';
   renderSide();
   if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
-  searchProgress(0, 0);
+  const searchNodes = HUB_MODE ? Nodes.list.filter(node => selectedNodeIds().includes(node.id)).map(node => ({
+    id: node.id, name: node.name, done: 0, total: node.online === false ? 0 : null,
+    state: node.online === false ? 'offline' : 'preparing',
+  })) : null;
+  searchProgress(0, null, searchNodes, false);
   let response;
   try {
     response = await fetchSearch(p, ac.signal);

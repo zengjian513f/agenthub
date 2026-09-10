@@ -321,6 +321,23 @@ class HubHTTPTests(unittest.TestCase):
         finally:
             self.b.state.pop('search_steps'); self.b.state.pop('search_delay')
 
+    def test_search_progress_waits_for_all_totals_and_reports_actual_truncated_scan(self):
+        settings = {'search_prepare_delay': .15, 'search_steps': 10, 'search_stop': 3,
+                    'search_pool': 10, 'search_scanned': 2, 'search_truncated': True}
+        self.b.state.update(settings)
+        try:
+            progress = [e for e in self.search_events() if e['type'] == 'progress']
+            ready_a = next(e for e in progress if e['done'] == 1 and not e['total_known'])
+            self.assertEqual(next(n for n in ready_a['nodes'] if n['name'] == 'NodeB')['state'], 'preparing')
+            last = progress[-1]
+            self.assertTrue(last['total_known'])
+            self.assertEqual((last['done'], last['total']), (3, 11))
+            limited = next(n for n in last['nodes'] if n['name'] == 'NodeB')
+            self.assertEqual((limited['state'], limited['done'], limited['total']), ('limited', 2, 10))
+        finally:
+            for key in settings:
+                self.b.state.pop(key)
+
     def test_slow_search_does_not_block_registry_or_other_node_results(self):
         self.b.state.update(search_steps=15, search_delay=.1)
         try:

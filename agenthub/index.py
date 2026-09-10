@@ -1071,9 +1071,9 @@ def search(query: str, sources=None, limit: int = 60,
            word=False, case=False, regex=False, progress=None, matches=None) -> dict:
     """按解析后的用户/助手/思考正文匹配，返回带命中片段的会话列表。"""
     if not query.strip():
-        return {"results": [], "truncated": False, "total_pool": 0}
+        return {"results": [], "truncated": False, "total_pool": 0, "scanned": 0}
     pat = build_pattern(query, word, case, regex)
-    hits, truncated = [], False
+    hits, truncated, scanned = [], False, 0
     pool = [s for s in load() if not sources or s["source"] in sources]
     if progress:
         progress(0, len(pool))
@@ -1096,7 +1096,8 @@ def search(query: str, sources=None, limit: int = 60,
             hits.append({**s, "hits": count, "hits_capped": capped, "snippet": snippet})
             if matches:
                 matches([hits[-1]])
+        scanned = done
         if progress:
             progress(done, len(pool))
     hits.sort(key=lambda x: x["updated"], reverse=True)
-    return {"results": hits, "truncated": truncated, "total_pool": len(pool)}
+    return {"results": hits, "truncated": truncated, "total_pool": len(pool), "scanned": scanned}

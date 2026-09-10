@@ -44,7 +44,9 @@ class NodeHandler(server.Handler):
             return self._json({'uids': [], 'tmux_uids': [], 'started_at': {}})
         if u.path == '/api/search':
             data = {'results': [{**s['row'], 'hits': 1, 'snippet': s['name'] + ' needle'}],
-                    'total_pool': 1, 'truncated': False}
+                    'total_pool': s.get('search_pool', 1), 'truncated': s.get('search_truncated', False)}
+            if 'search_scanned' in s:
+                data['scanned'] = s['search_scanned']
             if q.get('progress') != ['1'] or s.get('search_json'):
                 return self._json(data)
             self.send_response(200)
@@ -56,10 +58,11 @@ class NodeHandler(server.Handler):
                 self.wfile.write(json.dumps(event).encode() + b'\n')
                 self.wfile.flush()
             try:
+                time.sleep(s.get('search_prepare_delay', 0))
                 if s.get('search_matches'):
                     emit({'type': 'matches', 'results': data['results']})
                 steps = s.get('search_steps', 1)
-                for i in range(steps):
+                for i in range(s.get('search_stop', steps)):
                     emit({'type': 'progress', 'done': i, 'total': steps})
                     time.sleep(s.get('search_delay', 0))
                 if s.get('search_incomplete'):

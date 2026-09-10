@@ -151,7 +151,8 @@
         </div>
         <div id="search-progress" role="status" aria-live="polite">
           <div class="search-progress-head"><span>全文搜索</span><b>准备中…</b><button type="button" class="btn" id="search-cancel">取消</button></div>
-          <div class="search-progress-track"><i></i></div>
+          <div class="search-progress-track" role="progressbar" aria-label="会话扫描进度" aria-valuemin="0" aria-valuemax="100"><i></i></div>
+          <div class="search-progress-nodes"></div>
         </div>
       </div>
       <div id="side"><div class="spin">正在扫描会话…</div></div>

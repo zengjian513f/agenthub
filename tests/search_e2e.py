@@ -22,7 +22,7 @@ def main():
                                'token': node.state['token']})
         registry.health['c' * 32] = {'online': False, 'error': '连接超时', 'error_code': 'timeout',
                                      'offline_since': time.time() - 3600}
-        nodes[1].state.update(search_steps=20, search_delay=.1)
+        nodes[1].state.update(search_steps=20, search_delay=.1, search_prepare_delay=.6)
         central = ThreadingHTTPServer(('127.0.0.1', 0), MountedHub)
         central.daemon_threads = True
         central.registry = registry
@@ -42,6 +42,14 @@ def main():
                     page.locator('#q').fill('文件管理')
                     page.locator('#q').press('Enter')
                     page.wait_for_function('S.results?.length === 1 && !!searchAbort', timeout=1500)
+                    assert '离线跳过' in page.locator('.search-progress-nodes').inner_text()
+                    assert '准备中' in page.locator('.search-progress-nodes').inner_text()
+                    assert '%' not in page.locator('#search-progress b').inner_text()
+                    assert page.evaluate('getComputedStyle(document.querySelector("#search-progress i")).animationName === "none"')
+                    page.wait_for_function('document.querySelector("#search-progress b").textContent.includes("%")')
+                    assert page.locator('.search-progress-track').get_attribute('aria-valuenow') is not None
+                    assert '/ 21 个会话' in page.locator('#search-progress b').inner_text()
+                    assert '已完成' in page.locator('.search-progress-nodes').inner_text()
                     assert 'Fast' in page.locator('#side').inner_text()
                     assert page.evaluate('''() => document.querySelector('#search-progress').getBoundingClientRect().bottom
                         <= document.querySelector('#side').getBoundingClientRect().top''')
@@ -61,7 +69,7 @@ def main():
                     page.evaluate('window.cancelledSearch = searchAbort')
                     page.locator('#q').fill('changed title filter')
                     assert page.evaluate('cancelledSearch.signal.aborted && S.results === null')
-                    page.wait_for_timeout(2200)
+                    page.wait_for_timeout(2800)
                     assert page.evaluate('S.results === null && S.term === "changed title filter"')
                     assert not page.locator('#search-progress').is_visible()
 
