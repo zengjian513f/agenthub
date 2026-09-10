@@ -127,6 +127,55 @@ class HubHTTPTests(unittest.TestCase):
         finally:
             self.b.state['offline'] = False
 
+    def search_events(self, nodes=None):
+        path = '/api/search?q=needle&progress=1'
+        if nodes is not None:
+            path += '&nodes=' + nodes
+        with urlopen(self.base + path, timeout=10) as response:
+            self.assertIn('application/x-ndjson', response.headers['Content-Type'])
+            self.assertEqual(response.headers['X-Accel-Buffering'], 'no')
+            return [json.loads(line) for line in response]
+
+    def test_search_stream_progress_outlives_idle_timeout_and_scopes_results(self):
+        self.b.state.update(search_steps=8, search_delay=.04)
+        try:
+            with patch.object(hub, 'SEARCH_IDLE_TIMEOUT', .2):
+                events = self.search_events()
+            progress = [e for e in events if e['type'] == 'progress']
+            self.assertTrue(any(0 < e['done'] < e['total'] for e in progress))
+            result = events[-1]['data']
+            self.assertFalse(result['partial'])
+            self.assertEqual({r['node_name'] for r in result['results']}, {'NodeA', 'NodeB'})
+            self.assertEqual(len({r['uid'] for r in result['results']}), 2)
+            self.assertEqual(result['total_pool'], 2)
+        finally:
+            self.b.state.pop('search_steps'); self.b.state.pop('search_delay')
+
+    def test_search_failure_keeps_health_and_healthy_results(self):
+        self.call('/api/live')
+        for option in ('search_error', 'search_incomplete', 'search_delay'):
+            self.b.state[option] = .3 if option == 'search_delay' else True
+            try:
+                with patch.object(hub, 'SEARCH_IDLE_TIMEOUT', .1):
+                    result = self.search_events()[-1]['data']
+                self.assertTrue(result['partial'])
+                self.assertEqual([r['node_name'] for r in result['results']], ['NodeA'])
+                self.assertEqual([e['name'] for e in result['errors']], ['NodeB'])
+                self.assertTrue(next(n for n in result['nodes'] if n['name'] == 'NodeB')['online'])
+                self.assertNotIn('private upstream details', json.dumps(result))
+            finally:
+                self.b.state.pop(option)
+
+    def test_search_stream_empty_selection_and_json_node_compatibility(self):
+        self.assertEqual(self.search_events('')[-1]['data']['results'], [])
+        self.b.state['search_json'] = True
+        try:
+            result = self.search_events('b' * 32)[-1]['data']
+            self.assertFalse(result['partial'])
+            self.assertEqual([r['node_name'] for r in result['results']], ['NodeB'])
+        finally:
+            self.b.state.pop('search_json')
+
     def test_routes_writes_without_scoped_identifiers_and_rejects_mixed_targets(self):
         a = federation.qualify('a' * 32, 'claude:same-file-hash', True)
         b = federation.qualify('b' * 32, 'same-terminal')

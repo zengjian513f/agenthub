@@ -4868,6 +4868,7 @@ async function runSearch() {
   if (HUB_MODE) p.set('source', Object.keys(SOURCES).filter(x => !S.off.has(x)).join(','));
   for (const k of ['case', 'word', 'regex']) if (S.opts[k]) p.set(k, '1');
   const ac = searchAbort = new AbortController();
+  if (HUB_MODE) { Nodes.errors.delete('search'); renderNodes(); }
   searchProgress(0, 0);
   let response;
   try {
@@ -4891,6 +4892,7 @@ async function runSearch() {
     $('#stat').textContent = d.truncated
       ? ` 命中超过 ${d.results.length} 个会话（已截断，请细化条件）`
       : ` 全文命中 ${d.results.length} 个会话`;
+    if (d.partial) $('#stat').textContent += '（部分机器搜索失败，结果不完整）';
   }
   renderSide();
   // 全文搜索只筛左侧列表；右侧会话的内容、滚动位置和展开状态保持原样。

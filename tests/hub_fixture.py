@@ -38,8 +38,32 @@ class NodeHandler(server.Handler):
         if u.path == '/api/live':
             return self._json({'uids': [], 'tmux_uids': [], 'started_at': {}})
         if u.path == '/api/search':
-            return self._json({'results': [{**s['row'], 'hits': 1, 'snippet': s['name'] + ' needle'}],
-                               'total_pool': 1, 'truncated': False})
+            data = {'results': [{**s['row'], 'hits': 1, 'snippet': s['name'] + ' needle'}],
+                    'total_pool': 1, 'truncated': False}
+            if q.get('progress') != ['1'] or s.get('search_json'):
+                return self._json(data)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/x-ndjson')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+            def emit(event):
+                self.wfile.write(json.dumps(event).encode() + b'\n')
+                self.wfile.flush()
+            try:
+                steps = s.get('search_steps', 1)
+                for i in range(steps):
+                    emit({'type': 'progress', 'done': i, 'total': steps})
+                    time.sleep(s.get('search_delay', 0))
+                if s.get('search_incomplete'):
+                    return
+                if s.get('search_error'):
+                    emit({'type': 'error', 'error': 'private upstream details'})
+                else:
+                    emit({'type': 'result', 'data': data})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if u.path == '/api/term/list':
             time.sleep(s.get('term_delay', 0))
             return self._json({'enabled': True, 'sources': {'claude': True, 'codex': True},

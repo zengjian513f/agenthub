@@ -13,6 +13,7 @@ import http.client
 import ipaddress
 import json
 import os
+import queue
 import re
 import socket
 import threading
@@ -25,6 +26,7 @@ from . import federation as fed, server
 
 JSON_LIMIT = 64 * 1024 * 1024
 BODY_LIMIT = 4 * 1024 * 1024
+SEARCH_IDLE_TIMEOUT = 60
 
 
 class Registry:
@@ -123,12 +125,43 @@ class Registry:
         finally:
             conn.close()
 
-    def query(self, node, path, query):
+    def search_request(self, node, query, progress=None):
+        """Keep reading while the node makes progress, including cold scans."""
+        conn = self.connection(node, timeout=5)
+        try:
+            conn.request("GET", "/api/search?" + urlencode(
+                {**query, "progress": ["1"]}, doseq=True), headers=self.headers(node))
+            conn.sock.settimeout(SEARCH_IDLE_TIMEOUT)
+            response = conn.getresponse()
+            if "application/x-ndjson" not in response.getheader("Content-Type", ""):
+                raw = response.read(JSON_LIMIT + 1)
+                if len(raw) > JSON_LIMIT:
+                    raise ValueError("节点响应过大")
+                return response.status, json.loads(raw)
+            remaining = JSON_LIMIT
+            while True:
+                line = response.readline(remaining + 1)
+                remaining -= len(line)
+                if remaining < 0:
+                    raise ValueError("节点响应过大")
+                if not line:
+                    raise ValueError("搜索响应不完整")
+                event = json.loads(line)
+                if event.get("type") == "progress" and progress:
+                    progress(int(event["done"]), int(event["total"]))
+                elif event.get("type") == "result":
+                    return response.status, event["data"]
+                elif event.get("type") == "error":
+                    raise ValueError("节点搜索失败")
+        finally:
+            conn.close()
+
+    def query(self, node, path, query, progress=None):
         key = (node["id"], path, urlencode(query, doseq=True))
         stamp = time.time()
         try:
-            status, data = self.request(node, path + "?" + key[2],
-                                        timeout=15 if path == "/api/search" else 5)
+            status, data = (self.search_request(node, query, progress) if path == "/api/search"
+                            else self.request(node, path + "?" + key[2]))
             if status != 200:
                 raise ValueError(data.get("error") or f"HTTP {status}")
             data = fed.public_payload(data, node, path)
@@ -140,11 +173,13 @@ class Registry:
                         self.cache.pop(next(iter(self.cache)))
                 self.health[node["id"]] = {"online": True, "last_seen": stamp}
             return node, data, None
-        except (OSError, ValueError, http.client.HTTPException):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException):
             # Errors intentionally omit URL / token / upstream exception text.
             with self.lock:
                 prior = self.health.get(node["id"], {})
-                self.health[node["id"]] = {**prior, "online": False}
+                # A failed search says nothing about the node's live/terminal APIs.
+                if path != "/api/search":
+                    self.health[node["id"]] = {**prior, "online": False}
                 cached = self.cache.get(key) if path in {"/api/sessions", "/api/term/list"} else None
             data = copy.deepcopy(cached[1]) if cached else {}
             for row in data.get("sessions", []) + data.get("pending", []):
@@ -265,6 +300,8 @@ class HubHandler(server.Handler):
     def aggregate(self, path, query):
         nodes = self.selected(query)
         upstream = {k: v for k, v in query.items() if k not in {"nodes", "sig", "progress"}}
+        if path == "/api/search" and query.get("progress", [""])[0] == "1":
+            return self.search_aggregate(nodes, upstream)
         # Never wait sequentially for a slow node. Each node has a bounded timeout.
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes)) or 1) as pool:
             results = list(pool.map(lambda n: self.registry.query(n, path, upstream), nodes))
@@ -308,6 +345,81 @@ class HubHandler(server.Handler):
             result["size"] = sum(d.get("size", 0) for _, d, _ in results)
             result["dir"] = "所选机器的本地回收站"
         return self._json(result)
+
+    def search_aggregate(self, nodes, upstream):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        events = queue.Queue(maxsize=64)
+        cancelled = threading.Event()
+
+        def emit(event):
+            self.wfile.write(json.dumps(event, ensure_ascii=False).encode() + b"\n")
+            self.wfile.flush()
+
+        def put(event):
+            while not cancelled.is_set():
+                try:
+                    events.put(event, timeout=.2)
+                    return
+                except queue.Full:
+                    continue
+            raise ConnectionAbortedError("search cancelled")
+
+        def scan(node):
+            try:
+                result = self.registry.query(node, "/api/search", upstream,
+                    progress=lambda done, total: put(("progress", node["id"], done, total)))
+            except Exception:
+                # Always finish this node, even if its payload is malformed.
+                result = (node, {}, {"node_id": node["id"], "name": node["name"],
+                                     "error": "节点搜索失败"})
+            try:
+                put(("result", result))
+            except ConnectionAbortedError:
+                pass
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes)) or 1)
+        results, counts = [], {}
+        try:
+            emit({"type": "progress", "done": 0, "total": 0})
+            for node in nodes:
+                pool.submit(scan, node)
+            while len(results) < len(nodes):
+                try:
+                    event = events.get(timeout=1)
+                except queue.Empty:
+                    # Keep the browser/proxy alive while a node parses a large file.
+                    emit({"type": "heartbeat"})
+                    continue
+                if event[0] == "progress":
+                    _, nid, done, total = event
+                    counts[nid] = (done, total)
+                    emit({"type": "progress", "done": sum(v[0] for v in counts.values()),
+                          "total": sum(v[1] for v in counts.values())
+                          if len(counts) == len(nodes) else 0})
+                else:
+                    results.append(event[1])
+                    node, data, _ = event[1]
+                    total = counts.get(node["id"], (0, data.get("total_pool", 0)))[1]
+                    counts[node["id"]] = (total, total)
+            errors = [err for _, _, err in results if err]
+            rows = [row for _, data, _ in results for row in data.get("results", [])]
+            rows.sort(key=lambda row: (row.get("updated", ""), row["uid"]), reverse=True)
+            emit({"type": "result", "data": {
+                "errors": errors, "partial": bool(errors), "nodes": self.registry.public(),
+                "results": rows, "truncated": any(d.get("truncated") for _, d, _ in results),
+                "truncated_nodes": [n["id"] for n, d, _ in results if d.get("truncated")],
+                "total_pool": sum(d.get("total_pool", 0) for _, d, _ in results)}})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            cancelled.set()
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def resolve(self, explicit, path, query, body):
         candidates = {explicit} if explicit else set()

@@ -77,11 +77,14 @@ function renderNodes() {
   host.scrollLeft = scroll;
   host.parentElement.scrollLeft = toolbarScroll;
   const notice = document.querySelector('#node-notice');
-  const errors = [...Nodes.errors.values()].flat().filter(e => !Nodes.off.has(e.node_id));
-  const names = [...new Set(errors.map(e => e.name))];
-  notice.hidden = !names.length && !!Nodes.list.length;
-  notice.textContent = names.length
-    ? `${names.join('、')} 请求失败或超时；当前结果可能不完整，离线机器的运行状态未知。`
+  const labels = {search: '全文搜索', sessions: '会话列表', live: '运行状态', term: '终端列表'};
+  const failures = [...Nodes.errors].flatMap(([context, errors]) => {
+    const names = [...new Set(errors.filter(e => !Nodes.off.has(e.node_id)).map(e => e.name))];
+    return names.length ? [`${names.join('、')} ${labels[context] || '请求'}失败或超时`] : [];
+  });
+  notice.hidden = !failures.length && !!Nodes.list.length;
+  notice.textContent = failures.length
+    ? `${failures.join('；')}；相关结果可能不完整或未更新。`
     : '暂无可用机器。';
 }
 

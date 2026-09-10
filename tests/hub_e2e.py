@@ -89,6 +89,29 @@ def main():
                 assert {r['node_name'] for r in page.evaluate('S.results')} == {'NodeA', 'NodeB'}
                 assert '命中' in page.locator('.side-search #stat').inner_text()
                 assert page.locator('#session-total').inner_text() == '2'
+                # Cold searches exceeding the old 15s cutoff keep visible progress.
+                nodes[1].state.update(search_steps=17, search_delay=1)
+                seq = page.locator('#stat').get_attribute('data-seq')
+                page.locator('#q').press('Enter')
+                page.wait_for_function('document.querySelector("#search-progress b").textContent.includes(" / ")')
+                assert page.locator('#search-progress').is_visible()
+                page.wait_for_function('(seq) => document.querySelector("#stat").dataset.seq !== seq',
+                                       arg=seq, timeout=25000)
+                assert page.evaluate('S.results.length') == 2
+                assert not page.locator('#node-notice').is_visible()
+                nodes[1].state.pop('search_steps'); nodes[1].state.pop('search_delay')
+                nodes[1].state['search_error'] = True
+                seq = page.locator('#stat').get_attribute('data-seq')
+                page.locator('#q').press('Enter')
+                page.wait_for_function('(seq) => document.querySelector("#stat").dataset.seq !== seq', arg=seq)
+                assert 'NodeB 全文搜索失败' in page.locator('#node-notice').inner_text()
+                assert '离线' not in page.locator('#node-notice').inner_text()
+                assert '结果不完整' in page.locator('#stat').inner_text()
+                assert page.evaluate('Nodes.list.find(n => n.name === "NodeB").online')
+                nodes[1].state.pop('search_error')
+                page.locator('#q').press('Enter')
+                page.wait_for_function('S.results.length === 2 && !document.querySelector("#search-progress").classList.contains("on")')
+                assert not page.locator('#node-notice').is_visible()
                 # Open identical native IDs on distinct nodes, render media and SSE.
                 for i, name in enumerate(['NodeA', 'NodeB']):
                     uid = federation.qualify(chr(97 + i) * 32, 'claude:same-file-hash', True)
