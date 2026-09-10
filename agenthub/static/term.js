@@ -990,19 +990,21 @@ function showNewSessionStage(info) {
     <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
     <h2>${icon(info.source)}<span>${esc(pendingTitle)}</span></h2>
     <div class="dhead-actions" aria-label="会话操作">
-      <span class="mobile-msg-summary"><span class="mobile-msg-count" aria-label="0 条消息">0</span></span>
       <button class="iconbtn" id="a-term" title="切换到终端" aria-label="切换到终端">${uiIcon('terminal')}</button>
-      <button class="iconbtn" data-report-bug title="报告当前会话问题"
+      ${sessionActionsMarkup(`
+      <button class="session-menu-action" data-report-bug title="报告当前会话问题"
         aria-label="报告当前会话问题">${uiIcon('bug')}</button>
-      <button class="iconbtn danger" id="a-session-action" title="停止会话" aria-label="停止会话">${uiIcon('power')}</button>
-    </div></div>
+      <button class="session-menu-action danger" id="a-session-action" title="停止会话" aria-label="停止会话">${uiIcon('power')}</button>
+      `, `
     <div class="dmeta">${info.node_name ? `<span class="meta-node">${esc(info.node_name)}</span>` : ''}<span class="meta-source">${esc(src.name)}</span><span id="mcount-total">0 条消息</span>
       <span id="dlive" class="dlive on tmux" title="运行于 tmux" aria-label="运行于 tmux">●</span>
-      <span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>
+      <span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>`)}
+    </div></div>
   </div><div class="empty new-session-wait">终端已启动，正在等待会话记录落盘…</div>`;
   $('#detail .mobile-back').onclick = showMobileList;
   bindConsoleButton($('#a-term'), S.sel);
   $('#a-session-action').onclick = () => stopPendingSession(info, $('#a-session-action'));
+  bindSessionActions($('#detail .dhead'));
   showMobileDetail();
   T.uid = S.sel;
   if (!MOBILE.matches) T.mode = 'full';   // 手机本来就是终端覆盖层，不污染桌面保存的高度模式

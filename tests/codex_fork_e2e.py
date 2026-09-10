@@ -159,6 +159,7 @@ def main():
                     expect(page.locator('#item-menu [data-act="pick"]')).to_be_hidden()
                     page.keyboard.press('Escape')
 
+                    page.locator('#a-more').click()
                     page.locator('#a-session-action').click()
                     expect(page.locator('#side .item')).to_have_count(1)
                     assert not session_meta.snapshot(local_parent_uid).get('fork_parent_visible')

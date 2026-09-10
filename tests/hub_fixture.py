@@ -176,6 +176,7 @@ class NodeHandler(server.Handler):
             ], 'errors': []})
         if u.path == '/api/session/star':
             self.state['row']['starred'] = body['starred']
+            return self._json({'uid': body['uid'], 'starred': body['starred']})
         return self._json({'ok': True, 'uid': body.get('uid', ''), 'path': '/same/file', 'removed': 1, 'freed': 10})
 
 

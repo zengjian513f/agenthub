@@ -2197,6 +2197,7 @@ function paintStarButton(button, starred, busy = false) {
   button.setAttribute('aria-pressed', String(starred));
   button.disabled = busy;
   button.innerHTML = uiIcon(starred ? 'star-filled' : 'star');
+  labelSessionAction(button);
 }
 
 function applySessionStar(uid, starred, starredAt = null) {
@@ -2898,6 +2899,85 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
   }
 }
 
+function labelSessionAction(button) {
+  if (!button?.classList.contains('session-menu-action')) return;
+  let label = button.querySelector('span');
+  if (!label) button.appendChild(label = el('span'));
+  label.textContent = button.ariaLabel;
+}
+
+function sessionActionsMarkup(actions, metadata = '') {
+  return `<div class="session-actions">
+    <button class="iconbtn" id="a-more" type="button" title="更多会话操作"
+      aria-label="更多会话操作" aria-haspopup="menu" aria-expanded="false"
+      aria-controls="session-actions-menu"><span aria-hidden="true">⋯</span></button>
+    <div id="session-actions-menu" class="session-actions-menu" hidden>
+      <div role="menu" aria-label="会话操作">${actions}</div>${metadata}
+    </div>
+  </div>`;
+}
+
+function closeSessionActions(restoreFocus = false) {
+  const menu = $('#session-actions-menu');
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  const button = $('#a-more');
+  button?.setAttribute('aria-expanded', 'false');
+  if (restoreFocus) button?.focus();
+}
+
+function bindSessionActions(heading) {
+  const button = heading.querySelector('#a-more');
+  const menu = heading.querySelector('#session-actions-menu');
+  if (!button || !menu) return;
+  menu.querySelectorAll('button').forEach(item => {
+    item.setAttribute('role', 'menuitem');
+    labelSessionAction(item);
+  });
+  const items = () => [...menu.querySelectorAll('button:not(:disabled)')];
+  const open = () => {
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    const views = heading.querySelector('#session-view-menu');
+    if (views) views.hidden = true;
+    heading.querySelector('#a-view-switch')?.setAttribute('aria-expanded', 'false');
+  };
+  button.onclick = () => menu.hidden ? open() : closeSessionActions();
+  button.onkeydown = event => {
+    if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+    event.preventDefault();
+    open();
+    const rows = items();
+    (event.key === 'ArrowUp' ? rows.at(-1) : rows[0])?.focus();
+  };
+  menu.onclick = event => {
+    if (event.target.closest('button')) closeSessionActions(true);
+  };
+  menu.onkeydown = event => {
+    const rows = items(), index = rows.indexOf(document.activeElement);
+    const next = {ArrowDown: (index + 1) % rows.length,
+      ArrowUp: (index - 1 + rows.length) % rows.length, Home: 0, End: rows.length - 1}[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    rows[next]?.focus();
+  };
+  button.parentElement.addEventListener('focusout', event => {
+    if (!button.parentElement?.contains(event.relatedTarget)) closeSessionActions();
+  });
+}
+
+document.addEventListener('click', event => {
+  if (!event.target.closest('.session-actions')) closeSessionActions();
+}, true);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && $('#session-actions-menu')?.hidden === false) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeSessionActions(true);
+  }
+}, true);
+addEventListener('resize', () => closeSessionActions());
+
 function head(m, total) {
   const h = el('div', 'dhead');
   const tmuxLive = S.liveTmux.has(m.uid);
@@ -2925,23 +3005,20 @@ function head(m, total) {
       <h2 class="${hasAgents ? 'has-session-views' : ''}">${icon(m.source)}${titleView}</h2>
       ${menuView}
       <div class="dhead-actions" aria-label="会话操作">
-        <span class="mobile-msg-summary">
-          <span class="mobile-msg-count" aria-label="${total} 条消息">${total}</span>
-        </span>
-        ${starButtonMarkup(m.uid, !!m.starred, 'iconbtn', 'a-star')}
-        <button class="iconbtn turn-mode${S.compactTurns ? '' : ' on'}" id="a-turns"
+        ${consoleButtonMarkup()}
+        ${sessionActionsMarkup(`
+        ${starButtonMarkup(m.uid, !!m.starred, 'session-menu-action', 'a-star')}
+        <button class="session-menu-action turn-mode${S.compactTurns ? '' : ' on'}" id="a-turns"
           title="${S.compactTurns ? '展开所有过程' : '折叠已完成过程'}"
           aria-label="${S.compactTurns ? '展开所有过程' : '折叠已完成过程'}"
           aria-pressed="${!S.compactTurns}">${uiIcon('process')}</button>
-        ${consoleButtonMarkup()}
-        <button class="iconbtn" data-report-bug title="报告当前会话问题"
+        <button class="session-menu-action" data-report-bug title="报告当前会话问题"
           aria-label="报告当前会话问题">${uiIcon('bug')}</button>
-        ${S.term ? `<span class="mnav"><b id="mcount">…</b>
-          <button class="iconbtn" id="m-prev" title="上一处" aria-label="上一处">↑</button>
-          <button class="iconbtn" id="m-next" title="下一处" aria-label="下一处">↓</button></span>` : ''}
-        ${m.agent_id ? '' : '<button class="iconbtn danger" id="a-session-action"></button>'}
-      </div>
-    </div>
+        ${S.term ? `<div class="session-menu-search"><b id="mcount">…</b>
+          <button class="session-menu-action" id="m-prev" title="上一处" aria-label="上一处匹配">↑</button>
+          <button class="session-menu-action" id="m-next" title="下一处" aria-label="下一处匹配">↓</button></div>` : ''}
+        ${m.agent_id ? '' : '<button class="session-menu-action danger" id="a-session-action"></button>'}
+        `, `
     <div class="dmeta">
       <span id="mcount-total">${total} 条消息</span>
       <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}"
@@ -2954,6 +3031,8 @@ function head(m, total) {
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
+    </div>`)}
+      </div>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
   h.querySelector('#a-star').onclick = () => toggleSessionStar(m.uid);
@@ -2965,6 +3044,7 @@ function head(m, total) {
     turnMode.setAttribute('aria-pressed', String(!S.compactTurns));
     const label = S.compactTurns ? '展开所有过程' : '折叠已完成过程';
     turnMode.title = turnMode.ariaLabel = label;
+    labelSessionAction(turnMode);
     document.querySelectorAll('#msgs > .turn-process').forEach(
       node => S.compactTurns ? node._fold?.() : node._open?.());
     refreshMessageTimeDividers();
@@ -2996,6 +3076,7 @@ function head(m, total) {
   showConsoleToast('');
   if (typeof renderTakeoverBtn === 'function') setTimeout(renderTakeoverBtn, 0);
   renderSessionAction(m, h.querySelector('#a-session-action'));
+  bindSessionActions(h);
   return h;
 }
 
@@ -3006,6 +3087,7 @@ function renderSessionAction(m, button = $('#a-session-action')) {
     const label = shown ? '隐藏父会话' : '显示父会话';
     button.innerHTML = uiIcon('eye-off');
     button.title = button.ariaLabel = label;
+    labelSessionAction(button);
     button.onclick = () => setForkParentVisibility([m.uid], !shown, button);
     return;
   }
@@ -3013,6 +3095,7 @@ function renderSessionAction(m, button = $('#a-session-action')) {
   const label = running ? '停止会话' : '删除会话';
   button.innerHTML = uiIcon(running ? 'power' : 'trash');
   button.title = button.ariaLabel = label;
+  labelSessionAction(button);
   button.onclick = () => running ? stopSession(m, button) : del(m);
 }
 

@@ -1189,10 +1189,11 @@ def run(pw):
     check("会话来源图标与标题留有清晰间距", title_spacing >= 6, title_spacing)
     detail_star = p.locator("#a-star")
     list_star = p.locator(f'.item[data-uid="{fake_uid}"] .item-star')
-    check("会话列表和详情标题都提供星标开关",
+    check("会话列表和详情菜单都提供星标开关",
           detail_star.count() == 1 and list_star.count() == 1
           and detail_star.get_attribute("aria-pressed") == "false"
           and list_star.get_attribute("aria-pressed") == "false")
+    p.click("#a-more")
     with p.expect_response(lambda r: r.url.endswith("/api/session/star")
                            and r.request.method == "POST") as star_info:
         detail_star.click()
@@ -1215,12 +1216,14 @@ def run(pw):
     check("从列表取消星标会同步详情且不会打开别的会话",
           p.evaluate("S.sel") == selected_before_unstar
           and p.locator("#a-star.on").count() == 0)
+    p.click("#a-more")
     check("详情元信息含 cwd", "/tmp/agenthub-selftest" in p.locator(".dmeta").inner_text())
-    check("电脑版详情显示会话 UUID",
+    check("详情菜单显示会话 UUID",
           "00000000-dead-beef-0000-000000000001" in p.locator(".dmeta").inner_text())
     meta_codes = p.locator(".dmeta code").all_inner_texts()
     check("目录在前且 UUID 内容在后",
           meta_codes[-2:] == ["/tmp/agenthub-selftest", "00000000-dead-beef-0000-000000000001"], meta_codes)
+    p.keyboard.press("Escape")
     message_url = BASE + "/api/messages/" + urllib.parse.quote(p.evaluate("S.sel"), safe="")
     plain_res = urllib.request.urlopen(urllib.request.Request(
         message_url, headers={"Accept-Encoding": "identity"}), timeout=30)
@@ -1275,7 +1278,7 @@ def run(pw):
               "n => n.hidden && n.childElementCount === 0"))
     check("过程合集之后永久保留最终结论",
           turn_process.evaluate("n => n.nextElementSibling?.dataset.role") == "assistant")
-    check("顶栏提供持久化过程折叠开关",
+    check("详情菜单提供持久化过程折叠开关",
           p.locator("#a-turns").get_attribute("aria-pressed") == "false"
           and "on" not in (p.locator("#a-turns").get_attribute("class") or "").split()
           and p.evaluate("S.compactTurns") is True
@@ -1326,6 +1329,7 @@ def run(pw):
           <= middle_toolbar["boxTop"] + middle_toolbar["boxHeight"],
           f"{sticky_top:.1f} -> {collapsed_top:.1f}")
 
+    p.click("#a-more")
     p.click("#a-turns")
     p.wait_for_function("!document.querySelector('.turn-process-body').hidden")
     check("展开所有过程后才物化正文且保留内层工具折叠",
@@ -2550,7 +2554,7 @@ def run(pw):
     p.evaluate("uid => openSession(uid)", window_uid)
     p.wait_for_selector(".history-gap", timeout=120000)
     p.wait_for_function("!document.querySelector('#prog').classList.contains('on')", timeout=120000)
-    total = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
+    total = int(re.search(r"(\d+) 条消息", p.locator("#mcount-total").text_content()).group(1))
     sparse = p.evaluate("""() => { const e = cache.get(S.sel); return {
       shown:e.msgs.length, total:e.total, partial:e.partial,
       text:document.querySelector('#msgs').textContent}; }""")
@@ -2634,7 +2638,7 @@ def run(pw):
           f"cached={cached} reqs={reqs[-2:]}")
     # 活跃会话在这期间可能又被推了新消息, 也可能因回滚整份重来, 数字不好精确比;
     # 关键是缓存命中后内容正常渲染出来了
-    back = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
+    back = int(re.search(r"(\d+) 条消息", p.locator("#mcount-total").text_content()).group(1))
     check("缓存命中后内容照常渲染", back > 0 and p.locator("#msgs .msg").count() > 0,
           f"meta={back} dom={p.locator('#msgs .msg').count()} 首次={total}")
 
@@ -2718,7 +2722,7 @@ def run(pw):
     p.wait_for_timeout(250)
     p.locator(".item").first.click()
     p.wait_for_selector(".msg", timeout=20000)
-    n0 = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
+    n0 = int(re.search(r"(\d+) 条消息", p.locator("#mcount-total").text_content()).group(1))
     fake = FAKE_PROJ / "00000000-dead-beef-0000-000000000001.jsonl"
     with open(fake, "a") as fh:                       # 模拟 CLI 追加
         fh.write(json.dumps({
@@ -2728,7 +2732,7 @@ def run(pw):
     p.evaluate("syncSession(S.sel)")
     p.wait_for_function(f"document.querySelector('#mcount-total').textContent !== '{n0} 条消息'",
                         timeout=30000)
-    n1 = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
+    n1 = int(re.search(r"(\d+) 条消息", p.locator("#mcount-total").text_content()).group(1))
     check("增量同步接上新消息", n1 == n0 + 1, f"{n0}->{n1}")
 
     check("新消息出现在末尾", "追加的新消息ZZQ" in p.locator("#msgs > .msg").last.inner_text(),
@@ -2746,7 +2750,7 @@ def run(pw):
     p.evaluate("syncSession(S.sel)")
     p.wait_for_function("document.querySelector('.item.sel .item-status')?.textContent === '1'",
                         timeout=30000)
-    n1a = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
+    n1a = int(re.search(r"(\d+) 条消息", p.locator("#mcount-total").text_content()).group(1))
     status = p.locator(".item.sel .item-status")
     check("代理新内容显示在列表图标右上角",
           "counted" in (status.get_attribute("class") or "") and status.inner_text() == "1",
@@ -2768,7 +2772,7 @@ def run(pw):
                              "cwd": "/tmp/agenthub-selftest", "sessionId": fake.stem}, ensure_ascii=False) + "\n")
     p.evaluate("syncSession(S.sel)")
     p.wait_for_function("document.querySelector('#msgs').textContent.includes('改写后追加YYQ')", timeout=30000)
-    n2 = int(re.search(r"(\d+) 条消息", p.locator(".dmeta").inner_text()).group(1))
+    n2 = int(re.search(r"(\d+) 条消息", p.locator("#mcount-total").text_content()).group(1))
     check("文件改写后整份重载, 消息不重复", n2 == n1a + 1, f"{n1a}->{n2}")
     check("重载后旧消息仍在一次", p.locator("#msgs").inner_text().count("追加的新消息ZZQ") == 1,
           p.locator("#msgs").inner_text().count("追加的新消息ZZQ"))
@@ -3340,10 +3344,12 @@ def run(pw):
         p.evaluate("""n => openPendingSession(
           pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n))""", PENDING_TERM)
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
-        check("手机新建临时会话显示关机按钮",
+        p.click("#a-more")
+        check("手机新建临时会话菜单显示关机按钮",
               p.locator("#a-session-action").is_visible()
               and p.locator("#a-session-action").get_attribute("title") == "停止会话"
               and p.locator("#a-session-action use").get_attribute("href") == "#i-power")
+        p.keyboard.press("Escape")
         check("手机新建临时会话可从终端切换到对话",
               p.locator("#a-term").get_attribute("title") == "切换到对话")
         p.click("#a-term")
@@ -3379,6 +3385,7 @@ def run(pw):
                                  "files": 1, "uploadUid": "claude:e2e-draft"},
               migrated_draft)
         p.once("dialog", lambda d: d.accept())
+        p.click("#a-more")
         p.click("#a-session-action")
         p.wait_for_function("n => !T.pending.some(x => x.name === n)", arg=PENDING_TERM,
                             timeout=30000)
@@ -4234,15 +4241,17 @@ def run(pw):
               and mobile_head["textOverflow"] == "ellipsis"
               and mobile_head["height"] <= mobile_head["lineHeight"] + 2
               and mobile_head["noOverlap"], mobile_head)
+        p.click("#a-more")
         mobile_summary = p.evaluate("""() => {
-          const count = document.querySelector('.mobile-msg-count');
+          const count = document.querySelector('#mcount-total');
           const c = count.getBoundingClientRect();
           return {text: count.textContent, visible: c.width > 0 && c.height > 0,
             unread: document.querySelectorAll('.dhead .newmsg, .dmeta .newmsg').length};
         }""")
-        check("手机详情只显示消息总数，不显示未读数",
-              mobile_summary["text"].isdigit() and mobile_summary["visible"]
+        check("手机详情菜单显示消息总数，不显示未读数",
+              re.fullmatch(r"\d+ 条消息", mobile_summary["text"]) and mobile_summary["visible"]
               and mobile_summary["unread"] == 0, mobile_summary)
+        p.keyboard.press("Escape")
         p.fill("#cinput", "手机第一行")
         mobile_single_line_height = p.locator("#cinput").bounding_box()["height"]
         sent_before_enter = len(sent)
@@ -4976,7 +4985,8 @@ def run(pw):
     p.fill("#q", "AGENTHUB自测")
     p.wait_for_timeout(300)
     p.locator(".item").first.click()
-    p.wait_for_selector("#a-session-action[title='删除会话']", timeout=10000)
+    p.wait_for_selector("#a-session-action[title='删除会话']", state="attached", timeout=10000)
+    p.click("#a-more")
     p.once("dialog", lambda d: d.accept())
     # 删除前会强制扫描进程；机器繁忙时可能超过固定 sleep。等真实响应结束，
     # 否则 finally 的 cleanup 会先删掉测试文件，让尚在处理的请求误报 404。
@@ -5021,7 +5031,7 @@ def run(pw):
 
     p.locator("#trash-done").click()
     p.locator(".item").first.click()            # 先打开，删除后才有空态入口
-    p.wait_for_selector("#a-session-action[title='删除会话']", timeout=10000)
+    p.wait_for_selector("#a-session-action[title='删除会话']", state="attached", timeout=10000)
 
     # ---- 16c. 左栏多选删除 (列表里已筛成只剩自测会话) ----
     check("平时不占额外一行", p.locator("#side-tools").is_hidden())

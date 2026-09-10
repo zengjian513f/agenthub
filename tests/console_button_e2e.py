@@ -116,7 +116,7 @@ def main():
                 page.goto(f'http://127.0.0.1:{node.server_port}')
                 page.wait_for_function('S.sessions.length > 0')
                 page.evaluate('openSession(S.sessions[0].uid)')
-                page.locator('#a-star').wait_for()
+                page.locator('#a-more').wait_for()
                 with page.expect_event('dialog') as opened:
                     page.locator('#a-term').click()
                 assert '控制台组件' in opened.value.message
