@@ -1224,7 +1224,7 @@ class Handler(BaseHTTPRequestHandler):
                               for row in pending]
             available = TERMINAL and term.available()
             reason = ("" if available else "服务未启用控制台（缺少 --terminal 启动选项）。"
-                      if not TERMINAL else "服务器未安装 tmux，无法打开控制台。")
+                      if not TERMINAL else term.unavailable_reason())
             return self._json({"enabled": available, "unavailable_reason": reason,
                                "sources": term.available_sources() if TERMINAL else {},
                                "home": str(Path.home()),
@@ -2445,7 +2445,9 @@ def main():
     ap.add_argument("--allow", default="",
                     help="除本机外允许访问的 IP 或 CIDR, 逗号分隔")
     ap.add_argument("--terminal", action="store_true",
-                    help="开启 tmux 远程终端。这等于给白名单 IP 开放本机 shell, 谨慎使用")
+                    help="开启远程终端。这等于给白名单 IP 开放本机 shell, 谨慎使用")
+    ap.add_argument("--terminal-backend", default="auto", choices=["auto", "tmux", "host"],
+                    help="终端后端: tmux 或自制会话宿主 (host)。auto = Windows 用 host, 其他用 tmux")
     ap.add_argument("--node-token-file", type=Path, help="Hub 节点凭据文件（至少 32 字符）")
     ap.add_argument("--node-id-file", type=Path, help="持久节点身份文件；默认保存在本机数据目录")
     args = ap.parse_args()
@@ -2457,9 +2459,12 @@ def main():
         if not re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,256}", NODE_TOKEN):
             ap.error("node token must contain 32–256 characters")
     TERMINAL = args.terminal
+    backend = term.configure(args.terminal_backend)
     if TERMINAL and not term.available():
-        print("[agenthub] 警告: 找不到 tmux, 终端功能不可用")
+        print(f"[agenthub] 警告: 终端后端 {backend} 不可用, 终端功能关闭 ({term.unavailable_reason()})")
         TERMINAL = False
+    elif TERMINAL:
+        print(f"[agenthub] 终端后端: {backend}")
 
     if TERMINAL:
         send_queue.fail_unsubmitted()

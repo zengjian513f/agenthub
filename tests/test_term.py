@@ -4,7 +4,7 @@ import struct
 import tempfile
 from unittest.mock import call, patch
 
-from agenthub import term
+from agenthub import term, term_tmux
 
 
 class DirectoryCompletionTests(unittest.TestCase):
@@ -85,26 +85,26 @@ class NewSessionDirectoryTests(unittest.TestCase):
 
 class TerminalSubmitTests(unittest.TestCase):
     def test_new_session_uses_fallback_size_only_as_its_initial_size(self):
-        with patch.object(term, "has_session", return_value=False), \
-                patch.object(term, "_configure_managed"), \
-                patch.object(term, "_tmux") as tmux:
-            name = term.new_session("test", "command")
+        with patch.object(term_tmux, "has_session", return_value=False), \
+                patch.object(term_tmux, "_configure_managed"), \
+                patch.object(term_tmux, "_tmux") as tmux:
+            name = term_tmux.new_session("test", "command")
 
         self.assertEqual(name, "agenthub-test")
         tmux.assert_called_once_with(
             "new-session", "-d", "-s", "agenthub-test", "-x", "120", "-y", "32",
-            "command", server=term.MANAGED_SERVER)
+            "command", server=term_tmux.MANAGED_SERVER)
 
     def test_attach_ignores_hidden_xterm_minimum_size(self):
-        attach = term.Attach.__new__(term.Attach)
+        attach = term_tmux.Attach.__new__(term_tmux.Attach)
         attach.fd = 123
         attach.cols, attach.rows = 120, 32
-        with patch.object(term.fcntl, "ioctl") as ioctl:
+        with patch.object(term_tmux.fcntl, "ioctl") as ioctl:
             self.assertFalse(attach.resize(10, 6))
             ioctl.assert_not_called()
             self.assertTrue(attach.resize(80, 24))
         ioctl.assert_called_once_with(
-            123, term.termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+            123, term_tmux.termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         self.assertEqual((attach.cols, attach.rows), (80, 24))
 
     def test_claude_resume_includes_passive_question_bridge(self):
@@ -161,38 +161,38 @@ class TerminalSubmitTests(unittest.TestCase):
         self.assertEqual(result["name"], "agenthub-codex-test")
 
     def test_kill_session_treats_concurrent_natural_exit_as_success(self):
-        pane = {"name": "agenthub-test", "server": term.MANAGED_SERVER}
-        with patch.object(term, "session_info", side_effect=[pane, None]), \
-                patch.object(term, "_tmux",
+        pane = {"name": "agenthub-test", "server": term_tmux.MANAGED_SERVER}
+        with patch.object(term_tmux, "session_info", side_effect=[pane, None]), \
+                patch.object(term_tmux, "_tmux",
                              side_effect=RuntimeError("can't find session: agenthub-test")):
-            killed = term.kill_session("agenthub-test")
+            killed = term_tmux.kill_session("agenthub-test")
 
         self.assertFalse(killed)
 
     def test_kill_session_still_reports_a_real_tmux_failure(self):
-        pane = {"name": "agenthub-test", "server": term.MANAGED_SERVER}
-        with patch.object(term, "session_info", side_effect=[pane, pane]), \
-                patch.object(term, "_tmux", side_effect=RuntimeError("permission denied")):
+        pane = {"name": "agenthub-test", "server": term_tmux.MANAGED_SERVER}
+        with patch.object(term_tmux, "session_info", side_effect=[pane, pane]), \
+                patch.object(term_tmux, "_tmux", side_effect=RuntimeError("permission denied")):
             with self.assertRaisesRegex(RuntimeError, "permission denied"):
-                term.kill_session("agenthub-test")
+                term_tmux.kill_session("agenthub-test")
 
     def test_submit_uses_bracketed_paste_before_enter(self):
-        pane = {"name": "agenthub-test", "server": term.MANAGED_SERVER}
-        with patch.object(term, "session_info", return_value=pane), \
-                patch.object(term.uuid, "uuid4") as uuid4, \
-                patch.object(term.time, "sleep") as sleep, \
-                patch.object(term, "_tmux") as tmux:
+        pane = {"name": "agenthub-test", "server": term_tmux.MANAGED_SERVER}
+        with patch.object(term_tmux, "session_info", return_value=pane), \
+                patch.object(term_tmux.uuid, "uuid4") as uuid4, \
+                patch.object(term_tmux.time, "sleep") as sleep, \
+                patch.object(term_tmux, "_tmux") as tmux:
             uuid4.return_value.hex = "fixed"
-            term.submit_text("agenthub-test", "两行\n内容")
+            term_tmux.submit_text("agenthub-test", "两行\n内容")
 
         sleep.assert_called_once_with(0.04)
         self.assertEqual(tmux.call_args_list, [
             call("set-buffer", "-b", "agenthub-submit-fixed", "--", "两行\n内容",
-                 server=term.MANAGED_SERVER, no_start=True),
+                 server=term_tmux.MANAGED_SERVER, no_start=True),
             call("paste-buffer", "-p", "-d", "-b", "agenthub-submit-fixed",
-                 "-t", "agenthub-test", server=term.MANAGED_SERVER, no_start=True),
+                 "-t", "agenthub-test", server=term_tmux.MANAGED_SERVER, no_start=True),
             call("send-keys", "-t", "agenthub-test", "--", "Enter",
-                 server=term.MANAGED_SERVER, no_start=True),
+                 server=term_tmux.MANAGED_SERVER, no_start=True),
         ])
 
     def test_graceful_stop_lets_cli_close_tmux_naturally(self):
@@ -225,8 +225,8 @@ class TerminalSubmitTests(unittest.TestCase):
 
 class TermCaptureTests(unittest.TestCase):
     def test_history_capture_joins_old_soft_wraps_before_browser_reflow(self):
-        with patch.object(term, "_session_tmux", return_value="history") as run:
-            self.assertEqual(term.capture_history("agenthub-codex-u", 321), "history")
+        with patch.object(term_tmux, "_session_tmux", return_value="history") as run:
+            self.assertEqual(term_tmux.capture_history("agenthub-codex-u", 321), "history")
 
         run.assert_called_once_with(
             "agenthub-codex-u", "capture-pane", "-J", "-p", "-e", "-t",
