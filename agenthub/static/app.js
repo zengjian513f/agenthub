@@ -4524,7 +4524,7 @@ function referenceLink(ref, label, context, explicit = false) {
     const query = new URLSearchParams({uid: context.uid, ref});
     if (context.agent) query.set('agent', context.agent);
     href = appUrl('/api/session/file') + '?' + query;
-    const open = appUrl('files.html') + '?' + query + '&open=1';
+    const open = appUrl('file.html') + '?' + query + '&open=1';
     return `<a href="${esc(open)}" data-file-ref="${esc(ref)}" data-file-href="${esc(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
   }
   return `<a href="${esc(href)}" data-reference-kind="web" target="_blank" rel="noopener noreferrer">${label}</a>`;

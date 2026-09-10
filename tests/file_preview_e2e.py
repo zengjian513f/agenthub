@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -84,6 +85,35 @@ def main():
                     assert page.locator('.reader-markdown pre .hljs-keyword').count() > 0
                     page.set_viewport_size({'width':390, 'height':844})
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                    # Slow resolution must never paint the Explorer for a file.
+                    # Also cover old conversation tabs still linking to files.html?open=1.
+                    frames = []
+                    context.expose_binding('recordFileOpening', lambda source, state: frames.append(state))
+                    context.add_init_script('''addEventListener('DOMContentLoaded', () => {
+                      if (/\/files?\.html$/.test(location.pathname)) recordFileOpening({
+                        path: location.pathname, explorer: !!document.querySelector('.commandbar'),
+                        visibleHeader: !!document.querySelector('header:not([hidden])'),
+                      });
+                    });''')
+                    def slow_resolution(route):
+                        time.sleep(.25)
+                        route.continue_()
+                    context.route('**/api/session/resolve-files', slow_resolution)
+                    other.locator('.item').first.click()
+                    link = other.locator(f'.msg[data-role=assistant] a[data-file-ref="{doc}"]')
+                    link.wait_for()
+                    frames.clear()
+                    with other.expect_popup() as opened:
+                        link.click()
+                    reader = opened.value
+                    reader.locator('.reader-markdown h1').wait_for()
+                    assert frames and all(frame['path'].endswith('/file.html') and not frame['explorer'] and not frame['visibleHeader'] for frame in frames), frames
+                    reader.close()
+                    frames.clear()
+                    page.goto(base + 'files.html?' + urlencode({'uid':uid, 'ref':str(doc), 'open':'1'}))
+                    page.locator('.reader-markdown h1').wait_for()
+                    assert frames and all(frame['path'].endswith('/file.html') and not frame['explorer'] and not frame['visibleHeader'] for frame in frames), frames
+                    context.unroute('**/api/session/resolve-files', slow_resolution)
                     # Existing file manager dialogs use the same reader and fonts.
                     page.goto(base + 'files.html?' + urlencode({'uid':uid, 'ref':str(root)}))
                     page.get_by_role('link', name=doc.name, exact=True).dblclick()

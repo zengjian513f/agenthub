@@ -2368,6 +2368,13 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _static(self, path: str):
+        if path == '/files.html':
+            query = parse_qs(urlparse(getattr(self, 'path', '')).query, keep_blank_values=True)
+            if query.get('open', [''])[0] == '1':
+                # Cached conversation tabs may still link to the old intermediary.
+                # Redirect before any file manager HTML can reach the browser.
+                return self._send(303, b'', 'text/plain', {
+                    'Location': 'file.html?' + urlencode(query, doseq=True), 'Cache-Control': 'no-store'})
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
         f = (STATIC / rel).resolve()
         if not str(f).startswith(str(STATIC.resolve())) or not f.is_file():

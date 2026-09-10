@@ -421,8 +421,8 @@ def main():
                     with page.expect_popup() as opened:
                         link.click()
                     failed = opened.value
-                    failed.locator('#status.error').wait_for()
-                    assert 'unavailable' in failed.locator('#status').inner_text()
+                    failed.locator('#file-content.error').wait_for()
+                    assert 'unavailable' in failed.locator('#file-content').inner_text()
                     failed.close()
                     node.state['fail_checks'] = False
                     # Missing targets remain candidates, with errors on demand.
@@ -432,8 +432,8 @@ def main():
                     with page.expect_popup() as opened:
                         link.click()
                     missing = opened.value
-                    missing.locator('#status.error').wait_for()
-                    assert '文件不存在' in missing.locator('#status').inner_text()
+                    missing.locator('#file-content.error').wait_for()
+                    assert '文件不存在' in missing.locator('#file-content').inner_text()
                     image.write_bytes(PNG)
                     missing.get_by_role('button', name='刷新', exact=True).click()
                     missing.wait_for_function('document.querySelector("img")?.naturalWidth === 1')

@@ -9,6 +9,26 @@
     return url.href;
   };
   try {
+    if (context.get('open') === '1') {
+      const response = await fetch(new URL('api/session/resolve-files', base), {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({uid:context.get('uid'), agent:context.get('agent') || '', refs:[context.get('ref')]}),
+      });
+      if (!(response.headers.get('Content-Type') || '').includes('application/json')) throw new Error('请登录后刷新页面');
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '无法打开文件');
+      const target = result.targets?.find(item => item.ref === context.get('ref'));
+      if (!target && !result.resolved?.[context.get('ref')]) throw new Error('文件不存在、未在会话中提及，或有多个同名文件；请使用完整路径。');
+      context.delete('open');
+      if (!result.file_browser) { location.replace(api({raw:1})); return; }
+      if (target?.kind === 'directory') {
+        const url = new URL('files.html', base); url.search = context.toString();
+        location.replace(url); return;
+      }
+      // The file is rendered in this document; no file manager page is loaded.
+      const url = new URL(location.href); url.search = context.toString();
+      history.replaceState(history.state, '', url);
+    }
     const response = await fetch(api({mode:'info'}), {cache:'no-store'});
     if (!(response.headers.get('Content-Type') || '').includes('application/json')) throw new Error('请登录后刷新页面');
     const info = await response.json();
@@ -19,6 +39,7 @@
     }
     document.title = info.name + ' · AgentHub';
     document.getElementById('file-title').textContent = info.name;
+    document.querySelector('header').hidden = false;
     const download = document.getElementById('file-download');
     download.href = api({download:1}); download.hidden = false;
     host.replaceChildren();
@@ -40,5 +61,12 @@
       if (tag === 'audio' || tag === 'video') { media.controls = true; media.preload = 'metadata'; }
       host.append(media);
     } else host.textContent = '此格式暂不支持预览，请下载后打开。';
-  } catch (error) { host.textContent = error.message || '无法打开文件'; host.classList.add('error'); }
+  } catch (error) {
+    document.title = '无法打开文件 · AgentHub';
+    document.getElementById('file-title').textContent = '无法打开文件';
+    document.querySelector('header').hidden = false;
+    const retry = document.getElementById('file-retry'); retry.hidden = false;
+    retry.onclick = () => location.reload();
+    host.textContent = error.message || '无法打开文件'; host.classList.add('error');
+  }
 })();
