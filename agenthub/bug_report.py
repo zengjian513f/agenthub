@@ -260,6 +260,49 @@ def update_manifest(report_dir: Path, **changes) -> None:
         _write_json(path, value)
 
 
+# Codex reports an empty composer a few hundred milliseconds after start, but a
+# paste followed 40 ms later by Enter at that moment leaves the prompt sitting in
+# the composer: the TUI treats the Enter as part of the paste burst.  Require the
+# empty state to hold for a moment before pasting, then verify the composer
+# actually cleared and resend Enter a bounded number of times if it did not.
+SETTLE_SECONDS = 0.6
+CONFIRM_ATTEMPTS = 4
+CONFIRM_WAIT_SECONDS = 1.0
+
+
+def _probe_state(driver, name: str) -> str:
+    probe = driver.composer_probe(name) if driver else {"draft_state": "unknown"}
+    return str(probe.get("draft_state") or "unknown")
+
+
+def _confirm_submission(driver, name: str, report_id: str) -> bool:
+    """Return True once the composer is empty again after the paste + Enter."""
+    for attempt in range(1, CONFIRM_ATTEMPTS + 1):
+        waited = 0.0
+        state = "unknown"
+        while waited < CONFIRM_WAIT_SECONDS:
+            time.sleep(0.1)
+            waited += 0.1
+            if not term.has_session(name):
+                raise RuntimeError("Codex tmux 在提交缺陷报告后退出")
+            state = _probe_state(driver, name)
+            if state == "empty":
+                return True
+            if state != "editing":
+                break
+        if state != "editing":
+            # Codex is drawing something other than a live composer (busy turn,
+            # approval prompt, transient frame).  Keep watching, do not press keys.
+            continue
+        audit.record(
+            "bug_report.worker_enter_retry", category="bug-report",
+            trace_id=report_id,
+            data={"report_id": report_id, "tmux": name, "attempt": attempt},
+        )
+        term.send_keys(name, "Enter")
+    return _probe_state(driver, name) == "empty"
+
+
 def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
     report_dir = Path(report["path"])
     report_id = report["report_id"]
@@ -267,12 +310,12 @@ def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
     driver = send_protocol.driver_for("codex")
     deadline = time.monotonic() + timeout
     last_state = ""
+    empty_since: float | None = None
     try:
         while time.monotonic() < deadline:
             if not term.has_session(name):
                 raise RuntimeError("Codex tmux 在接收缺陷报告前退出")
-            probe = driver.composer_probe(name) if driver else {"draft_state": "unknown"}
-            state = str(probe.get("draft_state") or "unknown")
+            state = _probe_state(driver, name)
             if state != last_state:
                 last_state = state
                 audit.record(
@@ -282,16 +325,34 @@ def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
                           "draft_state": state},
                 )
             if state == "empty":
+                now = time.monotonic()
+                if empty_since is None:
+                    empty_since = now
+                if now - empty_since < SETTLE_SECONDS:
+                    time.sleep(0.1)
+                    continue
                 term.submit_text(name, report["prompt"])
+                confirmed = _confirm_submission(driver, name, report_id)
                 submitted = datetime.now(timezone.utc).isoformat()
-                update_manifest(report_dir, status="submitted",
-                                submitted_at=submitted, tmux=name)
-                audit.record(
-                    "bug_report.worker_submitted", category="bug-report",
-                    trace_id=report_id,
-                    data={"report_id": report_id, "tmux": name},
-                )
+                if confirmed:
+                    update_manifest(report_dir, status="submitted",
+                                    submitted_at=submitted, tmux=name)
+                    audit.record(
+                        "bug_report.worker_submitted", category="bug-report",
+                        trace_id=report_id,
+                        data={"report_id": report_id, "tmux": name},
+                    )
+                else:
+                    message = "提示词已粘贴到 Codex，但未能确认已提交；请在终端里检查"
+                    update_manifest(report_dir, status="submitted_unconfirmed",
+                                    submitted_at=submitted, tmux=name, error=message)
+                    audit.record(
+                        "bug_report.worker_unconfirmed", category="bug-report",
+                        severity="warning", trace_id=report_id,
+                        data={"report_id": report_id, "tmux": name},
+                    )
                 return
+            empty_since = None
             if state == "editing":
                 raise RuntimeError("新建 Codex 会话出现了意外草稿，未覆盖")
             time.sleep(0.25)

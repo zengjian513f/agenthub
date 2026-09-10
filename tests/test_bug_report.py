@@ -115,7 +115,14 @@ class BugReportBundleTests(unittest.TestCase):
 
 
 class BugReportWorkerTests(unittest.TestCase):
-    def test_ready_worker_receives_prompt_and_updates_manifest(self):
+    def _run_worker(self, after_paste, before_paste=("empty",), timeout=3.0):
+        """Drive _inject_worker with scripted composer states.
+
+        ``before_paste`` states are returned (last one repeating) until the
+        prompt is pasted; ``after_paste`` states follow the paste.  Each extra
+        Enter sent by the worker advances ``after_paste`` by one step so a
+        test can express "the composer clears after the second Enter".
+        """
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             (directory / "manifest.json").write_text('{"status":"starting"}\n')
@@ -123,18 +130,73 @@ class BugReportWorkerTests(unittest.TestCase):
                       "prompt": "investigate this report"}
             info = {"name": "agenthub-codex-new-ready"}
             driver = MagicMock()
-            driver.composer_probe.return_value = {"draft_state": "empty"}
-            with patch.object(bug_report.term, "has_session", return_value=True), \
+            phase = {"pasted": False, "before": list(before_paste), "after": list(after_paste)}
+
+            def probe(name):
+                if phase["pasted"]:
+                    return {"draft_state": phase["after"][0]}
+                script = phase["before"]
+                return {"draft_state": script.pop(0) if len(script) > 1 else script[0]}
+
+            def paste(name, text):
+                phase["pasted"] = True
+
+            def enter(name, key):
+                if len(phase["after"]) > 1:
+                    phase["after"].pop(0)
+            driver.composer_probe.side_effect = probe
+            events = []
+            with patch.object(bug_report, "SETTLE_SECONDS", 0.05), \
+                    patch.object(bug_report, "CONFIRM_WAIT_SECONDS", 0.2), \
+                    patch.object(bug_report.term, "has_session", return_value=True), \
                     patch.object(bug_report.send_protocol, "driver_for",
                                  return_value=driver), \
-                    patch.object(bug_report.term, "submit_text") as submit, \
-                    patch.object(bug_report.audit, "record"):
-                bug_report._inject_worker(report, info, timeout=0.1)
-
-            submit.assert_called_once_with(info["name"], report["prompt"])
+                    patch.object(bug_report.term, "submit_text", side_effect=paste) as submit, \
+                    patch.object(bug_report.term, "send_keys", side_effect=enter) as keys, \
+                    patch.object(bug_report.audit, "record",
+                                 side_effect=lambda event, **kw: events.append(event)):
+                bug_report._inject_worker(report, info, timeout=timeout)
             manifest = json.loads((directory / "manifest.json").read_text())
-            self.assertEqual(manifest["status"], "submitted")
-            self.assertEqual(manifest["tmux"], info["name"])
+            return submit, keys, events, manifest, info
+
+    def test_ready_worker_waits_for_a_settled_composer_then_confirms(self):
+        # empty (fresh start) → paste → empty again = submitted.
+        submit, keys, events, manifest, info = self._run_worker(["empty"])
+        submit.assert_called_once_with(info["name"], "investigate this report")
+        keys.assert_not_called()
+        self.assertEqual(manifest["status"], "submitted")
+        self.assertEqual(manifest["tmux"], info["name"])
+        self.assertIn("bug_report.worker_submitted", events)
+
+    def test_swallowed_enter_is_resent_until_the_composer_clears(self):
+        # Settle probes see "empty"; after the paste the prompt stays in the
+        # composer ("editing") until the second Enter.
+        # After the paste the prompt sits in the composer through the first
+        # Enter and clears only after the second one.
+        submit, keys, events, manifest, info = self._run_worker(
+            ["editing", "editing", "empty"])
+        submit.assert_called_once()
+        self.assertEqual(keys.call_count, 2)
+        keys.assert_called_with(info["name"], "Enter")
+        self.assertEqual(manifest["status"], "submitted")
+        self.assertIn("bug_report.worker_enter_retry", events)
+        self.assertIn("bug_report.worker_submitted", events)
+
+    def test_unconfirmed_submission_is_recorded_honestly(self):
+        submit, keys, events, manifest, info = self._run_worker(["editing"])
+        submit.assert_called_once()
+        self.assertEqual(keys.call_count, bug_report.CONFIRM_ATTEMPTS)
+        self.assertEqual(manifest["status"], "submitted_unconfirmed")
+        self.assertIn("未能确认已提交", manifest["error"])
+        self.assertIn("bug_report.worker_unconfirmed", events)
+        self.assertNotIn("bug_report.worker_submitted", events)
+
+    def test_worker_does_not_paste_before_the_composer_settles(self):
+        # A single early "empty" frame followed by "unknown" must not trigger the paste.
+        submit, keys, events, manifest, info = self._run_worker(
+            ["empty"], before_paste=["empty", "unknown", "unknown", "unknown", "empty"])
+        submit.assert_called_once()
+        self.assertEqual(manifest["status"], "submitted")
 
     def test_launch_creates_pending_session_without_running_model_in_test(self):
         with tempfile.TemporaryDirectory() as tmp:
