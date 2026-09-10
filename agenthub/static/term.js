@@ -846,6 +846,11 @@ function openNewSessionDialog() {
 
 function showNewSessionStage(info) {
   if (!T.pendingModes.has(info.name)) T.pendingModes.set(info.name, T.mode);
+  // 临时会话也必须完整切换视图；列表或字体慢时不能继续显示/操作旧终端。
+  inflight?.abort();
+  closeWatch();
+  closeTermPane(true);
+  progressDone();
   // create 返回后 term/list 可能还没拉完；先把服务端刚确认的新 tmux 放进本地
   // pending，详情页的终端切换、输入框和附件可以立即使用。
   if (!T.pending.some(x => x.name === info.name)) T.pending.push({ ...info, started: Date.now() / 1000 });
@@ -853,7 +858,9 @@ function showNewSessionStage(info) {
   S.term = '';
   $('#q').value = '';
   S.sel = pendingUid(info.name);
+  S.agent = null;
   store.set('sel', S.sel);
+  store.set('agent', null);
   renderSide();
   showSessionCount(sidebarSessions().length);
   const src = SOURCES[info.source];
@@ -974,11 +981,10 @@ async function resolveNewSession(info) {
         if (wait && S.sel === pendingId && !d.running) wait.textContent = 'CLI 已退出，尚未生成会话记录';
         continue;
       }
-      const active = S.sel === pendingId;
       await loadSessions(true);
       await loadTermList();
       if (controller.signal.aborted) return;
-      if (!active) return;                  // 用户已看别处，只更新列表，不抢走右侧页面
+      if (S.sel !== pendingId) return;      // 等待刷新期间也可能切走，不能抢走右侧页面
       migrateComposerDraft(pendingId, d.uid);
       T.uid = d.uid;
       if (d.running) {
@@ -986,6 +992,7 @@ async function resolveNewSession(info) {
         S.liveTmux.add(d.uid);
       }
       await openSession(d.uid);
+      if (S.sel !== d.uid || S.agent) return;
       if (d.running) await openTermPane(d.name);
       else closeTermPane();
       T.pendingModes.delete(info.name);
@@ -1038,10 +1045,9 @@ async function createNewSession(e) {
     const recent = [d.cwd, ...store.get(dirsKey, []).filter(x => x !== d.cwd)].slice(0, 8);
     store.set(dirsKey, recent);
     $('#new-session-dialog').close();
-    showNewSessionStage(d);
-    await loadTermList();
-    await openTermPane(d.name);
-    resolveNewSession(d);
+    await openPendingSession(d);
+    // create 已确认目标终端；全节点列表刷新不能阻塞新终端的显示与连接。
+    void loadTermList();
   } catch (err) {
     error.textContent = err.message || '创建失败';
   } finally {
