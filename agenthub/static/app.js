@@ -373,6 +373,41 @@ function shortCwd(p, max = 40) {
 }
 
 const timelinePath = cwd => (cwd || '(未知)').replace(/^\/home\/[^/]+/, '~').replace(/\/+$/, '') || '/';
+const TIMELINE_COLORS = ['blue', 'teal', 'violet', 'amber', 'rose', 'olive', 'rust', 'cyan'];
+let timelineColors = new Map();
+try {
+  for (const [path, color] of store.get('timelineDirectoryColors', [])) {
+    if (typeof path === 'string' && TIMELINE_COLORS.includes(color)
+        && ![...timelineColors.values()].includes(color)) timelineColors.set(path, color);
+  }
+} catch { /* Ignore invalid saved assignments. */ }
+
+function timelineDirectoryColors(rows) {
+  const counts = new Map(), seen = new Set();
+  for (const row of rows) {
+    if (!row.cwd || row.cwd === '(未知)' || seen.has(row.uid)) continue;
+    seen.add(row.uid); // Search results also contain sessions in the main list.
+    const path = timelinePath(row.cwd);
+    counts.set(path, (counts.get(path) || 0) + 1);
+  }
+  const common = [...counts].filter(([, count]) => count >= 2)
+    .sort(([a, ac], [b, bc]) => bc - ac || (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, TIMELINE_COLORS.length).map(([path]) => path);
+  const assigned = new Map(common.filter(path => timelineColors.has(path))
+    .map(path => [path, timelineColors.get(path)]));
+  const free = TIMELINE_COLORS.filter(color => ![...assigned.values()].includes(color));
+  for (const path of common) {
+    if (!assigned.has(path)) assigned.set(path, free.shift());
+  }
+  // Preserve slots when session counts reorder the common directories. Filters
+  // use the full pool, and reloads reuse the assignment instead of recoloring it.
+  if (assigned.size !== timelineColors.size
+      || [...assigned].some(([path, color]) => timelineColors.get(path) !== color)) {
+    timelineColors = assigned;
+    store.set('timelineDirectoryColors', [...assigned]);
+  }
+  return timelineColors;
+}
 
 /** Count directories, not sessions: a busy project must not change which parts
  *  identify a path. Keep the full pool even while filtering the sidebar. */
@@ -426,33 +461,33 @@ function fitTimelineDirectories() {
   if (S.view !== 'date') return;
   const elements = [...document.querySelectorAll('#side .cwd-path')];
   if (!elements.length) return;
-  const plans = timelinePathPlans([...S.sessions, ...pendingTmuxSessions(), ...(S.results || [])]);
+  const rows = [...S.sessions, ...pendingTmuxSessions(), ...(S.results || [])];
+  const plans = timelinePathPlans(rows), colors = timelineDirectoryColors(rows);
   const measure = document.createElement('canvas').getContext('2d');
   const font = getComputedStyle(elements[0]);
-  const normalFont = `${font.fontWeight} ${font.fontSize} ${font.fontFamily}`;
-  const leafFont = `600 ${font.fontSize} ${font.fontFamily}`;
+  measure.font = `${font.fontWeight} ${font.fontSize} ${font.fontFamily}`;
   const widths = new Map();
   // Batch layout reads before writes; repeated rows share measured labels.
   const updates = elements.map(element => {
     const plan = plans.get(element.dataset.path);
     if (!plan) return null;
+    const color = colors.get(element.dataset.path) || '';
     const width = element.clientWidth;
-    if (!width) return null; // A closed date group will be fitted when opened.
+    if (!width) return {element, color}; // Fit a closed date group when opened.
     const measured = label => {
       if (!widths.has(label)) {
-        measure.font = normalFont;
-        const prefix = measure.measureText(label.slice(0, label.length - plan.leaf.length)).width;
-        measure.font = leafFont;
-        widths.set(label, prefix + measure.measureText(plan.leaf).width);
+        widths.set(label, measure.measureText(label).width);
       }
       return widths.get(label);
     };
     const label = plan.labels.find(label => measured(label) <= width)
       || plan.labels.reduce((best, label) => measured(label) < measured(best) ? label : best);
-    return {element, markup: timelinePathMarkup(label, plan.leaf)};
+    return {element, color, markup: timelinePathMarkup(label, plan.leaf)};
   });
   for (const update of updates) {
-    if (update && update.element.innerHTML !== update.markup) update.element.innerHTML = update.markup;
+    if (!update) continue;
+    if (update.element.dataset.cwdColor !== update.color) update.element.dataset.cwdColor = update.color;
+    if (update.markup && update.element.innerHTML !== update.markup) update.element.innerHTML = update.markup;
   }
 }
 

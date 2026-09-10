@@ -74,7 +74,10 @@ def main():
                     for theme in ['light', 'dark']:
                         page.evaluate('(theme) => applyTheme(theme)', theme)
                         assert alpha.locator('.cwd-leaf').evaluate('''e =>
-                          getComputedStyle(e).color !== getComputedStyle(e.parentElement).color''')
+                          getComputedStyle(e).color === getComputedStyle(e.parentElement).color &&
+                          getComputedStyle(e).fontWeight === getComputedStyle(e.parentElement).fontWeight''')
+                        assert alpha.locator('.cwd-path').evaluate('''e =>
+                          getComputedStyle(e).color === getComputedStyle(e.parentElement).color''')
 
                     # Filtering and duplicate sessions must not change the global plan.
                     page.evaluate('''S.sessions.sort((a, b) => a.title.localeCompare(b.title));
@@ -128,10 +131,65 @@ def main():
                     page.locator('#view [data-v="tree"]').click()
                     assert page.locator('.cwd-leaf').count() == 0
                     assert '/srv/common-workspace/platform-alpha/build/cache/output/report' in ' '.join(page.locator('.gname').all_text_contents())
+                    # More common directories than available colors, plus a singleton.
+                    original_rows = node.state['rows']
+                    color_paths = ['/srv/team-alpha/report', '/srv/team-beta/report'] + [
+                        f'/srv/colors/directory-{i}' for i in range(2, 10)]
+                    node.state['rows'] = [
+                        {**node.state['row'], 'uid': f'claude:color-{i}-{j}',
+                         'sid': f'color-{i}-{j}', 'title': f'Color {i} session {j}', 'cwd': cwd}
+                        for i, cwd in enumerate(color_paths) for j in range(12 - i)
+                    ] + [{**node.state['row'], 'uid': 'claude:rare', 'title': 'Rare directory',
+                          'cwd': '/srv/colors/one-off'}]
+                    page.evaluate('loadSessions()')
+                    page.locator('#view [data-v="date"]').click()
+                    assigned = page.evaluate('Object.fromEntries(timelineColors)')
+                    assert set(assigned) == set(color_paths[:8]), assigned
+                    assert len(set(assigned.values())) == 8, assigned
+                    assert assigned[color_paths[0]] != assigned[color_paths[1]]
+                    for theme in ['light', 'dark']:
+                        page.evaluate('(theme) => applyTheme(theme)', theme)
+                        rendered = page.locator('.cwd-path').evaluate_all('''rows => rows.map(e => {
+                          const s = getComputedStyle(e), leaf = getComputedStyle(e.querySelector('.cwd-leaf'));
+                          return {path:e.dataset.path,slot:e.dataset.cwdColor,color:s.color,
+                            muted:getComputedStyle(e.parentElement).color,uniform:s.color === leaf.color && s.fontWeight === leaf.fontWeight};
+                        })''')
+                        assert all(row['uniform'] for row in rendered)
+                        assert all((row['color'] != row['muted']) == bool(row['slot']) for row in rendered)
+                        assert all(row['slot'] == assigned.get(row['path'], '') for row in rendered)
+                        assert len({row['color'] for row in rendered if row['slot']}) == 8
+                        page.locator('#left').screenshot(path=f'/tmp/agenthub-directory-colors-{scoped}-{theme}.png')
+                    # A filtered/search view cannot promote a rare directory or
+                    # double-count search results. Existing slots survive reordering.
+                    page.evaluate('''() => {
+                      S.term = 'Rare directory'; renderSide();
+                      S.results = [...S.sessions]; S.term = ''; renderSide();
+                    }''')
+                    assert page.evaluate('Object.fromEntries(timelineColors)') == assigned
+                    page.evaluate('''() => {
+                      S.results = null;
+                      const row = S.sessions.find(s => s.cwd === '/srv/team-beta/report');
+                      S.sessions.push(...Array.from({length:20}, (_, i) => ({...row, uid:'claude:extra-' + i})));
+                      patchSide(visible()) || renderSide();
+                    }''')
+                    assert page.evaluate('Object.fromEntries(timelineColors)') == assigned
+                    page.reload()
+                    page.wait_for_function('S.sessions.length > 8 && document.querySelector(".cwd-path")')
+                    assert page.evaluate('Object.fromEntries(timelineColors)') == assigned
+                    # A newcomer reuses the departed slot without recoloring peers.
+                    page.evaluate('''() => {
+                      S.sessions = S.sessions.filter(s => s.cwd !== '/srv/team-alpha/report');
+                      renderSide();
+                    }''')
+                    changed = page.evaluate('Object.fromEntries(timelineColors)')
+                    assert color_paths[0] not in changed and color_paths[8] in changed
+                    assert all(changed[path] == color for path, color in assigned.items() if path != color_paths[0])
+                    assert len(set(changed.values())) == 8
+                    node.state['rows'] = original_rows
                     assert not errors, errors
                     context.close()
                 browser.close()
-            print('PASS: global path distinction, shared ancestors, basename colors, filters, duplicate sessions, polling, resize, mobile, escaping, standalone and hub')
+            print('PASS: global path distinction, whole-path palette, gray fallback, stable assignments, filters, reload, duplicate sessions, polling, resize, mobile, escaping, standalone and hub')
         finally:
             for srv in [central, node]:
                 stop(srv)
