@@ -200,6 +200,30 @@ class HubHTTPTests(unittest.TestCase):
         self.assertNotIn('offline_since', public)
         self.assertFalse(any(r.get('stale') for r in data['sessions']))
 
+    def test_session_polls_are_conditional_and_served_from_cache_when_unchanged(self):
+        self.registry.check_all()
+        seen = len(self.b.state['gets'])
+        self.registry.check_all()
+        _, data = self.call('/api/sessions')
+        probes = self.b.state['gets'][seen:]
+        self.assertEqual([p for p, _ in probes], ['/api/sessions', '/api/sessions'])
+        self.assertTrue(all(q.get('sig') for _, q in probes))
+        self.assertEqual(len({r['uid'] for r in data['sessions'] if r['node_name'] == 'NodeB'}), 1)
+        self.assertFalse(any(r.get('stale') for r in data['sessions']))
+        self.assertTrue(next(n for n in data['nodes'] if n['name'] == 'NodeB')['online'])
+        # A forced refresh and a changed list both bypass the cache.
+        self.call('/api/sessions?force=1')
+        self.assertNotIn('sig', self.b.state['gets'][-1][1])
+        self.b.state['deleted'] = True
+        try:
+            _, data = self.call('/api/sessions')
+            self.assertEqual([r['node_name'] for r in data['sessions']], ['NodeA'])
+            self.assertTrue(self.b.state['gets'][-1][1].get('sig'))
+        finally:
+            self.b.state['deleted'] = False
+        _, data = self.call('/api/sessions')
+        self.assertEqual({r['node_name'] for r in data['sessions']}, {'NodeA', 'NodeB'})
+
     def test_session_snapshot_survives_hub_restart_for_offline_machine(self):
         self.registry.check_all()
         snapshot = self.registry.snapshot_path('b' * 32)

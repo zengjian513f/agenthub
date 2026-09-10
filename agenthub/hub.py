@@ -124,13 +124,24 @@ class Registry:
     def offline(self, nid):
         return self.state(nid).get("online") is False
 
+    def sessions_sig(self, nid):
+        with self.lock:
+            cached = self.cache.get((nid, "/api/sessions", ""))
+        return cached[1].get("sig") if cached else None
+
+    def check(self, node):
+        """Conditional session fetch: the node answers a tiny `unchanged` when its
+        list signature still matches, so heartbeats cost bytes, not megabytes."""
+        sig = self.sessions_sig(node["id"])
+        return self.query(node, "/api/sessions", {"sig": [sig]} if sig else {})
+
     def check_all(self):
         """One monitor pass: refresh state and the session snapshot of every node."""
         nodes = self.all()
         if not nodes:
             return
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:
-            list(pool.map(lambda n: self.query(n, "/api/sessions", {}), nodes))
+            list(pool.map(self.check, nodes))
 
     def monitor(self):
         while not self.stopped.is_set():
@@ -290,14 +301,16 @@ class Registry:
                             else self.request(node, path + "?" + key[2], timeout=timeout))
             if status != 200:
                 raise ValueError(data.get("error") or f"HTTP {status}")
-            data = fed.public_payload(data, node, path)
+            unchanged = path == "/api/sessions" and bool(data.get("unchanged"))
+            if not unchanged:
+                data = fed.public_payload(data, node, path)
             with self.lock:
-                if path != "/api/search":
+                if path != "/api/search" and not unchanged:
                     self.cache[key] = (stamp, copy.deepcopy(data))
                     # Bound variant caches (debug views / forced refreshes).
                     while len(self.cache) > 128:
                         self.cache.pop(next(iter(self.cache)))
-                if path == "/api/sessions" and set(query) <= {"force"}:
+                if path == "/api/sessions" and not unchanged and set(query) <= {"force", "sig"}:
                     self.save_snapshot(node, stamp, data)
                     self.cache[(node["id"], path, "")] = (stamp, copy.deepcopy(data))
                 self.health[node["id"]] = {"online": True, "last_seen": stamp, "checked_at": stamp}
@@ -339,6 +352,12 @@ class Registry:
         with self.lock:
             health = dict(self.health.get(nid, {}))
             if health.get("online") is not False:
+                if path == "/api/sessions" and not query and self.sessions_sig(nid):
+                    node, data, failure = self.check(node)
+                    if failure or not data.get("unchanged"):
+                        return node, data, failure
+                    with self.lock:
+                        return node, copy.deepcopy(self.cache[(nid, path, "")][1]), None
                 return self.query(node, path, query, progress)
             key = (nid, path, urlencode(query, doseq=True))
             cached = self.cache.get(key) if path in CACHED_PATHS else None

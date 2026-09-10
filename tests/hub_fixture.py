@@ -1,5 +1,6 @@
 """Isolated HTTP/SSE/WebSocket nodes; never starts a CLI or accesses real sessions."""
 import base64
+import hashlib
 import json
 import threading
 import time
@@ -34,7 +35,11 @@ class NodeHandler(server.Handler):
         if u.path == '/api/nodes':
             return self._json({'mode': 'local', 'nodes': []})
         if u.path == '/api/sessions':
-            return self._json({'sessions': [s['row']] if not s.get('deleted') else [], 'sig': 'fixture', 'built_at': 0})
+            rows = [s['row']] if not s.get('deleted') else []
+            sig = 'fixture-' + hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()[:12]
+            if q.get('sig', [''])[0] == sig and q.get('force', ['0'])[0] != '1':
+                return self._json({'unchanged': True, 'sig': sig})
+            return self._json({'sessions': rows, 'sig': sig, 'built_at': 0})
         if u.path == '/api/live':
             return self._json({'uids': [], 'tmux_uids': [], 'started_at': {}})
         if u.path == '/api/search':
