@@ -1,4 +1,4 @@
-"""Self-contained diagnostic bundles and automatic Codex bug workers."""
+"""Self-contained diagnostic bundles and automatic CLI bug workers."""
 
 from __future__ import annotations
 
@@ -21,6 +21,10 @@ EVENT_WINDOW_SECONDS = 15 * 60
 # Uploads share the conversation composer's directory layout under the worker cwd.
 ATTACHMENT_DIR = "agenthub_attachments"
 BUG_REPORT_UPLOAD_UID = "bug-report"
+# Any installed CLI can run the investigation; Codex stays the default.
+WORKER_SOURCES = ("claude", "codex", "grok")
+DEFAULT_SOURCE = "codex"
+SOURCE_LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok"}
 _manifest_lock = threading.Lock()
 
 
@@ -275,6 +279,46 @@ def _probe_state(driver, name: str) -> str:
     return str(probe.get("draft_state") or "unknown")
 
 
+class _ScreenProbe:
+    """Composer-agnostic fallback for CLIs without a send driver (Grok).
+
+    The screen is "empty" once it is non-blank and has stopped changing; after
+    the paste it counts as submitted once the frame moves on from the pasted
+    draft.  This cannot tell a live composer from other stable frames, so it is
+    only used where no bridge exists.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.last = None
+        self.last_change = time.monotonic()
+        self.pasted_frame = None
+
+    def composer_probe(self, name: str) -> dict:
+        try:
+            screen = term.capture_screen(name)
+        except (OSError, RuntimeError, ValueError):
+            return {"draft_state": "unknown"}
+        now = time.monotonic()
+        if screen != self.last:
+            self.last = screen
+            self.last_change = now
+        if self.pasted_frame is not None:
+            if screen == self.pasted_frame:
+                return {"draft_state": "editing"}
+            return {"draft_state": "empty" if screen.strip() else "unknown"}
+        if not screen.strip() or now - self.last_change < SETTLE_SECONDS:
+            return {"draft_state": "unknown"}
+        return {"draft_state": "empty"}
+
+    def note_paste(self) -> None:
+        time.sleep(0.3)
+        try:
+            self.pasted_frame = term.capture_screen(self.name)
+        except (OSError, RuntimeError, ValueError):
+            self.pasted_frame = self.last
+
+
 def _confirm_submission(driver, name: str, report_id: str) -> bool:
     """Return True once the composer is empty again after the paste + Enter."""
     for attempt in range(1, CONFIRM_ATTEMPTS + 1):
@@ -284,7 +328,7 @@ def _confirm_submission(driver, name: str, report_id: str) -> bool:
             time.sleep(0.1)
             waited += 0.1
             if not term.has_session(name):
-                raise RuntimeError("Codex tmux 在提交缺陷报告后退出")
+                raise RuntimeError("处理会话 tmux 在提交缺陷报告后退出")
             state = _probe_state(driver, name)
             if state == "empty":
                 return True
@@ -307,14 +351,16 @@ def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
     report_dir = Path(report["path"])
     report_id = report["report_id"]
     name = info["name"]
-    driver = send_protocol.driver_for("codex")
+    source = str(info.get("source") or DEFAULT_SOURCE)
+    label = SOURCE_LABELS.get(source, source)
+    driver = send_protocol.driver_for(source) or _ScreenProbe(name)
     deadline = time.monotonic() + timeout
     last_state = ""
     empty_since: float | None = None
     try:
         while time.monotonic() < deadline:
             if not term.has_session(name):
-                raise RuntimeError("Codex tmux 在接收缺陷报告前退出")
+                raise RuntimeError(f"{label} tmux 在接收缺陷报告前退出")
             state = _probe_state(driver, name)
             if state != last_state:
                 last_state = state
@@ -332,6 +378,8 @@ def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
                     time.sleep(0.1)
                     continue
                 term.submit_text(name, report["prompt"])
+                if isinstance(driver, _ScreenProbe):
+                    driver.note_paste()
                 confirmed = _confirm_submission(driver, name, report_id)
                 submitted = datetime.now(timezone.utc).isoformat()
                 if confirmed:
@@ -343,7 +391,7 @@ def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
                         data={"report_id": report_id, "tmux": name},
                     )
                 else:
-                    message = "提示词已粘贴到 Codex，但未能确认已提交；请在终端里检查"
+                    message = f"提示词已粘贴到 {label}，但未能确认已提交；请在终端里检查"
                     update_manifest(report_dir, status="submitted_unconfirmed",
                                     submitted_at=submitted, tmux=name, error=message)
                     audit.record(
@@ -354,9 +402,9 @@ def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
                 return
             empty_since = None
             if state == "editing":
-                raise RuntimeError("新建 Codex 会话出现了意外草稿，未覆盖")
+                raise RuntimeError(f"新建 {label} 会话出现了意外草稿，未覆盖")
             time.sleep(0.25)
-        raise TimeoutError("等待 Codex 输入框就绪超时")
+        raise TimeoutError(f"等待 {label} 输入框就绪超时")
     except Exception as error:
         message = f"{type(error).__name__}: {error}"
         update_manifest(report_dir, status="failed", error=message, tmux=name)
@@ -367,11 +415,14 @@ def _inject_worker(report: dict, info: dict, timeout: float = 90.0) -> None:
         )
 
 
-def launch(report: dict, cols: int = 120, rows: int = 36) -> dict:
-    """Start a pending Codex session and asynchronously submit the report."""
+def launch(report: dict, cols: int = 120, rows: int = 36,
+           source: str = DEFAULT_SOURCE) -> dict:
+    """Start a pending CLI session and asynchronously submit the report."""
+    if source not in WORKER_SOURCES:
+        raise ValueError(f"不支持的处理会话类型: {source}")
     before = {str(session["sid"]) for session in index.load()
-              if session.get("source") == "codex"}
-    info = term.new_cli_session("codex", str(PROJECT_ROOT), cols, rows,
+              if session.get("source") == source}
+    info = term.new_cli_session(source, str(PROJECT_ROOT), cols, rows,
                                 create_cwd=False)
     record = {
         **info, "before": before, "started": time.time(),
@@ -389,8 +440,9 @@ def launch(report: dict, cols: int = 120, rows: int = 36) -> dict:
         "bug_report.worker_started", category="bug-report",
         trace_id=report["report_id"],
         data={"report_id": report["report_id"], "tmux": info["name"],
-              "cwd": str(PROJECT_ROOT)},
+              "cwd": str(PROJECT_ROOT), "source": source},
     )
+    update_manifest(Path(report["path"]), worker_source=source)
     thread = threading.Thread(
         target=_inject_worker, args=(report, info), daemon=True,
         name=f"agenthub-{report['report_id']}")

@@ -304,6 +304,8 @@ body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix
 #bug-report-add { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; font-size: 12px; }
 #bug-report-add.on { color: var(--accent); border-color: var(--accent); }
 .report-attach-hint { min-width: 0; color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+.report-source { margin-top: 4px; }
+.report-source legend { margin-bottom: 4px; }
 .report-form.dragover { outline: 2px dashed var(--accent); outline-offset: -8px; }
 .bug-report-toast {
   position: fixed; z-index: 100; right: 16px; bottom: 16px;

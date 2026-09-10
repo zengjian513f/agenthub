@@ -462,12 +462,36 @@ async function post(url, body) {
 // ---------------------------------------------------------------- 缺陷报告
 let bugReportToastTimer = 0;
 
+const BUG_REPORT_SOURCES = { claude: 'Claude', codex: 'Codex', grok: 'Grok' };
+
+function bugReportSource() {
+  return $('#bug-report-source input:checked')?.value || 'codex';
+}
+
+// 与新建会话一样，三种 CLI 都可以做处理会话；记住上次的选择，本机缺少的
+// 命令置灰（中央站下由目标机器校验）。
+function syncBugReportSources() {
+  const remembered = store.get('bugReportSource', 'codex');
+  let checked = null;
+  for (const input of $('#bug-report-source').querySelectorAll('input')) {
+    const missing = !HUB_MODE && T.sources && Object.keys(T.sources).length
+      && T.sources[input.value] === false;
+    input.disabled = !!missing;
+    input.title = missing ? `本机找不到 ${input.value} 命令` : '';
+    if (input.value === remembered && !missing) checked = input;
+  }
+  const fallback = checked || [...$('#bug-report-source').querySelectorAll('input')]
+    .find(input => !input.disabled);
+  if (fallback) fallback.checked = true;
+}
+
 function showBugReportToast(report, worker) {
   const toast = $('#bug-report-toast');
   clearTimeout(bugReportToastTimer);
   toast.replaceChildren();
   const text = document.createElement('span');
-  text.textContent = `${report} 已保存，Codex 处理会话正在启动`;
+  const label = BUG_REPORT_SOURCES[worker?.source] || '处理';
+  text.textContent = `${report} 已保存，${label} 处理会话正在启动`;
   const open = document.createElement('button');
   open.type = 'button';
   open.className = 'btn';
@@ -550,6 +574,7 @@ function openBugReportDialog() {
   $('#bug-report-go').disabled = false;
   $('#bug-report-go').textContent = '保存并启动处理会话';
   renderBugReportItems();
+  syncBugReportSources();
   dialog.showModal();
   setTimeout(() => $('#bug-report-description').focus(), 0);
 }
@@ -636,9 +661,11 @@ $('#bug-report-form').onsubmit = async event => {
     }
     button.textContent = '正在提交…';
     const terminalName = takenOver(S.sel) || (T.uid === S.sel ? T.name : '') || '';
+    const source = bugReportSource();
+    store.set('bugReportSource', source);
     const d = await post('api/bug-report', {
       ...(HUB_MODE ? {_node: node} : {}),
-      description, uid: S.sel || '', page_id: TERM_PAGE_ID,
+      description, uid: S.sel || '', page_id: TERM_PAGE_ID, source,
       terminal_name: terminalName, snapshot, attachments: uploaded,
       cols: Math.max(80, T.term?.cols || 120), rows: Math.max(24, T.term?.rows || 36),
     });

@@ -208,7 +208,7 @@ class BugReportWorkerTests(unittest.TestCase):
                     "sid": None, "cwd": str(bug_report.PROJECT_ROOT), "token": "token"}
             fake_thread = MagicMock()
             with patch.object(bug_report.index, "load", return_value=[
-                    {"source": "codex", "sid": "old"}]), \
+                    {"source": "codex", "sid": "old"}, {"source": "claude", "sid": "c1"}]), \
                     patch.object(bug_report.term, "new_cli_session",
                                  return_value=info) as new, \
                     patch.object(bug_report.pending_store, "put") as put, \
@@ -216,15 +216,61 @@ class BugReportWorkerTests(unittest.TestCase):
                     patch.object(bug_report.threading, "Thread",
                                  return_value=fake_thread):
                 result = bug_report.launch(report, 100, 30)
+                claude = bug_report.launch(report, 100, 30, source="claude")
+                with self.assertRaisesRegex(ValueError, "不支持的处理会话类型"):
+                    bug_report.launch(report, 100, 30, source="bash")
 
-            new.assert_called_once_with(
-                "codex", str(bug_report.PROJECT_ROOT), 100, 30, create_cwd=False)
-            record = put.call_args.args[0]
+            self.assertEqual(new.call_args_list[0].args[0], "codex")
+            self.assertEqual(new.call_args_list[1].args[0], "claude")
+            new.assert_called_with(
+                "claude", str(bug_report.PROJECT_ROOT), 100, 30, create_cwd=False)
+            record = put.call_args_list[0].args[0]
             self.assertEqual(record["kind"], "bug-report")
             self.assertEqual(record["title"], "处理 BUG-test")
             self.assertEqual(record["before"], {"old"})
-            fake_thread.start.assert_called_once()
+            self.assertEqual(put.call_args_list[1].args[0]["before"], {"c1"})
+            self.assertEqual(fake_thread.start.call_count, 2)
             self.assertEqual(result["report_id"], "BUG-test")
+            self.assertEqual(claude["report_id"], "BUG-test")
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["worker_source"], "claude")
+
+    def test_grok_worker_uses_screen_stability_without_a_send_driver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "manifest.json").write_text('{"status":"starting"}\n')
+            report = {"report_id": "BUG-grok", "path": str(directory), "prompt": "look"}
+            info = {"name": "agenthub-grok-new-1", "source": "grok"}
+            frames = {"screen": "", "pasted": False}
+            events = []
+
+            def capture(name):
+                if frames["pasted"]:
+                    return frames["screen"]
+                return "grok> _"
+
+            def paste(name, text):
+                frames["pasted"] = True
+                frames["screen"] = "grok> look"
+
+            def enter(name, key):
+                frames["screen"] = "thinking…"
+            with patch.object(bug_report, "SETTLE_SECONDS", 0.05), \
+                    patch.object(bug_report, "CONFIRM_WAIT_SECONDS", 0.2), \
+                    patch.object(bug_report.term, "has_session", return_value=True), \
+                    patch.object(bug_report.term, "capture_screen", side_effect=capture), \
+                    patch.object(bug_report.term, "submit_text", side_effect=paste) as submit, \
+                    patch.object(bug_report.term, "send_keys", side_effect=enter) as keys, \
+                    patch.object(bug_report.time, "sleep"), \
+                    patch.object(bug_report.audit, "record",
+                                 side_effect=lambda event, **kw: events.append(event)):
+                bug_report._inject_worker(report, info, timeout=3.0)
+            submit.assert_called_once_with("agenthub-grok-new-1", "look")
+            # The frame after paste + first Enter stayed identical, so one more Enter.
+            self.assertEqual(keys.call_count, 1)
+            manifest = json.loads((directory / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "submitted")
+            self.assertIn("bug_report.worker_enter_retry", events)
 
     def test_server_endpoint_captures_then_launches_worker(self):
         handler = object.__new__(server.Handler)
@@ -241,7 +287,8 @@ class BugReportWorkerTests(unittest.TestCase):
                                "name": "shot.png", "mime": "image/png", "kind": "image",
                                "size": 4}
         with patch.object(server, "TERMINAL", True), \
-                patch.object(server.term, "available_sources", return_value={"codex": True}), \
+                patch.object(server.term, "available_sources",
+                             return_value={"codex": True, "claude": True, "grok": False}), \
                 patch.object(server.term, "list_sessions",
                              return_value=[{"name": "agenthub-codex-one"}]), \
                 patch.object(server.term, "capture_history", return_value="screen"), \
@@ -263,15 +310,29 @@ class BugReportWorkerTests(unittest.TestCase):
                     "description": "lost message", "uid": "codex:one",
                     "attachments": [{"path": "/etc/passwd"}],
                 })
+            claude = handler._bug_report({
+                "description": "lost message", "uid": "codex:one", "source": "claude",
+                "snapshot": {"data": {}}, "cols": 100, "rows": 30,
+            })
+            missing = handler._bug_report({
+                "description": "lost message", "uid": "codex:one", "source": "grok"})
+            bogus = handler._bug_report({
+                "description": "lost message", "uid": "codex:one", "source": "bash"})
 
         self.assertEqual(result["_status"], 202)
         self.assertEqual(result["report_id"], "BUG-test")
-        self.assertEqual(create.call_args.kwargs["terminal_capture"], "screen")
-        self.assertEqual(create.call_args.kwargs["attachments"], [resolved_attachment])
-        launch.assert_called_once_with(report, cols=100, rows=30)
+        self.assertEqual(create.call_args_list[0].kwargs["terminal_capture"], "screen")
+        self.assertEqual(create.call_args_list[0].kwargs["attachments"], [resolved_attachment])
+        self.assertEqual(launch.call_args_list[0].kwargs,
+                         {"cols": 100, "rows": 30, "source": "codex"})
         self.assertEqual(rejected["_status"], 400)
         self.assertIn("不在附件目录中", rejected["error"])
-        self.assertEqual(create.call_count, 1)
+        self.assertEqual(claude["_status"], 202)
+        self.assertEqual(launch.call_args_list[1].kwargs["source"], "claude")
+        self.assertEqual(missing["_status"], 503)
+        self.assertIn("grok", missing["error"])
+        self.assertEqual(bogus["_status"], 400)
+        self.assertEqual(create.call_count, 2)
 
     def test_upload_route_accepts_bug_report_uploads_into_the_repository(self):
         with tempfile.TemporaryDirectory() as tmp:

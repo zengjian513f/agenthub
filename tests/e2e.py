@@ -1766,7 +1766,7 @@ def run(pw):
         report_requests.append(route.request.post_data_json)
         route.fulfill(status=202, content_type="application/json", body=json.dumps({
             "ok": True, "report_id": "BUG-E2E", "path": "/tmp/BUG-E2E",
-            "worker": {"name": "agenthub-codex-new-e2e", "source": "codex",
+            "worker": {"name": "agenthub-grok-new-e2e", "source": "grok",
                        "sid": None, "cwd": str(Path(__file__).resolve().parents[1]),
                        "token": "e2e", "title": "处理 BUG-E2E",
                        "kind": "bug-report", "report_id": "BUG-E2E"},
@@ -1774,6 +1774,8 @@ def run(pw):
     p.route("**/api/bug-report*", fake_bug_report)
     check("会话标题栏提供问题报告入口",
           p.locator(".dhead [data-report-bug]").count() == 1)
+    # 报告入口位于标题栏「⋯」溢出菜单里，先展开再点击。
+    p.click('.dhead [aria-controls="session-actions-menu"]')
     p.click(".dhead [data-report-bug]")
     check("会话标题栏的问题报告入口可以打开弹窗",
           p.locator("#bug-report-dialog").is_visible())
@@ -1789,6 +1791,10 @@ def run(pw):
           and p.locator("#bug-report-add").is_visible()
           and p.locator("#bug-report-items .draft-card").count() == 0)
     p.fill("#bug-report-description", "E2E 隔离验证，不启动真实 Codex")
+    check("报告框提供 Claude/Codex/Grok 处理会话选择，默认 Codex",
+          p.locator("#bug-report-source input").count() == 3
+          and p.evaluate("bugReportSource()") == "codex")
+    p.locator("#bug-report-source input[value=grok]").check(force=True)
     shot_paste = p.evaluate("""() => {
       const png = Uint8Array.from(atob('%s'), c => c.charCodeAt(0));
       const image = new File([png], '屏幕截图.png', {type: 'image/png'});
@@ -1830,6 +1836,11 @@ def run(pw):
           and report_requests[0].get("snapshot", {}).get("data", {}).get("selected") == fake_uid
           and not p.locator("#bug-report-dialog").is_visible()
           and "BUG-E2E" in p.locator("#bug-report-toast").inner_text(), report_requests)
+    check("报告请求携带所选处理会话类型并记住选择，toast 显示对应 CLI",
+          report_requests[0].get("source") == "grok"
+          and p.evaluate("store.get('bugReportSource')") == "grok"
+          and "Grok 处理会话正在启动" in p.locator("#bug-report-toast").inner_text(),
+          report_requests[0].get("source"))
     sent_attachments = report_requests[0].get("attachments") or []
     uploaded_path = Path(sent_attachments[0]["path"]) if sent_attachments else None
     check("报告附件通过对话同款上传接口落到仓库 agenthub_attachments/ 后随请求引用",

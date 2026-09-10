@@ -1821,8 +1821,11 @@ class Handler(BaseHTTPRequestHandler):
         """Capture the current cross-layer state and start a Codex investigator."""
         if not TERMINAL:
             return self._json({"error": "终端未启用，无法启动处理会话"}, 403)
-        if not term.available_sources().get("codex"):
-            return self._json({"error": "本机找不到 codex 命令"}, 503)
+        worker_source = str(body.get("source") or bug_report.DEFAULT_SOURCE)
+        if worker_source not in bug_report.WORKER_SOURCES:
+            return self._json({"error": f"不支持的处理会话类型: {worker_source}"}, 400)
+        if not term.available_sources().get(worker_source):
+            return self._json({"error": f"本机找不到 {worker_source} 命令"}, 503)
         description = str(body.get("description") or "").strip()
         try:
             attachments = bug_report.resolve_attachments(body.get("attachments"))
@@ -1859,9 +1862,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             worker = bug_report.launch(
                 report, cols=max(40, min(int(body.get("cols") or 120), 300)),
-                rows=max(12, min(int(body.get("rows") or 36), 120)))
+                rows=max(12, min(int(body.get("rows") or 36), 120)),
+                source=worker_source)
         except Exception as error:
-            message = f"诊断已保存，但 Codex 会话启动失败：{error}"
+            label = bug_report.SOURCE_LABELS.get(worker_source, worker_source)
+            message = f"诊断已保存，但 {label} 会话启动失败：{error}"
             bug_report.update_manifest(
                 Path(report["path"]), status="failed", error=message)
             audit.record(
