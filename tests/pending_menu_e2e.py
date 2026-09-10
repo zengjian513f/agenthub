@@ -16,6 +16,12 @@ from hub_fixture import NodeHandler, start_node, stop
 
 
 class PendingNode(NodeHandler):
+    def do_GET(self):
+        if urlparse(self.path).path == '/api/live':
+            uids = [self.state['row']['uid']] if self.state.get('live') else []
+            return self._json({'uids': uids, 'tmux_uids': [], 'started_at': {}})
+        return super().do_GET()
+
     def do_POST(self):
         if urlparse(self.path).path == '/api/term/kill':
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
@@ -28,7 +34,7 @@ class PendingNode(NodeHandler):
 
 
 def seed(node):
-    node.state.update(deleted=False, writes=[], fail_kill=[])
+    node.state.update(deleted=False, writes=[], fail_kill=[], live=False)
     node.state['pending'] = [
         {'name': f'pending-{i}', 'source': source, 'cwd': '/same/project',
          'started': time.time(), 'title': f'New {source} {i}'}
@@ -114,10 +120,12 @@ def main():
                         recorded = page.locator(f'#side .item[data-uid="{recorded_uid}"]')
                         menu(recorded)
                         assert page.locator('#item-menu button:visible').all_text_contents() == ['删除会话', '多选…']
-                        page.evaluate('(uid) => {closeItemMenu(); S.live.add(uid)}', recorded_uid)
+                        nodes[0].state['live'] = True
+                        page.evaluate('async () => {closeItemMenu(); await refreshLive(true)}')
                         menu(recorded)
                         assert page.locator('#item-menu button:visible').all_text_contents() == ['停止会话', '多选…']
-                        page.evaluate('(uid) => {closeItemMenu(); S.live.delete(uid)}', recorded_uid)
+                        nodes[0].state['live'] = False
+                        page.evaluate('async () => {closeItemMenu(); await refreshLive(true)}')
 
                         # Cancellation makes no mutation request.
                         page.remove_listener('dialog', accept)
@@ -143,7 +151,8 @@ def main():
                         assert page.evaluate('(uid) => !composerDrafts.has(uid) && !T.views.has(uid.slice(5)) && !T.openViews.has(uid.slice(5)) && S.sel === null', pending_uid)
                         assert page.locator('#a-term').count() == 1
                         assert '草稿' in dialogs[-1] and '回收站' not in dialogs[-1]
-                        assert nodes[0].state['writes'][-1][1].get('name') == 'pending-0'
+                        kills = [body for path, body in nodes[0].state['writes'] if path == '/api/term/kill']
+                        assert kills[-1]['name'] == 'pending-0'
                         assert len(nodes[1].state['pending']) == 2
 
                         # Mixed batch: one failed stop remains selected, others are removed.
