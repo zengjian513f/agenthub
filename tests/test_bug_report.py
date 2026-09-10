@@ -1,3 +1,4 @@
+import io
 import json
 import tempfile
 import time
@@ -45,10 +46,72 @@ class BugReportBundleTests(unittest.TestCase):
         self.assertEqual((directory / "terminal.txt").read_text(), "terminal frame")
         worker_prompt = (directory / "worker-prompt.md").read_text()
         self.assertIn("Playwright/headless Chromium", worker_prompt)
-        self.assertIn("默认创建一个本地 commit", worker_prompt)
-        self.assertIn("绝不 push", worker_prompt)
-        self.assertNotIn("不 commit", worker_prompt)
+        self.assertIn("创建一个 commit 并 push 到 GitHub", worker_prompt)
+        self.assertIn("同步到中央 Hub 和全部已部署节点", worker_prompt)
+        self.assertIn("绝不 reset/clean/强推", worker_prompt)
+        self.assertNotIn("绝不 push", worker_prompt)
+        self.assertNotIn("附件", worker_prompt.split("诊断包")[0])
+        self.assertEqual(manifest["attachments"], [])
         self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+
+    def test_bundle_keeps_attachments_and_lists_them_like_the_composer(self):
+        project = self.root / "repo"
+        uploads = project / bug_report.ATTACHMENT_DIR / "7"
+        uploads.mkdir(parents=True)
+        shot = uploads / "屏幕截图.png"
+        shot.write_bytes(b"\x89PNG" + b"\0" * 16)
+        with patch.object(bug_report, "REPORT_ROOT", self.root / "reports"), \
+                patch.object(bug_report, "PROJECT_ROOT", project), \
+                patch.object(bug_report, "_command", return_value={"exit_code": 0}):
+            attachments = bug_report.resolve_attachments([
+                {"path": str(shot), "number": 3, "name": "屏幕截图.png",
+                 "kind": "image", "mime": "image/png"}])
+            report = bug_report.create(
+                "点了按钮没反应，见 [附件3]", uid="codex:one",
+                event_store=self.store, attachments=attachments)
+        self.assertEqual(attachments[0]["relative_path"],
+                         f"{bug_report.ATTACHMENT_DIR}/7/屏幕截图.png")
+        self.assertEqual(attachments[0]["size"], 20)
+        directory = Path(report["path"])
+        manifest = json.loads((directory / "manifest.json").read_text())
+        bundled = directory / "attachments" / "03-屏幕截图.png"
+        self.assertEqual(bundled.read_bytes(), shot.read_bytes())
+        self.assertEqual(manifest["attachments"][0]["bundle_file"], "attachments/03-屏幕截图.png")
+        self.assertEqual(manifest["attachments"][0]["path"], str(shot))
+        prompt = (directory / "worker-prompt.md").read_text()
+        self.assertIn("点了按钮没反应，见 [附件3]\n\n附件3: ./agenthub_attachments/7/屏幕截图.png",
+                      prompt)
+        self.assertIn("上传了 1 个附件", prompt)
+        self.assertEqual((directory / "description.md").read_text(),
+                         "点了按钮没反应，见 [附件3]\n")
+
+    def test_resolve_attachments_rejects_paths_outside_the_upload_directory(self):
+        project = self.root / "repo"
+        (project / bug_report.ATTACHMENT_DIR).mkdir(parents=True)
+        outside = self.root / "secret.txt"
+        outside.write_text("no")
+        with patch.object(bug_report, "PROJECT_ROOT", project):
+            self.assertEqual(bug_report.resolve_attachments(None), [])
+            self.assertEqual(bug_report.resolve_attachments([]), [])
+            with self.assertRaisesRegex(ValueError, "不在附件目录中"):
+                bug_report.resolve_attachments([{"path": str(outside)}])
+            with self.assertRaisesRegex(ValueError, "不在附件目录中"):
+                bug_report.resolve_attachments(
+                    [{"path": str(project / bug_report.ATTACHMENT_DIR / "1" / "gone.png")}])
+            with self.assertRaisesRegex(ValueError, "缺少路径"):
+                bug_report.resolve_attachments([{"name": "x"}])
+            with self.assertRaisesRegex(ValueError, "格式无效"):
+                bug_report.resolve_attachments("x")
+            with self.assertRaisesRegex(ValueError, "最多附带"):
+                bug_report.resolve_attachments(
+                    [{"path": "x"}] * (bug_report.ATTACHMENT_MAX_COUNT + 1))
+            link = project / bug_report.ATTACHMENT_DIR / "link.txt"
+            link.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "不在附件目录中"):
+                bug_report.resolve_attachments([{"path": str(link)}])
+        with patch.object(bug_report, "PROJECT_ROOT", self.root / "missing"):
+            with self.assertRaisesRegex(ValueError, "尚未上传"):
+                bug_report.resolve_attachments([{"path": "x"}])
 
 
 class BugReportWorkerTests(unittest.TestCase):
@@ -111,11 +174,17 @@ class BugReportWorkerTests(unittest.TestCase):
                   "sid": None, "cwd": str(bug_report.PROJECT_ROOT), "token": "token",
                   "title": "处理 BUG-test", "kind": "bug-report",
                   "report_id": "BUG-test"}
+        resolved_attachment = {"number": 1, "path": "/repo/agenthub_attachments/1/shot.png",
+                               "relative_path": "agenthub_attachments/1/shot.png",
+                               "name": "shot.png", "mime": "image/png", "kind": "image",
+                               "size": 4}
         with patch.object(server, "TERMINAL", True), \
                 patch.object(server.term, "available_sources", return_value={"codex": True}), \
                 patch.object(server.term, "list_sessions",
                              return_value=[{"name": "agenthub-codex-one"}]), \
                 patch.object(server.term, "capture_history", return_value="screen"), \
+                patch.object(server.bug_report, "resolve_attachments",
+                             return_value=[resolved_attachment]), \
                 patch.object(server.index, "get", return_value=session), \
                 patch.object(server.send_protocol, "snapshot", return_value={"outbox": []}), \
                 patch.object(server.bug_report, "create", return_value=report) as create, \
@@ -124,12 +193,49 @@ class BugReportWorkerTests(unittest.TestCase):
                 "description": "lost message", "uid": "codex:one",
                 "page_id": "page", "terminal_name": "agenthub-codex-one",
                 "snapshot": {"data": {}}, "cols": 100, "rows": 30,
+                "attachments": [{"path": "/repo/agenthub_attachments/1/shot.png", "number": 1}],
             })
+            with patch.object(server.bug_report, "resolve_attachments",
+                              side_effect=ValueError("第 1 个附件不在附件目录中或已不存在")):
+                rejected = handler._bug_report({
+                    "description": "lost message", "uid": "codex:one",
+                    "attachments": [{"path": "/etc/passwd"}],
+                })
 
         self.assertEqual(result["_status"], 202)
         self.assertEqual(result["report_id"], "BUG-test")
         self.assertEqual(create.call_args.kwargs["terminal_capture"], "screen")
+        self.assertEqual(create.call_args.kwargs["attachments"], [resolved_attachment])
         launch.assert_called_once_with(report, cols=100, rows=30)
+        self.assertEqual(rejected["_status"], 400)
+        self.assertIn("不在附件目录中", rejected["error"])
+        self.assertEqual(create.call_count, 1)
+
+    def test_upload_route_accepts_bug_report_uploads_into_the_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            handler = object.__new__(server.Handler)
+            handler._json = lambda payload, status=200: {**payload, "_status": status}
+            payload = b"\x89PNG" + b"\1" * 8
+            handler.headers = {"Content-Length": str(len(payload)), "Content-Type": "image/png"}
+            handler.rfile = io.BytesIO(payload)
+            with patch.object(server, "TERMINAL", True), \
+                    patch.object(server.bug_report, "PROJECT_ROOT", project), \
+                    patch.object(server.index, "get", return_value=None) as lookup, \
+                    patch.object(server.media, "register_path", return_value=None):
+                result = handler._upload_attachment(
+                    {"uid": ["bug-report"], "name": ["屏幕截图.png"]})
+            lookup.assert_not_called()
+            self.assertEqual(result["_status"], 200)
+            self.assertEqual(result["relative_path"], "agenthub_attachments/1/屏幕截图.png")
+            self.assertEqual(Path(result["path"]).read_bytes(), payload)
+            self.assertEqual(result["kind"], "image")
+            handler.headers = {"Content-Length": "4"}
+            handler.rfile = io.BytesIO(b"abcd")
+            with patch.object(server, "TERMINAL", False), \
+                    patch.object(server.bug_report, "PROJECT_ROOT", project):
+                denied = handler._upload_attachment({"uid": ["bug-report"], "name": ["x"]})
+            self.assertEqual(denied["_status"], 403)
 
 
 if __name__ == "__main__":

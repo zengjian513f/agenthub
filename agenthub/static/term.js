@@ -483,10 +483,52 @@ function showBugReportToast(report, worker) {
   bugReportToastTimer = setTimeout(() => toast.classList.add('hidden'), 20000);
 }
 
+// 报告框的附件复用对话输入框那一套：同样的选择菜单、粘贴/拖放、[附件N]
+// 引用，以及同一个上传接口。处理会话的 cwd 固定为仓库根目录，因此上传
+// 先落到仓库的 agenthub_attachments/，与在该目录的会话里发送附件完全一致。
+const BUG_REPORT_UPLOAD_UID = 'bug-report';
+// newComposerDraft 定义在下方的对话输入框段落，只能在运行时按需创建。
+let bugReportDraft = null;
+let bugReportSending = false;
+const bugReportDraftObject = () => (bugReportDraft ||= newComposerDraft());
+
+function renderBugReportItems() {
+  renderAttachmentCards($('#bug-report-items'), bugReportDraftObject().attachments, {
+    disabled: bugReportSending,
+    onInsert: number => insertComposerReference(number, $('#bug-report-description')),
+    onRemove: id => {
+      if (bugReportSending) return;
+      removeDraftAttachment(bugReportDraftObject(), id);
+      renderBugReportItems();
+    },
+  });
+}
+
+function addBugReportFiles(files) {
+  addDraftFiles(bugReportDraftObject(), files);
+  renderBugReportItems();
+}
+
+function clearBugReportDraft() {
+  for (const attachment of bugReportDraftObject().attachments) {
+    if (attachment.preview) URL.revokeObjectURL(attachment.preview);
+  }
+  bugReportDraft = newComposerDraft();
+  renderBugReportItems();
+}
+
+function closeBugReportAttachMenu() {
+  $('#bug-report-attach-menu').classList.add('hidden');
+  $('#bug-report-add').classList.remove('on');
+  $('#bug-report-add').setAttribute('aria-expanded', 'false');
+}
+
 function openBugReportDialog() {
   const dialog = $('#bug-report-dialog');
   $('#bug-report-error').textContent = '';
   $('#bug-report-go').disabled = false;
+  $('#bug-report-go').textContent = '保存并启动处理会话';
+  renderBugReportItems();
   dialog.showModal();
   setTimeout(() => $('#bug-report-description').focus(), 0);
 }
@@ -502,8 +544,35 @@ $('#bug-report-dialog .modal-cancel').onclick = () => $('#bug-report-dialog').cl
 $('#bug-report-dialog').addEventListener('click', event => {
   if (event.target === $('#bug-report-dialog')) $('#bug-report-dialog').close();
 });
+$('#bug-report-add').onclick = event => {
+  event.stopPropagation();
+  const menu = $('#bug-report-attach-menu');
+  const open = menu.classList.toggle('hidden');
+  $('#bug-report-add').classList.toggle('on', !open);
+  $('#bug-report-add').setAttribute('aria-expanded', String(!open));
+};
+$('#bug-report-attach-menu').onclick = event => {
+  const button = event.target.closest('button[data-attach]');
+  if (!button) return;
+  closeBugReportAttachMenu();
+  const input = $('#bug-report-file');
+  input.accept = ATTACH_ACCEPT[button.dataset.attach] ?? '';
+  input.click();
+};
+$('#bug-report-file').onchange = event => {
+  addBugReportFiles([...event.target.files]);
+  event.target.value = '';
+};
+$('#bug-report-dialog').addEventListener('click', event => {
+  if (!event.target.closest('#bug-report-dialog .attach-picker')) closeBugReportAttachMenu();
+});
+// 截图通常来自系统剪贴板；粘贴落在描述框或对话框内任意位置都接收。
+$('#bug-report-form').addEventListener('paste', event => pasteAttachmentFiles(event, addBugReportFiles));
+bindFileDrop($('#bug-report-form'), addBugReportFiles);
+
 $('#bug-report-form').onsubmit = async event => {
   event.preventDefault();
+  if (bugReportSending) return;
   const description = $('#bug-report-description').value.trim();
   const error = $('#bug-report-error');
   if (!description) {
@@ -512,16 +581,39 @@ $('#bug-report-form').onsubmit = async event => {
     return;
   }
   const button = $('#bug-report-go');
+  const attachments = [...bugReportDraftObject().attachments];
+  const node = HUB_MODE ? (nodeOf(S.sel) || selectedNodeIds()[0]) : '';
+  bugReportSending = true;
   button.disabled = true;
+  $('#bug-report-add').disabled = true;
   error.textContent = '';
+  renderBugReportItems();
   const snapshot = browserStateSnapshot('bug-report');
-  browserAuditEvent('bug_report.requested', snapshot.data, snapshot.content);
+  browserAuditEvent('bug_report.requested', {
+    ...snapshot.data, attachments: attachments.length,
+  }, snapshot.content);
   try {
+    // 与对话发送一致：同一批附件共用一个编号目录，失败的附件保留在卡片上重试。
+    const uploaded = [];
+    let attachmentId = attachments.find(x => x.uploaded?.uid === BUG_REPORT_UPLOAD_UID)
+      ?.uploaded?.attachment_id || null;
+    for (let i = 0; i < attachments.length; i++) {
+      button.textContent = `上传 ${i + 1}/${attachments.length}`;
+      const result = await uploadComposerAttachment(
+        attachments[i], BUG_REPORT_UPLOAD_UID, attachmentId, { node, render: renderBugReportItems });
+      attachmentId ||= result.attachment_id;
+      uploaded.push({
+        number: attachments[i].number, path: result.path, relative_path: result.relative_path,
+        name: result.name, kind: result.kind, mime: result.mime, size: result.size,
+        attachment_id: result.attachment_id,
+      });
+    }
+    button.textContent = '正在提交…';
     const terminalName = takenOver(S.sel) || (T.uid === S.sel ? T.name : '') || '';
     const d = await post('api/bug-report', {
-      ...(HUB_MODE ? {_node: nodeOf(S.sel) || selectedNodeIds()[0]} : {}),
+      ...(HUB_MODE ? {_node: node} : {}),
       description, uid: S.sel || '', page_id: TERM_PAGE_ID,
-      terminal_name: terminalName, snapshot,
+      terminal_name: terminalName, snapshot, attachments: uploaded,
       cols: Math.max(80, T.term?.cols || 120), rows: Math.max(24, T.term?.rows || 36),
     });
     if (d.error) {
@@ -530,12 +622,17 @@ $('#bug-report-form').onsubmit = async event => {
     }
     $('#bug-report-dialog').close();
     $('#bug-report-description').value = '';
+    clearBugReportDraft();
     await loadTermList();
     showBugReportToast(d.report_id, d.worker);
   } catch (failure) {
     error.textContent = `提交失败：${failure.message || failure}`;
   } finally {
+    bugReportSending = false;
     button.disabled = false;
+    $('#bug-report-add').disabled = false;
+    button.textContent = '保存并启动处理会话';
+    renderBugReportItems();
   }
 };
 
@@ -2307,17 +2404,15 @@ function closeAttachMenu() {
   $('#cadd').setAttribute('aria-expanded', 'false');
 }
 
-function renderComposerItems() {
-  const box = $('#compose-items');
+// 附件卡片同时服务对话输入框和缺陷报告框：两者的草稿结构、编号与上传流程一致。
+function renderAttachmentCards(box, attachments, { onInsert, onRemove, disabled = false }) {
   box.replaceChildren();
-  const draft = composerDraft();
-  if (!draft) return;
-  for (const attachment of draft.attachments) {
+  for (const attachment of attachments) {
     const card = el('div', `draft-card ${attachment.status || ''}`);
     card.dataset.draftId = attachment.id;
     card.title = `点击插入 [附件${attachment.number}]`;
     card.onclick = e => {
-      if (!e.target.closest('.draft-remove')) insertComposerReference(attachment.number);
+      if (!e.target.closest('.draft-remove')) onInsert(attachment.number);
     };
     const thumb = el('span', 'draft-thumb');
     if (attachment.kind === 'image') {
@@ -2343,14 +2438,28 @@ function renderComposerItems() {
     const remove = el('button', 'draft-remove', '×');
     remove.type = 'button';
     remove.title = remove.ariaLabel = '移除附件';
-    remove.disabled = composerSending;
+    remove.disabled = disabled;
     remove.onclick = e => {
       e.stopPropagation();
-      removeComposerAttachment(attachment.id);
+      onRemove(attachment.id);
     };
     card.append(thumb, info, remove);
     box.appendChild(card);
   }
+}
+
+function renderComposerItems() {
+  const box = $('#compose-items');
+  const draft = composerDraft();
+  if (!draft) {
+    box.replaceChildren();
+    return;
+  }
+  renderAttachmentCards(box, draft.attachments, {
+    disabled: composerSending,
+    onInsert: insertComposerReference,
+    onRemove: removeComposerAttachment,
+  });
   for (const quote of draft.quotes) {
     const card = el('div', 'draft-card draft-quote');
     card.dataset.draftId = quote.id;
@@ -2374,6 +2483,11 @@ function renderComposerItems() {
 function addComposerFiles(files) {
   const draft = composerDraft();
   if (!draft) return;
+  addDraftFiles(draft, files);
+  renderComposerItems();
+}
+
+function addDraftFiles(draft, files) {
   for (const file of files) {
     if (draft.attachments.length >= COMPOSER_MAX_FILES) {
       alert(`一次最多添加 ${COMPOSER_MAX_FILES} 个附件`);
@@ -2390,7 +2504,6 @@ function addComposerFiles(files) {
       status: '', uploaded: null, error: '',
     });
   }
-  renderComposerItems();
 }
 
 function clipboardAttachmentFiles(data) {
@@ -2456,8 +2569,7 @@ function clipboardCsvFile(data, callback) {
   return true;
 }
 
-function insertComposerReference(number) {
-  const ta = $('#cinput');
+function insertComposerReference(number, ta = $('#cinput')) {
   if (!ta) return;
   const token = `[附件${number}]`;
   ta.focus();
@@ -2467,12 +2579,17 @@ function insertComposerReference(number) {
   ta.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-function removeComposerAttachment(id, draft = composerDraft()) {
-  if (!draft || composerSending) return;
+function removeDraftAttachment(draft, id) {
   const at = draft.attachments.findIndex(x => x.id === id);
-  if (at < 0) return;
+  if (at < 0) return false;
   const [removed] = draft.attachments.splice(at, 1);
   if (removed.preview) URL.revokeObjectURL(removed.preview);
+  return true;
+}
+
+function removeComposerAttachment(id, draft = composerDraft()) {
+  if (!draft || composerSending) return;
+  removeDraftAttachment(draft, id);
   renderComposerItems();
 }
 
@@ -2524,15 +2641,17 @@ function buildComposerPrompt(text, attachments = [], quotes = []) {
   return prompt;
 }
 
-async function uploadComposerAttachment(attachment, uid, attachmentId = null) {
+async function uploadComposerAttachment(attachment, uid, attachmentId = null,
+  { node = '', render = renderComposerItems } = {}) {
   if (attachment.uploaded?.uid === uid) return attachment.uploaded;
   attachment.status = 'uploading';
   attachment.error = '';
-  renderComposerItems();
+  render();
   const url = new URL(appUrl('api/session/attachment'));
   url.searchParams.set('uid', uid);
   url.searchParams.set('name', attachment.file.name || 'attachment');
   if (attachmentId) url.searchParams.set('id', attachmentId);
+  if (node) url.searchParams.set('node', node);
   try {
     const response = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': attachment.file.type || 'application/octet-stream' },
@@ -2542,12 +2661,12 @@ async function uploadComposerAttachment(attachment, uid, attachmentId = null) {
     if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
     attachment.uploaded = { ...data, uid };
     attachment.status = 'ready';
-    renderComposerItems();
+    render();
     return attachment.uploaded;
   } catch (error) {
     attachment.status = 'failed';
     attachment.error = error.message || String(error);
-    renderComposerItems();
+    render();
     throw error;
   }
 }
@@ -2827,44 +2946,50 @@ document.addEventListener('selectionchange', () => {
     lastMessageSelectionUid = S.sel;
   }
 });
-$('#cinput').addEventListener('paste', e => {
+function pasteAttachmentFiles(e, addFiles) {
   const directories = clipboardDirectoryNames(e.clipboardData);
   const files = clipboardAttachmentFiles(e.clipboardData);
   if (directories.length) {
     e.preventDefault();
-    if (files.length) addComposerFiles(files);
+    if (files.length) addFiles(files);
     alert(`暂不支持直接粘贴文件夹：${directories.join('、')}。请先压缩后再粘贴。`);
     return;
   }
   if (!files.length) {
     // 表格软件偶尔只提供 text/csv 剪贴板项而不提供 File。此时保留其
     // 二进制附件语义；普通 text/plain 粘贴仍完全交给浏览器。
-    if (!clipboardCsvFile(e.clipboardData, file => addComposerFiles([file]))) return;
+    if (!clipboardCsvFile(e.clipboardData, file => addFiles([file]))) return;
     e.preventDefault();
     return;
   }
   // 带附件的剪贴板常同时携带 text/plain；交给浏览器会把那份文字再粘贴一次。
   e.preventDefault();
-  addComposerFiles(files);
-});
-$('#composer').addEventListener('dragenter', e => {
-  if (e.dataTransfer?.types?.includes('Files')) $('#composer').classList.add('dragover');
-});
-$('#composer').addEventListener('dragover', e => {
-  if (!e.dataTransfer?.types?.includes('Files')) return;
-  e.preventDefault();
-  e.dataTransfer.dropEffect = 'copy';
-});
-$('#composer').addEventListener('dragleave', e => {
-  if (!$('#composer').contains(e.relatedTarget)) $('#composer').classList.remove('dragover');
-});
-$('#composer').addEventListener('drop', e => {
-  $('#composer').classList.remove('dragover');
-  const files = [...(e.dataTransfer?.files || [])];
-  if (!files.length) return;
-  e.preventDefault();
-  addComposerFiles(files);
-});
+  addFiles(files);
+}
+
+function bindFileDrop(zone, addFiles) {
+  zone.addEventListener('dragenter', e => {
+    if (e.dataTransfer?.types?.includes('Files')) zone.classList.add('dragover');
+  });
+  zone.addEventListener('dragover', e => {
+    if (!e.dataTransfer?.types?.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  zone.addEventListener('dragleave', e => {
+    if (!zone.contains(e.relatedTarget)) zone.classList.remove('dragover');
+  });
+  zone.addEventListener('drop', e => {
+    zone.classList.remove('dragover');
+    const files = [...(e.dataTransfer?.files || [])];
+    if (!files.length) return;
+    e.preventDefault();
+    addFiles(files);
+  });
+}
+
+$('#cinput').addEventListener('paste', e => pasteAttachmentFiles(e, addComposerFiles));
+bindFileDrop($('#composer'), addComposerFiles);
 
 function setTermCtrl(on) {
   T.ctrlArmed = !!on;

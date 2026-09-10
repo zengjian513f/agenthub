@@ -392,10 +392,14 @@ API key 与 access/refresh token；附件只记录既有引用和元数据，不
 
 点「报告问题」后，私有包写到
 `~/.local/share/agenthub/bug-reports/<BUG-id>/`，包含 `manifest.json`、用户描述、浏览器状态、
-相关事件、tmux scrollback 和 Git 状态。随后新建 Codex tmux，会话提示词要求先按
-`AGENTS.md` 用 Playwright 重现，再找出链路中第一个偏差并修复；验证通过后默认只提交本次
-报告产生的修改，创建本地 commit，但不会自动 push。若工作区原有改动与修复重叠、无法
-安全隔离，或测试没有通过，则保留未提交状态并在处理会话中说明。
+相关事件、tmux scrollback 和 Git 状态。报告框的附件与对话输入框共用同一套交互和上传
+方式（粘贴/拖入/附件菜单、`[附件N]` 引用、`POST /api/session/attachment?uid=bug-report`），
+文件落在仓库根目录的 `agenthub_attachments/<批次>/` 下，与处理会话的 cwd 一致，并硬链接到
+诊断包 `attachments/` 留档。随后新建 Codex tmux，会话提示词
+要求先按 `AGENTS.md` 用 Playwright 重现，再找出链路中第一个偏差并修复；验证通过后只提交
+本次报告产生的修改，push 到 GitHub，并按 `docs/deployment.md` 与本机 `DEPLOYMENT.local.md`
+同步到中央 Hub 和全部已部署节点，无法连通的目标会在会话中列出。若工作区原有改动与修复
+重叠、无法安全隔离，或测试没有通过，则保留未提交状态并在处理会话中说明。
 如果 Codex 启动失败，诊断包仍会保留。报告按钮会实际调用当前账号配置的 Codex 模型，
 并产生相应模型用量。
 

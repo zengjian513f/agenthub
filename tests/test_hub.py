@@ -290,6 +290,24 @@ class HubHTTPTests(unittest.TestCase):
         self.assertEqual(forwarded['text'], 'keep exact text')
         self.assertEqual(forwarded['request_id'], 'request-123')
 
+    def test_bug_report_uploads_route_by_node_query_without_a_session(self):
+        req = Request(self.base + '/api/session/attachment?uid=bug-report&node=' + 'b' * 32
+                      + '&name=%E6%88%AA%E5%9B%BE.png', data=b'\x89PNG', method='POST',
+                      headers={'Content-Type': 'image/png'})
+        with urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read())
+        self.assertEqual(payload['name'], '截图.png')
+        query, raw = self.b.state['uploads'][-1]
+        self.assertEqual(query['uid'], ['bug-report'])
+        self.assertEqual(raw, b'\x89PNG')
+        self.assertNotIn('node', query)
+        # 没有 node 又不是限定 uid 的上传依旧被拒绝，不会猜测机器。
+        req = Request(self.base + '/api/session/attachment?uid=bug-report&name=x.png',
+                      data=b'x', method='POST', headers={'Content-Type': 'image/png'})
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=20)
+        self.assertEqual(caught.exception.code, 400)
+
     def test_bulk_delete_and_trash_route_by_machine(self):
         uids = [federation.qualify(c * 32, 'claude:same-file-hash', True) for c in 'ab']
         try:

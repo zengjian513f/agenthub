@@ -258,11 +258,28 @@
     </div>
     <label class="report-label" for="bug-report-description">发生了什么</label>
     <textarea id="bug-report-description" rows="6" maxlength="50000"
-      placeholder="描述操作步骤、预期结果和实际现象。当前页面、消息状态与终端画面会自动附上。"></textarea>
+      placeholder="描述操作步骤、预期结果和实际现象，可直接粘贴截图或拖入文件。当前页面、消息状态与终端画面会自动附上。"></textarea>
+    <div id="bug-report-items" class="report-items" aria-live="polite"></div>
+    <div class="report-attach-row">
+      <div class="attach-picker">
+        <button class="btn" id="bug-report-add" type="button" title="添加附件" aria-expanded="false">
+          <svg class="ui-icon" aria-hidden="true"><use href="#i-plus"/></svg><span>附件</span>
+        </button>
+        <div class="attach-menu hidden" id="bug-report-attach-menu" role="menu">
+          <button type="button" data-attach="image" role="menuitem"><span>▧</span>图片</button>
+          <button type="button" data-attach="video" role="menuitem"><span>▶</span>视频</button>
+          <button type="button" data-attach="audio" role="menuitem"><span>♪</span>音频</button>
+          <button type="button" data-attach="file" role="menuitem"><span>⌑</span>文件</button>
+        </div>
+        <input id="bug-report-file" type="file" multiple hidden>
+      </div>
+      <span class="report-attach-hint">截图可直接粘贴或拖入；点附件卡片可在描述中插入 [附件N]。</span>
+    </div>
     <div class="report-capture-note">
       将保存当前页面 DOM、收发事件、服务端发送账本、tmux 画面和最近 15 分钟审计记录。
+      附件与对话附件走同一上传方式，保存在仓库的 agenthub_attachments/ 下并随诊断包留档。
       不保存 Cookie、鉴权头或 API Key；启动处理会话会产生 Codex 模型用量。
-      修复验证通过后默认创建本地 commit，但不会自动 push。
+      修复验证通过后会自动 commit、push 到 GitHub，并同步到中央 Hub 和其他机器。
     </div>
     <div id="bug-report-error" role="alert"></div>
     <div class="modal-actions">

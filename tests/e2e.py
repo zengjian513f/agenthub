@@ -31,6 +31,12 @@ PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBA
 PASS, FAIL = [], []
 
 
+# 1×1 像素图片，用于附件/截图相关断言。
+E2E_PNG_BASE64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/"
+                  "q842iQAAAABJRU5ErkJggg==")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def check(name, cond, extra=""):
     (PASS if cond else FAIL).append(name)
     print(f"{'✅' if cond else '❌'} {name}{'  ' + str(extra) if extra and not cond else ''}")
@@ -1773,7 +1779,45 @@ def run(pw):
           p.locator("#bug-report-dialog").is_visible()
           and "最近 15 分钟" in p.locator(".report-capture-note").inner_text()
           and "模型用量" in p.locator(".report-capture-note").inner_text())
+    check("问题报告弹窗说明修复后自动 push 并同步其他机器",
+          "push 到 GitHub" in p.locator(".report-capture-note").inner_text()
+          and "同步到中央 Hub" in p.locator(".report-capture-note").inner_text()
+          and p.locator("#bug-report-add").is_visible()
+          and p.locator("#bug-report-items .draft-card").count() == 0)
     p.fill("#bug-report-description", "E2E 隔离验证，不启动真实 Codex")
+    shot_paste = p.evaluate("""() => {
+      const png = Uint8Array.from(atob('%s'), c => c.charCodeAt(0));
+      const image = new File([png], '屏幕截图.png', {type: 'image/png'});
+      const transfer = new DataTransfer(); transfer.items.add(image);
+      const clipboard = {files: transfer.files, items: transfer.items, types: ['Files'],
+                         getData: () => ''};
+      const event = new Event('paste', {bubbles: true, cancelable: true});
+      Object.defineProperty(event, 'clipboardData', {value: clipboard});
+      document.querySelector('#bug-report-description').dispatchEvent(event);
+      return event.defaultPrevented;
+    }""" % E2E_PNG_BASE64)
+    check("在问题描述框粘贴截图会成为与对话一致的附件卡片",
+          shot_paste
+          and p.locator("#bug-report-items .draft-card").count() == 1
+          and p.locator("#bug-report-items .draft-info b").inner_text() == "屏幕截图.png"
+          and "[附件1] · 图片" in p.locator("#bug-report-items .draft-info small").inner_text()
+          and p.locator("#bug-report-items img").evaluate("img => img.naturalWidth") == 1)
+    p.click("#bug-report-add")
+    check("报告框的附件菜单与对话输入框一致",
+          p.locator("#bug-report-attach-menu").is_visible()
+          and p.locator("#bug-report-attach-menu button[data-attach]").count() == 4)
+    p.locator("#bug-report-attach-menu button[data-attach=file]").click()
+    p.locator("#bug-report-file").set_input_files([{
+        "name": "notes.txt", "mimeType": "text/plain", "buffer": b"hello"}])
+    check("附件菜单选择的文件追加到附件列表",
+          not p.locator("#bug-report-attach-menu").is_visible()
+          and p.locator("#bug-report-items .draft-card").count() == 2
+          and "[附件2] · 文件" in p.locator("#bug-report-items .draft-info small").nth(1).inner_text())
+    p.locator("#bug-report-items .draft-card").nth(1).locator(".draft-remove").click()
+    p.locator("#bug-report-items .draft-card").first.click()
+    check("附件可在提交前移除，点击卡片把 [附件N] 插入描述",
+          p.locator("#bug-report-items .draft-card").count() == 1
+          and p.input_value("#bug-report-description").endswith("[附件1]"))
     p.click("#bug-report-go")
     p.wait_for_selector("#bug-report-toast:not(.hidden)", timeout=10000)
     check("报告提交包含最终页面快照且不强制切走当前会话",
@@ -1782,6 +1826,20 @@ def run(pw):
           and report_requests[0].get("snapshot", {}).get("data", {}).get("selected") == fake_uid
           and not p.locator("#bug-report-dialog").is_visible()
           and "BUG-E2E" in p.locator("#bug-report-toast").inner_text(), report_requests)
+    sent_attachments = report_requests[0].get("attachments") or []
+    uploaded_path = Path(sent_attachments[0]["path"]) if sent_attachments else None
+    check("报告附件通过对话同款上传接口落到仓库 agenthub_attachments/ 后随请求引用",
+          len(sent_attachments) == 1
+          and sent_attachments[0]["number"] == 1
+          and sent_attachments[0]["name"] == "屏幕截图.png"
+          and sent_attachments[0]["kind"] == "image"
+          and re.fullmatch(r"agenthub_attachments/\d+/屏幕截图\.png", sent_attachments[0]["relative_path"])
+          and uploaded_path.parent.parent == REPO_ROOT / "agenthub_attachments"
+          and uploaded_path.read_bytes() == base64.b64decode(E2E_PNG_BASE64)
+          and p.evaluate("bugReportDraftObject().attachments.length") == 0,
+          sent_attachments)
+    if uploaded_path and uploaded_path.parent.parent == REPO_ROOT / "agenthub_attachments":
+        shutil.rmtree(uploaded_path.parent, ignore_errors=True)
     p.unroute("**/api/bug-report*", fake_bug_report)
     p.locator("#bug-report-toast").evaluate("node => node.classList.add('hidden')")
     check("滚动条使用细圆角低对比样式且轨道不是纯黑",

@@ -721,8 +721,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "附件目录编号无效"}, 400)
         # 新建 CLI 在写出第一条正式会话记录前只有 tmux 名，没有普通 uid。
         # pending 记录同样由服务端创建并保存可信 cwd，允许它先接收附件。
+        # 缺陷报告的处理会话在提交后才创建，其 cwd 固定为仓库根目录，因此
+        # 报告框的附件与对话一样先上传到该 cwd 的附件目录。
         session = None
-        if uid.startswith("tmux:"):
+        if uid == bug_report.BUG_REPORT_UPLOAD_UID:
+            if not TERMINAL:
+                return self._json({"error": "终端未启用，无法上传报告附件"}, 403)
+            session = {"cwd": str(bug_report.PROJECT_ROOT)}
+        elif uid.startswith("tmux:"):
             pending = pending_store.get(uid.removeprefix("tmux:"))
             if pending:
                 session = {"cwd": pending.get("cwd")}
@@ -1790,6 +1796,10 @@ class Handler(BaseHTTPRequestHandler):
         if not term.available_sources().get("codex"):
             return self._json({"error": "本机找不到 codex 命令"}, 503)
         description = str(body.get("description") or "").strip()
+        try:
+            attachments = bug_report.resolve_attachments(body.get("attachments"))
+        except ValueError as error:
+            return self._json({"error": str(error)}, 400)
         uid = str(body.get("uid") or "")[:512]
         session = index.get(uid) if uid and not uid.startswith("tmux:") else None
         snapshot = body.get("snapshot") if isinstance(body.get("snapshot"), dict) else {}
@@ -1814,6 +1824,7 @@ class Handler(BaseHTTPRequestHandler):
                 build=str(body.get("_build") or "")[:128], hostname=HOSTNAME,
                 client_ip=self._display_ip(), snapshot=snapshot,
                 terminal_capture=terminal_capture, session=session, outbox=outbox,
+                attachments=attachments,
             )
         except (OSError, ValueError) as error:
             return self._json({"error": str(error)}, 400)
