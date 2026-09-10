@@ -453,7 +453,7 @@ function timelinePathMarkup(path, leaf) {
 
 function timelineDirectoryMarkup(row) {
   const path = timelinePath(row.cwd), leaf = path === '/' ? '/' : path.split('/').at(-1);
-  return (row.node_name ? `<span class="cwd-machine">${nodeBadge(row.node_name)} · </span>` : '')
+  return (row.node_name ? `<span class="cwd-machine">${nodeBadge(row.node_name)}</span>` : '')
     + `<span class="cwd-path" data-path="${esc(path)}">${timelinePathMarkup(path, leaf)}</span>`;
 }
 
