@@ -1902,6 +1902,7 @@ async function deleteSessions(uids, button = null) {
       $('#detail').innerHTML = '<div class="empty">已移入回收站'
         + '<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>';
       $('#detail-open-trash').onclick = openTrash;
+      ensureConsolePlaceholder();
       showMobileList();
     }
   }
@@ -2423,6 +2424,15 @@ function updateMatchNav({jump = false} = {}) {
 // ---------------------------------------------------------------- 详情
 let inflight = null;
 
+function ensureConsolePlaceholder() {
+  if ($('#a-term')) return;
+  const heading = el('div', 'dhead');
+  heading.innerHTML = `<div class="dtitle"><h2>控制台</h2><div class="dhead-actions">${consoleButtonMarkup()}</div></div>`;
+  $('#detail').prepend(heading);
+  bindConsoleButton(heading.querySelector('#a-term'), S.sel, S.agent);
+  showConsoleToast('');
+}
+
 async function openSession(uid, agent = null) {
   const selectedAgent = agent || null;
   browserAuditEvent('session.opened', {agent: selectedAgent || '', cached: cache.has(viewKey(uid, selectedAgent))},
@@ -2456,6 +2466,7 @@ async function openSession(uid, agent = null) {
   }
 
   $('#detail').innerHTML = '<div class="spin">正在读取会话…</div>';
+  ensureConsolePlaceholder();
   progress(0, 0, '下载');
   let res;
   try {
@@ -2468,6 +2479,7 @@ async function openSession(uid, agent = null) {
     if (e.name === 'AbortError') return;      // 已经切到别的会话了
     progressDone();
     $('#detail').innerHTML = `<div class="empty">读取失败: ${esc(e.message)}</div>`;
+    ensureConsolePlaceholder();
     return;
   }
   if (S.sel !== uid || S.agent !== selectedAgent) return; // 期间切了别的视图
@@ -2764,9 +2776,7 @@ function head(m, total) {
           title="${S.compactTurns ? '展开所有过程' : '折叠已完成过程'}"
           aria-label="${S.compactTurns ? '展开所有过程' : '折叠已完成过程'}"
           aria-pressed="${!S.compactTurns}">${uiIcon('process')}</button>
-        ${/* const 声明的全局不会挂到 window 上, 只能这样探 */
-          (!m.agent_id && sessionTerminalEnabled(m.uid))
-            ? `<button class="iconbtn" id="a-term" title="接管会话" aria-label="接管会话">${uiIcon('terminal')}</button>` : ''}
+        ${consoleButtonMarkup()}
         <button class="iconbtn" data-report-bug title="报告当前会话问题"
           aria-label="报告当前会话问题">${uiIcon('bug')}</button>
         ${S.term ? `<span class="mnav"><b id="mcount">…</b>
@@ -2825,14 +2835,9 @@ function head(m, total) {
     };
   }
   const tb = h.querySelector('#a-term');
-  if (tb) {
-    tb.onclick = async () => {
-      if (linkedTermSession(m.uid, { followReplacement: true })) {
-        await toggleLinkedTermSession(m.uid);
-      } else await takeover(m.uid, tb);
-    };
-    setTimeout(renderTakeoverBtn, 0);
-  }
+  bindConsoleButton(tb, m.uid, m.agent_id);
+  showConsoleToast('');
+  if (typeof renderTakeoverBtn === 'function') setTimeout(renderTakeoverBtn, 0);
   renderSessionAction(m, h.querySelector('#a-session-action'));
   return h;
 }
@@ -2894,6 +2899,7 @@ async function del(m) {
   $('#detail').innerHTML = `<div class="empty">已移入回收站<br><code>${esc(data.trash)}</code>`
     + `<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>`;
   $('#detail-open-trash').onclick = openTrash;
+  ensureConsolePlaceholder();
   showMobileList();
 }
 
@@ -5097,6 +5103,7 @@ setSideCollapsed(store.get('sideCollapsed', false), false);
 renderOpts();
 renderPickBar();
 renderView();
+ensureConsolePlaceholder();
 pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
 function uidOfDeepLink(spec) {
   if (!spec) return null;

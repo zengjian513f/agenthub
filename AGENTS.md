@@ -46,6 +46,12 @@
 
 ## Diagnose browser-visible bugs before changing code
 
+- Always keep the console button visible, including loading, unavailable nodes,
+  and subagent views. When unavailable, show a gray button (no exclamation badge),
+  explain the reason in a toast on hover/focus, and show the specific error on
+  click. Keep it clickable; never hide it or use the native disabled attribute
+  to prevent access to the explanation.
+
 - Reproduce a reported UI, rendering, queue, or terminal interaction bug with
   Playwright/headless Chromium against the exact session named by the user
   before implementing a fix. Inspect the rendered DOM and relevant browser

@@ -336,6 +336,7 @@ class HubHandler(server.Handler):
             for n, d, err in results:
                 result["capabilities"][n["id"]] = {
                     "enabled": bool(d.get("enabled")) and not err,
+                    "unavailable_reason": err["error"] if err else d.get("unavailable_reason", ""),
                     "sources": d.get("sources", {}), "home": d.get("home", "")}
                 if not err:
                     for source, available in d.get("sources", {}).items():

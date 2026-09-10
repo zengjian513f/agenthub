@@ -30,6 +30,85 @@ function sessionTerminalEnabled(uid) {
   return typeof T !== 'undefined' && (HUB_MODE ? !!Nodes.capabilities[nodeOf(uid)]?.enabled : T.enabled);
 }
 
+const ConsoleUI = {errors: new Map(), busy: new Set()};
+
+function consoleUnavailableReason(uid, agent = null, lastError = true) {
+  if (!uid) return '请先选择一个会话，再打开控制台。';
+  if (agent) return '子代理没有独立控制台，请切换到主会话后打开控制台。';
+  if (typeof T === 'undefined' || typeof takeover !== 'function')
+    return '控制台组件尚未加载完成或加载失败，请稍后重试；持续失败时请刷新页面。';
+  if (typeof Terminal === 'undefined' || typeof FitAddon === 'undefined')
+    return '浏览器终端组件加载失败，无法显示控制台，请刷新页面重新加载。';
+  if (ConsoleUI.busy.has(uid)) return '正在打开控制台，请等待当前连接请求完成。';
+  if (T.listError) return T.listError;
+  if (!T.listLoaded) return '正在读取控制台状态，请稍后重试。';
+  const nid = nodeOf(uid), node = Nodes.list.find(n => n.id === nid);
+  const cap = HUB_MODE ? Nodes.capabilities[nid] : T;
+  if (HUB_MODE) {
+    if (!node) return '会话所属机器尚未加载或已被移除，无法连接控制台。';
+    const error = Nodes.errors.get('term')?.find(e => e.node_id === nid);
+    if (error) return `${node.name} 终端列表请求失败：${error.error || '服务器未返回原因'}。`;
+    if (!cap) return `${node.name} 的控制台状态尚未返回，请稍后重试。`;
+  }
+  if (!cap?.enabled) return `${node ? node.name + '：' : ''}${cap?.unavailable_reason || '服务报告控制台不可用，但未返回具体原因。'}`;
+  const linked = linkedTermSession(uid, {followReplacement: true});
+  const source = sessionTermMeta(uid)?.source || String(uid).split(':')[0];
+  if (!linked && !cap.sources?.[source])
+    return `此机器未找到可用的 ${SOURCES[source]?.name || source} 命令，无法启动该会话的控制台。`;
+  return lastError ? ConsoleUI.errors.get(uid) || '' : '';
+}
+
+function showConsoleToast(reason) {
+  const toast = document.querySelector('#console-toast');
+  if (!toast) return;
+  toast.textContent = reason;
+  toast.hidden = !reason;
+}
+
+function paintConsoleAvailability(button, uid, agent = null) {
+  const reason = consoleUnavailableReason(uid, agent);
+  button.classList.toggle('console-unavailable', !!reason);
+  button.dataset.unavailable = String(!!reason);
+  button.disabled = false; // The explanation must remain reachable by mouse and keyboard.
+  if (reason) {
+    button.title = '';
+    button.ariaLabel = '控制台不可用：' + reason;
+  }
+  if (button.matches(':hover') || document.activeElement === button) showConsoleToast(reason);
+}
+
+function consoleButtonMarkup() {
+  return `<button class="iconbtn" id="a-term" type="button" title="打开控制台" aria-label="打开控制台">${uiIcon('terminal')}</button>`;
+}
+
+function bindConsoleButton(button, uid, agent = null) {
+  if (!button) return;
+  button.onmouseenter = button.onfocus = () => showConsoleToast(consoleUnavailableReason(uid, agent));
+  button.onmouseleave = button.onblur = () => showConsoleToast('');
+  button.onclick = async () => {
+    showConsoleToast('');
+    const reason = consoleUnavailableReason(uid, agent, false);
+    if (reason) return alert('控制台不可用：\n' + reason);
+    const previous = ConsoleUI.errors.get(uid);
+    if (previous && !confirm('控制台不可用：\n' + previous + '\n\n是否重新尝试打开？')) return;
+    ConsoleUI.busy.add(uid);
+    ConsoleUI.errors.delete(uid);
+    paintConsoleAvailability(button, uid, agent);
+    try {
+      if (linkedTermSession(uid, {followReplacement: true})) await toggleLinkedTermSession(uid);
+      else await takeover(uid, button);
+    } catch (error) {
+      const message = error.message || String(error);
+      ConsoleUI.errors.set(uid, message);
+      alert('打开控制台失败：\n' + message);
+    } finally {
+      ConsoleUI.busy.delete(uid);
+      if (typeof renderTakeoverBtn === 'function') renderTakeoverBtn();
+    }
+  };
+  paintConsoleAvailability(button, uid, agent);
+}
+
 function applyNodeState(data, context = 'nodes') {
   if (!HUB_MODE || !data) return;
   if (Array.isArray(data.nodes)) Nodes.list = data.nodes;

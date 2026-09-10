@@ -1196,7 +1196,10 @@ class Handler(BaseHTTPRequestHandler):
                                ("name", "source", "sid", "cwd", "started",
                                 "cols", "rows", "title", "kind", "report_id")}
                               for row in pending]
-            return self._json({"enabled": TERMINAL and term.available(),
+            available = TERMINAL and term.available()
+            reason = ("" if available else "服务未启用控制台（缺少 --terminal 启动选项）。"
+                      if not TERMINAL else "服务器未安装 tmux，无法打开控制台。")
+            return self._json({"enabled": available, "unavailable_reason": reason,
                                "sources": term.available_sources() if TERMINAL else {},
                                "home": str(Path.home()),
                                "sessions": tmux_sessions,

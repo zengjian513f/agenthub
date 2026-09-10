@@ -175,6 +175,18 @@ class DirectoryCompletionRouteTests(unittest.TestCase):
         self.assertEqual(result, {"error": "终端未启用", "_status": 403})
         complete.assert_not_called()
 
+    def test_terminal_list_explains_disabled_service_and_missing_tmux(self):
+        for enabled, available, expected in [(False, True, '--terminal'), (True, False, 'tmux')]:
+            with self.subTest(enabled=enabled, available=available), \
+                    patch.object(server, 'TERMINAL', enabled), \
+                    patch.object(server.term, 'available', return_value=available), \
+                    patch.object(server.term, 'available_sources', return_value={}), \
+                    patch.object(server.term, 'list_sessions', return_value=[]), \
+                    patch.object(server.pending_store, 'active', return_value=[]):
+                result = self.handler()._api_get('/api/term/list', {})
+            self.assertFalse(result['enabled'])
+            self.assertIn(expected, result['unavailable_reason'])
+
     def test_route_returns_bounded_directory_candidates(self):
         rows = ["/tmp/agenthub/", "/tmp/session/"]
         with patch.object(server, "TERMINAL", True), \

@@ -17,6 +17,9 @@ const T = {
   uid: null,       // 对应的 agenthub 会话
   views: new Map(), // 已打开过且仍存活的 tmux → xterm/WebSocket；切会话只隐藏
   enabled: false,
+  listLoaded: false,
+  listError: '',
+  unavailable_reason: '',
   height: store.get('termh', 320),
   mode: store.get('termmode', 'full'), // normal(手动分屏) | collapsed(对话) | full(终端)
   ctrlArmed: false,                         // 手机 Ctrl / 桌面右 Ctrl：只修饰下一次输入
@@ -228,10 +231,14 @@ async function loadTermList() {
   const before = fingerprint();
   let loaded = false;
   let data = null;
+  let failure = '';
   try {
-    data = await (await fetch(appUrl('api/term/list'))).json();
+    const response = await fetch(appUrl('api/term/list'));
+    data = await response.json();
+    if (!response.ok || data.error) throw new Error(
+      `终端列表请求失败（HTTP ${response.status}）：${data.error || response.statusText}`);
     loaded = true;
-  } catch { /* 下方统一应用失败状态 */ }
+  } catch (error) { failure = error.message || String(error); }
   // 只允许最后发出的请求改状态；否则慢响应会覆盖更新的 tmux 列表。
   if (requestSeq !== termListRequestSeq) return;
   // 请求在终端打开/切换之前发出时，它的“没有该视图”结论已经过期。丢弃
@@ -240,9 +247,12 @@ async function loadTermList() {
     void loadTermList();
     return;
   }
+  T.listLoaded = true;
+  T.listError = loaded ? '' : `无法读取控制台状态：${failure}`;
   if (loaded) {
     applyNodeState(data, 'term');
     T.enabled = !!data.enabled;
+    T.unavailable_reason = data.unavailable_reason || '';
     T.list = data.sessions || [];
     T.sources = data.sources || {};
     T.home = data.home || '';
@@ -271,13 +281,7 @@ async function loadTermList() {
     await rebindSelectedTermSession();
   }
   $('#new-session')?.classList.toggle('hidden', !T.enabled);
-  // app.js 先于体积较大的终端库执行。若详情已在终端库就绪前打开，
-  // 重新生成一次标题栏，把接管/切换入口补上。
-  const current = typeof cache !== 'undefined' ? cache.get(viewKey(S.sel, S.agent)) : null;
-  const oldHead = $('#detail > .dhead');
-  if (sessionTerminalEnabled(S.sel) && current && oldHead && !S.agent && !oldHead.querySelector('#a-term')) {
-    oldHead.replaceWith(head(current.meta, messageCount(current.msgs)));
-  }
+  renderTakeoverBtn();
   const after = fingerprint();
   if (after !== before && S.sig && typeof renderSide === 'function') {
     const side = $('#side'), top = side?.scrollTop || 0;
@@ -379,14 +383,14 @@ async function toggleLinkedTermSession(uid) {
   } else {
     T.uid = toUid;
   }
-  toggleTermPane(linked.name);
+  await toggleTermPane(linked.name);
   return true;
 }
 
 // ---------------------------------------------------------------- 接管
 async function takeover(uid, btn) {
   const setBtn = (t, dis) => {
-    if (btn) { btn.title = btn.ariaLabel = t; btn.disabled = dis; }
+    if (btn) { btn.title = btn.ariaLabel = t; btn.setAttribute('aria-busy', String(dis)); }
   };
   setBtn('接管中…', true);
   try {
@@ -401,13 +405,17 @@ async function takeover(uid, btn) {
       setBtn('结束旧实例…', true);
       d = await post('api/term/takeover', { uid, force: true, cols: 120, rows: termRows() });
     }
-    if (d.error) return alert('接管失败: ' + d.error);
+    if (d.error) {
+      ConsoleUI.errors.set(uid, d.error);
+      return alert('打开控制台失败：' + d.error);
+    }
     await loadTermList();
     T.uid = uid;
     S.live.add(uid);
     S.liveTmux.add(uid);
     paintLive();
-    openTermPane(d.name);
+    ConsoleUI.errors.delete(uid);
+    await openTermPane(d.name);
   } finally {
     setBtn('接管会话', false);
     renderTakeoverBtn();
@@ -864,10 +872,7 @@ function showNewSessionStage(info) {
       <span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>
   </div><div class="empty new-session-wait">终端已启动，正在等待会话记录落盘…</div>`;
   $('#detail .mobile-back').onclick = showMobileList;
-  $('#a-term').onclick = () => {
-    T.uid = S.sel;
-    toggleTermPane(info.name);
-  };
+  bindConsoleButton($('#a-term'), S.sel);
   $('#a-session-action').onclick = () => stopPendingSession(info, $('#a-session-action'));
   showMobileDetail();
   T.uid = S.sel;
@@ -1113,6 +1118,7 @@ function renderTakeoverBtn() {
   b.classList.toggle('on', !!name);
   b.classList.toggle('session-live', S.live.has(S.sel));
   b.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
+  paintConsoleAvailability(b, S.sel, S.agent);
   renderComposer();
 }
 
@@ -1550,8 +1556,7 @@ async function openTermPane(name, autoFocus = true, requestedMode = null) {
 function toggleTermPane(name) {
   const pane = $('#termpane');
   if (pane.classList.contains('hidden')) {
-    openTermPane(name, true, MOBILE.matches ? null : 'full');
-    return;
+    return openTermPane(name, true, MOBILE.matches ? null : 'full');
   }
   if (!MOBILE.matches) {
     // 分屏状态点按钮也进入纯终端；下一次再切到纯对话。
@@ -1560,7 +1565,7 @@ function toggleTermPane(name) {
     rememberTermLayout(name);
     layoutTermPane();
     renderTakeoverBtn();
-    if (T.mode === 'full') openTermPane(name);
+    if (T.mode === 'full') return openTermPane(name);
     return;
   }
   closeTermPane();
@@ -1641,7 +1646,7 @@ function layoutTermPane() {
   }
 }
 
-async function claimTermOwnership(name) {
+async function claimTermOwnership(name, uid = T.uid) {
   let result = await post('api/term/claim', {name, page: TERM_PAGE_ID});
   if (result.conflict) {
     const ownerIp = result.owner?.ip || '另一地址';
@@ -1649,6 +1654,8 @@ async function claimTermOwnership(name) {
     result = await post('api/term/claim', {name, page: TERM_PAGE_ID, force: true});
   }
   if (result.error || !result.token) {
+    ConsoleUI.errors.set(uid, result.error || '无法取得终端控制权');
+    renderTakeoverBtn();
     alert('打开终端失败：' + (result.error || '无法取得终端控制权'));
     return null;
   }
@@ -1676,11 +1683,12 @@ function attachTerm(name) {
 
 async function attachOwnedTerm(view) {
   const name = view.name;
+  const uid = [...(T.list || []), ...(T.pending || [])].find(row => row.name === name)?.uid || T.uid;
   const active = !$('#termpane').classList.contains('hidden') && T.name === name;
   if (active) activateTermView(view);
   cancelTermReconnect(view);
   dropTermSocket(view);
-  const token = await claimTermOwnership(name);
+  const token = await claimTermOwnership(name, uid);
   if (!token) {
     view.revoked = true;
     view.focusRequest = null;
@@ -1738,6 +1746,8 @@ async function attachOwnedTerm(view) {
     queueTermOutput(view, s);
   };
   ws.onopen = () => {
+    ConsoleUI.errors.delete(uid);
+    renderTakeoverBtn();
     browserAuditEvent('terminal.opened', {name, cols, rows}, null,
       {uid: T.uid || '', connectionId});
     view.reconnectDelay = 500;
@@ -1751,6 +1761,9 @@ async function attachOwnedTerm(view) {
   };
   ws.onclose = event => {
     if (view.ws !== ws) return;           // 主动换 socket 后，旧 close 事件作废
+    ConsoleUI.errors.set(uid,
+      `控制台连接已关闭（WebSocket ${event.code}）${event.reason ? '：' + event.reason : '，服务器未提供详细原因。'}`);
+    renderTakeoverBtn();
     queueTermOutput(view, dec.decode());
     flushTermOutput(view);
     flushOutputAudit();
@@ -1773,8 +1786,13 @@ async function attachOwnedTerm(view) {
       if (T.views.get(name) === view && !view.ws) scheduleTermReconnect(view);
     });
   };
-  ws.onerror = () => browserAuditEvent('terminal.error', {name}, null,
-    {uid: T.uid || '', connectionId, severity: 'error'});
+  ws.onerror = () => {
+    if (view.ws !== ws) return;
+    ConsoleUI.errors.set(uid, '控制台 WebSocket 连接失败；浏览器未提供更详细的错误，请检查网络或重新连接。');
+    renderTakeoverBtn();
+    browserAuditEvent('terminal.error', {name}, null,
+      {uid: T.uid || '', connectionId, severity: 'error'});
+  };
   return true;
 }
 

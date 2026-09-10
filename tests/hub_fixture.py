@@ -66,7 +66,9 @@ class NodeHandler(server.Handler):
             return
         if u.path == '/api/term/list':
             time.sleep(s.get('term_delay', 0))
-            return self._json({'enabled': True, 'sources': {'claude': True, 'codex': True},
+            return self._json({'enabled': s.get('term_enabled', True),
+                               'unavailable_reason': s.get('term_reason', ''),
+                               'sources': s.get('term_sources', {'claude': True, 'codex': True}),
                                'home': '/home/' + s['name'], 'sessions': [], 'pending': s['pending']})
         if u.path == '/api/term/complete-dir':
             return self._json({'directories': ['/home/' + s['name'] + '/work/']})
