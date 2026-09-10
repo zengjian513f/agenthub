@@ -28,12 +28,13 @@ from . import federation as fed, server
 JSON_LIMIT = 64 * 1024 * 1024
 BODY_LIMIT = 4 * 1024 * 1024
 SEARCH_IDLE_TIMEOUT = 60
-# A node whose failure itself took this long (timeouts, black-holed tunnels) is
-# re-probed in the background every PROBE_INTERVAL seconds; page requests never
-# wait for it again until a probe succeeds. Fast failures (refused, HTTP 5xx)
-# keep being queried inline so recovery shows up immediately.
-SLOW_FAILURE = 1.0
+# The hub owns node state. A monitor thread checks every registered node each
+# PROBE_INTERVAL seconds (and immediately when nudged by a user action); page
+# requests only consult that state and never wait on a node known to be down.
+# Machines being switched off is normal, so the last session list of each node
+# is persisted and shown as an offline cache until the node is back.
 PROBE_INTERVAL = 10
+RECHECK_TIMEOUT = 2
 CACHED_PATHS = {"/api/sessions", "/api/term/list"}
 
 
@@ -58,17 +59,107 @@ def request_failure(error, status=None, timeout=5):
 
 
 class Registry:
-    def __init__(self, path: Path, networks):
+    def __init__(self, path: Path, networks, monitor=True):
         self.path = path
+        self.snapshot_dir = path.parent / "hub-cache"
         self.networks = [ipaddress.ip_network(x) for x in networks]
         self.lock = threading.RLock()
         self.cache = {}
         self.health = {}
-        # Internal outage bookkeeping; never merged into the public node list.
-        self.outages = {}
+        self.wake = threading.Event()
+        self.stopped = threading.Event()
+        self.snapshot_sigs = {}
         self.nodes = json.loads(path.read_text()) if path.exists() else []
         for node in self.nodes:
             self.validate_url(node["url"])
+            self.load_snapshot(node)
+        if monitor:
+            self.start_monitor()
+
+    # ---- node state -------------------------------------------------------
+
+    def snapshot_path(self, nid):
+        return self.snapshot_dir / f"{nid}.sessions.json"
+
+    def load_snapshot(self, node):
+        """Seed the offline cache from disk so a switched-off machine still lists
+        its sessions after a hub restart. State stays unknown until the monitor
+        has checked the node."""
+        try:
+            raw = json.loads(self.snapshot_path(node["id"]).read_text())
+            stamp, data = float(raw["stamp"]), raw["data"]
+            if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+                raise ValueError("bad snapshot")
+        except (OSError, ValueError, TypeError, KeyError):
+            return
+        with self.lock:
+            self.cache[(node["id"], "/api/sessions", "")] = (stamp, data)
+            self.health.setdefault(node["id"], {"online": None, "last_seen": stamp})
+
+    def save_snapshot(self, node, stamp, data):
+        try:
+            sig = data.get("sig")
+            if sig and self.snapshot_sigs.get(node["id"]) == sig and self.snapshot_path(node["id"]).exists():
+                return
+            self.snapshot_sigs[node["id"]] = sig
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            temp = self.snapshot_path(node["id"]).with_suffix(".tmp")
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as out:
+                json.dump({"stamp": stamp, "data": data}, out, ensure_ascii=False)
+            temp.replace(self.snapshot_path(node["id"]))
+        except OSError:
+            pass
+
+    def drop_snapshot(self, nid):
+        try:
+            self.snapshot_path(nid).unlink()
+        except OSError:
+            pass
+
+    def state(self, nid):
+        with self.lock:
+            return dict(self.health.get(nid, {}))
+
+    def offline(self, nid):
+        return self.state(nid).get("online") is False
+
+    def check_all(self):
+        """One monitor pass: refresh state and the session snapshot of every node."""
+        nodes = self.all()
+        if not nodes:
+            return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes))) as pool:
+            list(pool.map(lambda n: self.query(n, "/api/sessions", {}), nodes))
+
+    def monitor(self):
+        while not self.stopped.is_set():
+            try:
+                self.check_all()
+            except Exception as error:  # keep the monitor alive no matter what
+                print(f"[hub] monitor: {type(error).__name__}")
+            self.wake.wait(PROBE_INTERVAL)
+            self.wake.clear()
+
+    def start_monitor(self):
+        self.stopped.clear()
+        self.wake.clear()
+        threading.Thread(target=self.monitor, name="hub-monitor", daemon=True).start()
+
+    def stop_monitor(self):
+        self.stopped.set()
+        self.wake.set()
+
+    def nudge(self):
+        """Ask the monitor to re-check now (a user just acted on an offline node)."""
+        self.wake.set()
+
+    def recheck(self, node):
+        """Quick inline re-check before refusing an explicit action on an offline
+        node, so a machine that just came back is usable at once."""
+        self.query(node, "/api/live", {}, timeout=RECHECK_TIMEOUT)
+        self.nudge()
+        return not self.offline(node["id"])
 
     def validate_url(self, value):
         u = urlparse(value)
@@ -119,7 +210,10 @@ class Registry:
                 raise ValueError("地址对应另一台机器，不能覆盖原节点身份")
             self.nodes = [n for n in self.nodes if n["id"] != node["id"]] + [node]
             self.cache = {k: v for k, v in self.cache.items() if k[0] != node["id"]}
+            self.health.pop(node["id"], None)
+            self.drop_snapshot(node["id"])
             self.save()
+        self.nudge()
         return {"id": node["id"], "name": name}
 
     def remove(self, nid):
@@ -127,7 +221,7 @@ class Registry:
             self.nodes = [n for n in self.nodes if n["id"] != nid]
             self.cache = {k: v for k, v in self.cache.items() if k[0] != nid}
             self.health.pop(nid, None)
-            self.outages.pop(nid, None)
+            self.drop_snapshot(nid)
             self.save()
 
     def connection(self, node, timeout=5):
@@ -187,13 +281,13 @@ class Registry:
         finally:
             conn.close()
 
-    def query(self, node, path, query, progress=None):
+    def query(self, node, path, query, progress=None, timeout=5):
         key = (node["id"], path, urlencode(query, doseq=True))
         stamp = time.time()
         status = None
         try:
             status, data = (self.search_request(node, query, progress) if path == "/api/search"
-                            else self.request(node, path + "?" + key[2]))
+                            else self.request(node, path + "?" + key[2], timeout=timeout))
             if status != 200:
                 raise ValueError(data.get("error") or f"HTTP {status}")
             data = fed.public_payload(data, node, path)
@@ -203,23 +297,26 @@ class Registry:
                     # Bound variant caches (debug views / forced refreshes).
                     while len(self.cache) > 128:
                         self.cache.pop(next(iter(self.cache)))
-                self.health[node["id"]] = {"online": True, "last_seen": stamp}
-                self.outages.pop(node["id"], None)
+                if path == "/api/sessions" and set(query) <= {"force"}:
+                    self.save_snapshot(node, stamp, data)
+                    self.cache[(node["id"], path, "")] = (stamp, copy.deepcopy(data))
+                self.health[node["id"]] = {"online": True, "last_seen": stamp, "checked_at": stamp}
             return node, data, None
         except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException) as error:
             # Errors intentionally omit URL / token / upstream exception text.
-            code, reason = request_failure(error, status, SEARCH_IDLE_TIMEOUT if path == "/api/search" else 5)
+            code, reason = request_failure(error, status, SEARCH_IDLE_TIMEOUT if path == "/api/search" else timeout)
             with self.lock:
                 prior = self.health.get(node["id"], {})
                 # A failed search says nothing about the node's live/terminal APIs.
                 if path != "/api/search":
-                    self.health[node["id"]] = {**prior, "online": False,
-                                              "error": reason, "error_code": code, "failed_path": path}
-                    if time.time() - stamp >= SLOW_FAILURE:
-                        self.outages[node["id"]] = {"failed_at": time.time(), "probing": False}
-                    else:
-                        self.outages.pop(node["id"], None)
+                    now = time.time()
+                    self.health[node["id"]] = {
+                        **prior, "online": False, "error": reason, "error_code": code,
+                        "failed_path": path, "checked_at": now,
+                        "offline_since": prior.get("offline_since", now) if prior.get("online") is False else now}
                 cached = self.cache.get(key) if path in CACHED_PATHS else None
+                if cached is None and path == "/api/sessions":
+                    cached = self.cache.get((node["id"], path, ""))
             return node, self.stale_payload(path, cached), {
                 "node_id": node["id"], "name": node["name"],
                 "error": reason, "error_code": code, "last_seen": prior.get("last_seen")}
@@ -236,39 +333,22 @@ class Registry:
         return data
 
     def fetch(self, node, path, query, progress=None):
-        """Like query(), but never blocks a page request on a node that is known
-        to be down. The last failure is repeated from memory (with any cached
-        rows marked stale) while a background probe checks for recovery."""
+        """Aggregate-side query: a node the monitor knows to be offline is never
+        waited on. Its last failure and offline cache are returned instead."""
         nid = node["id"]
         with self.lock:
-            outage = self.outages.get(nid)
-            if outage is None:
-                return self.query(node, path, query, progress)
-            probe = (not outage["probing"]
-                     and time.time() - outage["failed_at"] >= PROBE_INTERVAL)
-            if probe:
-                outage["probing"] = True
             health = dict(self.health.get(nid, {}))
+            if health.get("online") is not False:
+                return self.query(node, path, query, progress)
             key = (nid, path, urlencode(query, doseq=True))
             cached = self.cache.get(key) if path in CACHED_PATHS else None
-        if probe:
-            threading.Thread(target=self.probe, args=(node,), daemon=True).start()
+            if cached is None and path == "/api/sessions":
+                cached = self.cache.get((nid, path, ""))
         return node, self.stale_payload(path, cached), {
             "node_id": nid, "name": node["name"],
             "error": health.get("error", "节点暂时离线"),
             "error_code": health.get("error_code", "connection_failed"),
-            "last_seen": health.get("last_seen")}
-
-    def probe(self, node):
-        """Re-check a failed node off the request path. /api/live is the cheapest
-        health-bearing endpoint; success lets the next page request go through."""
-        try:
-            self.query(node, "/api/live", {})
-        finally:
-            with self.lock:
-                outage = self.outages.get(node["id"])
-                if outage:
-                    outage["probing"] = False
+            "last_seen": health.get("last_seen"), "offline_since": health.get("offline_since")}
 
     def public(self):
         with self.lock:
@@ -345,6 +425,12 @@ class HubHandler(server.Handler):
             node = self.registry.get(nid)
             if not node:
                 return self._json({"error": "机器未注册或已移除"}, 404)
+            if self.registry.offline(nid) and not self.registry.recheck(node):
+                state = self.registry.state(nid)
+                self.close_connection = True
+                return self._json({"error": f"{node['name']} 离线：{state.get('error', '中央站未能连接该机器')}",
+                                   "node_offline": True, "node_id": nid,
+                                   "offline_since": state.get("offline_since")}, 503)
             if self.command == "POST" and path in {
                     "/api/session/send", "/api/session/outbox/retry", "/api/term/send", "/api/term/create"}:
                 if body.get("_build") != server.ASSET_VERSION:
@@ -385,7 +471,7 @@ class HubHandler(server.Handler):
         if path == "/api/search" and query.get("progress", [""])[0] == "1":
             return self.search_aggregate(nodes, upstream)
         # Never wait sequentially for a slow node. Each node has a bounded timeout,
-        # and a node that already failed is skipped until a background probe succeeds.
+        # and a node the monitor knows to be offline is skipped entirely.
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes)) or 1) as pool:
             results = list(pool.map(lambda n: self.registry.fetch(n, path, upstream), nodes))
         errors = [err for _, _, err in results if err]

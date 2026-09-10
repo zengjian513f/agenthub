@@ -8,6 +8,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from agenthub import create_requests, federation, hub, server
@@ -74,7 +75,7 @@ class HubHTTPTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         cls.a = start_node('a' * 32, 'NodeA')
         cls.b = start_node('b' * 32, 'NodeB')
-        cls.registry = hub.Registry(Path(cls.temp.name) / 'nodes.json', ['127.0.0.0/8'])
+        cls.registry = hub.Registry(Path(cls.temp.name) / 'nodes.json', ['127.0.0.0/8'], monitor=False)
         for srv in (cls.a, cls.b):
             cls.registry.register({'name': srv.state['name'], 'url': f'http://127.0.0.1:{srv.server_port}',
                                    'token': srv.state['token']})
@@ -128,72 +129,123 @@ class HubHTTPTests(unittest.TestCase):
             self.assertEqual([r['node_name'] for r in search['results']], ['NodeA'])
         finally:
             self.b.state['offline'] = False
+            self.registry.check_all()
 
-    def test_slow_node_failure_is_skipped_until_background_probe_recovers(self):
-        self.call('/api/sessions')
+    def test_offline_node_is_skipped_and_recovers_through_monitor(self):
+        self.registry.check_all()
         self.assertFalse(self.call('/api/sessions')[1]['partial'])
         node_b = 'b' * 32
         real = self.registry.request
 
-        def slow(node, path, *args, **kwargs):
+        def dead(node, path, *args, **kwargs):
             if node['id'] != node_b:
                 return real(node, path, *args, **kwargs)
             time.sleep(.3)
             raise TimeoutError('private upstream details')
 
-        with patch.object(hub, 'SLOW_FAILURE', .1), patch.object(hub, 'PROBE_INTERVAL', .4):
-            with patch.object(self.registry, 'request', side_effect=slow):
+        uid = quote(federation.qualify(node_b, 'claude:same-file-hash', True), safe='')
+        with patch.object(self.registry, 'request', side_effect=dead):
+            started = time.monotonic()
+            self.registry.check_all()                     # the monitor notices the outage
+            self.assertGreaterEqual(time.monotonic() - started, .3)
+            # Page requests never wait for a node the monitor knows to be down.
+            for path in ('/api/sessions', '/api/live', '/api/term/list', '/api/trash'):
                 started = time.monotonic()
-                _, data = self.call('/api/sessions')
-                self.assertGreaterEqual(time.monotonic() - started, .3)
-                self.assertTrue(data['partial'])
-                # Every later request answers from memory instead of waiting again.
-                for path in ('/api/sessions', '/api/live', '/api/term/list', '/api/trash'):
-                    started = time.monotonic()
-                    _, data = self.call(path)
-                    self.assertLess(time.monotonic() - started, .15, path)
-                    self.assertTrue(data['partial'], path)
-                    self.assertEqual([e['name'] for e in data['errors']], ['NodeB'])
-                    self.assertEqual(data['errors'][0]['error_code'], 'timeout')
-                    public = next(n for n in data['nodes'] if n['id'] == node_b)
-                    self.assertFalse(public['online'])
-                    self.assertNotIn('failed_at', public)
-                    self.assertNotIn('probing', public)
-                _, data = self.call('/api/sessions')
-                stale = next(r for r in data['sessions'] if r['node_name'] == 'NodeB')
-                self.assertTrue(stale['stale'])
-                _, term = self.call('/api/term/list')
-                self.assertFalse(term['capabilities'][node_b]['enabled'])
-                started = time.monotonic()
-                result = self.search_events()[-1]['data']
-                self.assertLess(time.monotonic() - started, .15)
-                self.assertTrue(result['partial'])
-                self.assertEqual([r['node_name'] for r in result['results']], ['NodeA'])
-                # A probe is started off the request path once the interval passes.
-                time.sleep(.45)
-                gets = len(self.b.state['gets'])
-                started = time.monotonic()
-                self.call('/api/live')
-                self.assertLess(time.monotonic() - started, .15)
-                time.sleep(.05)
-                self.assertTrue(self.registry.outages[node_b]['probing'])
-                time.sleep(.4)
-                self.assertFalse(self.registry.outages[node_b]['probing'])
-                self.assertEqual(len(self.b.state['gets']), gets)
-            # Node is back: the next probe succeeds and requests go inline again.
-            time.sleep(.45)
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                _, data = self.call('/api/live')
-                if not data['partial']:
-                    break
-                time.sleep(.05)
-            self.assertFalse(data['partial'])
-            self.assertNotIn(node_b, self.registry.outages)
-            self.assertTrue(next(n for n in data['nodes'] if n['id'] == node_b)['online'])
-            self.assertEqual(self.b.state['gets'][-1][0], '/api/live')
+                _, data = self.call(path)
+                self.assertLess(time.monotonic() - started, .15, path)
+                self.assertTrue(data['partial'], path)
+                self.assertEqual([e['name'] for e in data['errors']], ['NodeB'])
+                self.assertEqual(data['errors'][0]['error_code'], 'timeout')
+                public = next(n for n in data['nodes'] if n['id'] == node_b)
+                self.assertFalse(public['online'])
+                self.assertIn('offline_since', public)
+                self.assertIn('checked_at', public)
+                self.assertNotIn('private upstream details', json.dumps(data))
             _, data = self.call('/api/sessions')
-            self.assertFalse(any(r.get('stale') for r in data['sessions']))
+            stale = next(r for r in data['sessions'] if r['node_name'] == 'NodeB')
+            self.assertTrue(stale['stale'])
+            _, data = self.call('/api/sessions?force=1')
+            self.assertTrue(next(r for r in data['sessions'] if r['node_name'] == 'NodeB')['stale'])
+            _, term = self.call('/api/term/list')
+            self.assertFalse(term['capabilities'][node_b]['enabled'])
+            started = time.monotonic()
+            result = self.search_events()[-1]['data']
+            self.assertLess(time.monotonic() - started, .15)
+            self.assertTrue(result['partial'])
+            self.assertEqual([r['node_name'] for r in result['results']], ['NodeA'])
+            # Explicit actions re-check once, then refuse with the known reason and
+            # ask the monitor to look again.
+            self.registry.wake.clear()
+            started = time.monotonic()
+            status, body = self.call('/api/messages/' + uid)
+            elapsed = time.monotonic() - started
+            self.assertEqual(status, 503)
+            self.assertTrue(body['node_offline'])
+            self.assertIn('NodeB 离线', body['error'])
+            self.assertGreaterEqual(elapsed, .3)
+            self.assertLess(elapsed, 1.5)
+            self.assertTrue(self.registry.wake.is_set())
+            self.assertFalse(self.call('/api/sessions')[1]['nodes'][1]['online'])
+        # The machine is back: an explicit action succeeds at once through the
+        # re-check, and the next monitor pass clears the offline cache.
+        status, body = self.call('/api/messages/' + uid)
+        self.assertEqual(status, 200)
+        self.assertEqual(body['meta']['uid'], federation.qualify(node_b, 'claude:same-file-hash', True))
+        self.assertFalse(self.registry.offline(node_b))
+        self.registry.check_all()
+        _, data = self.call('/api/sessions')
+        self.assertFalse(data['partial'])
+        public = next(n for n in data['nodes'] if n['id'] == node_b)
+        self.assertTrue(public['online'])
+        self.assertNotIn('offline_since', public)
+        self.assertFalse(any(r.get('stale') for r in data['sessions']))
+
+    def test_session_snapshot_survives_hub_restart_for_offline_machine(self):
+        self.registry.check_all()
+        snapshot = self.registry.snapshot_path('b' * 32)
+        self.assertTrue(snapshot.exists())
+        self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+        fresh = hub.Registry(self.registry.path, ['127.0.0.0/8'], monitor=False)
+        public = next(n for n in fresh.public() if n['id'] == 'b' * 32)
+        self.assertIsNone(public['online'])
+        self.assertIn('last_seen', public)
+        node = fresh.get('b' * 32)
+        self.b.state['offline'] = True
+        try:
+            fresh.check_all()
+            for query in ({}, {'force': ['1']}):
+                _, data, failure = fresh.fetch(node, '/api/sessions', query)
+                self.assertEqual(failure['error_code'], 'http_error')
+                self.assertEqual([r['node_name'] for r in data['sessions']], ['NodeB'])
+                self.assertTrue(data['sessions'][0]['stale'])
+                self.assertEqual(data['sessions'][0]['last_seen'], public['last_seen'])
+        finally:
+            self.b.state['offline'] = False
+        fresh.check_all()
+        self.assertTrue(fresh.state('b' * 32)['online'])
+
+    def test_monitor_thread_polls_and_wakes_on_nudge(self):
+        with tempfile.TemporaryDirectory() as root:
+            registry = hub.Registry(Path(root) / 'nodes.json', ['127.0.0.0/8'], monitor=False)
+            registry.register({'name': 'NodeA', 'url': f'http://127.0.0.1:{self.a.server_port}',
+                               'token': self.a.state['token']})
+            seen = len(self.a.state['gets'])
+            probes = lambda: len([p for p, _ in self.a.state['gets'][seen:] if p == '/api/sessions'])
+            def wait_for(condition):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and not condition():
+                    time.sleep(.02)
+                self.assertTrue(condition())
+            with patch.object(hub, 'PROBE_INTERVAL', 30):
+                registry.start_monitor()
+                try:
+                    wait_for(lambda: registry.state('a' * 32).get('online'))
+                    time.sleep(.1)
+                    self.assertEqual(probes(), 1)
+                    registry.nudge()
+                    wait_for(lambda: probes() == 2)
+                finally:
+                    registry.stop_monitor()
 
     def test_node_health_exposes_safe_failure_reason_and_clears_on_recovery(self):
         node = self.registry.get('b' * 32)

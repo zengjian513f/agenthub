@@ -117,12 +117,27 @@ function applyNodeState(data, context = 'nodes') {
   renderNodes();
 }
 
+function nodeClock(ts) {
+  return new Date(ts * 1000).toLocaleString('zh-CN',
+    {hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+}
+function nodeAgo(ts) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (s < 60) return `${s} 秒`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时 ${Math.floor(s % 3600 / 60)} 分`;
+  return `${Math.floor(s / 86400)} 天 ${Math.floor(s % 86400 / 3600)} 小时`;
+}
 function nodeOfflineReason(node) {
   if (node?.online !== false) return '';
   const fallback = [...Nodes.errors.values()].flat().find(e => e.node_id === node.id)?.error;
   const path = {'/api/live': '运行状态', '/api/sessions': '会话列表', '/api/term/list': '终端列表'}[node.failed_path];
-  return `${node.name} 离线：${node.error || fallback || '中央站未能连接该机器，暂未收到具体错误原因。'}`
-    + (path ? `\n失败请求：${path}。` : '');
+  const lines = [`${node.name} 离线：${node.error || fallback || '中央站未能连接该机器，暂未收到具体错误原因。'}`];
+  if (path) lines.push(`失败请求：${path}。`);
+  if (node.offline_since) lines.push(`已离线 ${nodeAgo(node.offline_since)}（自 ${nodeClock(node.offline_since)}）。`);
+  if (node.checked_at) lines.push(`上次检测：${nodeAgo(node.checked_at)}前；中央每 10 秒自动重试，机器恢复后会自动回到列表。`);
+  if (node.last_seen) lines.push(`当前显示的是 ${nodeClock(node.last_seen)} 同步的离线缓存会话。`);
+  return lines.join('\n');
 }
 
 function renderNodes() {
