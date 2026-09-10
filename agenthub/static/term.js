@@ -517,6 +517,27 @@ function clearBugReportDraft() {
   renderBugReportItems();
 }
 
+// 中央站上未选中会话时，报告和附件必须落到同一台在线机器；机器列表的
+// 第一台可能正好离线，不能盲目取它。
+function bugReportNode() {
+  if (!HUB_MODE) return '';
+  const fromSession = nodeOf(S.sel);
+  if (fromSession) return fromSession;
+  const candidates = selectedNodeIds();
+  const online = candidates.find(id => Nodes.list.find(n => n.id === id)?.online !== false);
+  return online || candidates[0] || '';
+}
+
+function bugReportNodeError(node) {
+  if (!HUB_MODE) return '';
+  if (!node) return '没有可用的机器：请先在顶部选择一台机器或打开一个会话';
+  const info = Nodes.list.find(n => n.id === node);
+  if (info?.online === false) {
+    return `${info.name || '目标机器'} 离线，无法在该机器上保存报告；请先切换到在线机器的会话`;
+  }
+  return '';
+}
+
 function closeBugReportAttachMenu() {
   $('#bug-report-attach-menu').classList.add('hidden');
   $('#bug-report-add').classList.remove('on');
@@ -582,7 +603,12 @@ $('#bug-report-form').onsubmit = async event => {
   }
   const button = $('#bug-report-go');
   const attachments = [...bugReportDraftObject().attachments];
-  const node = HUB_MODE ? (nodeOf(S.sel) || selectedNodeIds()[0]) : '';
+  const node = bugReportNode();
+  const nodeError = bugReportNodeError(node);
+  if (nodeError) {
+    error.textContent = nodeError;
+    return;
+  }
   bugReportSending = true;
   button.disabled = true;
   $('#bug-report-add').disabled = true;

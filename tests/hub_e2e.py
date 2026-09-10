@@ -194,6 +194,26 @@ def main():
                 page.wait_for_function('S.sessions.some(s => s.node_name === "Vega" && s.stale)')
                 assert not page.locator('#node-notice').is_visible()
                 assert page.locator('#node-chips button.node-offline').is_visible()
+                # Bug reports with no selected session go to an online machine, and an
+                # offline-only selection is refused before any attachment upload.
+                report_target = page.evaluate('''() => {
+                  const offline = Nodes.list.filter(n => n.online === false).map(n => n.id);
+                  const selectedBefore = S.sel;
+                  const fromSession = bugReportNode();
+                  S.sel = null;
+                  const chosen = bugReportNode();
+                  const onlyOffline = new Set(Nodes.list.filter(n => n.online !== false).map(n => n.id));
+                  const saved = new Set(Nodes.off);
+                  for (const id of onlyOffline) Nodes.off.add(id);
+                  const refused = bugReportNodeError(bugReportNode());
+                  Nodes.off.clear(); for (const id of saved) Nodes.off.add(id);
+                  S.sel = selectedBefore;
+                  return {offline, chosen, refused, fromSession, selected: S.sel, sessionNode: nodeOf(S.sel)};
+                }''')
+                assert report_target['fromSession'] == report_target['sessionNode'], report_target
+                assert report_target['offline'] and report_target['chosen'] not in report_target['offline'], report_target
+                assert report_target['chosen'] in [n.state['id'] for n in nodes], report_target
+                assert '离线' in report_target['refused'], report_target
                 page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
                 page.wait_for_function('S.results?.length === 2')
                 # Mobile: same machine controls, no horizontal document overflow.
