@@ -2,6 +2,7 @@ import json
 import errno
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -127,6 +128,72 @@ class HubHTTPTests(unittest.TestCase):
             self.assertEqual([r['node_name'] for r in search['results']], ['NodeA'])
         finally:
             self.b.state['offline'] = False
+
+    def test_slow_node_failure_is_skipped_until_background_probe_recovers(self):
+        self.call('/api/sessions')
+        self.assertFalse(self.call('/api/sessions')[1]['partial'])
+        node_b = 'b' * 32
+        real = self.registry.request
+
+        def slow(node, path, *args, **kwargs):
+            if node['id'] != node_b:
+                return real(node, path, *args, **kwargs)
+            time.sleep(.3)
+            raise TimeoutError('private upstream details')
+
+        with patch.object(hub, 'SLOW_FAILURE', .1), patch.object(hub, 'PROBE_INTERVAL', .4):
+            with patch.object(self.registry, 'request', side_effect=slow):
+                started = time.monotonic()
+                _, data = self.call('/api/sessions')
+                self.assertGreaterEqual(time.monotonic() - started, .3)
+                self.assertTrue(data['partial'])
+                # Every later request answers from memory instead of waiting again.
+                for path in ('/api/sessions', '/api/live', '/api/term/list', '/api/trash'):
+                    started = time.monotonic()
+                    _, data = self.call(path)
+                    self.assertLess(time.monotonic() - started, .15, path)
+                    self.assertTrue(data['partial'], path)
+                    self.assertEqual([e['name'] for e in data['errors']], ['NodeB'])
+                    self.assertEqual(data['errors'][0]['error_code'], 'timeout')
+                    public = next(n for n in data['nodes'] if n['id'] == node_b)
+                    self.assertFalse(public['online'])
+                    self.assertNotIn('failed_at', public)
+                    self.assertNotIn('probing', public)
+                _, data = self.call('/api/sessions')
+                stale = next(r for r in data['sessions'] if r['node_name'] == 'NodeB')
+                self.assertTrue(stale['stale'])
+                _, term = self.call('/api/term/list')
+                self.assertFalse(term['capabilities'][node_b]['enabled'])
+                started = time.monotonic()
+                result = self.search_events()[-1]['data']
+                self.assertLess(time.monotonic() - started, .15)
+                self.assertTrue(result['partial'])
+                self.assertEqual([r['node_name'] for r in result['results']], ['NodeA'])
+                # A probe is started off the request path once the interval passes.
+                time.sleep(.45)
+                gets = len(self.b.state['gets'])
+                started = time.monotonic()
+                self.call('/api/live')
+                self.assertLess(time.monotonic() - started, .15)
+                time.sleep(.05)
+                self.assertTrue(self.registry.outages[node_b]['probing'])
+                time.sleep(.4)
+                self.assertFalse(self.registry.outages[node_b]['probing'])
+                self.assertEqual(len(self.b.state['gets']), gets)
+            # Node is back: the next probe succeeds and requests go inline again.
+            time.sleep(.45)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                _, data = self.call('/api/live')
+                if not data['partial']:
+                    break
+                time.sleep(.05)
+            self.assertFalse(data['partial'])
+            self.assertNotIn(node_b, self.registry.outages)
+            self.assertTrue(next(n for n in data['nodes'] if n['id'] == node_b)['online'])
+            self.assertEqual(self.b.state['gets'][-1][0], '/api/live')
+            _, data = self.call('/api/sessions')
+            self.assertFalse(any(r.get('stale') for r in data['sessions']))
 
     def test_node_health_exposes_safe_failure_reason_and_clears_on_recovery(self):
         node = self.registry.get('b' * 32)

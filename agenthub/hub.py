@@ -28,6 +28,13 @@ from . import federation as fed, server
 JSON_LIMIT = 64 * 1024 * 1024
 BODY_LIMIT = 4 * 1024 * 1024
 SEARCH_IDLE_TIMEOUT = 60
+# A node whose failure itself took this long (timeouts, black-holed tunnels) is
+# re-probed in the background every PROBE_INTERVAL seconds; page requests never
+# wait for it again until a probe succeeds. Fast failures (refused, HTTP 5xx)
+# keep being queried inline so recovery shows up immediately.
+SLOW_FAILURE = 1.0
+PROBE_INTERVAL = 10
+CACHED_PATHS = {"/api/sessions", "/api/term/list"}
 
 
 def request_failure(error, status=None, timeout=5):
@@ -57,6 +64,8 @@ class Registry:
         self.lock = threading.RLock()
         self.cache = {}
         self.health = {}
+        # Internal outage bookkeeping; never merged into the public node list.
+        self.outages = {}
         self.nodes = json.loads(path.read_text()) if path.exists() else []
         for node in self.nodes:
             self.validate_url(node["url"])
@@ -118,6 +127,7 @@ class Registry:
             self.nodes = [n for n in self.nodes if n["id"] != nid]
             self.cache = {k: v for k, v in self.cache.items() if k[0] != nid}
             self.health.pop(nid, None)
+            self.outages.pop(nid, None)
             self.save()
 
     def connection(self, node, timeout=5):
@@ -194,6 +204,7 @@ class Registry:
                     while len(self.cache) > 128:
                         self.cache.pop(next(iter(self.cache)))
                 self.health[node["id"]] = {"online": True, "last_seen": stamp}
+                self.outages.pop(node["id"], None)
             return node, data, None
         except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException) as error:
             # Errors intentionally omit URL / token / upstream exception text.
@@ -204,16 +215,60 @@ class Registry:
                 if path != "/api/search":
                     self.health[node["id"]] = {**prior, "online": False,
                                               "error": reason, "error_code": code, "failed_path": path}
-                cached = self.cache.get(key) if path in {"/api/sessions", "/api/term/list"} else None
-            data = copy.deepcopy(cached[1]) if cached else {}
-            for row in data.get("sessions", []) + data.get("pending", []):
-                row["stale"] = True
-                row["last_seen"] = cached[0]
-            if path == "/api/term/list":
-                data["enabled"] = False
-                data["sources"] = {}
-            return node, data, {"node_id": node["id"], "name": node["name"],
-                                "error": reason, "error_code": code, "last_seen": prior.get("last_seen")}
+                    if time.time() - stamp >= SLOW_FAILURE:
+                        self.outages[node["id"]] = {"failed_at": time.time(), "probing": False}
+                    else:
+                        self.outages.pop(node["id"], None)
+                cached = self.cache.get(key) if path in CACHED_PATHS else None
+            return node, self.stale_payload(path, cached), {
+                "node_id": node["id"], "name": node["name"],
+                "error": reason, "error_code": code, "last_seen": prior.get("last_seen")}
+
+    @staticmethod
+    def stale_payload(path, cached):
+        data = copy.deepcopy(cached[1]) if cached else {}
+        for row in data.get("sessions", []) + data.get("pending", []):
+            row["stale"] = True
+            row["last_seen"] = cached[0]
+        if path == "/api/term/list":
+            data["enabled"] = False
+            data["sources"] = {}
+        return data
+
+    def fetch(self, node, path, query, progress=None):
+        """Like query(), but never blocks a page request on a node that is known
+        to be down. The last failure is repeated from memory (with any cached
+        rows marked stale) while a background probe checks for recovery."""
+        nid = node["id"]
+        with self.lock:
+            outage = self.outages.get(nid)
+            if outage is None:
+                return self.query(node, path, query, progress)
+            probe = (not outage["probing"]
+                     and time.time() - outage["failed_at"] >= PROBE_INTERVAL)
+            if probe:
+                outage["probing"] = True
+            health = dict(self.health.get(nid, {}))
+            key = (nid, path, urlencode(query, doseq=True))
+            cached = self.cache.get(key) if path in CACHED_PATHS else None
+        if probe:
+            threading.Thread(target=self.probe, args=(node,), daemon=True).start()
+        return node, self.stale_payload(path, cached), {
+            "node_id": nid, "name": node["name"],
+            "error": health.get("error", "节点暂时离线"),
+            "error_code": health.get("error_code", "connection_failed"),
+            "last_seen": health.get("last_seen")}
+
+    def probe(self, node):
+        """Re-check a failed node off the request path. /api/live is the cheapest
+        health-bearing endpoint; success lets the next page request go through."""
+        try:
+            self.query(node, "/api/live", {})
+        finally:
+            with self.lock:
+                outage = self.outages.get(node["id"])
+                if outage:
+                    outage["probing"] = False
 
     def public(self):
         with self.lock:
@@ -329,9 +384,10 @@ class HubHandler(server.Handler):
         upstream = {k: v for k, v in query.items() if k not in {"nodes", "sig", "progress"}}
         if path == "/api/search" and query.get("progress", [""])[0] == "1":
             return self.search_aggregate(nodes, upstream)
-        # Never wait sequentially for a slow node. Each node has a bounded timeout.
+        # Never wait sequentially for a slow node. Each node has a bounded timeout,
+        # and a node that already failed is skipped until a background probe succeeds.
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(nodes)) or 1) as pool:
-            results = list(pool.map(lambda n: self.registry.query(n, path, upstream), nodes))
+            results = list(pool.map(lambda n: self.registry.fetch(n, path, upstream), nodes))
         errors = [err for _, _, err in results if err]
         result = {"errors": errors, "partial": bool(errors), "nodes": self.registry.public()}
         if path in {"/api/sessions", "/api/search"}:
@@ -400,7 +456,7 @@ class HubHandler(server.Handler):
 
         def scan(node):
             try:
-                result = self.registry.query(node, "/api/search", upstream,
+                result = self.registry.fetch(node, "/api/search", upstream,
                     progress=lambda done, total: put(("progress", node["id"], done, total)))
             except Exception:
                 # Always finish this node, even if its payload is malformed.
@@ -463,6 +519,11 @@ class HubHandler(server.Handler):
                 if path.startswith(prefix) and (prefix == "/api/messages/" or self.command == "DELETE"):
                     path = prefix + quote(decode(unquote(path[len(prefix):]), True), safe=":")
             for key in ("uid", "name"):
+                # Bug-report uploads have no session yet; the browser names the
+                # machine with ?node= instead of a scoped uid.
+                if (key == "uid" and path == "/api/session/attachment"
+                        and query.get(key) == [server.bug_report.BUG_REPORT_UPLOAD_UID]):
+                    continue
                 if query.get(key) and (key == "uid" or path.startswith("/api/term/")):
                     query[key] = [decode(query[key][0], key == "uid")]
             if body:
