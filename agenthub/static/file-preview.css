@@ -25,11 +25,21 @@
 .reader-markdown thead { position:static; }
 .reader-markdown th:nth-child(n),.reader-markdown td:nth-child(n) { display:table-cell; width:auto; }
 body.file-page { display:block; height:auto; min-height:100dvh; overflow:auto; font-family:var(--reading-font); }
-.file-page main { max-width:1280px; margin:auto; padding:20px 28px 48px; height:auto; }
-.file-page header { padding:0; min-height:48px; height:auto; gap:16px; border-bottom:1px solid var(--line); background:none; }
-.file-page header h1 { flex:1; font:600 17px/1.5 var(--reading-font); white-space:normal; overflow-wrap:anywhere; }
+.file-page main { max-width:1280px; margin:auto; padding:0 20px 28px; height:auto; }
+.file-page header { padding:6px 0; min-height:44px; height:auto; gap:12px; border-bottom:1px solid var(--line); background:none; }
+.file-page header h1 { flex:1; min-width:0; font:600 13px/1.4 var(--reading-font); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.file-page #file-actions { flex:none; }
+.file-page .reader-toolbar { flex-wrap:nowrap; gap:4px; padding:0; }
+.file-page .reader-toolbar button { font-size:12px; padding:3px 8px; min-height:28px; }
+.file-page .reader-note:empty { display:none; }
+.file-page .reader-content > :first-child { margin-top:0; }
 .file-page header a { color:var(--accent); white-space:nowrap; }
-.file-page #file-content { margin-top:16px; }
+.file-page #file-content { margin-top:10px; }
 .file-page .file-media { display:block; max-width:100%; margin:auto; }
 .file-page iframe.file-media { width:100%; height:82dvh; border:0; }
-@media(max-width:700px) { .file-page main { padding:12px 14px 28px; } .file-reader { font-size:14px; } .file-reader pre { padding:12px; } }
+@media(max-width:700px) {
+  .file-page main { padding:0 12px 24px; }
+  .file-page header { gap:8px; }
+  .file-page .reader-toolbar button { min-height:32px; padding:3px 7px; }
+  .file-reader { font-size:14px; } .file-reader pre { padding:12px; }
+}

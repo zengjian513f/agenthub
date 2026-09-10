@@ -15,7 +15,7 @@
   }
   addEventListener('agenthub-highlight-ready', () => highlight(document));
 
-  function textPreview(host, info, resolveLink) {
+  function textPreview(host, info, resolveLink, toolbarHost = null) {
     const markdown = /\.(md|markdown|mdown)$/i.test(info.name);
     const reader = element('section', undefined, 'file-reader');
     const toolbar = element('div', undefined, 'reader-toolbar');
@@ -81,12 +81,15 @@
     };
     const previewButton = button('预览', () => { source = false; render(); });
     const sourceButton = button('源码', () => { source = true; render(); });
-    const wrapButton = button('自动换行', () => { wrap = !wrap; render(); });
-    button('复制源码', async () => {
+    const wrapButton = button(toolbarHost ? '换行' : '自动换行', () => { wrap = !wrap; render(); });
+    wrapButton.title = '自动换行'; wrapButton.setAttribute('aria-label', '自动换行');
+    const copyButton = button(toolbarHost ? '复制' : '复制源码', async () => {
       try { await navigator.clipboard.writeText(info.text); note.textContent = '已复制'; }
       catch { note.textContent = '复制失败，请在源码视图中选择文本复制'; }
     });
-    toolbar.append(note); reader.append(toolbar);
+    copyButton.title = '复制源码'; copyButton.setAttribute('aria-label', '复制源码');
+    if (toolbarHost) { toolbarHost.append(toolbar); reader.append(note); }
+    else { toolbar.append(note); reader.append(toolbar); }
     if (info.truncated) reader.append(element('p', '仅预览前 1 MiB，完整内容请下载。', 'reader-note'));
     reader.append(content); host.append(reader); render();
   }

@@ -39,6 +39,7 @@
     }
     document.title = info.name + ' · AgentHub';
     document.getElementById('file-title').textContent = info.name;
+    document.getElementById('file-title').title = info.name;
     document.querySelector('header').hidden = false;
     const download = document.getElementById('file-download');
     download.href = api({download:1}); download.hidden = false;
@@ -52,7 +53,7 @@
             url.searchParams.set('path', path); return url.href + hash;
           }
           return api({ref:path, ...(media ? {raw:1} : {})}) + hash;
-        }, image));
+        }, image), document.getElementById('file-actions'));
     } else if (/^(image\/|audio\/|video\/|application\/pdf$)/.test(info.preview || '')) {
       const tag = info.preview.startsWith('image/') ? 'img' : info.preview.startsWith('audio/') ? 'audio' : info.preview.startsWith('video/') ? 'video' : 'iframe';
       const media = document.createElement(tag); media.className = 'file-media';
