@@ -28,6 +28,7 @@ const T = {
   pending: [],
   pendingModes: new Map(), // 临时会话名 → 打开前的终端布局；退出未落盘时恢复
   resolving: new Set(),
+  discarding: new Set(),
   resolveControllers: new Map(),
   openViews: new Map(store.get('termviews', [])), // tmux 名 → {mode, height}
 };
@@ -882,29 +883,18 @@ function showNewSessionStage(info) {
 }
 
 async function stopPendingSession(info, button) {
-  if (!confirm(`停止并移除「新建 ${SOURCES[info.source].name} 会话」?`)) return;
-  button.disabled = true;
+  return deleteSessions([pendingUid(info.name)], button);
+}
+
+async function discardPendingSession(info) {
+  T.discarding.add(info.name);
+  T.resolveControllers.get(info.name)?.abort();
   try {
-    T.resolveControllers.get(info.name)?.abort();
     const d = await post('api/term/kill', { name: info.name });
-    if (d.error) return alert('停止失败: ' + d.error);
-    const uid = pendingUid(info.name);
-    if (S.sel === uid) {
-      const previousMode = T.pendingModes.get(info.name);
-      if (['normal', 'collapsed', 'full'].includes(previousMode)) T.mode = previousMode;
-      closeTermPane();
-      S.sel = null;
-      store.set('sel', null);
-      $('#composer').classList.add('hidden');
-      $('#detail').innerHTML = '<div class="empty">会话已停止</div>';
-      showMobileList();
-    }
-    T.pendingModes.delete(info.name);
-    await loadTermList();
-    renderSide();
-    showSessionCount(sidebarSessions().length);
+    if (d.error || !d.ok) throw new Error(d.error || '丢弃失败');
+    discardAbandonedNewSession(info);
   } finally {
-    if (button.isConnected) button.disabled = false;
+    T.discarding.delete(info.name);
   }
 }
 
@@ -917,7 +907,9 @@ async function openPendingSession(info) {
 
 function discardAbandonedNewSession(info) {
   const uid = pendingUid(info.name);
+  T.resolveControllers.get(info.name)?.abort();
   T.pending = (T.pending || []).filter(x => x.name !== info.name);
+  T.list = (T.list || []).filter(x => x.name !== info.name);
   T.openViews.delete(info.name);
   store.set('termviews', [...T.openViews]);
   disposeTermView(info.name);
@@ -937,6 +929,7 @@ function discardAbandonedNewSession(info) {
     store.set('sel', null);
     $('#composer').classList.add('hidden');
     $('#detail').innerHTML = '<div class="empty">从左侧选择一个会话</div>';
+    ensureConsolePlaceholder();
     showMobileList();
   }
   T.pendingModes.delete(info.name);
@@ -947,7 +940,7 @@ function discardAbandonedNewSession(info) {
 
 async function resolveNewSession(info) {
   const pendingId = pendingUid(info.name);
-  if (T.resolving.has(info.name)) return;
+  if (T.resolving.has(info.name) || T.discarding.has(info.name)) return;
   T.resolving.add(info.name);
   const controller = new AbortController();
   T.resolveControllers.set(info.name, controller);
@@ -959,6 +952,7 @@ async function resolveNewSession(info) {
         const response = await fetch(appUrl(`api/term/new-status?name=${encodeURIComponent(info.name)}`),
           { signal: controller.signal });
         d = await response.json();
+        if (controller.signal.aborted) return;
         if (HUB_MODE && response.status >= 500) continue;
       } catch {
         if (controller.signal.aborted) return;
@@ -983,6 +977,7 @@ async function resolveNewSession(info) {
       const active = S.sel === pendingId;
       await loadSessions(true);
       await loadTermList();
+      if (controller.signal.aborted) return;
       if (!active) return;                  // 用户已看别处，只更新列表，不抢走右侧页面
       migrateComposerDraft(pendingId, d.uid);
       T.uid = d.uid;

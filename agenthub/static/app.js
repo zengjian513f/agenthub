@@ -1777,8 +1777,10 @@ function visible() {
 const sessionStarred = uid => !!S.sessions.find(s => s.uid === uid)?.starred;
 
 /* ---------- 左栏多选删除 ---------- */
-// 一条条删太慢；勾中的会话一次性移入回收站，正在运行的会话由服务端逐条拒绝。
+// 已有记录移入回收站；未落盘的新建会话停止并丢弃，正式运行会话由服务端拒绝删除。
 const pickedSessions = new Set();
+const sessionPickable = session => !session.fork_parent;
+let sessionDeleteBusy = false;
 
 /** 列表会被 SSE/轮询整份重画，选择集合里只保留仍然存在且可删的会话。 */
 function syncPickedSessions() {
@@ -1786,7 +1788,7 @@ function syncPickedSessions() {
     pickedSessions.clear();
     return pickedSessions;
   }
-  const alive = new Set(S.sessions.filter(s => !s.pending && !s.fork_parent).map(s => s.uid));
+  const alive = new Set(sidebarSessions().filter(sessionPickable).map(s => s.uid));
   for (const uid of [...pickedSessions]) if (!alive.has(uid)) pickedSessions.delete(uid);
   return pickedSessions;
 }
@@ -1837,7 +1839,7 @@ function paintGroupPick(group) {
 }
 
 function pickAllVisible() {
-  const rows = visible().filter(s => !s.pending && !s.fork_parent);
+  const rows = visible().filter(sessionPickable);
   const all = rows.length && rows.every(s => pickedSessions.has(s.uid));
   pickedSessions.clear();
   if (!all) rows.forEach(s => pickedSessions.add(s.uid));
@@ -1852,47 +1854,68 @@ function renderPickBar() {
   $('#side-tools').hidden = !S.picking;   // 不在选择模式时整条不占高度
   $('#side').classList.toggle('picking', S.picking);
   $('#side-picked').textContent = picked ? `已选 ${picked} 项` : '点会话行勾选';
-  $('#side-pick-delete').textContent = picked ? `删除 (${picked})` : '删除';
-  $('#side-pick-delete').disabled = !picked;
-  const rows = S.picking ? visible().filter(s => !s.pending && !s.fork_parent) : [];
+  const pending = pendingTmuxSessions().filter(s => pickedSessions.has(s.uid)).length;
+  const action = pending ? (pending === picked ? '丢弃' : '删除 / 丢弃') : '删除';
+  $('#side-pick-delete').textContent = picked ? `${action} (${picked})` : action;
+  $('#side-pick-delete').disabled = !picked || sessionDeleteBusy;
+  const rows = S.picking ? visible().filter(sessionPickable) : [];
   $('#side-pick-all').disabled = !rows.length;
   $('#side-pick-all').textContent =
     rows.length && rows.every(s => pickedSessions.has(s.uid)) ? '全不选' : '全选';
 }
 
 async function deleteSessions(uids, button = null) {
-  if (!uids.length) return null;
+  if (!uids.length || sessionDeleteBusy) return null;
+  const pending = pendingTmuxSessions().filter(s => uids.includes(s.uid));
+  const pendingIds = new Set(pending.map(s => s.uid));
+  const recorded = uids.filter(uid => !pendingIds.has(uid));
+  const action = pending.length ? (recorded.length ? '删除 / 丢弃' : '丢弃') : '删除';
   const only = uids.length === 1
-    ? (S.sessions.find(x => x.uid === uids[0])?.title || '') : '';
-  const running = uids.filter(uid => S.live.has(uid)).length;
+    ? (sidebarSessions().find(x => x.uid === uids[0])?.title || '') : '';
+  const running = recorded.filter(uid => S.live.has(uid)).length;
   if (!confirm((uids.length === 1
-      ? `删除会话「${only}」?\n\n` : `删除选中的 ${uids.length} 个会话?\n\n`)
-    + '文件会移入回收站 ~/.local/share/agenthub/trash/, 不会真删。'
+      ? `${action}会话「${only}」?\n\n` : `${action}选中的 ${uids.length} 个会话?\n\n`)
+    + (pending.length ? `${pending.length} 个新建会话将停止并丢弃，未发送的草稿也会清除；若已生成会话记录，记录会保留。` : '')
+    + (pending.length && recorded.length ? '\n' : '')
+    + (recorded.length ? '文件会移入回收站 ~/.local/share/agenthub/trash/, 不会真删。' : '')
     + (running ? `\n其中 ${running} 个还在运行，会被跳过，需要先停止。` : '')))
     return null;
+  sessionDeleteBusy = true;
   if (button) button.disabled = true;
-  if (uids.includes(S.sel)) closeWatch();   // 文件即将移走，先停掉这条 SSE
-  let d;
+  const watched = recorded.includes(S.sel) ? S.sel : null;
+  if (watched) closeWatch();   // 文件即将移走，先停掉这条 SSE
+  const d = { deleted: [], errors: [] };
   try {
-    const r = await fetch(appUrl('api/sessions/delete'), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ uids }),
-    });
-    d = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      if (uids.includes(S.sel)) watchSession(S.sel);   // 一条都没删成，恢复同步
-      alert('删除失败: ' + (d.error || r.status));
-      return null;
+    for (const info of pending) {
+      try {
+        await discardPendingSession(info);
+        d.deleted.push({ uid: info.uid });
+      } catch (e) {
+        d.errors.push({ uid: info.uid, title: info.title, error: e.message });
+      }
     }
-  } catch (e) {
-    if (uids.includes(S.sel)) watchSession(S.sel);
-    alert('删除失败: ' + e.message);
-    return null;
+    if (recorded.length) {
+      try {
+        const r = await fetch(appUrl('api/sessions/delete'), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uids: recorded }),
+        });
+        const result = await r.json();
+        if (!r.ok || result.error) throw new Error(result.error || `HTTP ${r.status}`);
+        d.deleted.push(...(result.deleted || []));
+        d.errors.push(...(result.errors || []));
+      } catch (e) {
+        d.errors.push(...recorded.map(uid => ({ uid, error: e.message })));
+      }
+    }
+    if (pending.length) await loadTermList();
   } finally {
+    sessionDeleteBusy = false;
     if (button) button.disabled = false;
   }
   const gone = new Set((d.deleted || []).map(x => x.uid));
   const failed = d.errors || [];
+  if (watched && S.sel === watched && !gone.has(watched)) watchSession(watched, S.agent);
   if (gone.size) {
     S.sessions = S.sessions.filter(x => !gone.has(x.uid));
     if (S.results) S.results = S.results.filter(x => !gone.has(x.uid));
@@ -1909,10 +1932,10 @@ async function deleteSessions(uids, button = null) {
   renderChips();
   renderSide();
   if (failed.length === 1 && uids.length === 1) {
-    alert('删除失败: ' + failed[0].error);
+    alert(`${action}失败: ` + failed[0].error);
   } else if (failed.length) {
     const lines = failed.slice(0, 5).map(x => `· ${x.title || x.uid}: ${x.error}`);
-    alert(`已删除 ${gone.size} 个，${failed.length} 个没能删除:\n\n`
+    alert(`已${action} ${gone.size} 个，${failed.length} 个操作失败:\n\n`
       + lines.join('\n') + (failed.length > 5 ? '\n…' : ''));
   }
   return { gone, failed };
@@ -1942,12 +1965,13 @@ let suppressItemClick = false;
 function openItemMenu(uid, x, y) {
   const menu = $('#item-menu');
   menuUid = uid;
-  const row = S.sessions.find(session => session.uid === uid);
+  const row = sidebarSessions().find(session => session.uid === uid);
   const parent = !!row?.fork_parent;
   const running = S.live.has(uid);
-  menu.querySelector('[data-act="stop"]').hidden = parent || !running;
+  menu.querySelector('[data-act="stop"]').hidden = parent || row?.pending || !running;
   menu.querySelector('[data-act="hide"]').hidden = !parent;
-  menu.querySelector('[data-act="delete"]').hidden = parent || running;
+  menu.querySelector('[data-act="delete"]').hidden = parent || (!row?.pending && running);
+  menu.querySelector('[data-act="delete"]').textContent = row?.pending ? '丢弃会话' : '删除会话';
   menu.querySelector('[data-act="pick"]').hidden = parent;
   menu.hidden = false;
   const box = menu.getBoundingClientRect();
@@ -1966,7 +1990,7 @@ function cancelLongPress() {
   longPress.timer = 0;
 }
 
-const menuTarget = e => e.target.closest('#side .item:not(.pending)');
+const menuTarget = e => e.target.closest('#side .item');
 
 $('#side').addEventListener('contextmenu', e => {
   const row = menuTarget(e);
@@ -2253,6 +2277,7 @@ function renderSide() {
   side.innerHTML = '';
   const list = visible();
   const picked = syncPickedSessions();
+  renderPickBar();
   if (!list.length) {
     const text = S.activeOnly
       ? (S.results ? '没有活动的匹配会话' : '没有活动会话')
@@ -2264,7 +2289,7 @@ function renderSide() {
     const g = el('div', 'group' + (S.closed.has(key) ? ' closed' : ''));
     g.dataset.key = key;
     const label = S.view === 'tree' ? nodeDirectory(items[0]) : key;   // 分组标题不缩写, 只换 ~
-    const groupUids = items.filter(x => !x.pending && !x.fork_parent).map(x => x.uid);
+    const groupUids = items.filter(sessionPickable).map(x => x.uid);
     const head = el('div', 'ghead',
       `${S.picking ? `<input type="checkbox" class="ghead-pick"
          aria-label="选中「${esc(label)}」下的全部会话">` : ''}
@@ -2286,7 +2311,7 @@ function renderSide() {
     const ul = el('div', 'glist');
     for (const s of items) {
       const meta = itemMeta(s);
-      const pickable = S.picking && !s.pending && !s.fork_parent;
+      const pickable = S.picking && sessionPickable(s);
       const it = el('div', 'item' + (S.sel === s.uid ? ' sel' : '')
                               + (s.pending ? (s.stale ? ' pending' : ' pending live live-tmux') : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
@@ -2307,7 +2332,7 @@ function renderSide() {
       if (s.pending) it.dataset.tmuxName = s.tmuxName;
       it.onclick = () => {
         if (pickable) return toggleSessionPick(s.uid);
-        if (S.picking) return;      // 临时会话还没有文件可删，选择模式里不响应
+        if (S.picking) return;
         s.pending ? openPendingSession(s) : openSession(s.uid);
       };
       const star = it.querySelector('.item-star');
