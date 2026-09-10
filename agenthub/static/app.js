@@ -1800,6 +1800,8 @@ function refreshSessionMeta() {
       const childPath = e.meta.path;
       e.meta = {
         ...e.meta, ...s, path: childPath,
+        cwd: item.cwd ?? e.meta.cwd, model: item.model ?? e.meta.model,
+        created: item.created ?? e.meta.created,
         sid: agent, title: item.title, size: item.size, updated: item.updated,
         agent_id: agent, agent_type: item.type, parent_title: s.title,
       };

@@ -6,6 +6,13 @@ from agenthub import server
 
 
 class AccessAllowlistTests(unittest.TestCase):
+    def test_subagent_activity_does_not_inherit_parent_stop_state(self):
+        native = {"state": "working", "turn_id": "child-turn"}
+        result = {"meta": {"agent_id": "child"}, "activity": native}
+        with patch.object(server.session_meta, "resolve_activity",
+                          side_effect=AssertionError("parent state must not reach child")):
+            self.assertEqual(server._resolve_activity("codex:parent", result)["activity"], native)
+
     def setUp(self):
         self.allowed_ips = set(server.ALLOWED_IPS)
         self.allowed_networks = list(server.ALLOWED_NETWORKS)

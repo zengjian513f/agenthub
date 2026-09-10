@@ -851,6 +851,10 @@ class ClaudeProtocolTests(unittest.TestCase):
                              set(agent_ids))
             self.assertEqual([row["sid"] for row in public], [parent_id])
             self.assertEqual(public[0]["title"], "正在运行的主会话")
+            self.assertEqual(public[0]["agents"], 3)
+            self.assertEqual([item["id"] for item in public[0]["agent_items"]], agent_ids)
+            self.assertEqual([item["title"] for item in public[0]["agent_items"]],
+                             [f"/root/review_{number}" for number in range(3)])
             self.assertEqual(adapter._sid_paths, {parent_id: parent})
 
 

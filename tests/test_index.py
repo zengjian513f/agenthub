@@ -351,6 +351,61 @@ class IsolatedIndexTests(unittest.TestCase):
         raw_agent = index._state["raw"]["codex"][str(agent)]
         self.assertEqual(raw_agent["sid"], agent_sid)
         self.assertTrue(raw_agent["_is_subagent"])
+        self.assertEqual(public[0]["agents"], 1)
+        item = index.with_cursors(public)[0]["agent_items"][0]
+        self.assertEqual(item["id"], agent_sid)
+        self.assertEqual(item["cursor"]["end"], agent.stat().st_size)
+
+        uid = public[0]["uid"]
+        before = index.messages(uid, agent_sid)
+        self.assertEqual(before["meta"]["path"], str(agent))
+        self.assertEqual(before["meta"]["sid"], agent_sid)
+        self.assertEqual(before["meta"]["parent_title"], "主线程")
+        self.assertEqual(before["messages"], [])
+        with agent.open("a") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "子代理更新"}]}}) + "\n")
+        with patch.object(index, "_scan_raw", side_effect=AssertionError("incremental only")):
+            updated = index.load()[0]
+        after = index.messages(uid, agent_sid, start=before["end"],
+                               head=before["version"]["head"], anchor=before["anchor"])
+        self.assertFalse(after["reset"])
+        self.assertEqual([m["text"] for m in after["messages"]], ["子代理更新"])
+        self.assertEqual(updated["agent_items"][0]["size"], agent.stat().st_size)
+        self.assertEqual([m["text"] for m in index.messages(uid)["messages"]], ["主线程"])
+        for invalid in ("../rollout-other", parent_sid, "unrelated-agent"):
+            with self.assertRaises(KeyError):
+                index.session_view(updated, invalid)
+
+        index._state = index._empty_state()
+        with patch.object(index, "_scan_raw", side_effect=AssertionError("restore raw cache")):
+            restored = index.load()[0]
+        self.assertEqual(restored["agent_items"], updated["agent_items"])
+        agent.unlink()
+        with self.assertRaises(KeyError):
+            index.session_view(restored, agent_sid)
+        self.assertFalse(index.load()[0].get("agent_items"))
+
+    def test_codex_nested_agents_stay_with_their_owner_and_not_a_fork(self):
+        self.codex_session("parent", "主线程")
+        self.codex_session("fork", "回滚分支", parent="parent")
+        child = self.codex_session("child", "子任务", parent="parent",
+                                   thread_source="subagent", session_id="parent")
+        self.codex_session("nested", "嵌套任务", parent="child",
+                           thread_source="subagent", session_id="parent")
+        self.codex_session("orphan", parent="missing", thread_source="subagent")
+        self.codex_session("cycle-a", parent="cycle-b", thread_source="subagent")
+        self.codex_session("cycle-b", parent="cycle-a", thread_source="subagent")
+        rows = {row["sid"]: row for row in index.load(force=True)}
+        self.assertEqual(set(rows), {"parent", "fork"})
+        self.assertEqual({a["id"] for a in rows["parent"]["agent_items"]}, {"child", "nested"})
+        self.assertFalse(rows["fork"].get("agent_items"))
+        self.codex_index.write_text(json.dumps({
+            "id": "parent", "thread_name": "主线程改名", "updated_at": "2026-08-11T09:00:00Z",
+        }) + "\n")
+        messages, _ = self.fresh_adapters["codex"].read(str(child))
+        self.assertEqual([m["text"] for m in messages], ["子任务"])
 
     def test_codex_rename_recomputes_without_reading_rollouts(self):
         sid = "00000000-0000-0000-0000-000000000003"

@@ -21,7 +21,7 @@ from . import audit, media, session_meta, trash
 
 CACHE_DIR = Path.home() / ".cache" / "agenthub"
 CACHE_FILE = CACHE_DIR / "index.json"
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
 WINDOW_CACHE_VERSION = 8
 MESSAGE_CURSOR_VERSION = 8
@@ -740,7 +740,7 @@ def _cached_cursor(s: dict) -> dict:
 
 
 def with_cursors(sessions: list[dict]) -> list[dict]:
-    """给列表元数据附加主会话及 Claude 子代理的 EOF 游标。
+    """给列表元数据附加主会话及子代理的 EOF 游标。
 
     这里只读取每个文件头 4 KiB、尾部锚点和 Claude 最后一条树记录；浏览器
     随后只拉变化文件的新增区间，不需要为了左栏未读数下载整份历史。
@@ -767,15 +767,20 @@ def session_view(s: dict, agent: str = "") -> dict:
     """把子代理作为父会话的一个可切换视图，不升格为独立 session。"""
     if not agent:
         return s
-    if s.get("source") != "claude":
+    if s.get("source") not in {"claude", "codex"}:
         raise KeyError(agent)
     item = next((x for x in s.get("agent_items", []) if x.get("id") == agent), None)
     if not item:
         raise KeyError(agent)
-    path = Path(s["path"]).parent / Path(s["path"]).stem / "subagents" / f"agent-{agent}.jsonl"
+    if s["source"] == "codex":
+        # 路径仅来自已索引的父子关系，绝不把请求里的 agent 当文件路径解析。
+        path = Path(item["path"])
+    else:
+        path = Path(s["path"]).parent / Path(s["path"]).stem / "subagents" / f"agent-{agent}.jsonl"
     if not path.is_file():
         raise KeyError(agent)
-    return {**s, "path": str(path), "sid": agent, "title": item["title"],
+    return {**s, **{k: item[k] for k in ("cwd", "model", "created") if k in item},
+            "path": str(path), "sid": agent, "title": item["title"],
             "size": item.get("size", path.stat().st_size),
             "updated": item.get("updated", s["updated"]),
             "agent_id": agent, "agent_type": item.get("type", "subagent"),

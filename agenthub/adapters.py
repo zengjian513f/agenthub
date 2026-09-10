@@ -1527,6 +1527,9 @@ class CodexAdapter:
         source_meta = meta.get("source")
         is_subagent = (thread_source == "subagent"
                        or isinstance(source_meta, dict) and "subagent" in source_meta)
+        subagent = source_meta.get("subagent") if isinstance(source_meta, dict) else None
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        spawn = spawn if isinstance(spawn, dict) else {}
         # Codex multi-agent rollout 的 session_id 指向父线程，真正唯一的是 id。
         # 若仍优先 session_id，多个 agent 会覆盖父 row；其 forked_from_id 又
         # 等于父 SID，最终会把正在运行的父会话从公开列表完全隐藏。
@@ -1546,6 +1549,14 @@ class CodexAdapter:
             "renamed_at": None, "renamed_to": None,
             "_base_title": base_title, "_named": False, "_local_size": st.st_size,
             "_is_subagent": is_subagent,
+            "_agent_parent_sid": str(meta.get("parent_thread_id")
+                                     or spawn.get("parent_thread_id")
+                                     or meta.get("forked_from_id") or "") if is_subagent else "",
+            "_agent_title": str(meta.get("agent_path") or spawn.get("agent_path")
+                                or meta.get("agent_nickname")
+                                or spawn.get("agent_nickname") or sid),
+            "_agent_type": str(meta.get("agent_role") or spawn.get("agent_role")
+                               or "subagent"),
         }
 
     def session_meta(self, path: str | Path) -> dict | None:
@@ -1576,8 +1587,7 @@ class CodexAdapter:
         """套用 rename、分叉继承和逻辑大小；父项留给用户决定是否隐藏。"""
         names = self._thread_names()
         # 协作 agent rollout 是父线程的内部执行记录，不是用户的回滚分支。
-        # 暂留在 raw cache 供将来做 agent 视图，但不参与公开列表、fork 替代
-        # 和 history path 映射。
+        # 挂到所属主会话的视图列表，不参与公开列表、fork 替代和 history path 映射。
         out = [dict(s) for s in sessions if not s.get("_is_subagent")]
         self._sid_paths = {str(s["sid"]): Path(s["path"]) for s in out}
         for s in out:
@@ -1590,6 +1600,22 @@ class CodexAdapter:
             s["renamed_to"] = name_event.get("name") if name_event else None
 
         by_sid = {str(s["sid"]): s for s in out}
+        agents = {str(s["sid"]): s for s in sessions if s.get("_is_subagent")}
+        for agent in sorted(agents.values(), key=lambda s: (s["created"], s["sid"])):
+            owner = agent.get("_agent_parent_sid", "")
+            seen = {agent["sid"]}
+            while owner in agents and owner not in seen:
+                seen.add(owner)
+                owner = agents[owner].get("_agent_parent_sid", "")
+            if owner in seen or owner not in by_sid:
+                continue
+            items = by_sid[owner].setdefault("agent_items", [])
+            items.append({
+                "id": agent["sid"], "title": agent["_agent_title"],
+                "type": agent["_agent_type"],
+                **{k: agent[k] for k in ("path", "cwd", "model", "created", "updated", "size")},
+            })
+            by_sid[owner]["agents"] = len(items)
         # 双 Esc 回退会创建一个新 UUID，但新 rollout 只保存分叉点之后的增量，
         # history_base 指向父文件的有效前缀。父子会话都保留供用户查看；
         # 历史仍由 read() 按链补齐，不能把两个分支的尾部直接拼在一起。
@@ -1627,6 +1653,9 @@ class CodexAdapter:
             s.pop("_named", None)
             s.pop("_local_size", None)
             s.pop("_is_subagent", None)
+            s.pop("_agent_parent_sid", None)
+            s.pop("_agent_title", None)
+            s.pop("_agent_type", None)
         return out
 
     def list_sessions(self):
@@ -1809,7 +1838,8 @@ class CodexAdapter:
         # /rename 是 TUI 本地命令，不进入 rollout。session_index 只证明名称在此时
         # 被设置过，因此显示成不计数的会话事件，不能伪装成原始 user 消息。
         if session_meta and not search_only:
-            sid = session_meta.get("session_id") or session_meta.get("id")
+            # 子代理的 session_id 可能继承自主线程，不能套用主线程的改名事件。
+            sid = session_meta.get("id") or session_meta.get("session_id")
             name_event = self._name_event(str(sid or ""))
             if name_event:
                 event = _msg("command", f'/rename {name_event["name"]}',

@@ -142,6 +142,8 @@ def _after_terminal_keys(uid: str, keys: list[str]) -> dict | None:
 
 
 def _resolve_activity(uid: str, result: dict) -> dict:
+    if (result.get("meta") or {}).get("agent_id"):
+        return result
     resolved = session_meta.resolve_activity(uid, result.get("activity"))
     if resolved != result.get("activity"):
         result["activity"] = resolved
