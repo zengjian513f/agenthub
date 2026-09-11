@@ -3,11 +3,18 @@
 //! 只服务 capture / cursor 查询和 attach 回放：实时字节由读线程直接转发，
 //! 不经过这里。SGR 的具体字节由 vt100 生成，和参考实现不必逐字节相同；
 //! 调用方（claude_bridge / codex_bridge）都先剥离转义再解析文本与光标。
+//!
+//! vt100 内部的 panic 在这里拦下：模型只是画面的副本，坏了可以从头重建，
+//! 但绝不能让宿主里的锁中毒、把 attach 和 pty 读线程一起拖死。
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub struct Screen {
     parser: vt100::Parser,
     cols: u16,
     rows: u16,
+    history: usize,
+    resets: u64,
 }
 
 impl Screen {
@@ -16,17 +23,87 @@ impl Screen {
             parser: vt100::Parser::new(rows.max(1), cols.max(1), history),
             cols: cols.max(1),
             rows: rows.max(1),
+            history,
+            resets: 0,
         }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
-        self.parser.process(data);
+        if catch_unwind(AssertUnwindSafe(|| self.parser.process(data))).is_err() {
+            self.recover();
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.cols = cols.max(1);
-        self.rows = rows.max(1);
-        self.parser.screen_mut().set_size(self.rows, self.cols);
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        if cols < self.cols {
+            self.erase_wide_cells_crossing(cols - 1);
+        }
+        self.cols = cols;
+        self.rows = rows;
+        if catch_unwind(AssertUnwindSafe(|| self.parser.screen_mut().set_size(rows, cols)))
+            .is_err()
+        {
+            self.recover();
+        }
+    }
+
+    /// 模型因 panic 被重建的次数；capture 应答里带上，调用方可据此判断画面是否可信。
+    pub fn resets(&self) -> u64 {
+        self.resets
+    }
+
+    /// vt100 截短行时不处理跨越新边界的宽字符：左半留在新的最后一列，右半被截掉。
+    /// 之后擦除或覆盖到那一格，`Row::clear_wide` 会去找早已不存在的右半而越界 panic
+    /// （vt100 0.16.2 `row.rs:89`）。宽字符本来不可能落在最后一列——写到那里会先换行，
+    /// 所以先把这些字符擦成空格，再交给 vt100 截短。只处理当前活动的那张屏；
+    /// 另一张屏若也有同样的残留，切换回去后由 [`Self::recover`] 兜底。
+    fn erase_wide_cells_crossing(&mut self, last: u16) {
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(0);
+        let rows: Vec<u16> = (0..self.rows)
+            .filter(|&row| screen.cell(row, last).is_some_and(vt100::Cell::is_wide))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let attrs = screen.attributes_formatted();
+        let mut seq = Vec::new();
+        // DECSC 保存光标位置与原点模式；关掉原点模式后 CUP 才是绝对坐标。
+        seq.extend_from_slice(b"\x1b7\x1b[?6l\x1b[0m");
+        for row in rows {
+            seq.extend_from_slice(format!("\x1b[{};{}H ", row + 1, last + 1).as_bytes());
+        }
+        seq.extend_from_slice(b"\x1b8");
+        seq.extend_from_slice(&attrs);
+        self.feed(&seq);
+    }
+
+    /// vt100 半途 panic 后模型不可信：用同尺寸的新模型接上当前画面（含备用屏与各项
+    /// 模式），历史不保留，交给 TUI 的下一次整屏重绘纠正。快照本身也可能撞上同一处
+    /// 损坏，那就只能从空屏开始。
+    fn recover(&mut self) {
+        let (cols, rows, history) = (self.cols, self.rows, self.history);
+        let snapshot = catch_unwind(AssertUnwindSafe(|| {
+            self.parser.screen_mut().set_scrollback(0);
+            snapshot_without_broken_cells(self.parser.screen())
+        }));
+        self.parser = vt100::Parser::new(rows, cols, history);
+        let restored = match snapshot {
+            Ok(bytes) => catch_unwind(AssertUnwindSafe(|| self.parser.process(&bytes))).is_ok(),
+            Err(_) => false,
+        };
+        if !restored {
+            self.parser = vt100::Parser::new(rows, cols, history);
+        }
+        self.resets += 1;
+        eprintln!(
+            "screen model reset #{} ({}x{}, {})",
+            self.resets,
+            cols,
+            rows,
+            if restored { "current screen kept" } else { "blank" }
+        );
     }
 
     pub fn cursor(&self) -> (u16, u16) {
@@ -150,6 +227,36 @@ impl Screen {
                 .collect()
         }
     }
+}
+
+/// 逐行重画当前屏，每行绝对定位。行尾残缺的宽字符（panic 的源头）不带上，
+/// 否则新模型会把它折到下一行、把整屏错开一行。`state_formatted` 靠 vt100 自己的
+/// 换行推断串行，在这种损坏上做不到这一点。软换行标记随之丢失，只影响历史合并的
+/// 逻辑行边界。
+fn snapshot_without_broken_cells(screen: &vt100::Screen) -> Vec<u8> {
+    let (_, cols) = screen.size();
+    let last = cols.saturating_sub(1);
+    let mut out = Vec::new();
+    if screen.alternate_screen() {
+        out.extend_from_slice(b"\x1b[?1049h");
+    }
+    out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
+    let whole_rows = screen.rows_formatted(0, cols);
+    let cut_rows = screen.rows_formatted(0, last);
+    for (row, (whole, cut)) in whole_rows.zip(cut_rows).enumerate() {
+        let broken = cols > 1
+            && screen
+                .cell(row as u16, last)
+                .is_some_and(vt100::Cell::is_wide);
+        out.extend_from_slice(format!("\x1b[{};1H\x1b[0m", row + 1).as_bytes());
+        out.extend_from_slice(if broken { &cut } else { &whole });
+    }
+    let (row, col) = screen.cursor_position();
+    out.extend_from_slice(format!("\x1b[0m\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    out.extend_from_slice(&screen.attributes_formatted());
+    out.extend_from_slice(&screen.input_mode_formatted());
+    out.extend_from_slice(if screen.hide_cursor() { b"\x1b[?25l" } else { b"\x1b[?25h" });
+    out
 }
 
 /// 软换行合并：与参考实现一致，wrapped 行与下一行拼成同一条逻辑行。
@@ -319,6 +426,71 @@ mod tests {
             stripped.find("line-1").unwrap() < stripped.find("line-10").unwrap(),
             "回放顺序颠倒"
         );
+    }
+
+    #[test]
+    fn narrowing_across_a_wide_char_keeps_the_model_alive() {
+        // 12 列里 "abcdefghi你"：'你' 占第 10、11 列。截到 10 列后第 10 列只剩左半，
+        // 再在那一行擦到行尾曾让 vt100 越界 panic，宿主从此连不上。
+        let mut screen = Screen::new(12, 3, 0);
+        screen.feed("abcdefghi你\r\nsecond".as_bytes());
+        screen.feed(b"\x1b[1;31m");            // 当前属性要在擦除后原样保留
+        screen.resize(10, 3);
+        screen.feed(b"\x1b[1;10H\x1b[K");
+        let rows: Vec<String> = plain(&mut screen).iter().map(|r| r.trim_end().to_string()).collect();
+        assert_eq!(rows, vec!["abcdefghi", "second", ""]);
+        assert_eq!(screen.resets(), 0, "预处理后不应再走重建");
+        assert_eq!(screen.cursor(), (9, 0));
+        screen.feed(b"X");
+        let styled = screen.screen_lines(true, false).remove(0);
+        assert_eq!(strip_ansi(&styled).trim_end(), "abcdefghiX");
+        assert!(styled.contains("31"), "属性丢失: {styled:?}");
+    }
+
+    #[test]
+    fn narrowing_restores_cursor_and_origin_mode() {
+        let mut screen = Screen::new(12, 4, 0);
+        screen.feed("abcdefghi你\r\n".as_bytes());
+        screen.feed(b"\x1b[2;4r\x1b[?6h\x1b[2;3H");   // 滚动区 2..4 + 原点模式，光标在区内第 2 行第 3 列
+        assert_eq!(screen.cursor(), (2, 2));
+        screen.resize(10, 4);
+        assert_eq!(screen.cursor(), (2, 2), "清理宽字符不能移动应用的光标");
+        screen.feed(b"\x1b[1;1H");                   // 原点模式下 CUP 仍相对滚动区
+        assert_eq!(screen.cursor(), (0, 1), "原点模式被清理过程改掉了");
+    }
+
+    #[test]
+    fn a_vt100_panic_rebuilds_the_model_instead_of_poisoning_it() {
+        let mut screen = Screen::new(12, 3, 0);
+        screen.feed("abcdefghi你\r\n\x1b[32msecond\x1b[?2004h\x1b[?25l".as_bytes());
+        // 绕过预处理，直接制造 vt100 里的残缺宽字符，模拟未知的内部越界。
+        screen.cols = 10;
+        screen.parser.screen_mut().set_size(3, 10);
+        screen.feed(b"\x1b[1;10H\x1b[K");
+        assert_eq!(screen.resets(), 1);
+        assert!(screen.bracketed_paste(), "重建后应保留各项模式");
+        assert!(!screen.cursor_visible(), "重建后应保留光标可见性");
+        assert_eq!(screen.cursor(), (9, 0), "重建后光标应仍在 panic 前的位置");
+        let rows: Vec<String> = plain(&mut screen).iter().map(|r| r.trim_end().to_string()).collect();
+        assert_eq!(rows, vec!["abcdefghi", "second", ""], "重建后的画面不能错行");
+        let styled = screen.screen_lines(true, false).remove(1);
+        assert!(styled.contains("32"), "重建后应保留各行样式: {styled:?}");
+        screen.feed(b"\x1b[3;1Hthird");
+        assert!(plain(&mut screen).iter().any(|r| r.trim_end() == "third"));
+        assert_eq!(screen.resets(), 1, "之后的正常输出不应再触发重建");
+    }
+
+    #[test]
+    fn recovery_keeps_the_alternate_screen() {
+        let mut screen = Screen::new(12, 3, 10);
+        screen.feed(b"main\r\n\x1b[?1049h\x1b[H");
+        screen.feed("alt-line-你".as_bytes());
+        screen.cols = 10;
+        screen.parser.screen_mut().set_size(3, 10);
+        screen.feed(b"\x1b[1;10H\x1b[K");
+        assert_eq!(screen.resets(), 1);
+        assert!(screen.alt(), "重建后应仍在备用屏");
+        assert_eq!(plain(&mut screen)[0].trim_end(), "alt-line-");
     }
 
     #[test]

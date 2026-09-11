@@ -2364,10 +2364,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             att = term.Attach(name, int(q.get("cols", ["120"])[0]),
                               int(q.get("rows", ["32"])[0]))
-        except Exception:
+        except Exception as e:
+            # 会话在列表里却接不上（宿主进程坏了、tmux attach 失败）。原因必须
+            # 进审计并随 close 帧带给浏览器，否则整条链路只剩"1011 attach failed"。
+            reason = str(e) or e.__class__.__name__
+            audit.record(
+                "terminal.connection.failed", category="terminal",
+                severity="error", page_id=page, connection_id=connection_id,
+                data={"tmux": name, "reason": reason},
+            )
             TERM_OWNERS.release(name, token)
             connection.closed.set()
-            wsock.close(sock, 1011, "attach failed")
+            wsock.close(sock, 1011, f"attach failed: {reason}")
             self.close_connection = True
             return
 

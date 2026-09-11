@@ -80,7 +80,8 @@ class NodeHandler(server.Handler):
             return self._json({'enabled': s.get('term_enabled', True),
                                'unavailable_reason': s.get('term_reason', ''),
                                'sources': s.get('term_sources', {'claude': True, 'codex': True}),
-                               'home': '/home/' + s['name'], 'sessions': [], 'pending': s['pending'],
+                               'home': '/home/' + s['name'], 'sessions': s.get('term_sessions', []),
+                               'pending': s['pending'],
                                'backend': current,
                                'backends': [{'name': n, 'label': n, 'available': True,
                                              'current': n == current, 'unavailable_reason': ''}
@@ -126,6 +127,10 @@ class NodeHandler(server.Handler):
         if u.path == '/api/term/attach':
             if wsock.handshake(self):
                 self.close_connection = True
+                if s.get('attach_error'):
+                    # 与真实服务一致：升级成功之后才 attach，失败立即以 1011 带原因关闭。
+                    wsock.close(self.connection, 1011, 'attach failed: ' + s['attach_error'])
+                    return
                 wsock.send(self.connection, s['name'].encode(), wsock.OP_BIN)
                 try:
                     while True:

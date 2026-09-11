@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
@@ -32,6 +32,13 @@ const STRIP_ENV: &[&str] = &[
     "TMUX",
 ];
 
+/// 中毒的锁照常用。持锁线程 panic 只说明它半途而废，数据本身还在；若在这里
+/// `unwrap()`，一次屏幕模型的内部越界就会让 attach、capture、连 pty 读线程
+/// 都跟着 panic，宿主变成"活着但永远连不上"（BUG-20260911-170830）。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct Client {
     id: u64,
     out: Mutex<Stream>,
@@ -43,10 +50,7 @@ impl Client {
         if self.dead.load(Ordering::Relaxed) {
             return;
         }
-        let mut out = match self.out.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let mut out = lock(&self.out);
         if out.write_all(frame).and_then(|_| out.flush()).is_err() {
             self.dead.store(true, Ordering::Relaxed);
         }
@@ -240,7 +244,7 @@ impl Session {
         });
 
         let listener = session.listen()?;
-        *session.listener.lock().unwrap() = Some(listener.clone());
+        *lock(&session.listener) = Some(listener.clone());
         session.write_info();
 
         let reader_session = session.clone();
@@ -267,13 +271,13 @@ impl Session {
         #[cfg(not(unix))]
         {
             let (listener, port) = Listener::bind_local_tcp()?;
-            *self.port.lock().unwrap() = port;
+            *lock(&self.port) = port;
             Ok(Arc::new(listener))
         }
     }
 
     fn name_now(&self) -> String {
-        self.name.lock().unwrap().clone()
+        lock(&self.name).clone()
     }
 
     fn sock_path(&self) -> PathBuf {
@@ -307,11 +311,8 @@ impl Session {
     }
 
     pub fn info(&self) -> Value {
-        let (cols, rows) = *self.size.lock().unwrap();
-        let attached = self
-            .clients
-            .lock()
-            .unwrap()
+        let (cols, rows) = *lock(&self.size);
+        let attached = lock(&self.clients)
             .iter()
             .any(|c| !c.dead.load(Ordering::Relaxed));
         let mut info = json!({
@@ -330,7 +331,7 @@ impl Session {
         });
         let map = info.as_object_mut().unwrap();
         if cfg!(windows) {
-            map.insert("port".into(), json!(*self.port.lock().unwrap()));
+            map.insert("port".into(), json!(*lock(&self.port)));
             map.insert("token".into(), json!(self.token));
         } else {
             map.insert(
@@ -386,7 +387,7 @@ impl Session {
                 (!payload.is_empty()).then(|| pack_frame(FRAME_DATA, payload))
             };
             let clients: Vec<Arc<Client>> = {
-                let mut backlog = self.backlog.lock().unwrap();
+                let mut backlog = lock(&self.backlog);
                 for piece in pieces {
                     backlog.pending += piece.data_len();
                     backlog.fed += piece.data_len() as u64;
@@ -406,9 +407,7 @@ impl Session {
     }
 
     fn live_clients(&self) -> Vec<Arc<Client>> {
-        self.clients
-            .lock()
-            .unwrap()
+        lock(&self.clients)
             .iter()
             .filter(|c| !c.dead.load(Ordering::Relaxed))
             .cloned()
@@ -418,7 +417,7 @@ impl Session {
     fn screen_loop(self: Arc<Self>) {
         loop {
             let piece = {
-                let mut backlog = self.backlog.lock().unwrap();
+                let mut backlog = lock(&self.backlog);
                 while backlog.queue.is_empty() {
                     if self.exited.load(Ordering::Relaxed) {
                         return;
@@ -426,7 +425,7 @@ impl Session {
                     let (guard, _) = self
                         .backlog_cv
                         .wait_timeout(backlog, Duration::from_millis(200))
-                        .unwrap();
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     backlog = guard;
                 }
                 let piece = backlog.queue.pop_front().unwrap();
@@ -437,17 +436,17 @@ impl Session {
             };
             let answer = match &piece {
                 Piece::Data(bytes) => {
-                    self.screen.lock().unwrap().feed(bytes);
+                    lock(&self.screen).feed(bytes);
                     None
                 }
                 query => {
                     // 在这里应答，光标就是流里这个位置的光标：前面的字节都已喂完。
-                    let (col, row) = self.screen.lock().unwrap().cursor();
+                    let (col, row) = lock(&self.screen).cursor();
                     dsr::reply(query, col, row)
                 }
             };
             {
-                let mut backlog = self.backlog.lock().unwrap();
+                let mut backlog = lock(&self.backlog);
                 backlog.inflight = None;
                 backlog.pending -= piece.data_len().min(backlog.pending);
                 backlog.applied += piece.data_len() as u64;
@@ -462,7 +461,7 @@ impl Session {
     /// 等模型追上已读入的字节；返回仍未应用的字节数（0 表示完全同步）。
     fn wait_applied(&self, timeout: Duration) -> usize {
         let deadline = Instant::now() + timeout;
-        let mut backlog = self.backlog.lock().unwrap();
+        let mut backlog = lock(&self.backlog);
         while backlog.pending > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -471,7 +470,7 @@ impl Session {
             let (guard, _) = self
                 .backlog_cv
                 .wait_timeout(backlog, left.min(Duration::from_millis(50)))
-                .unwrap();
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             backlog = guard;
         }
         backlog.pending
@@ -486,7 +485,7 @@ impl Session {
         self.wait_applied(SCREEN_SYNC_TIMEOUT);
 
         let code = {
-            let mut child = self.child.lock().unwrap();
+            let mut child = lock(&self.child);
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 match child.try_wait() {
@@ -506,14 +505,12 @@ impl Session {
         };
         self.exit_code.store(code, Ordering::SeqCst);
         self.exited.store(true, Ordering::SeqCst);
-        let clients: Vec<Arc<Client>> = std::mem::take(&mut *self.clients.lock().unwrap());
+        let clients: Vec<Arc<Client>> = std::mem::take(&mut *lock(&self.clients));
         let frame = pack_frame(FRAME_EXIT, json!({"code": code}).to_string().as_bytes());
         for client in clients {
             client.send(&frame);
             client.dead.store(true, Ordering::Relaxed);
-            if let Ok(out) = client.out.lock() {
-                out.shutdown();
-            }
+            lock(&client.out).shutdown();
         }
         self.backlog_cv.notify_all();
     }
@@ -523,7 +520,7 @@ impl Session {
             std::thread::sleep(Duration::from_millis(100));
             // 子进程已退出但 pty 迟迟不给 EOF（极少数平台）时的兜底判定。
             if !self.finishing.load(Ordering::Relaxed) {
-                let dead = matches!(self.child.lock().unwrap().try_wait(), Ok(Some(_)));
+                let dead = matches!(lock(&self.child).try_wait(), Ok(Some(_)));
                 if dead {
                     std::thread::sleep(Duration::from_millis(200));
                     self.finish();
@@ -536,7 +533,7 @@ impl Session {
 
     pub fn stop(&self, force: bool) {
         if force {
-            let _ = self.child.lock().unwrap().kill();
+            let _ = lock(&self.child).kill();
             return;
         }
         #[cfg(unix)]
@@ -551,7 +548,7 @@ impl Session {
         }
         #[cfg(not(unix))]
         {
-            let _ = self.child.lock().unwrap().kill();
+            let _ = lock(&self.child).kill();
         }
     }
 
@@ -559,7 +556,7 @@ impl Session {
     /// 每轮重新取当前 listener：改名会换掉它，旧 listener 被唤醒后自然退场。
     fn accept_loop(self: Arc<Self>) {
         while !self.exited.load(Ordering::Relaxed) {
-            let listener = match self.listener.lock().unwrap().clone() {
+            let listener = match lock(&self.listener).clone() {
                 Some(listener) => listener,
                 None => return,
             };
@@ -571,7 +568,7 @@ impl Session {
                         .spawn(move || session.serve_conn(stream));
                 }
                 Err(_) => {
-                    let current = self.listener.lock().unwrap().clone();
+                    let current = lock(&self.listener).clone();
                     match current {
                         Some(current) if !Arc::ptr_eq(&current, &listener) => continue,
                         _ => return,
@@ -613,10 +610,9 @@ impl Session {
     }
 
     fn write_pty(&self, data: &[u8]) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(data);
-            let _ = writer.flush();
-        }
+        let mut writer = lock(&self.writer);
+        let _ = writer.write_all(data);
+        let _ = writer.flush();
     }
 
     fn dispatch(&self, op: &str, req: &Value) -> Result<Value, String> {
@@ -630,7 +626,7 @@ impl Session {
                 Ok(json!({"ok": true}))
             }
             "keys" => {
-                let app_cursor = self.screen.lock().unwrap().app_cursor();
+                let app_cursor = lock(&self.screen).app_cursor();
                 let mut out = Vec::new();
                 if let Some(keys) = req.get("keys").and_then(|v| v.as_array()) {
                     for key in keys {
@@ -644,7 +640,7 @@ impl Session {
             }
             "paste" => {
                 let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                let bracketed = self.screen.lock().unwrap().bracketed_paste();
+                let bracketed = lock(&self.screen).bracketed_paste();
                 let wanted = req
                     .get("bracketed")
                     .and_then(|v| v.as_bool())
@@ -669,13 +665,13 @@ impl Session {
             "capture" => self.capture(req),
             "cursor" => {
                 let lag = self.wait_applied(SCREEN_SYNC_TIMEOUT);
-                let dropped = self.backlog.lock().unwrap().dropped;
-                let screen = self.screen.lock().unwrap();
+                let dropped = lock(&self.backlog).dropped;
+                let screen = lock(&self.screen);
                 let (x, y) = screen.cursor();
                 Ok(json!({
                     "ok": true, "x": x, "y": y,
                     "visible": screen.cursor_visible(), "alt": screen.alt(),
-                    "lag": lag, "dropped": dropped
+                    "lag": lag, "dropped": dropped, "resets": screen.resets()
                 }))
             }
             "rename" => self.rename(req.get("to").and_then(|v| v.as_str()).unwrap_or("")),
@@ -697,9 +693,9 @@ impl Session {
         let lines = req.get("lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         // 先让模型追上刚写出的输出，再取屏幕；composer 判定依赖这一点。
         let lag = self.wait_applied(SCREEN_SYNC_TIMEOUT);
-        let dropped = self.backlog.lock().unwrap().dropped;
-        let (cols, rows) = *self.size.lock().unwrap();
-        let mut screen = self.screen.lock().unwrap();
+        let dropped = lock(&self.backlog).dropped;
+        let (cols, rows) = *lock(&self.size);
+        let mut screen = lock(&self.screen);
         let text = if kind == "screen" {
             screen.screen_lines(styled, join)
         } else {
@@ -709,21 +705,23 @@ impl Session {
         let (x, y) = screen.cursor();
         Ok(json!({
             "ok": true, "text": text, "cursor": [x, y], "alt": screen.alt(),
-            "cols": cols, "rows": rows, "lag": lag, "dropped": dropped
+            "cols": cols, "rows": rows, "lag": lag, "dropped": dropped,
+            "resets": screen.resets()
         }))
     }
 
     fn resize(&self, cols: u16, rows: u16) {
         let (cols, rows) = (cols.max(1), rows.max(1));
         {
-            let mut size = self.size.lock().unwrap();
+            let mut size = lock(&self.size);
             if *size == (cols, rows) {
                 return;
             }
             *size = (cols, rows);
         }
-        self.screen.lock().unwrap().resize(cols, rows);
-        if let Ok(master) = self.master.lock() {
+        lock(&self.screen).resize(cols, rows);
+        {
+            let master = lock(&self.master);
             let _ = master.resize(PtySize {
                 rows,
                 cols,
@@ -752,9 +750,9 @@ impl Session {
             let path = self.directory.join(format!("{new}.sock"));
             let fresh = Listener::bind_unix(&path)
                 .map_err(|e| format!("重建 socket 失败: {e}"))?;
-            *self.listener.lock().unwrap() = Some(Arc::new(fresh));
+            *lock(&self.listener) = Some(Arc::new(fresh));
         }
-        *self.name.lock().unwrap() = new.to_string();
+        *lock(&self.name) = new.to_string();
         self.write_info();
         #[cfg(unix)]
         {
@@ -771,7 +769,7 @@ impl Session {
             let _ = send_json(&mut writer, &json!({"ok": false, "error": "会话已结束"}));
             return;
         }
-        let (cur_cols, cur_rows) = *self.size.lock().unwrap();
+        let (cur_cols, cur_rows) = *lock(&self.size);
         let cols = req.get("cols").and_then(|v| v.as_u64()).unwrap_or(cur_cols as u64) as u16;
         let rows = req.get("rows").and_then(|v| v.as_u64()).unwrap_or(cur_rows as u64) as u16;
         self.resize(cols, rows);
@@ -788,16 +786,16 @@ impl Session {
         // 已读入的数据，所以回放 = 模型当前画面 + 尚未喂入的原始字节；客户端
         // 加入列表与快照在同一把 backlog 锁下完成，读线程分发不会插进中间。
         let replay = {
-            let backlog = self.backlog.lock().unwrap();
+            let backlog = lock(&self.backlog);
             let mut replay = Vec::new();
             if req.get("replay").and_then(|v| v.as_bool()).unwrap_or(true) {
-                replay.extend_from_slice(&self.screen.lock().unwrap().replay_bytes(self.history));
+                replay.extend_from_slice(&lock(&self.screen).replay_bytes(self.history));
                 replay.extend_from_slice(&backlog.unapplied_bytes());
             }
-            self.clients.lock().unwrap().push(client.clone());
+            lock(&self.clients).push(client.clone());
             replay
         };
-        let (size_cols, size_rows) = *self.size.lock().unwrap();
+        let (size_cols, size_rows) = *lock(&self.size);
         if send_json(&mut writer, &json!({"ok": true, "cols": size_cols, "rows": size_rows})).is_err() {
             self.drop_client(&client);
             return;
@@ -837,7 +835,7 @@ impl Session {
     }
 
     fn drop_client(&self, client: &Arc<Client>) {
-        self.clients.lock().unwrap().retain(|c| c.id != client.id);
+        lock(&self.clients).retain(|c| c.id != client.id);
     }
 }
 
@@ -875,6 +873,20 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_poisoned_lock_is_still_usable() {
+        let shared = Arc::new(Mutex::new(vec![1]));
+        let poisoner = shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = lock(&poisoner);
+            panic!("模拟屏幕模型越界");
+        })
+        .join();
+        assert!(shared.is_poisoned());
+        lock(&shared).push(2);
+        assert_eq!(*lock(&shared), vec![1, 2]);
+    }
 
     fn backlog_with(chunks: &[&[u8]]) -> Backlog {
         let mut backlog = Backlog::default();

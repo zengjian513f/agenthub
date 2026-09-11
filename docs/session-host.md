@@ -28,6 +28,11 @@ ptyhost 本体是 Rust 二进制；Python 侧只保留客户端（`agenthub/host
   `dropped`（累计丢弃），调用方可据此判断这一帧是否可信。
   attach 的回放 = 历史 + 终端完整状态（`state_formatted`，含备用屏、DECCKM、bracketed paste）
   + 尚未喂入的原始字节，与客户端随后收到的实时字节严格接续。
+- **模型崩坏不拖垮宿主**：vt100 内部的 panic（已知一例：把行截短时留下半个宽字符，
+  之后擦到那一格就越界）在 `screen.rs` 里被拦下，模型按当前画面重建并在 `capture` /
+  `cursor` 应答里计入 `resets`；`session.rs` 里的锁一律容忍中毒，绝不因为某个线程 panic
+  就让 attach、capture 和 pty 读线程一起失效。截短前还会先把跨越新边界的宽字符擦成空格，
+  避免触发那个已知的越界。宿主 stderr（`<name>.log`）里仍会留下 panic 信息供诊断。
 - Linux 上宿主进程会尽量通过 `systemd-run --user --scope` 放进独立的 transient scope，
   这样 `systemctl --user restart agenthub.service` 不会连带结束 CLI；没有用户 systemd 时退回
   `start_new_session` 的普通独立进程（`AGENTHUB_HOST_SCOPE=0` 可强制）。Windows 用

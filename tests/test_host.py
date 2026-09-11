@@ -119,6 +119,44 @@ class SessionProcessTests(unittest.TestCase):
         self.assertEqual(list(self.dir.glob("agenthub-t1.json")) + list(self.dir.glob("agenthub-t1.sock")), [])
         self.assertEqual(client.list_sessions(self.dir), [])
 
+    def test_narrowing_across_a_wide_character_keeps_the_host_attachable(self):
+        """BUG-20260911-170830：147 列切到 97 列时某行的汉字正好跨过新边界，vt100 截行后
+        留下半个宽字符，应用下一次擦到行尾就在模型线程里越界 panic；锁中毒后 attach、
+        capture 和 pty 读线程全部失效，浏览器只能每 0.5s 重连一次。"""
+        name = "agenthub-t-wide"
+        # 命令放进脚本里，回显才不会在 10 列宽的屏上折成好几行把画面顶走。
+        (self.dir / "w.sh").write_text("printf 'abcdefghi\\344\\275\\240\\n'\n")
+        erase = "".join(f"\\033[{r};10H\\033[K" for r in range(1, 7))
+        (self.dir / "e.sh").write_text(f"printf '{erase}'\n")
+        proc, _ = self.start(name, "sh", "-i", cols=12, rows=6)
+        # 第 10、11 列放一个宽字符，再把宽度切到 10 列：第 10 列只剩它的左半。
+        client.request(name, "send", self.dir, text="sh w.sh\r")
+        self.wait_screen(name, "abcdefghi你")
+        client.request(name, "resize", self.dir, cols=10, rows=6)
+        client.request(name, "send", self.dir, text="sh e.sh\r")       # 每一行都擦到行尾
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            reply = client.request(name, "capture", self.dir, kind="scrollback", lines=100,
+                                   styled=False, join=True)
+            if reply["cols"] == 10 and "e.sh" in reply["text"]:
+                break
+            time.sleep(0.05)
+        lines = [line.rstrip() for line in reply["text"].splitlines()]
+        self.assertEqual(reply["cols"], 10)
+        self.assertIn("abcdefghi", lines, "跨边界的汉字应被擦掉、其余内容保留")
+        self.assertNotIn("abcdefghi你", lines)
+        self.assertEqual(reply["resets"], 0, "预处理后不该走模型重建")
+        att = client.Attach(name, 10, 6, directory=self.dir)
+        att.write(b"echo still-$((5*5))\r")
+        got = b""
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and b"still-25" not in got:
+            got += att.read(0.1)
+        att.close()
+        self.assertIn(b"still-25", got, "宿主应仍能 attach 并转发输出")
+        self.assertIsNone(proc.poll())
+        self.assertNotIn("panicked", (self.dir / f"{name}.log").read_text(errors="replace"))
+
     def test_attach_learns_about_exit_and_paste_respects_bracketed_mode(self):
         proc, _ = self.start("agenthub-t2", "sh", "-i")
         att = client.Attach("agenthub-t2", 80, 24, replay=False, directory=self.dir)
@@ -455,6 +493,70 @@ class ServerHostBackendTests(unittest.TestCase):
                 closed = True
         self.assertTrue(closed)
         sock.close()
+
+    def test_an_attach_failure_is_audited_and_explained_to_the_browser(self):
+        """会话还在列表里、宿主却接不上时（BUG-20260911-170830：宿主进程内部锁中毒），
+        关闭帧要带原因、审计要记 terminal.connection.failed，所有权也要放掉；否则整条
+        链路只剩一个裸 1011，浏览器和诊断包都看不出是哪一层坏了。"""
+        import socket
+        import urllib.parse
+        from agenthub import wsock
+
+        name = term.new_session("ws-b", ["sh", "-i"], self.tmp.name, 60, 12)
+        status, claim = self.api("/api/term/claim", {"name": name, "page": "page-2"})
+        self.assertEqual(status, 200, claim)
+        query = urllib.parse.urlencode({"name": name, "page": "page-2", "token": claim["token"],
+                                        "cols": 80, "rows": 24})
+        term_host.audit.record.reset_mock()
+        with patch.object(term, "Attach", side_effect=RuntimeError("attach 失败: 连接已关闭")):
+            sock = socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=10)
+            sock.sendall((f"GET /api/term/attach?{query} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+                          "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                          "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += sock.recv(4096)
+            self.assertTrue(head.startswith(b"HTTP/1.1 101"), head)
+
+            class Buffered:                   # 关闭帧紧跟 101 之后，可能已被上面读走
+                def __init__(self, sock, rest):
+                    self.sock, self.rest = sock, rest
+
+                def recv(self, n):
+                    if self.rest:
+                        chunk, self.rest = self.rest[:n], self.rest[n:]
+                        return chunk
+                    return self.sock.recv(n)
+
+            op, payload = wsock.recv(Buffered(sock, head.split(b"\r\n\r\n", 1)[1]))
+        sock.close()
+        self.assertEqual(op, wsock.OP_CLOSE)
+        self.assertEqual(int.from_bytes(payload[:2], "big"), 1011)
+        self.assertEqual(payload[2:].decode("utf-8"), "attach failed: attach 失败: 连接已关闭")
+        failed = [call for call in term_host.audit.record.call_args_list
+                  if call.args[0] == "terminal.connection.failed"]
+        self.assertEqual(len(failed), 1, term_host.audit.record.call_args_list)
+        self.assertEqual(failed[0].kwargs["severity"], "error")
+        self.assertEqual(failed[0].kwargs["data"], {"tmux": name, "reason": "attach 失败: 连接已关闭"})
+        # 失败后所有权必须已释放：同一页面再认领不需要强制接管。
+        status, again = self.api("/api/term/claim", {"name": name, "page": "page-2"})
+        self.assertEqual(status, 200, again)
+        self.assertTrue(again.get("token"), again)
+
+    def test_a_truncated_close_reason_stays_valid_utf8(self):
+        from agenthub import wsock
+
+        left, right = socket.socketpair()
+        try:
+            wsock.close(left, 1011, "attach failed: " + "会话不存在" * 40)
+            op, payload = wsock.recv(right)
+        finally:
+            left.close()
+            right.close()
+        self.assertEqual(op, wsock.OP_CLOSE)
+        self.assertLessEqual(len(payload), 125)
+        payload[2:].decode("utf-8")               # 切在多字节中间会抛 UnicodeDecodeError
+        self.assertTrue(payload[2:].decode("utf-8").startswith("attach failed: 会话不存在"))
 
 
 class BackendSelectionTests(unittest.TestCase):

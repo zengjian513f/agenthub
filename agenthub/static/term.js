@@ -1887,8 +1887,18 @@ async function attachOwnedTerm(view) {
     outputBytes = 0;
     outputChunks = 0;
   };
+  let settled = false;
   ws.onmessage = e => {
     if (view.ws !== ws) return;           // 已替换连接的尾包不能重画新终端
+    if (!settled) {
+      // 握手成功不等于接上了会话：服务端在升级之后才 attach，失败时立即以
+      // 1011 关闭。只有真正收到会话字节才算连上——此时才清错误、重置退避，
+      // 否则坏掉的会话会让按钮每 0.5s 闪一次并无限快速重连。
+      settled = true;
+      view.reconnectDelay = 500;
+      ConsoleUI.errors.delete(uid);
+      renderTakeoverBtn();
+    }
     if (typeof e.data === 'string') {
       try {
         const message = JSON.parse(e.data);
@@ -1906,11 +1916,8 @@ async function attachOwnedTerm(view) {
     queueTermOutput(view, s);
   };
   ws.onopen = () => {
-    ConsoleUI.errors.delete(uid);
-    renderTakeoverBtn();
     browserAuditEvent('terminal.opened', {name, cols, rows}, null,
       {uid: T.uid || '', connectionId});
-    view.reconnectDelay = 500;
     if (T.name === name) {
       syncTermAliases(view);
       fitTerm(true, true);

@@ -107,6 +107,43 @@ def main():
                     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                     page.screenshot(path=f'/tmp/agenthub-console-{hub_mode}-mobile.png')
                     assert not errors, errors
+
+                    # A session that is listed but whose host refuses attach (BUG-20260911-170830):
+                    # the socket upgrades and then closes 1011 before any frame. That must not
+                    # count as a connection — the button keeps its explanation instead of
+                    # flashing, retries back off, and the first real frame clears the state.
+                    page.set_viewport_size({'width': 1280, 'height': 900})
+                    page.evaluate('(uid) => openSession(uid)', uid)
+                    page.wait_for_function('document.querySelector("#a-term") !== null')
+                    button = page.locator('#a-term')
+                    node.state['term_sessions'] = [{
+                        'name': 'same-terminal', 'uid': node.state['row']['uid'], 'created': 1,
+                        'attached': False, 'pid': 1, 'cwd': '/same/project', 'cmd': 'sh', 'cols': 80,
+                        'rows': 24, 'owned': True, 'server': 'ptyhost', 'backend': 'ptyhost'}]
+                    node.state['attach_error'] = 'attach 失败: 连接已关闭'
+                    sockets = []
+                    page.on('websocket', lambda ws: sockets.append(ws))
+                    page.evaluate('loadTermList()')
+                    page.wait_for_function('T.list.some(x => x.name.endsWith("same-terminal"))')
+                    view = 'T.views.get(T.list.find(x => x.name.endsWith("same-terminal")).name)'
+                    page.evaluate('ConsoleUI.errors.delete(S.sel); renderTakeoverBtn()')
+                    button.click()
+                    page.wait_for_function('!document.querySelector("#termpane").classList.contains("hidden")')
+                    page.wait_for_function(
+                        '(ConsoleUI.errors.get(S.sel) || "").includes("attach failed: attach 失败: 连接已关闭")')
+                    page.wait_for_timeout(4000)
+                    attempts = len(sockets)
+                    assert 2 <= attempts <= 5, f'4 秒内重连 {attempts} 次，退避没有生效'
+                    assert page.evaluate(f'{view}.reconnectDelay') > 900
+                    assert button.get_attribute('data-unavailable') == 'true'
+                    assert 'attach 失败' in button.get_attribute('aria-label')
+                    node.state['attach_error'] = ''
+                    page.wait_for_function(
+                        f'!ConsoleUI.errors.has(S.sel) && {view}.reconnectDelay === 500', timeout=15000)
+                    page.wait_for_function('document.querySelector("#a-term").dataset.unavailable === "false"')
+                    page.evaluate('closeTermPane()')
+                    node.state['term_sessions'] = []
+                    assert not errors, errors
                     context.close()
 
                 # App UI must explain a terminal script load failure on its own.

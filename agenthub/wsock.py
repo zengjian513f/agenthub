@@ -87,7 +87,9 @@ def recv(sock) -> tuple[int, bytes]:
 
 def close(sock, code: int = 1000, reason: str = "") -> None:
     try:
-        payload = struct.pack(">H", code) + reason.encode("utf-8")[:120]
+        # 理由最多 123 字节且必须是完整 UTF-8，切在多字节中间浏览器会按协议错误处理。
+        text = reason.encode("utf-8")[:120].decode("utf-8", "ignore")
+        payload = struct.pack(">H", code) + text.encode("utf-8")
         send(sock, payload, OP_CLOSE)
     except OSError:
         pass
