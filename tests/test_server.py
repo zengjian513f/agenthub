@@ -140,7 +140,30 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn(f"style.css?v={server.ASSET_VERSION}", page)
         self.assertIn(
             f'<meta name="agenthub-build" content="{server.ASSET_VERSION}">', page)
+        self.assertIn('<link rel="manifest" href="manifest.webmanifest">', page)
+        self.assertIn("navigator.serviceWorker.register('service-worker.js')", page)
         self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_pwa_assets_have_installable_types(self):
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._send = lambda status, data, ctype, headers=None: replies.append(
+            (status, data, ctype, headers))
+
+        for path, expected_type in [
+            ("/manifest.webmanifest", "application/manifest+json"),
+            ("/service-worker.js", "javascript"),
+            ("/icons/icon-192.png", "image/png"),
+            ("/icons/icon-512.png", "image/png"),
+        ]:
+            with self.subTest(path=path):
+                replies.clear()
+                handler._static(path)
+                status, data, ctype, headers = replies[0]
+                self.assertEqual(status, 200)
+                self.assertTrue(data)
+                self.assertIn(expected_type, ctype)
+                self.assertEqual(headers["Cache-Control"], "no-cache")
 
     def test_thinking_messages_are_compact_timeline_notes(self):
         handler = object.__new__(server.Handler)
