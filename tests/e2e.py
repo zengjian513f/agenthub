@@ -42,6 +42,13 @@ def check(name, cond, extra=""):
     print(f"{'✅' if cond else '❌'} {name}{'  ' + str(extra) if extra and not cond else ''}")
 
 
+def open_session_menu(p):
+    """宽屏会话操作已摊在标题栏上；只有窄屏需要先展开「⋯」菜单。"""
+    more = p.locator("#a-more")
+    if more.is_visible():
+        more.click()
+
+
 def tmux_run(server, *args, **kwargs):
     """显式选择 tmux socket，避免测试误操作用户默认 server 中的同名会话。"""
     return subprocess.run(["tmux", "-L", server, *args], **kwargs)
@@ -1193,7 +1200,7 @@ def run(pw):
           detail_star.count() == 1 and list_star.count() == 1
           and detail_star.get_attribute("aria-pressed") == "false"
           and list_star.get_attribute("aria-pressed") == "false")
-    p.click("#a-more")
+    open_session_menu(p)
     with p.expect_response(lambda r: r.url.endswith("/api/session/star")
                            and r.request.method == "POST") as star_info:
         detail_star.click()
@@ -1216,7 +1223,7 @@ def run(pw):
     check("从列表取消星标会同步详情且不会打开别的会话",
           p.evaluate("S.sel") == selected_before_unstar
           and p.locator("#a-star.on").count() == 0)
-    p.click("#a-more")
+    open_session_menu(p)
     check("详情元信息含 cwd", "/tmp/agenthub-selftest" in p.locator(".dmeta").inner_text())
     check("详情菜单显示会话 UUID",
           "00000000-dead-beef-0000-000000000001" in p.locator(".dmeta").inner_text())
@@ -1329,7 +1336,7 @@ def run(pw):
           <= middle_toolbar["boxTop"] + middle_toolbar["boxHeight"],
           f"{sticky_top:.1f} -> {collapsed_top:.1f}")
 
-    p.click("#a-more")
+    open_session_menu(p)
     p.click("#a-turns")
     p.wait_for_function("!document.querySelector('.turn-process-body').hidden")
     check("展开所有过程后才物化正文且保留内层工具折叠",
@@ -1774,8 +1781,8 @@ def run(pw):
     p.route("**/api/bug-report*", fake_bug_report)
     check("会话标题栏提供问题报告入口",
           p.locator(".dhead [data-report-bug]").count() == 1)
-    # 报告入口位于标题栏「⋯」溢出菜单里，先展开再点击。
-    p.click('.dhead [aria-controls="session-actions-menu"]')
+    # 窄屏时报告入口收在标题栏「⋯」菜单里，先展开再点击。
+    open_session_menu(p)
     p.click(".dhead [data-report-bug]")
     check("会话标题栏的问题报告入口可以打开弹窗",
           p.locator("#bug-report-dialog").is_visible())
@@ -3355,7 +3362,7 @@ def run(pw):
         p.evaluate("""n => openPendingSession(
           pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n))""", PENDING_TERM)
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
-        p.click("#a-more")
+        open_session_menu(p)
         check("手机新建临时会话菜单显示关机按钮",
               p.locator("#a-session-action").is_visible()
               and p.locator("#a-session-action").get_attribute("title") == "停止会话"
@@ -3396,7 +3403,7 @@ def run(pw):
                                  "files": 1, "uploadUid": "claude:e2e-draft"},
               migrated_draft)
         p.once("dialog", lambda d: d.accept())
-        p.click("#a-more")
+        open_session_menu(p)
         p.click("#a-session-action")
         p.wait_for_function("n => !T.pending.some(x => x.name === n)", arg=PENDING_TERM,
                             timeout=30000)
@@ -4252,7 +4259,7 @@ def run(pw):
               and mobile_head["textOverflow"] == "ellipsis"
               and mobile_head["height"] <= mobile_head["lineHeight"] + 2
               and mobile_head["noOverlap"], mobile_head)
-        p.click("#a-more")
+        open_session_menu(p)
         mobile_summary = p.evaluate("""() => {
           const count = document.querySelector('#mcount-total');
           const c = count.getBoundingClientRect();
@@ -4997,7 +5004,7 @@ def run(pw):
     p.wait_for_timeout(300)
     p.locator(".item").first.click()
     p.wait_for_selector("#a-session-action[title='删除会话']", state="attached", timeout=10000)
-    p.click("#a-more")
+    open_session_menu(p)
     p.once("dialog", lambda d: d.accept())
     # 删除前会强制扫描进程；机器繁忙时可能超过固定 sleep。等真实响应结束，
     # 否则 finally 的 cleanup 会先删掉测试文件，让尚在处理的请求误报 404。

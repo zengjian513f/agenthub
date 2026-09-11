@@ -2966,6 +2966,40 @@ function bindSessionActions(heading) {
   button.parentElement.addEventListener('focusout', event => {
     if (!button.parentElement?.contains(event.relatedTarget)) closeSessionActions();
   });
+  layoutSessionHead(heading);
+}
+
+// 桌面把会话操作和元信息直接摆在标题栏上，只有窄屏才收进 ⋯ 菜单。
+function layoutSessionHead(heading = $('#detail .dhead')) {
+  const wrap = heading?.querySelector('.session-actions');
+  const menu = heading?.querySelector('#session-actions-menu');
+  const list = menu?.querySelector('[role="menu"]');
+  if (!wrap || !menu || !list) return;
+  const actions = wrap.parentElement;
+  const flat = !MOBILE.matches;
+  const menuButtons = node => node.matches('button') ? [node] : [...node.querySelectorAll('button')];
+  heading.classList.toggle('head-flat', flat);
+  if (flat) {
+    closeSessionActions();
+    for (const node of [...list.children]) {
+      node.dataset.fromMenu = '1';
+      for (const item of menuButtons(node)) item.removeAttribute('role');
+      actions.insertBefore(node, wrap);
+    }
+    const meta = menu.querySelector('.dmeta');
+    if (meta) heading.appendChild(meta);
+  } else {
+    for (const node of actions.querySelectorAll(':scope > [data-from-menu]')) {
+      delete node.dataset.fromMenu;
+      for (const item of menuButtons(node)) {
+        item.setAttribute('role', 'menuitem');
+        labelSessionAction(item);
+      }
+      list.appendChild(node);
+    }
+    const meta = heading.querySelector(':scope > .dmeta');
+    if (meta) menu.appendChild(meta);
+  }
 }
 
 document.addEventListener('click', event => {
@@ -2979,6 +3013,7 @@ document.addEventListener('keydown', event => {
   }
 }, true);
 addEventListener('resize', () => closeSessionActions());
+MOBILE.addEventListener('change', () => layoutSessionHead());
 
 function head(m, total) {
   const h = el('div', 'dhead');
