@@ -121,7 +121,7 @@ class SessionProcessTests(unittest.TestCase):
 
     def test_narrowing_across_a_wide_character_keeps_the_host_attachable(self):
         """BUG-20260911-170830：147 列切到 97 列时某行的汉字正好跨过新边界，vt100 截行后
-        留下半个宽字符，应用下一次擦到行尾就在模型线程里越界 panic；锁中毒后 attach、
+        留下半个宽字符，应用下一次擦到行尾就在模型线程里越界 panic；持锁线程 panic 后锁被标记失效，attach、
         capture 和 pty 读线程全部失效，浏览器只能每 0.5s 重连一次。"""
         name = "agenthub-t-wide"
         # 命令放进脚本里，回显才不会在 10 列宽的屏上折成好几行把画面顶走。
@@ -495,7 +495,7 @@ class ServerHostBackendTests(unittest.TestCase):
         sock.close()
 
     def test_an_attach_failure_is_audited_and_explained_to_the_browser(self):
-        """会话还在列表里、宿主却接不上时（BUG-20260911-170830：宿主进程内部锁中毒），
+        """会话还在列表里、宿主却接不上时（BUG-20260911-170830：宿主进程里的锁被 panic 标记失效），
         关闭帧要带原因、审计要记 terminal.connection.failed，所有权也要放掉；否则整条
         链路只剩一个裸 1011，浏览器和诊断包都看不出是哪一层坏了。"""
         import socket

@@ -5,7 +5,7 @@
 //! 调用方（claude_bridge / codex_bridge）都先剥离转义再解析文本与光标。
 //!
 //! vt100 内部的 panic 在这里拦下：模型只是画面的副本，坏了可以从头重建，
-//! 但绝不能让宿主里的锁中毒、把 attach 和 pty 读线程一起拖死。
+//! 但绝不能让宿主里的锁因此失效、把 attach 和 pty 读线程一起拖死。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 

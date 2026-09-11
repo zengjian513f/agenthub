@@ -32,9 +32,9 @@ const STRIP_ENV: &[&str] = &[
     "TMUX",
 ];
 
-/// 中毒的锁照常用。持锁线程 panic 只说明它半途而废，数据本身还在；若在这里
-/// `unwrap()`，一次屏幕模型的内部越界就会让 attach、capture、连 pty 读线程
-/// 都跟着 panic，宿主变成"活着但永远连不上"（BUG-20260911-170830）。
+/// 被 panic 标记失效的锁（PoisonError）照常用。持锁线程 panic 只说明它半途而废，
+/// 数据本身还在；若在这里 `unwrap()`，一次屏幕模型的内部越界就会让 attach、capture、
+/// 连 pty 读线程都跟着 panic，宿主变成"活着但永远连不上"（BUG-20260911-170830）。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
