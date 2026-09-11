@@ -33,6 +33,7 @@ ASSET_VERSION = hashlib.sha256(b"".join(
     for name in ("style.css", "cli.js", "nodes.js", "app.js", "term.js",
                  "files.html", "files.js", "files.css", "typography.css", "typography.js",
                  "file.html", "file.js", "file-preview.css", "file-preview.js",
+                 "pwa-install.js", "syntax.js",
                  "vendor/markdown-it/markdown-it.min.js")
 )).hexdigest()[:12]
 HOSTNAME = socket.gethostname().strip() or "localhost"

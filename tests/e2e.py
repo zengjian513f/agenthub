@@ -42,6 +42,20 @@ def check(name, cond, extra=""):
     print(f"{'✅' if cond else '❌'} {name}{'  ' + str(extra) if extra and not cond else ''}")
 
 
+def check_hidden_stays_invisible(p, where):
+    """凡是带 hidden 的元素都必须真的看不见。
+
+    hidden 只是 UA 样式里的 display:none，作者样式里一句 display:flex 就能
+    盖过它（实测 Chromium 151 如此）。设置面板出过这个事：切到"机器"那一页，
+    "外观"整页仍堆在上面，而针对性的断言全都通过。所以这条不针对某个面板，
+    页面每到一个状态就整体查一遍。
+    """
+    leaked = p.evaluate("""() => [...document.querySelectorAll('[hidden]')]
+        .filter(e => e.getClientRects().length || e.offsetWidth || e.offsetHeight)
+        .map(e => (e.id || e.className || e.tagName) + ' → ' + getComputedStyle(e).display)""")
+    check(f"{where}：带 hidden 的元素都看不见", not leaked, leaked)
+
+
 def open_session_menu(p):
     """宽屏会话操作已摊在标题栏上；只有窄屏需要先展开「⋯」菜单。"""
     more = p.locator("#a-more")
@@ -1776,6 +1790,12 @@ def run(pw):
           and p.locator("#setting-font").input_value() == "ubuntu"
           and p.locator("#setting-theme").input_value() == "system"
           and p.locator("#setting-cache").input_value() == "256")
+    check_hidden_stays_invisible(p, "设置窗口打开时")
+    p.click(".settings-tab[data-tab='machines']")
+    p.wait_for_selector("#settings-machines:not([hidden])", timeout=10000)
+    check_hidden_stays_invisible(p, "设置窗口切到机器那一页时")
+    p.click(".settings-tab[data-tab='appearance']")
+    p.wait_for_selector("#settings-appearance:not([hidden])", timeout=10000)
     p.select_option("#setting-font", "system")
     p.select_option("#setting-theme", "dark")
     p.select_option("#setting-cache", "512")
