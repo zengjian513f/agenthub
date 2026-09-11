@@ -569,9 +569,19 @@ class BackendSelectionTests(unittest.TestCase):
         # 切换走 API 会写审计账本；不打桩的话测试会把事件写进生产的 audit.sqlite3。
         self.audit = patch.object(server.audit, "record")
         self.audit.start()
+        # 选择逻辑不该依赖这台机器上装了什么：bin/ptyhost 是 gitignored 的产物，
+        # tmux 也未必在，全新 clone 里这几条测试会凭空失败。打桩打在最底层的
+        # 探测上，available() 本身仍走真实逻辑，专门测"二进制不在"的那条照样管用。
+        self.backends = [patch.object(term_host, "host_binary",
+                                      return_value="/nonexistent/ptyhost"),
+                         patch.object(term_tmux, "available", return_value=True)]
+        for item in self.backends:
+            item.start()
         term.configure(None)
 
     def tearDown(self):
+        for item in self.backends:
+            item.stop()
         self.audit.stop()
         self.file.stop()
         term.configure(None)
