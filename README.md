@@ -290,8 +290,8 @@ python3 tests/e2e.py
 `tests/claude_monkey.py` 是需要真实 Claude 账号、会产生费用的显式压力测试，不属于
 普通测试套件。它会创建至少 6 个隔离会话，交叉执行消息发送、原生忙时排队、丢失 HTTP
 响应后的同请求重放、切换会话、缩放窗口和终端/对话切换。脚本固定使用完整的
-`claude-haiku-4-5-20251001` 模型 ID，并从 JSONL 再次核对实际模型；不得用可能被配置重映射
-的 `haiku` 别名。只有明确接受真实模型费用时才运行：
+`claude-haiku-4-5-20251001` 模型 ID 加 `--effort low`，并从 JSONL 再次核对实际模型；
+不得用可能被配置重映射的 `haiku` 别名，也不得换成更贵的模型。需要时直接运行：
 
 ```bash
 python3 tests/claude_monkey.py --base http://127.0.0.1:8710
@@ -299,8 +299,8 @@ python3 tests/claude_monkey.py --base http://127.0.0.1:8710
 
 `tests/dual_cli_monkey.py` 是 Claude/Codex 双端的一小时状态机 monkey，也属于显式
 付费测试，不能被普通测试套件调用。它固定使用完整的
-`claude-haiku-4-5-20251001` 和 `gpt-5.6-luna` 模型 ID，每端创建 10 个隐藏 debug
-会话。调度器按当前 tmux 状态和尚未覆盖的转移选择动作，不再按固定阶段顺序重复脚本；
+`claude-haiku-4-5-20251001` 和 `gpt-5.6-luna` 模型 ID 并把推理强度压到 low，
+每端创建 10 个隐藏 debug 会话。调度器按当前 tmux 状态和尚未覆盖的转移选择动作，不再按固定阶段顺序重复脚本；
 动作包括网页与 tmux 双向输入、首尾空白、服务端已接收但 HTTP 响应丢失后的同 ID 重试、
 忙时排队、快/慢 ESC、终端草稿覆盖、选择题、斜杠命令，以及工作期间切会话、切终端、
 横纵 resize、刷新、断网恢复和双页面接管。
@@ -314,7 +314,7 @@ python3 tests/claude_monkey.py --base http://127.0.0.1:8710
 python3 tests/dual_cli_monkey.py --simulate --steps 900 --seed 4815
 ```
 
-只有明确接受真实模型费用后才能运行或重放：
+真实运行或重放（付费，模型固定为最便宜档）：
 
 ```bash
 python3 tests/dual_cli_monkey.py --duration 3600 --sessions 10 --max-paid-turns 14
