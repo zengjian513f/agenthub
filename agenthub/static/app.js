@@ -5354,12 +5354,96 @@ $('#trash-dialog').addEventListener('click', e => {
   if (e.target === $('#trash-dialog')) $('#trash-dialog').close();
 });
 
+// 终端后端是每台机器的服务端设置，不进 localStorage：换个浏览器看到的必须是同一份。
+function backendTargets() {
+  if (typeof T === 'undefined' || !T.listLoaded) return [];
+  if (!HUB_MODE) {
+    return T.enabled && (T.backends || []).length
+      ? [{id: '', name: '', backends: T.backends, backend: T.backend}] : [];
+  }
+  return Nodes.list
+    .map(node => ({node, cap: Nodes.capabilities[node.id] || {}}))
+    .filter(({cap}) => cap.enabled && (cap.backends || []).length)
+    .map(({node, cap}) => ({id: node.id, name: node.name,
+                            backends: cap.backends, backend: cap.backend}));
+}
+
+function setBackendNote(text, isError = false) {
+  const note = $('#setting-backend-note');
+  note.textContent = text || '';
+  note.hidden = !text;
+  note.dataset.state = isError ? 'error' : 'ok';
+}
+
+function renderBackendSettings() {
+  const group = $('#setting-backends'), rows = $('#setting-backend-rows');
+  const targets = backendTargets();
+  group.hidden = !targets.length;
+  rows.textContent = '';
+  for (const target of targets) {
+    const row = document.createElement('label');
+    row.className = 'setting-row';
+    const label = document.createElement('span');
+    const title = document.createElement('b');
+    title.textContent = target.name || '本机';
+    const hint = document.createElement('small');
+    const blocked = target.backends.filter(b => !b.available);
+    hint.textContent = blocked.length
+      ? blocked.map(b => `${b.label}不可用：${b.unavailable_reason}`).join('；')
+      : '新建会话将由所选后端托管';
+    label.append(title, hint);
+    const select = document.createElement('select');
+    for (const backend of target.backends) {
+      const option = document.createElement('option');
+      option.value = backend.name;
+      option.textContent = backend.label + (backend.available ? '' : '（不可用）');
+      option.disabled = !backend.available && backend.name !== target.backend;
+      select.append(option);
+    }
+    select.value = target.backend || '';
+    select.onchange = () => void chooseBackend(target, select);
+    row.append(label, select);
+    rows.append(row);
+  }
+}
+
+async function chooseBackend(target, select) {
+  const wanted = select.value, previous = target.backend;
+  if (wanted === previous) return;
+  select.disabled = true;
+  setBackendNote('正在切换…');
+  try {
+    const url = (HUB_MODE && target.id ? `api/nodes/${target.id}/` : '') + 'api/term/backend';
+    const response = await fetch(appUrl(url), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({backend: wanted}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.error) throw new Error(
+      data.error || `请求失败（HTTP ${response.status}）`);
+    target.backend = data.backend;
+    if (Array.isArray(data.backends)) target.backends = data.backends;
+    const label = (target.backends.find(b => b.name === data.backend) || {}).label || data.backend;
+    setBackendNote(`${target.name ? target.name + '：' : ''}新建会话改用 ${label}；`
+      + '已在运行的会话不受影响。');
+    if (typeof loadTermList === 'function') void loadTermList();
+  } catch (error) {
+    select.value = previous;
+    setBackendNote(`${target.name ? target.name + '：' : ''}切换失败：`
+      + (error.message || String(error)), true);
+  } finally {
+    select.disabled = false;
+  }
+}
+
 function openSettings() {
   $('#setting-font').value = store.get('font', 'ubuntu');
   $('#setting-theme').value = store.get('theme', 'system');
   $('#setting-tool-icons').value = document.documentElement.dataset.toolIcons;
   $('#setting-cache').value = String(cacheLimitMb);
   $('#restore-fork-parents').disabled = !S.sessions.some(sessionHidden);
+  setBackendNote('');
+  renderBackendSettings();
   $('#settings-dialog').showModal();
 }
 

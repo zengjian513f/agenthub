@@ -541,7 +541,10 @@ class HubHandler(server.Handler):
                 result["capabilities"][n["id"]] = {
                     "enabled": bool(d.get("enabled")) and not err,
                     "unavailable_reason": err["error"] if err else d.get("unavailable_reason", ""),
-                    "sources": d.get("sources", {}), "home": d.get("home", "")}
+                    "sources": d.get("sources", {}), "home": d.get("home", ""),
+                    # 终端后端是每台机器各自的设置，网页按机器分别展示和切换。
+                    "backend": d.get("backend", ""),
+                    "backends": d.get("backends", []) if not err else []}
                 if not err:
                     for source, available in d.get("sources", {}).items():
                         result["sources"][source] = result["sources"].get(source, False) or available

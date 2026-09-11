@@ -20,6 +20,8 @@ const T = {
   listLoaded: false,
   listError: '',
   unavailable_reason: '',
+  backend: '',     // 本机当前的终端后端；hub 模式下按机器看 Nodes.capabilities
+  backends: [],
   height: store.get('termh', 320),
   mode: store.get('termmode', 'full'), // normal(手动分屏) | collapsed(对话) | full(终端)
   ctrlArmed: false,                         // 手机 Ctrl / 桌面右 Ctrl：只修饰下一次输入
@@ -257,13 +259,19 @@ async function loadTermList() {
     T.list = data.sessions || [];
     T.sources = data.sources || {};
     T.home = data.home || '';
+    T.backend = data.backend || '';
+    T.backends = data.backends || [];
     T.pending = data.pending || [];
   } else {
     T.enabled = false;
     T.list = [];
     T.sources = {};
+    T.backends = [];
     T.pending = [];
   }
+  // 设置面板开着时，后端清单要跟着刷新，否则显示的是上一轮的状态。
+  if (typeof renderBackendSettings === 'function'
+      && document.querySelector('#settings-dialog')?.open) renderBackendSettings();
   if (loaded) {
     const valid = new Set([...T.list, ...T.pending].map(x => x.name));
     const kept = new Map([...T.openViews].filter(([name]) => valid.has(name)));

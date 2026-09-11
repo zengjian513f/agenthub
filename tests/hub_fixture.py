@@ -76,10 +76,15 @@ class NodeHandler(server.Handler):
             return
         if u.path == '/api/term/list':
             time.sleep(s.get('term_delay', 0))
+            current = s.get('backend', 'tmux')
             return self._json({'enabled': s.get('term_enabled', True),
                                'unavailable_reason': s.get('term_reason', ''),
                                'sources': s.get('term_sources', {'claude': True, 'codex': True}),
-                               'home': '/home/' + s['name'], 'sessions': [], 'pending': s['pending']})
+                               'home': '/home/' + s['name'], 'sessions': [], 'pending': s['pending'],
+                               'backend': current,
+                               'backends': [{'name': n, 'label': n, 'available': True,
+                                             'current': n == current, 'unavailable_reason': ''}
+                                            for n in ('tmux', 'host')]})
         if u.path == '/api/term/complete-dir':
             return self._json({'directories': ['/home/' + s['name'] + '/work/']})
         if u.path == '/api/term/new-status':
@@ -165,6 +170,15 @@ class NodeHandler(server.Handler):
                     'cwd': body['cwd'], 'token': 'fixture-lease', 'started': time.time()}
             self.state['pending'].append(info)
             return self._json(info)
+        if u.path == '/api/term/backend':
+            wanted = str(body.get('backend') or '')
+            if wanted not in ('tmux', 'host'):
+                return self._json({'error': f'未知终端后端: {wanted}'}, 400)
+            self.state['backend'] = wanted
+            return self._json({'ok': True, 'backend': wanted,
+                               'backends': [{'name': n, 'label': n, 'available': True,
+                                             'current': n == wanted, 'unavailable_reason': ''}
+                                            for n in ('tmux', 'host')]})
         if u.path == '/api/term/claim':
             return self._json({'ok': True, 'token': 'fixture-lease'})
         if u.path == '/api/sessions/delete':

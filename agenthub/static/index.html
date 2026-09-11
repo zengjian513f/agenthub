@@ -317,7 +317,7 @@
 <dialog id="settings-dialog" class="app-dialog" aria-labelledby="settings-title">
   <form method="dialog" class="settings-form">
     <div class="modal-head">
-      <div><h2 id="settings-title">设置</h2><p>界面偏好保存在浏览器，父会话状态保存在服务端</p></div>
+      <div><h2 id="settings-title">设置</h2><p>界面偏好保存在浏览器，父会话状态与终端后端保存在服务端</p></div>
       <button type="submit" class="modal-close" title="关闭" aria-label="关闭">×</button>
     </div>
     <label class="setting-row" for="setting-font">
@@ -359,6 +359,11 @@
     <div class="setting-row">
       <span><b>回退父会话</b><small>为服务端默认隐藏的父会话添加显示标志</small></span>
       <button type="button" class="btn" id="restore-fork-parents">显示全部</button>
+    </div>
+    <div id="setting-backends" class="setting-group" hidden>
+      <p class="setting-group-title">终端后端<small>保存在各机器的服务端；只影响新建会话，已在跑的会话不受影响</small></p>
+      <div id="setting-backend-rows"></div>
+      <p id="setting-backend-note" class="setting-note" hidden role="status" aria-live="polite"></p>
     </div>
     <div class="modal-actions"><button type="submit" class="btn go">完成</button></div>
   </form>

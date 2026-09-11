@@ -643,6 +643,8 @@ class Handler(BaseHTTPRequestHandler):
                     name, str(body.get("page") or ""), self._display_ip(),
                     bool(body.get("force")))
                 return self._json(result, 409 if result.get("conflict") else 200)
+            if u.path == "/api/term/backend":
+                return self._set_terminal_backend(body)
             if u.path == "/api/term/kill":
                 term.kill_session(body["name"])
                 pending_store.discard(body["name"])
@@ -1228,6 +1230,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"enabled": available, "unavailable_reason": reason,
                                "sources": term.available_sources() if TERMINAL else {},
                                "home": str(Path.home()),
+                               "backend": term.backend_name(),
+                               "backends": term.backends() if TERMINAL else [],
                                "sessions": tmux_sessions,
                                "pending": public_pending})
 
@@ -2200,6 +2204,20 @@ class Handler(BaseHTTPRequestHandler):
             term.kill_session(info["name"])
             raise
         return self._json({k: info[k] for k in ("name", "source", "sid", "cwd", "token")})
+
+    def _set_terminal_backend(self, body: dict):
+        """选择本机新建会话用哪个终端后端。已在跑的会话不受影响。"""
+        if not TERMINAL:
+            return self._json({"error": "终端未启用"}, 403)
+        previous = term.backend_name()
+        try:
+            chosen = term.set_backend(str(body.get("backend") or ""))
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        if chosen != previous:
+            audit.record("terminal.backend.changed", category="terminal",
+                         data={"from": previous, "to": chosen})
+        return self._json({"ok": True, "backend": chosen, "backends": term.backends()})
 
     def _new_session_status(self, q: dict):
         """等待 CLI 落盘后，把临时 tmux 名称关联到真正的 agenthub 会话。"""

@@ -53,8 +53,13 @@ cd host-rs && cargo build --release      # 产物: host-rs/target/release/agenth
 
 `agenthub/term.py` 是调度层：`term_tmux.py` 是原有的 tmux 后端，`term_host.py` 驱动会话宿主。
 
-- 主后端由 `python3 -m agenthub.server --terminal-backend {auto,tmux,host}` 或环境变量
-  `AGENTHUB_TERM_BACKEND` 决定，新会话在主后端创建。`auto` 在 Windows 取 `host`，其他平台仍取 `tmux`。
+- 主后端在网页「设置 → 终端后端」里按机器选择，保存在各机器服务端的
+  `~/.local/share/agenthub/terminal-backend`，重启后仍然生效。没选过时用
+  `python3 -m agenthub.server --terminal-backend {auto,tmux,host}` 或环境变量
+  `AGENTHUB_TERM_BACKEND` 给的初始默认值；`auto` 在 Windows 取 `host`，其他平台取 `tmux`。
+  要让启动参数重新说了算，删掉那个文件即可。
+- 切换只影响新建会话。不可用的后端不能被选中，`/api/term/list` 的 `backends` 会带上原因
+  （例如没构建宿主二进制、没装 tmux），网页把它显示在该机器那一行下面。
 - 按名称操作（发送、截屏、attach、结束、改名）会在两个后端里查找会话，因此把节点切到 `host`
   之后，仍在 tmux 里跑的旧会话继续可用，直到自然结束。`/api/term/list` 里宿主会话的
   `server` 字段为 `host`。

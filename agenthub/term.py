@@ -1,10 +1,12 @@
 """终端后端调度: 共享的 CLI 命令拼装、目录校验、进程结束, 以及 tmux / 宿主两个后端。
 
-后端选择:
-  - ``AGENTHUB_TERM_BACKEND`` 或 server ``--terminal-backend`` 指定主后端 (新会话在此创建)。
+后端选择 (决定新会话建在哪里, 按优先级):
+  - 网页设置里选过的值, 持久化在本机数据目录, 重启后仍然生效。
+  - ``AGENTHUB_TERM_BACKEND`` 或 server ``--terminal-backend`` 给出的初始默认值。
   - 默认 Windows 用宿主 (host), 其他平台仍用 tmux。
-  - 按名称操作的接口会在两个后端里查找会话, 因此切换主后端后, 旧后端里仍在跑的
-    会话继续可用, 直到自然结束。
+
+按名称操作的接口会在两个后端里查找会话, 因此切换主后端只影响新建, 旧后端里
+仍在跑的会话继续可用, 直到自然结束。
 """
 
 from __future__ import annotations
@@ -40,7 +42,10 @@ CODEX_QUESTION_ARGS = (
 )
 
 BACKENDS = {"tmux": term_tmux, "host": term_host}
-_configured: str | None = None
+BACKEND_LABELS = {"tmux": "tmux", "host": "自制会话宿主"}
+BACKEND_FILE = Path.home() / ".local" / "share" / "agenthub" / "terminal-backend"
+_default: str | None = None        # 启动参数给的初始默认值
+_chosen: str | None = None         # 网页里选过的值, 覆盖默认
 
 
 class DirectoryCreationRequired(ValueError):
@@ -59,20 +64,67 @@ def default_backend() -> str:
     return "host" if WINDOWS else "tmux"
 
 
+def _read_choice() -> str | None:
+    try:
+        value = BACKEND_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return None
+    return value if value in BACKENDS else None
+
+
 def configure(backend: str | None) -> str:
-    """server 启动时设定主后端; None/auto 取默认。返回实际生效的名称。"""
-    global _configured
+    """server 启动时设定初始默认后端; 网页选过的值优先。返回实际生效的名称。"""
+    global _default, _chosen
     name = (backend or "").strip().lower()
     if name in ("", "auto"):
         name = default_backend()
     if name not in BACKENDS:
         raise ValueError(f"未知终端后端: {backend}")
-    _configured = name
-    return name
+    _default = name
+    _chosen = _read_choice()
+    return backend_name()
 
 
 def backend_name() -> str:
-    return _configured or default_backend()
+    return _chosen or _default or default_backend()
+
+
+def set_backend(name: str) -> str:
+    """网页选择主后端。只影响新建会话, 已在跑的会话不受影响。"""
+    global _chosen
+    value = str(name or "").strip().lower()
+    if value not in BACKENDS:
+        raise ValueError(f"未知终端后端: {name}")
+    module = BACKENDS[value]
+    if not module.available():
+        raise ValueError(backend_unavailable_reason(value)
+                         or f"{BACKEND_LABELS[value]} 当前不可用")
+    if value != backend_name():
+        try:
+            BACKEND_FILE.parent.mkdir(parents=True, exist_ok=True)
+            BACKEND_FILE.write_text(value + "\n", encoding="utf-8")
+        except OSError as e:
+            raise ValueError(f"无法保存终端后端选择：{getattr(e, 'strerror', None) or e}") from None
+    _chosen = value
+    return value
+
+
+def backend_unavailable_reason(name: str) -> str:
+    if name == "tmux":
+        return "" if term_tmux.available() else "服务器未安装 tmux。"
+    return term_host.unavailable_reason()
+
+
+def backends() -> list[dict]:
+    """供网页渲染的后端清单, 含当前选中项与不可用原因。"""
+    current = backend_name()
+    rows = []
+    for name, module in BACKENDS.items():
+        ok = module.available()
+        rows.append({"name": name, "label": BACKEND_LABELS[name], "available": ok,
+                     "current": name == current,
+                     "unavailable_reason": "" if ok else backend_unavailable_reason(name)})
+    return rows
 
 
 def primary():
@@ -90,9 +142,9 @@ def available() -> bool:
 
 
 def unavailable_reason() -> str:
-    if backend_name() == "tmux":
-        return "服务器未安装 tmux，无法打开控制台。"
-    return term_host.unavailable_reason() or "会话宿主不可用，无法打开控制台。"
+    name = backend_name()
+    return (backend_unavailable_reason(name)
+            or f"当前终端后端（{BACKEND_LABELS.get(name, name)}）不可用。")
 
 
 def _owner(name: str):

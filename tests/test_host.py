@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agenthub import term, term_host, term_tmux
+from agenthub import server, term, term_host, term_tmux
 from agenthub.host import client, procs
 from agenthub.host.protocol import FRAME_DATA, FRAME_RESIZE, pack_frame, read_frames
 
@@ -402,3 +402,97 @@ class ServerHostBackendTests(unittest.TestCase):
                 closed = True
         self.assertTrue(closed)
         sock.close()
+
+
+class BackendSelectionTests(unittest.TestCase):
+    """终端后端是每台机器的服务端设置，网页可切换，只影响新建会话。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="agenthub-backend-")
+        self.file = patch.object(term, "BACKEND_FILE", Path(self.tmp.name) / "terminal-backend")
+        self.file.start()
+        term.configure(None)
+
+    def tearDown(self):
+        self.file.stop()
+        term.configure(None)
+        self.tmp.cleanup()
+
+    @staticmethod
+    def handler():
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        return handler
+
+    def post(self, backend):
+        with patch.object(server, "TERMINAL", True):
+            return self.handler()._set_terminal_backend({"backend": backend})
+
+    def test_a_choice_outlives_the_startup_default(self):
+        self.assertEqual(term.configure("tmux"), "tmux")
+        self.assertEqual(term.set_backend("host"), "host")
+        # 重启时启动参数仍是 tmux，但网页选过的值优先
+        self.assertEqual(term.configure("tmux"), "host")
+        self.assertEqual(term.backend_name(), "host")
+        self.assertIs(term.primary(), term_host)
+
+    def test_the_listing_marks_the_current_backend_and_explains_the_others(self):
+        term.configure("tmux")
+        with patch.object(term_host, "available", return_value=False), \
+                patch.object(term_host, "unavailable_reason", return_value="没装宿主程序。"):
+            rows = {row["name"]: row for row in term.backends()}
+        self.assertTrue(rows["tmux"]["current"])
+        self.assertFalse(rows["host"]["current"])
+        self.assertFalse(rows["host"]["available"])
+        self.assertEqual(rows["host"]["unavailable_reason"], "没装宿主程序。")
+        self.assertEqual(rows["tmux"]["label"], "tmux")
+
+    def test_an_unavailable_or_unknown_backend_is_refused(self):
+        term.configure("tmux")
+        with patch.object(term_host, "available", return_value=False), \
+                patch.object(term_host, "unavailable_reason", return_value="没装宿主程序。"):
+            with self.assertRaisesRegex(ValueError, "没装宿主程序"):
+                term.set_backend("host")
+        with self.assertRaisesRegex(ValueError, "未知终端后端"):
+            term.set_backend("nope")
+        self.assertEqual(term.backend_name(), "tmux")
+        self.assertFalse(term.BACKEND_FILE.exists())
+
+    def test_switching_leaves_sessions_of_the_other_backend_reachable(self):
+        term.configure("tmux")
+        legacy = [{"name": "agenthub-legacy", "pid": 0, "owned": True, "server": "agenthub"}]
+        with patch.object(term_tmux, "available", return_value=True), \
+                patch.object(term_tmux, "list_sessions", return_value=legacy), \
+                patch.object(term_tmux, "has_session",
+                             side_effect=lambda n: n == "agenthub-legacy"), \
+                patch.object(term_tmux, "send_keys") as keys, \
+                patch.object(term_host, "list_sessions", return_value=[]), \
+                patch.object(term_host, "has_session", return_value=False):
+            term.set_backend("host")
+            self.assertIs(term.primary(), term_host)
+            # 新建走宿主，但旧 tmux 会话仍在列表里，也仍然能操作
+            self.assertEqual([r["name"] for r in term.list_sessions()], ["agenthub-legacy"])
+            term.send_keys("agenthub-legacy", "Enter")
+            keys.assert_called_once_with("agenthub-legacy", "Enter")
+
+    def test_the_api_reports_the_change_and_refuses_a_bad_value(self):
+        term.configure("tmux")
+        result = self.post("host")
+        self.assertEqual(result["_status"], 200)
+        self.assertEqual(result["backend"], "host")
+        self.assertEqual([b["name"] for b in result["backends"] if b["current"]], ["host"])
+        bad = self.post("nope")
+        self.assertEqual(bad["_status"], 400)
+        self.assertIn("未知终端后端", bad["error"])
+        self.assertEqual(term.backend_name(), "host")
+
+    def test_the_terminal_listing_carries_the_backend_for_the_settings_panel(self):
+        term.configure("tmux")
+        with patch.object(server, "TERMINAL", True), \
+                patch.object(server.term, "list_sessions", return_value=[]), \
+                patch.object(server.term, "available_sources", return_value={}), \
+                patch.object(server.pending_store, "active", return_value=[]), \
+                patch.object(server.debug_runs, "filter_rows", side_effect=lambda rows, _="": rows):
+            listing = self.handler()._api_get("/api/term/list", {})
+        self.assertEqual(listing["backend"], "tmux")
+        self.assertEqual({b["name"] for b in listing["backends"]}, {"tmux", "host"})

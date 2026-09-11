@@ -121,7 +121,8 @@ GET /api/nodes                        机器列表（不含凭据）
 GET /api/sessions[?nodes=...]          汇总列表与签名
 GET /api/search?nodes=...&q=...        汇总全文搜索
 GET /api/live                         汇总实时状态
-GET /api/term/list                    汇总终端和逐节点能力
+GET /api/term/list                    汇总终端和逐节点能力（含各机器的终端后端）
+POST /api/nodes/<node_id>/api/term/backend  切换指定机器的终端后端
 /api/nodes/<node_id>/api/...           指定节点，携带本地引用的直接代理
 ```
 

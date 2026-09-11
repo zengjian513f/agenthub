@@ -2,7 +2,7 @@ import re
 import unittest
 from unittest.mock import patch
 
-from agenthub import server
+from agenthub import server, term_host, term_tmux
 
 
 class AccessAllowlistTests(unittest.TestCase):
@@ -182,17 +182,26 @@ class DirectoryCompletionRouteTests(unittest.TestCase):
         self.assertEqual(result, {"error": "终端未启用", "_status": 403})
         complete.assert_not_called()
 
-    def test_terminal_list_explains_disabled_service_and_missing_tmux(self):
-        for enabled, available, expected in [(False, True, '--terminal'), (True, False, 'tmux')]:
-            with self.subTest(enabled=enabled, available=available), \
+    def test_terminal_list_explains_disabled_service_and_missing_backend(self):
+        """控制台不可用时必须说清是哪一种不可用，而不是只说"不可用"。"""
+        # 每种后端都打桩它自己的判据来源，可用性与原因才不会自相矛盾。
+        missing_tmux = patch.object(term_tmux, 'available', return_value=False)
+        missing_host = patch.object(term_host, 'host_binary', return_value=None)
+        cases = [
+            (False, 'tmux', missing_tmux, '--terminal'),   # 没加 --terminal
+            (True, 'tmux', missing_tmux, 'tmux'),          # 缺依赖时要点名后端
+            (True, 'host', missing_host, 'cargo build'),
+        ]
+        for enabled, backend, missing, expected in cases:
+            with self.subTest(enabled=enabled, backend=backend), missing, \
                     patch.object(server, 'TERMINAL', enabled), \
-                    patch.object(server.term, 'available', return_value=available), \
+                    patch.object(server.term, 'backend_name', return_value=backend), \
                     patch.object(server.term, 'available_sources', return_value={}), \
                     patch.object(server.term, 'list_sessions', return_value=[]), \
                     patch.object(server.pending_store, 'active', return_value=[]):
                 result = self.handler()._api_get('/api/term/list', {})
-            self.assertFalse(result['enabled'])
-            self.assertIn(expected, result['unavailable_reason'])
+                self.assertFalse(result['enabled'])
+                self.assertIn(expected, result['unavailable_reason'])
 
     def test_route_returns_bounded_directory_candidates(self):
         rows = ["/tmp/agenthub/", "/tmp/session/"]

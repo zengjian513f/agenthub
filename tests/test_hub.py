@@ -463,6 +463,34 @@ class HubHTTPTests(unittest.TestCase):
         self.assertEqual(self.b.state['writes'][-1][0],
                          '/api/sessions/fork-visibility')
 
+    def test_terminal_backend_is_reported_and_switched_per_machine(self):
+        """终端后端是每台机器各自的设置，网页按机器读取和切换。"""
+        self.registry.check_all()
+        node_a, node_b = 'a' * 32, 'b' * 32
+        _, listing = self.call('/api/term/list')
+        self.assertEqual(listing['capabilities'][node_a]['backend'], 'tmux')
+        self.assertEqual({b['name'] for b in listing['capabilities'][node_b]['backends']},
+                         {'tmux', 'host'})
+        try:
+            status, body = self.call(f'/api/nodes/{node_b}/api/term/backend',
+                                     {'backend': 'host'})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body['backend'], 'host')
+
+            _, listing = self.call('/api/term/list')
+            self.assertEqual(listing['capabilities'][node_b]['backend'], 'host')
+            # 只改了这台，另一台不受影响
+            self.assertEqual(listing['capabilities'][node_a]['backend'], 'tmux')
+            self.assertEqual([b['current'] for b in listing['capabilities'][node_b]['backends']
+                              if b['name'] == 'host'], [True])
+
+            status, body = self.call(f'/api/nodes/{node_b}/api/term/backend',
+                                     {'backend': 'nope'})
+            self.assertEqual(status, 400)
+            self.assertIn('未知终端后端', body['error'])
+        finally:
+            self.b.state.pop('backend', None)
+
     def test_cross_origin_post_and_websocket_are_rejected(self):
         for headers, method in [({'Origin': 'https://other.invalid'}, 'POST'),
                                 ({'Origin': 'https://other.invalid', 'Upgrade': 'websocket'}, 'GET')]:
