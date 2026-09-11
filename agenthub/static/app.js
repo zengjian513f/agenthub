@@ -5269,19 +5269,29 @@ function setSideCollapsed(collapsed, save = true) {
 $('#side-toggle').onclick = () => setSideCollapsed(
   !document.body.classList.contains('side-collapsed'));
 
+// 横屏手机和平板也走这套桌面分栏；手指拖动只产生 pointer/touch 事件，
+// 浏览器不会为触摸合成 mousemove，所以和 #tgrip 一样用 pointer 事件加捕获。
 let dragging = false;
-$('#drag').addEventListener('mousedown', e => {
+let dragPointer = null;
+$('#drag').addEventListener('pointerdown', e => {
   dragging = true;
+  dragPointer = e.pointerId;
+  e.currentTarget.setPointerCapture?.(e.pointerId);
   document.body.classList.add('dragging');
-  e.preventDefault();                 // 否则拖动会选中文本
+  e.preventDefault();                 // 否则拖动会选中文本、输入框失焦
 });
-document.addEventListener('mousemove', e => { if (dragging) setSideWidth(e.clientX); });
-document.addEventListener('mouseup', () => {
-  if (!dragging) return;
+document.addEventListener('pointermove', e => {
+  if (dragging && e.pointerId === dragPointer) setSideWidth(e.clientX);
+});
+function finishSideDrag(e) {
+  if (!dragging || e.pointerId !== dragPointer) return;
   dragging = false;
+  dragPointer = null;
   document.body.classList.remove('dragging');
   setSideWidth(parseInt($('#left').style.width, 10), true);
-});
+}
+document.addEventListener('pointerup', finishSideDrag);
+document.addEventListener('pointercancel', finishSideDrag);
 $('#drag').addEventListener('dblclick', () => setSideWidth(SIDE_DEFAULT, true));
 window.addEventListener('resize', () => setSideWidth(
   parseInt($('#left').style.width, 10) || store.get('width', SIDE_DEFAULT)));
