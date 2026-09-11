@@ -375,6 +375,25 @@ class SendQueueTests(unittest.TestCase):
         self.assertEqual(again["_status"], 200)
         self.assertEqual(again["outbox"], [])
 
+    def test_unconfirmed_terminal_receipt_can_be_removed_without_resending(self):
+        """BUG-20260912-014830-879a23: the TUI merged the paste into a draft, so
+        no native record will ever retire the ``confirming`` row.  The user must
+        be able to drop it; nothing may be written to the terminal for that."""
+        send_queue.enqueue(
+            "codex:u", "pane", "现在后端代码在哪？", [], {"state": "idle"}, "merged")
+        send_queue.mark_delivering("merged")
+        send_queue.mark_confirming("merged")
+        session = {"uid": "codex:u", "source": "codex", "sid": "u"}
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.term, "submit_text") as submit, \
+                patch.object(server.term, "send_keys") as keys:
+            result = self.handler()._discard_message({"uid": "codex:u", "id": "merged"})
+        self.assertEqual(result["_status"], 200)
+        self.assertEqual(result["outbox"], [])
+        self.assertEqual(send_queue.list_for("codex:u"), [])
+        submit.assert_not_called()
+        keys.assert_not_called()
+
     def test_codex_escape_does_not_reclassify_terminal_receipts(self):
         send_queue.enqueue(
             "codex:u", "pane", "下一条", [], {"state": "working"}, "followup")

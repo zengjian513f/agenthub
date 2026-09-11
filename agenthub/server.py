@@ -2105,8 +2105,12 @@ class Handler(BaseHTTPRequestHandler):
         if not existing:
             return self._json({"ok": True, "uid": uid,
                                **send_queue.snapshot(uid)})
-        if not send_queue.discard(
-                item_id, uid, {"injecting", "failed", "aborted", "restored"}):
+        # A ``confirming`` receipt only records that paste/Enter reached the
+        # TUI.  Removing it never resends anything, and once Codex has moved on
+        # without recording the text (BUG-20260912-014830-879a23: it merged
+        # into a terminal draft) no native record will ever retire it.
+        if not send_queue.discard(item_id, uid, {
+                "injecting", "confirming", "failed", "aborted", "restored"}):
             return self._json({"error": "消息不存在或已经开始发送"}, 409)
         return self._json({"ok": True, "uid": uid,
                            **send_queue.snapshot(uid)})

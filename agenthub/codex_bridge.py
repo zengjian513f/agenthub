@@ -27,6 +27,23 @@ _REWIND_FOOTER = re.compile(
 _BUSY_STATUS = re.compile(r"\bWorking\b.*\besc to interrupt\b", re.IGNORECASE)
 _SGR = re.compile(r"\x1b\[([0-9;:]*)m")
 _COMPOSER_MARKERS = {"›", "»"}
+# Codex 0.154 animates a field of braille "particles" (U+2800–U+28FF) through
+# the composer's padding rows and the blank cells of its input row.  They are
+# painted in ordinary RGB colours, not dim, so without special handling the
+# padding rows look like a wrapped draft block that starts without a marker
+# (``unknown``) and an empty composer looks like it holds text (``editing``).
+# In BUG-20260912-014830-879a23 that ``unknown`` let a web message be pasted
+# into the middle of a terminal draft and submitted as one merged prompt.
+_PARTICLES = re.compile(r"[\u2800-\u28ff]")
+
+
+def _is_particle(char: str) -> bool:
+    return "\u2800" <= char <= "\u28ff"
+
+
+def _plain(line: str) -> str:
+    """Visible text with ANSI stripped and particle cells blanked in place."""
+    return _PARTICLES.sub(" ", _ANSI.sub("", line))
 
 
 def busy_screen(screen: str) -> bool:
@@ -92,7 +109,7 @@ def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
     final ``model · cwd`` status line is also accepted.
     """
     raw_lines = str(screen or "").replace("\r", "").splitlines()
-    clean_lines = [_ANSI.sub("", line) for line in raw_lines]
+    clean_lines = [_plain(line) for line in raw_lines]
     status: list[tuple[int, int]] = []
     for ready, line in enumerate(clean_lines):
         if not _READY_FOOTER.search(line):
@@ -122,7 +139,7 @@ def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
             # quoted terminal output with the same English sentence must not
             # turn an arbitrary historic › line into a writable composer.
             rewind_style = [dim for char, dim in _styled_chars(raw_lines[candidate])
-                            if not char.isspace()]
+                            if not char.isspace() and not _is_particle(char)]
             if (_REWIND_FOOTER.match(clean_lines[candidate])
                     and rewind_style and all(rewind_style)):
                 footer = candidate
@@ -188,7 +205,8 @@ def composer_state(screen: str, cursor: tuple[int, int] | None = None) -> str:
                       if char in _COMPOSER_MARKERS)
     except StopIteration:
         return "unknown"
-    content = [(char, dim) for char, dim in styled[marker + 1:] if not char.isspace()]
+    content = [(char, dim) for char, dim in styled[marker + 1:]
+               if not char.isspace() and not _is_particle(char)]
     if any(not dim for _, dim in content):
         return "editing"
     return "empty"

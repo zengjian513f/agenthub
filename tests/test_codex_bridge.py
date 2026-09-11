@@ -142,6 +142,59 @@ class CodexBridgeTests(unittest.TestCase):
         )
         self.assertEqual(codex_bridge.composer_state(draft), "editing")
 
+    def test_particle_field_around_the_composer_is_not_input(self):
+        """Codex 0.154 scatters RGB-coloured braille particles over the composer.
+
+        BUG-20260912-014830-879a23: the particle rows made the block above the
+        footer start without a marker, so ``draft-status`` answered ``unknown``
+        for a real draft; the web text was then pasted into the middle of that
+        draft and submitted as one merged prompt.  Particles must count neither
+        as a draft block nor as draft text.
+        """
+        def particle(glyph, shade):
+            return f"\x1b[38;2;{shade};{shade};{shade}m{glyph}\x1b[39m"
+
+        above = ("\x1b[38;2;97;102;107;48;2;30;30;30m⠁\x1b[39m      "
+                 + particle("⠄", 95) + "     " + particle("⢀", 70))
+        below = ("\x1b[48;2;30;30;30m      " + particle("⠠", 54) + " "
+                 + particle("⠐", 84) + "        " + particle("⠄", 70))
+        working = ("\x1b[38;2;143;150;160;1m•\x1b[m Working "
+                   "\x1b[2m(12m 06s • esc to interrupt)")
+        footers = {
+            "ready": ("  \x1b[38;2;246;226;183mgpt-6-astra xhigh\x1b[39;2m · "
+                      "\x1b[38;2;171;223;167;22m~/Projects/agenthub\x1b[39;2m · "
+                      "\x1b[38;2;242;181;144;22mContext 77% used\x1b[39;2m · "
+                      "Ready · Full Access\x1b[m"),
+            "working": ("  \x1b[38;2;246;226;183mgpt-6-astra high\x1b[39;2m · "
+                        "\x1b[38;2;171;223;167;22m~/Projects/agenthub\x1b[39;2m · "
+                        "\x1b[38;2;200;169;238;22mWorking\x1b[39;2m · Main [default]"
+                        "\x1b[m"),
+        }
+        # A particle may sit in the cell between the marker and the placeholder.
+        empty_row = ("\x1b[48;2;30;30;30;1m›\x1b[22m" + particle("⠁", 48)
+                     + "\x1b[2mAsk Codex to do anything\x1b[22m   " + particle("⠈", 54))
+        draft_row = ("\x1b[48;2;30;30;30;1m›\x1b[22m 我想agenthub后端并列建一个agenthub-rs "
+                     + particle("⠁", 60) + " " + particle("⠁", 40))
+
+        def frame(row, footer=None):
+            lines = [working, "", above, row, below]
+            if footer:
+                lines.append(footers[footer])
+            return "\n".join(lines)
+
+        for footer in footers:
+            with self.subTest(footer=footer):
+                self.assertEqual(
+                    codex_bridge.composer_state(frame(empty_row, footer)), "empty")
+                self.assertEqual(
+                    codex_bridge.composer_state(frame(draft_row, footer)), "editing")
+        # Short panes hide the footer; the cursor after "我" is the same spot
+        # the merged paste landed in.
+        self.assertEqual(
+            codex_bridge.composer_state(frame(draft_row), (4, 3)), "editing")
+        self.assertEqual(
+            codex_bridge.composer_state(frame(empty_row), (2, 3)), "empty")
+
     def test_resize_frame_does_not_treat_historic_prompt_as_composer(self):
         screen = ("\x1b[1m›\x1b[0m 历史用户消息\n\n"
                   "• 正在重绘，当前输入框尚未出现\n\n"

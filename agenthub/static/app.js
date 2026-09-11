@@ -4707,9 +4707,12 @@ function renderQueuedMessages(uid = S.sel) {
       inspect.title = `消息可能已经被 ${cli.name} 接收；打开终端核对，不会重复发送`;
       inspect.onclick = () => globalThis.revealNativeTerminal?.(uid);
       actions.append(inspect);
-      if (item.state === 'failed') {
+      if (item.state === 'failed' || item.state === 'confirming') {
+        // 回执只说明粘贴和回车已到达终端；移除它不会重发。终端把它并进
+        // 草稿后原生记录永远不会出现，用户必须能自己收掉这条回执。
         const discard = el('button', '', '移除');
         discard.type = 'button';
+        discard.title = '只移除这条回执，不会重新发送';
         discard.onclick = () => discardServerQueuedMessage(uid, item.id);
         actions.append(discard);
       }
