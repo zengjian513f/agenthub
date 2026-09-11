@@ -1674,6 +1674,21 @@ function pendingTmuxSessions() {
 }
 
 const sessionHidden = session => !!session?.fork_parent && !session.fork_parent_visible;
+// 沿 forked_from_id 往上追整条父会话链（近的在前）。只在同来源、同机器内按
+// 原生 sid 匹配；记录已不存在的一级保留占位并到此为止。
+function forkAncestors(session) {
+  const chain = [];
+  const seen = new Set();
+  let sid = String(session?.forked_from_id || '');
+  while (sid && !seen.has(sid)) {
+    seen.add(sid);
+    const row = S.sessions.find(s => s.source === session.source
+      && (s.node_id || '') === (session.node_id || '') && String(s.sid) === sid);
+    chain.push({ sid, row: row || null });
+    sid = String(row?.forked_from_id || '');
+  }
+  return chain;
+}
 const sidebarSessions = () => [...pendingTmuxSessions(), ...S.sessions]
   .filter(s => !sessionHidden(s));
 
@@ -2250,6 +2265,7 @@ async function setForkParentVisibility(uids, visible, button = null) {
     showSessionCount();
     const selected = S.sessions.find(session => session.uid === S.sel);
     if (selected) renderSessionAction(selected);
+    renderForkChainMenu();
     if (data.errors?.length) {
       alert(`父会话显示状态有 ${data.errors.length} 项未保存：${data.errors[0].error}`);
     }
@@ -2943,6 +2959,7 @@ function bindSessionActions(heading) {
     const views = heading.querySelector('#session-view-menu');
     if (views) views.hidden = true;
     heading.querySelector('#a-view-switch')?.setAttribute('aria-expanded', 'false');
+    closeForkChainMenu();
   };
   button.onclick = () => menu.hidden ? open() : closeSessionActions();
   button.onkeydown = event => {
@@ -3042,6 +3059,7 @@ function head(m, total) {
       <h2 class="${hasAgents ? 'has-session-views' : ''}">${icon(m.source)}${titleView}</h2>
       ${menuView}
       <div class="dhead-actions" aria-label="会话操作">
+        ${forkChainButtonMarkup(m)}
         ${consoleButtonMarkup()}
         ${sessionActionsMarkup(`
         ${starButtonMarkup(m.uid, !!m.starred, 'session-menu-action', 'a-star')}
@@ -3108,6 +3126,7 @@ function head(m, total) {
       openSession(m.uid, b.dataset.agent || null);
     };
   }
+  bindForkChainMenu(h, m);
   const tb = h.querySelector('#a-term');
   bindConsoleButton(tb, m.uid, m.agent_id);
   showConsoleToast('');
@@ -3116,6 +3135,99 @@ function head(m, total) {
   bindSessionActions(h);
   return h;
 }
+
+/* ---------- 回退父会话链 ---------- */
+// Codex 回退会生成子会话，原会话默认从左栏隐藏。子会话标题栏给一个图标，
+// 下拉列出整条父会话链，每一级可单独显示到左栏或再次隐藏。
+function forkChainButtonMarkup(m) {
+  if (m.agent_id || !m.forked_from_id) return '';
+  return `<button class="iconbtn" id="a-fork-chain" type="button" title="父会话链"
+      aria-label="父会话链" aria-haspopup="menu" aria-expanded="false"
+      aria-controls="fork-chain-menu">${uiIcon('fork')}</button>
+    <div class="session-view-menu fork-chain-menu" id="fork-chain-menu" hidden role="menu"
+      aria-label="父会话链"></div>`;
+}
+
+function closeForkChainMenu() {
+  const menu = $('#fork-chain-menu');
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  $('#a-fork-chain')?.setAttribute('aria-expanded', 'false');
+}
+
+function renderForkChainMenu() {
+  const menu = $('#fork-chain-menu');
+  if (!menu || menu.hidden) return;
+  const current = S.sessions.find(session => session.uid === S.sel)
+    || (S.results || []).find(session => session.uid === S.sel) || menu._meta;
+  const chain = current ? forkAncestors(current) : [];
+  menu.innerHTML = chain.map(({ sid, row }, i) => {
+    const level = i === 0 ? '父会话' : `上 ${i + 1} 级父会话`;
+    if (!row) return `<div class="chain-row gone" role="none">
+        <span><small>${level} · 记录已不存在</small><b><code>${esc(sid)}</code></b></span>
+      </div>`;
+    const shown = !row.fork_parent || !!row.fork_parent_visible;
+    const when = `${esc(fmtTime(row.created))} → ${esc(fmtTime(row.updated))}`;
+    return `<div class="chain-row${shown ? ' shown' : ''}" role="none" data-uid="${esc(row.uid)}">
+        <button type="button" class="chain-open" role="menuitem" title="打开这条会话">
+          <small>${level} · ${when}${shown ? ' · 已在左栏' : ''}</small><b>${esc(row.title || row.sid)}</b>
+        </button>
+        ${row.fork_parent ? `<button type="button" class="btn chain-toggle" role="menuitem"
+          data-visible="${shown ? 0 : 1}">${shown ? '隐藏' : '显示'}</button>` : ''}
+      </div>`;
+  }).join('') || '<div class="chain-row gone" role="none"><span><small>没有父会话</small></span></div>';
+}
+
+function bindForkChainMenu(heading, m) {
+  const button = heading.querySelector('#a-fork-chain');
+  const menu = heading.querySelector('#fork-chain-menu');
+  if (!button || !menu) return;
+  menu._meta = m;
+  const open = () => {
+    closeSessionActions();
+    const views = heading.querySelector('#session-view-menu');
+    if (views) views.hidden = true;
+    heading.querySelector('#a-view-switch')?.setAttribute('aria-expanded', 'false');
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    renderForkChainMenu();
+  };
+  button.onclick = e => {
+    e.stopPropagation();
+    menu.hidden ? open() : closeForkChainMenu();
+  };
+  menu.onclick = async e => {
+    e.stopPropagation();
+    const row = e.target.closest('.chain-row[data-uid]');
+    if (!row) return;
+    const toggle = e.target.closest('.chain-toggle');
+    if (toggle) {
+      const visible = toggle.dataset.visible === '1';
+      await setForkParentVisibility([row.dataset.uid], visible, toggle);
+      if (visible) {
+        // 新显示的会话在左栏滚到可见处，让“显示”有个看得见的结果
+        $(`#side .item[data-uid="${CSS.escape(row.dataset.uid)}"]`)
+          ?.scrollIntoView({ block: 'nearest' });
+      }
+      return;
+    }
+    if (e.target.closest('.chain-open')) {
+      closeForkChainMenu();
+      openSession(row.dataset.uid);
+    }
+  };
+}
+document.addEventListener('click', event => {
+  if (!event.target.closest('#fork-chain-menu, #a-fork-chain')) closeForkChainMenu();
+}, true);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && $('#fork-chain-menu')?.hidden === false) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeForkChainMenu();
+    $('#a-fork-chain')?.focus();
+  }
+}, true);
 
 function renderSessionAction(m, button = $('#a-session-action')) {
   if (!button || m.uid !== S.sel) return;
@@ -5394,17 +5506,10 @@ function openSettings() {
   $('#setting-theme').value = store.get('theme', 'system');
   $('#setting-tool-icons').value = document.documentElement.dataset.toolIcons;
   $('#setting-cache').value = String(cacheLimitMb);
-  $('#restore-fork-parents').disabled = !S.sessions.some(sessionHidden);
   $('#settings-dialog').showModal();
 }
 
 $('#settings').onclick = openSettings;
-$('#restore-fork-parents').onclick = async event => {
-  const button = event.currentTarget;
-  const hidden = S.sessions.filter(sessionHidden).map(session => session.uid);
-  const data = await setForkParentVisibility(hidden, true, button);
-  if (data && !(data.errors || []).length) button.disabled = true;
-};
 $('#settings-dialog').addEventListener('click', e => {
   if (e.target === $('#settings-dialog')) $('#settings-dialog').close();
 });

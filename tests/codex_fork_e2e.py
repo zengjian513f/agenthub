@@ -133,12 +133,24 @@ def main():
                     assert page.locator('#session-total').inner_text() == '1'
                     assert page.locator('dialog[open]').count() == 0
 
-                    # Settings writes a server flag. A brand-new browser sees it,
+                    # The child's fork-chain dropdown lists the hidden parent;
+                    # "显示" writes a server flag. A brand-new browser sees it,
                     # proving this is not localStorage state.
-                    page.locator('#settings').click()
-                    page.locator('#restore-fork-parents').click()
+                    child_uid = page.evaluate(
+                        '(sid) => S.sessions.find(row => row.sid === sid).uid', child)
+                    page.locator(f'.item[data-uid="{child_uid}"]').click()
+                    page.wait_for_selector('#a-fork-chain')
+                    assert page.locator('#settings-dialog #restore-fork-parents').count() == 0
+                    page.locator('#a-fork-chain').click()
+                    chain = page.locator('#fork-chain-menu .chain-row')
+                    expect(chain).to_have_count(1)
+                    expect(chain.first.locator('.chain-toggle')).to_have_text('显示')
+                    chain.first.locator('.chain-toggle').click()
                     expect(page.locator('#side .item')).to_have_count(2)
-                    page.locator('#settings-dialog button[type="submit"]').last.click()
+                    expect(chain.first.locator('.chain-toggle')).to_have_text('隐藏')
+                    expect(page.locator('#fork-chain-menu')).to_be_visible()
+                    page.keyboard.press('Escape')
+                    expect(page.locator('#fork-chain-menu')).to_be_hidden()
                     local_parent_uid = next(row['uid'] for row in rows if row['sid'] == parent)
                     assert session_meta.snapshot(local_parent_uid)['fork_parent_visible'] is True
                     fresh = browser.new_context(viewport=dict(width=1100, height=850))
@@ -168,15 +180,31 @@ def main():
                     page.reload()
                     expect(page.locator('#side .item')).to_have_count(1)
 
-                    # A further rewind hides its immediate parent too. Showing
-                    # all creates one durable flag per current parent.
+                    # A further rewind hides its immediate parent too. The
+                    # grandchild's chain lists both levels, nearest first, and
+                    # each "显示" creates one durable flag for that parent.
                     write(grandchild, child)
                     page.evaluate('pollSessions()')
                     expect(page.locator('#side .item')).to_have_count(1)
-                    page.locator('#settings').click()
-                    page.locator('#restore-fork-parents').click()
+                    grandchild_uid = page.evaluate(
+                        '(sid) => S.sessions.find(row => row.sid === sid).uid', grandchild)
+                    page.locator(f'.item[data-uid="{grandchild_uid}"]').click()
+                    page.wait_for_selector('#a-fork-chain')
+                    page.locator('#a-fork-chain').click()
+                    chain = page.locator('#fork-chain-menu .chain-row')
+                    expect(chain).to_have_count(2)
+                    assert chain.nth(0).get_attribute('data-uid') == child_uid
+                    assert chain.nth(1).get_attribute('data-uid') == parent_uid
+                    expect(chain.nth(0).locator('.chain-toggle')).to_have_text('显示')
+                    expect(chain.nth(1).locator('.chain-toggle')).to_have_text('显示')
+                    chain.nth(0).locator('.chain-toggle').click()
+                    expect(page.locator('#side .item')).to_have_count(2)
+                    chain.nth(1).locator('.chain-toggle').click()
                     expect(page.locator('#side .item')).to_have_count(3)
-                    page.locator('#settings-dialog button[type="submit"]').last.click()
+                    # Opening a level from the chain navigates to it.
+                    chain.nth(1).locator('.chain-open').click()
+                    page.wait_for_function('(uid) => S.sel === uid', arg=parent_uid)
+                    expect(page.locator('#fork-chain-menu')).to_have_count(0)
                     page.evaluate("localStorage.setItem('forkParentChoices', JSON.stringify([['ignored',true]]))")
                     page.reload()
                     expect(page.locator('#side .item')).to_have_count(3)
