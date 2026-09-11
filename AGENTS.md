@@ -57,16 +57,23 @@
   only opens the specific error dialog; neither clicking nor double-clicking
   may change selection. Do not show a separate offline warning banner.
 
-- Reproduce a reported UI, rendering, queue, or terminal interaction bug with
-  Playwright/headless Chromium against the exact session named by the user
-  before implementing a fix. Inspect the rendered DOM and relevant browser
-  state as well as the API and native JSONL; API/JSONL evidence alone is not a
-  browser reproduction.
+- Diagnose from the captured evidence first. A bug report bundle carries the
+  user's screenshots, `browser-state.json`, `events.jsonl` and the audit
+  store, and the server records every event anyway; read those before
+  touching code. Read the DOM, browser state, HTTP/SSE audit, server ledgers,
+  tmux/ptyhost screens and native JSONL together, and find the first event in
+  that chain that disagrees with expectation.
+- Reproduce with Playwright/headless Chromium when it is cheap and the
+  evidence leaves a real gap; it is a tool, not a gate. Intermittent bugs
+  often will not reproduce on demand: do not spend the task forcing one, and
+  do not build a reproduction framework before diagnosing.
 - A headless browser has isolated storage. If the issue exists only in the
   user's original tab, distinguish browser-local state from server/session
   state and inspect or export that tab's state instead of guessing.
-- Re-run the same browser scenario after the change. Do not turn a missing
-  reproduction into cleanup logic that merely hides the symptom.
+- Verify the fix against the failure's shape: a regression test that fails on
+  the pre-fix commit, or the same browser scenario when one was reproduced.
+  Do not turn a missing reproduction into cleanup logic that merely hides the
+  symptom.
 
 ## Paid CLI tests
 
