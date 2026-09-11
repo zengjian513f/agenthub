@@ -13,12 +13,12 @@ function selectedNodeIds() { return Nodes.list.filter(n => !Nodes.off.has(n.id))
 function nodeDirectory(row, length = 999) {
   return (row.node_name ? row.node_name + ' ' : '') + shortCwd(row.cwd || '(未知)', length);
 }
+// 机器配色由中央的注册表按机器配置，前端只负责显示。
 function nodeColor(name) {
-  const key = String(name || '').trim().toLowerCase();
-  return ['orion', 'lyra', 'cygnus'].includes(key) ? key : '';
+  return Nodes.list.find(n => n.name === name)?.color || '';
 }
 function nodeBadge(name) {
-  return `<span class="node-badge" data-node-color="${nodeColor(name)}">${esc(name)}</span>`;
+  return `<span class="node-badge" data-node-color="${esc(nodeColor(name))}">${esc(name)}</span>`;
 }
 function nodeDirectoryMarkup(row, length = 999) {
   return (row.node_name ? nodeBadge(row.node_name) + ' ' : '') + esc(shortCwd(row.cwd || '(未知)', length));
@@ -176,7 +176,7 @@ function renderNodes() {
     countLabel.className = 'node-count'; countLabel.textContent = count;
     item.replaceChildren(document.createTextNode(`${n.name} `), countLabel);
     item.dataset.node = n.id;
-    item.dataset.nodeColor = nodeColor(n.name);
+    item.dataset.nodeColor = n.color || '';
     item.classList.toggle('node-offline', n.online === false);
     item.ariaLabel = `${n.name} ${count}` + (n.online === false ? `，${nodeOfflineReason(n)}` : '');
     item.ondblclick = () => {

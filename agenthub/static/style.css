@@ -177,9 +177,15 @@ header {
 .seg button.on:hover { background: color-mix(in srgb, var(--accent) 20%, var(--panel-2)); }
 .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .seg b { font-weight: 400; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
-[data-node-color="orion"] { --node-color: light-dark(#1d4ed8, #93c5fd); }
-[data-node-color="lyra"] { --node-color: light-dark(#7e22ce, #d8b4fe); }
-[data-node-color="cygnus"] { --node-color: light-dark(#a14408, #fdba74); }
+/* 机器配色板。哪台机器用哪个色在中央注册表里配，这里只定义可选的颜色本身。 */
+[data-node-color="blue"] { --node-color: light-dark(#1d4ed8, #93c5fd); }
+[data-node-color="violet"] { --node-color: light-dark(#7e22ce, #d8b4fe); }
+[data-node-color="amber"] { --node-color: light-dark(#a14408, #fdba74); }
+[data-node-color="teal"] { --node-color: light-dark(#0f766e, #5eead4); }
+[data-node-color="rose"] { --node-color: light-dark(#be123c, #fda4af); }
+[data-node-color="lime"] { --node-color: light-dark(#4d7c0f, #bef264); }
+[data-node-color="cyan"] { --node-color: light-dark(#0e7490, #67e8f9); }
+[data-node-color="fuchsia"] { --node-color: light-dark(#a21caf, #f0abfc); }
 .node-badge {
   display: inline-block; padding: 1px 6px; border-radius: 4px;
   color: var(--node-color, var(--muted)); font-weight: 600;

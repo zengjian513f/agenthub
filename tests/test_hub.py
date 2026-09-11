@@ -513,6 +513,31 @@ class HubHTTPTests(unittest.TestCase):
         self.assertEqual(self.b.state['writes'][-1][0],
                          '/api/sessions/fork-visibility')
 
+    def test_machine_colour_comes_from_the_registry(self):
+        """配色按机器配在注册表里：加机器只改配置，不用改代码再部署三台。
+
+        用独立注册表，因为重新注册会把节点挪到列表末尾，共享夹具里有测试按下标取节点。
+        """
+        with tempfile.TemporaryDirectory() as root:
+            registry = hub.Registry(Path(root) / 'nodes.json', ['127.0.0.0/8'], monitor=False)
+            base = {'name': 'NodeA', 'url': f'http://127.0.0.1:{self.a.server_port}',
+                    'token': self.a.state['token']}
+            self.assertEqual(registry.register(base)['color'], '')
+            self.assertEqual([n['color'] for n in registry.public()], [''])
+
+            self.assertEqual(registry.register({**base, 'color': 'teal'})['color'], 'teal')
+            row = registry.public()[0]
+            self.assertEqual(row['color'], 'teal')
+            self.assertNotIn('url', row)          # 公开列表仍然不含连接地址
+
+            with self.assertRaisesRegex(ValueError, '机器颜色'):
+                registry.register({**base, 'color': '#ff0000'})
+            self.assertEqual(registry.get('a' * 32).get('color'), 'teal')
+
+            # 配色随注册表落盘，重启后仍在
+            fresh = hub.Registry(Path(root) / 'nodes.json', ['127.0.0.0/8'], monitor=False)
+            self.assertEqual(fresh.public()[0]['color'], 'teal')
+
     def test_terminal_backend_is_reported_and_switched_per_machine(self):
         """终端后端是每台机器各自的设置，网页按机器读取和切换。"""
         self.registry.check_all()

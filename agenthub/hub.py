@@ -33,6 +33,8 @@ SEARCH_IDLE_TIMEOUT = 60
 # requests only consult that state and never wait on a node known to be down.
 # Machines being switched off is normal, so the last session list of each node
 # is persisted and shown as an offline cache until the node is back.
+# 机器配色在注册表里按机器配置：加机器只改配置，不用改代码。没配的机器没有颜色。
+NODE_PALETTE = ("blue", "violet", "amber", "teal", "rose", "lime", "cyan", "fuchsia")
 PROBE_INTERVAL = 10
 RECHECK_TIMEOUT = 5
 # A node that is currently online is only painted offline after this many
@@ -221,6 +223,11 @@ class Registry:
                 or not re.fullmatch(r"[a-f0-9]{32}", str(meta.get("node_id", "")))):
             raise ValueError("节点认证或协议检查失败，请先升级节点并配置凭据")
         node = {**candidate, "id": meta["node_id"], "name": name}
+        color = str(body.get("color") or "").strip().lower()
+        if color:
+            if color not in NODE_PALETTE:
+                raise ValueError(f"机器颜色只能取 {'、'.join(NODE_PALETTE)}")
+            node["color"] = color
         with self.lock:
             if body.get("id") and body["id"] != node["id"]:
                 raise ValueError("地址对应另一台机器，不能覆盖原节点身份")
@@ -230,7 +237,7 @@ class Registry:
             self.drop_snapshot(node["id"])
             self.save()
         self.nudge()
-        return {"id": node["id"], "name": name}
+        return {"id": node["id"], "name": name, "color": node.get("color", "")}
 
     def remove(self, nid):
         with self.lock:
@@ -404,7 +411,7 @@ class Registry:
 
     def public(self):
         with self.lock:
-            return [{"id": n["id"], "name": n["name"],
+            return [{"id": n["id"], "name": n["name"], "color": n.get("color", ""),
                      **self.health.get(n["id"], {"online": None})} for n in self.nodes]
 
 
