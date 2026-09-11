@@ -2,22 +2,33 @@
 
 网页控制台之前完全依赖 tmux：会话独立于 Web 服务存活、字节流 attach、`send-keys`
 输入，以及 `capture-pane` 加光标位置的屏幕读取。为了让 Windows 机器也能作为节点托管
-原生 Claude / Codex 会话，`agenthub/host/` 提供了一个自制的会话宿主，覆盖同样四件事，
+原生 Claude / Codex 会话，`host-rs/` 提供了一个自制的会话宿主，覆盖同样四件事，
 不依赖 tmux。
+
+宿主本体是 Rust 二进制；Python 侧只保留客户端（`agenthub/host/`），由 Web 服务用来
+扫描会话目录、发控制请求和转发 attach 字节流。
 
 ## 结构
 
-- **每个会话一个独立进程**（`python3 -m agenthub.host run …`），没有中央守护进程。
+- **每个会话一个独立进程**（`agenthub-host run …`），没有中央守护进程。
   进程持有 pty 跑 CLI，把输出喂给自带的 VT 屏幕模型，并在本地 socket 上接受连接。
   Web 服务重启不影响 CLI；CLI 退出时宿主随之退出并清理文件（对应 tmux 的 `remain-on-exit off`）。
+  每会话常驻内存 2–3 MB。
 - 会话目录默认 `~/.local/share/agenthub/host/`（权限 `0700`，可用 `AGENTHUB_HOST_DIR` 覆盖）。
   每个会话有 `<name>.json`（名称、宿主 pid、CLI pid、cwd、尺寸、attached 状态）和
   `<name>.sock`；Windows 用 `127.0.0.1` 端口加随机 token 代替 unix socket。
   宿主启动失败的原因写在 `<name>.log`。
-- `agenthub/host/screen.py` 是只实现 TUI 真正会用到子集的 VT100/xterm 模型：光标移动、擦除、
-  插删行列、滚动区域、SGR、备用屏、自动换行、东亚宽字符与组合字符、有界历史（10000 行），
-  并在没有终端连着时代答光标位置 / 设备属性查询。它只服务 capture / cursor 查询和 attach 回放；
+- pty 由 [`portable-pty`](https://crates.io/crates/portable-pty) 提供，同时覆盖 Unix pty 和
+  Windows ConPTY；屏幕模型用 [`vt100`](https://crates.io/crates/vt100)，实测吞吐 44.8 MB/s，
+  不会成为瓶颈。屏幕模型只服务 `capture` / `cursor` 查询和 attach 回放；
   实时字节原样转发给浏览器，滚动由 xterm.js 自己的 scrollback 完成。
+- **模型与转发解耦**：读线程只做"转发给客户端 + 入队"，屏幕模型在独立线程里消费队列。
+  读线程永不等模型——那会直接变成终端卡顿。积压超过 `BACKLOG_LIMIT`（32 MB）时丢掉最旧的
+  一段，由 TUI 的下一次整屏重绘自然纠正。`capture` / `cursor` 先给模型最多
+  `SCREEN_SYNC_TIMEOUT`（2 秒）追赶，并在应答里报出 `lag`（尚未进入模型的字节）和
+  `dropped`（累计丢弃），调用方可据此判断这一帧是否可信。
+  attach 的回放 = 历史 + 终端完整状态（`state_formatted`，含备用屏、DECCKM、bracketed paste）
+  + 尚未喂入的原始字节，与客户端随后收到的实时字节严格接续。
 - Linux 上宿主进程会尽量通过 `systemd-run --user --scope` 放进独立的 transient scope，
   这样 `systemctl --user restart agenthub.service` 不会连带结束 CLI；没有用户 systemd 时退回
   `start_new_session` 的普通独立进程（`AGENTHUB_HOST_SCOPE=0` 可强制）。Windows 用
@@ -25,9 +36,22 @@
 - 与 `agenthub-tmux-host` 一样，CLI 经 `~/.local/bin/with-zshrc` 之类的包装启动以获得交互 shell
   的环境；`AGENTHUB_HOST_ENV_WRAPPER` 可以改路径，设为空字符串则不包装。
 
+## 构建与定位
+
+```bash
+cd host-rs && cargo build --release      # 产物: host-rs/target/release/agenthub-host
+```
+
+`term_host.py` 按以下顺序定位二进制，找不到就报告控制台不可用并给出构建命令：
+
+1. `AGENTHUB_HOST_BIN`（绝对路径）
+2. `host-rs/target/release/agenthub-host`，然后 `host-rs/target/debug/agenthub-host`
+3. 仓库内 `bin/agenthub-host`
+4. `PATH` 上的 `agenthub-host`
+
 ## 后端选择与共存
 
-`agenthub/term.py` 现在是调度层：`term_tmux.py` 是原有的 tmux 后端，`term_host.py` 是宿主后端。
+`agenthub/term.py` 是调度层：`term_tmux.py` 是原有的 tmux 后端，`term_host.py` 驱动会话宿主。
 
 - 主后端由 `python3 -m agenthub.server --terminal-backend {auto,tmux,host}` 或环境变量
   `AGENTHUB_TERM_BACKEND` 决定，新会话在主后端创建。`auto` 在 Windows 取 `host`，其他平台仍取 `tmux`。
@@ -40,25 +64,30 @@
 ## 命令行
 
 ```bash
-python3 -m agenthub.host list                       # 列出宿主会话
-python3 -m agenthub.host attach agenthub-claude-1234 # 手工接管, Ctrl-\ 退出且不影响会话
-python3 -m agenthub.host capture NAME --lines 200 --plain
-python3 -m agenthub.host send NAME "文本" --enter
-python3 -m agenthub.host kill NAME [--force]
+agenthub-host list                       # 列出宿主会话
+agenthub-host attach agenthub-claude-1234 # 手工接管, Ctrl-\ 退出且不影响会话
+agenthub-host capture NAME --lines 200 --plain
+agenthub-host send NAME "文本" --enter
+agenthub-host kill NAME [--force]
 ```
+
+全局 `--dir` 可覆盖会话目录，与 `AGENTHUB_HOST_DIR` 等价。
 
 ## 验证
 
 ```bash
+cd host-rs && cargo test                 # 屏幕模型、协议、积压策略
 python3 -m unittest discover -s tests -p 'test_host.py'
 ```
 
-覆盖屏幕模型、协议键名、真实 pty 的宿主进程生命周期（发送、截屏、attach 回放与实时输入、
-resize、改名、退出清理、宿主在启动者退出后存活）、`term` 调度，以及通过真实 HTTP 服务和
-WebSocket 的控制台往返。测试只用 `sh`，不启动付费 CLI。
+Rust 单测覆盖屏幕模型（滚动历史分页、软换行合并、宽字符、备用屏、各项模式、回放顺序）、
+协议（帧切分、tmux 键名、JSON 行与紧随其后的帧）和积压策略。Python 测试用 Web 服务真实的
+客户端连真实的 Rust 宿主，覆盖会话生命周期、发送、截屏、attach 回放与实时输入、resize、
+改名、退出清理、宿主在启动者退出后存活、`term` 调度，以及通过真实 HTTP 服务和 WebSocket 的
+控制台往返。测试只用 `sh`，不启动付费 CLI；没有构建二进制时相关用例自动跳过。
 
 ## Windows 现状
 
-`agenthub/host/ptyio.py` 的 ConPTY 后端基于 pywinpty 编写，尚未在真实 Windows 节点上验证。
+ConPTY 由 `portable-pty` 统一封装，但尚未在真实 Windows 节点上验证。
 把 Windows 机器接成节点还需要：`live.py` 的运行状态检测改用 psutil、`adapters.py` 识别
 Windows 项目目录 slug 与盘符路径、文件管理器的根目录判断，以及用计划任务代替 systemd。

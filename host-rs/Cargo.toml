@@ -1,0 +1,20 @@
+[package]
+name = "agenthub-host"
+version = "0.1.0"
+edition = "2024"
+description = "AgentHub 会话宿主：每个 CLI 会话一个独立进程，pty + 本地 socket"
+
+[[bin]]
+name = "agenthub-host"
+path = "src/main.rs"
+
+[dependencies]
+portable-pty = "0.9"
+serde_json = "1"
+vt100 = "0.16"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true

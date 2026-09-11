@@ -1,6 +1,7 @@
 """自制会话宿主后端: 每个会话一个独立进程 + 本地 socket。
 
-对外提供与 tmux 后端相同的函数面, 由 term.py 统一调度。宿主进程与 Web 服务
+对外提供与 tmux 后端相同的函数面, 由 term.py 统一调度。宿主本体是 Rust 二进制
+(见 host-rs/), 这里只负责把它拉起来并作为客户端和它对话。宿主进程与 Web 服务
 互不牵连, Linux 下尽量放进独立的 systemd scope, Windows 下以脱离作业对象的
 独立进程启动, 这样重启 agenthub 服务不会结束 CLI。
 """
@@ -24,21 +25,34 @@ from .host import client, procs
 PREFIX = "agenthub-"
 WINDOWS = sys.platform == "win32"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+BINARY_NAME = "agenthub-host.exe" if WINDOWS else "agenthub-host"
 _submit_locks: dict[str, threading.Lock] = {}
 _submit_locks_guard = threading.Lock()
 
 
+def host_binary() -> str | None:
+    """定位宿主二进制。AGENTHUB_HOST_BIN 优先, 然后是构建产物, 最后看 PATH。"""
+    raw = os.environ.get("AGENTHUB_HOST_BIN")
+    if raw:
+        path = Path(raw).expanduser()
+        return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+    for candidate in (PROJECT_ROOT / "host-rs" / "target" / "release" / BINARY_NAME,
+                      PROJECT_ROOT / "host-rs" / "target" / "debug" / BINARY_NAME,
+                      PROJECT_ROOT / "bin" / BINARY_NAME):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return shutil.which(BINARY_NAME)
+
+
 def available() -> bool:
-    if WINDOWS:
-        try:
-            import winpty  # type: ignore[import-not-found]  # noqa: F401
-        except ImportError:
-            return False
-    return True
+    return host_binary() is not None
 
 
 def unavailable_reason() -> str:
-    return "服务器未安装 pywinpty，无法托管控制台。" if WINDOWS else ""
+    if host_binary() is None:
+        return ("服务器未安装会话宿主程序，无法打开控制台"
+                "（在 host-rs/ 执行 cargo build --release）。")
+    return ""
 
 
 def list_sessions() -> list[dict]:
@@ -126,8 +140,11 @@ def new_session(name: str, cmd: str | list[str], cwd: str | None = None,
             os.chmod(directory, 0o700)
         except OSError:
             pass
+    binary = host_binary()
+    if not binary:
+        raise RuntimeError(unavailable_reason())
     argv = [*_env_wrapper(), *_argv_for(cmd)]
-    launch = [sys.executable, "-m", "agenthub.host", "--dir", str(directory), "run",
+    launch = [binary, "--dir", str(directory), "run",
               "--name", full, "--cols", str(cols), "--rows", str(rows)]
     if cwd and os.path.isdir(cwd):
         launch += ["--cwd", cwd]

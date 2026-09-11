@@ -2,9 +2,12 @@
 
 import json
 import os
+import re
 import stat
+import socket
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import unittest
@@ -13,122 +16,15 @@ from unittest.mock import patch
 
 from agenthub import term, term_host, term_tmux
 from agenthub.host import client, procs
-from agenthub.host.protocol import (FRAME_DATA, FRAME_RESIZE, key_bytes, pack_frame,
-                                    read_frames)
-from agenthub.host.screen import Screen, strip_sgr
+from agenthub.host.protocol import FRAME_DATA, FRAME_RESIZE, pack_frame, read_frames
 
 POSIX = os.name == "posix"
 ROOT = Path(__file__).resolve().parent.parent
-
-
-class ScreenTests(unittest.TestCase):
-    def test_lines_scroll_into_history_and_soft_wraps_join(self):
-        s = Screen(10, 3)
-        s.feed(b"hello\r\nworld\r\nabcdefghijklmno")
-        self.assertEqual(s.screen_lines(styled=False), ["world", "abcdefghij", "klmno"])
-        self.assertEqual([t for t, _ in s.history], ["hello"])
-        self.assertEqual(s.scrollback_lines(100, styled=False, join=True),
-                         ["hello", "world", "abcdefghijklmno"])
-        self.assertEqual(s.cursor, (5, 2))
-
-    def test_sgr_attributes_render_and_strip(self):
-        s = Screen(20, 2)
-        s.feed(b"\x1b[1;31mRED\x1b[0m ok \x1b[38;2;1;2;3mrgb\x1b[m")
-        styled = s.screen_lines()[0]
-        self.assertEqual(styled, "\x1b[0m\x1b[1;31mRED\x1b[0m ok \x1b[0m\x1b[38;2;1;2;3mrgb\x1b[0m")
-        self.assertEqual(strip_sgr(styled), "RED ok rgb")
-        self.assertEqual(s.screen_lines(styled=False)[0], "RED ok rgb")
-
-    def test_cursor_moves_erase_and_insert_delete(self):
-        s = Screen(10, 4)
-        s.feed(b"line1\r\nline2\r\nline3\r\nline4")
-        s.feed(b"\x1b[2;1H\x1b[K")                  # 清第二行
-        s.feed(b"\x1b[1;3H\x1b[2@")                 # 第一行插两个空格
-        s.feed(b"\x1b[4;1H\x1b[2P")                 # 第四行删两个字符
-        self.assertEqual(s.screen_lines(styled=False), ["li  ne1", "", "line3", "ne4"])
-        s.feed(b"\x1b[3;1H\x1b[M")                  # 删第三行
-        self.assertEqual(s.screen_lines(styled=False), ["li  ne1", "", "ne4", ""])
-        s.feed(b"\x1b[2J\x1b[H")
-        self.assertEqual(s.screen_lines(styled=False), ["", "", "", ""])
-        self.assertEqual(s.cursor, (0, 0))
-
-    def test_scroll_region_does_not_leak_into_history(self):
-        s = Screen(10, 4)
-        s.feed(b"top\r\n\x1b[2;3r\x1b[2;1Ha\r\nb\r\nc\r\nd")
-        self.assertEqual(s.screen_lines(styled=False), ["top", "c", "d", ""])
-        self.assertEqual(len(s.history), 0)
-
-    def test_ink_style_redraw_keeps_cursor_and_screen_consistent(self):
-        s = Screen(20, 5)
-        s.feed(b"> hi\r\n\x1b[2mthinking\x1b[0m\r\n")
-        s.feed(b"\x1b[2A\x1b[J> hi there\r\ndone\r\n")   # 上移两行整段重绘
-        self.assertEqual(s.screen_lines(styled=False), ["> hi there", "done", "", "", ""])
-        self.assertEqual(s.cursor, (0, 2))
-
-    def test_alternate_screen_restores_main_content(self):
-        s = Screen(10, 3)
-        s.feed(b"main\r\n")
-        s.feed(b"\x1b[?1049h\x1b[HALT\x1b[?1049l")
-        self.assertFalse(s.alt)
-        self.assertEqual(s.screen_lines(styled=False), ["main", "", ""])
-        self.assertEqual(s.cursor, (0, 1))
-
-    def test_wide_and_combining_characters_take_correct_columns(self):
-        s = Screen(6, 2)
-        s.feed("你好e\u0301x".encode())
-        self.assertEqual(s.screen_lines(styled=False)[0], "你好e\u0301x")
-        self.assertEqual(s.cursor, (6 - 1, 0))
-        s.feed("世界".encode())                          # 剩 1 列, 宽字符整体换行
-        self.assertEqual(s.screen_lines(styled=False), ["你好e\u0301x", "世界"])
-        self.assertTrue(s.wrapped[0])
-
-    def test_resize_moves_rows_between_screen_and_history(self):
-        s = Screen(10, 4)
-        s.feed(b"a\r\nb\r\nc\r\nd")
-        s.resize(10, 2)
-        self.assertEqual(s.screen_lines(styled=False), ["c", "d"])
-        self.assertEqual([t for t, _ in s.history], ["a", "b"])
-        self.assertEqual(s.cursor, (1, 1))
-        s.resize(10, 5)
-        self.assertEqual(s.screen_lines(styled=False), ["a", "b", "c", "d", ""])
-        self.assertEqual(s.cursor, (1, 3))
-
-    def test_queries_are_answered_and_modes_tracked(self):
-        s = Screen(10, 3)
-        s.feed(b"\x1b[6n\x1b[c\x1b[18t\x1b[?1h\x1b[?2004h")
-        self.assertEqual(s.responses, [b"\x1b[1;1R", b"\x1b[?1;2c", b"\x1b[8;3;10t"])
-        self.assertTrue(s.app_cursor)
-        self.assertTrue(s.bracketed_paste)
-        s.feed(b"\x1b[?1l\x1b[?2004l")
-        self.assertFalse(s.app_cursor)
-        self.assertFalse(s.bracketed_paste)
-
-    def test_osc_and_unknown_sequences_are_ignored(self):
-        s = Screen(10, 2)
-        s.feed(b"\x1b]0;title\x07a\x1b]8;;http://x\x1b\\b\x1b[?25l\x1b[2 qc")
-        self.assertEqual(s.screen_lines(styled=False)[0], "abc")
-        self.assertFalse(s.cursor_visible)
-
-    def test_redraw_bytes_fill_viewport_and_place_cursor(self):
-        s = Screen(10, 3)
-        s.feed(b"a\r\nbb")
-        out = s.redraw_bytes().decode()
-        self.assertIn("a\r\nbb\r\n", out)
-        self.assertTrue(out.endswith("\x1b[2;3H\x1b[?25h"))
+HOST_BIN = term_host.host_binary()
+NEEDS_BIN = "需要先构建会话宿主: cd host-rs && cargo build --release"
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_key_names_follow_tmux_conventions(self):
-        self.assertEqual(key_bytes("Enter"), b"\r")
-        self.assertEqual(key_bytes("C-d"), b"\x04")
-        self.assertEqual(key_bytes("C-u"), b"\x15")
-        self.assertEqual(key_bytes("Escape"), b"\x1b")
-        self.assertEqual(key_bytes("Up"), b"\x1b[A")
-        self.assertEqual(key_bytes("Up", app_cursor=True), b"\x1bOA")
-        self.assertEqual(key_bytes("M-x"), b"\x1bx")
-        self.assertEqual(key_bytes("BSpace"), b"\x7f")
-        self.assertEqual(key_bytes("literal text"), b"literal text")
-
     def test_frames_round_trip_across_partial_reads(self):
         stream = pack_frame(FRAME_DATA, b"abc") + pack_frame(FRAME_RESIZE, b"{}")
         buffer = bytearray(stream[:7])
@@ -139,7 +35,10 @@ class ProtocolTests(unittest.TestCase):
 
 
 @unittest.skipUnless(POSIX, "宿主进程测试需要 POSIX pty")
+@unittest.skipUnless(HOST_BIN, NEEDS_BIN)
 class SessionProcessTests(unittest.TestCase):
+    """Web 服务的 Python 客户端 × Rust 宿主：协议与行为。"""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="agenthub-host-")
         self.dir = Path(self.tmp.name)
@@ -154,7 +53,7 @@ class SessionProcessTests(unittest.TestCase):
 
     def start(self, name, *command, cols=40, rows=8):
         proc = subprocess.Popen(
-            [sys.executable, "-m", "agenthub.host", "--dir", str(self.dir), "run",
+            [HOST_BIN, "--dir", str(self.dir), "run",
              "--name", name, "--cwd", self.tmp.name, "--cols", str(cols), "--rows", str(rows),
              "--", *command],
             cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -205,8 +104,12 @@ class SessionProcessTests(unittest.TestCase):
         while time.monotonic() < deadline and b"live-49" not in got:
             got += att.read(0.1)
         self.assertIn(b"live-49", got)
+        # resize 是一帧异步消息, 等它生效而不是假设它已经生效
         self.assertTrue(att.resize(100, 30))
-        self.wait_screen("agenthub-t1", "live-49")
+        deadline = time.monotonic() + 3
+        while (time.monotonic() < deadline
+               and client.session_info("agenthub-t1", self.dir)["cols"] != 100):
+            time.sleep(0.02)
         self.assertEqual(client.session_info("agenthub-t1", self.dir)["cols"], 100)
         att.close()
 
@@ -259,10 +162,10 @@ class SessionProcessTests(unittest.TestCase):
         launcher = subprocess.Popen(
             [sys.executable, "-c",
              "import subprocess, sys;"
-             "subprocess.Popen([sys.executable, '-m', 'agenthub.host', '--dir', sys.argv[1], 'run',"
+             "subprocess.Popen([sys.argv[1], '--dir', sys.argv[2], 'run',"
              " '--name', 'agenthub-t5', '--', 'sh', '-i'], start_new_session=True,"
              " stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
-             str(self.dir)], cwd=str(ROOT))
+             HOST_BIN, str(self.dir)], cwd=str(ROOT))
         launcher.wait(timeout=10)
         info = client.wait_for("agenthub-t5", self.dir, timeout=8)
         self.assertIsNotNone(info)
@@ -275,6 +178,7 @@ class SessionProcessTests(unittest.TestCase):
 
 
 @unittest.skipUnless(POSIX, "宿主后端测试需要 POSIX pty")
+@unittest.skipUnless(HOST_BIN, NEEDS_BIN)
 class TermHostBackendTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="agenthub-termhost-")
@@ -311,7 +215,7 @@ class TermHostBackendTests(unittest.TestCase):
         while time.monotonic() < deadline and "sub-25" not in term.capture_screen_plain(name):
             time.sleep(0.05)
         screen, cursor = term.capture_screen_state(name)
-        self.assertIn("sub-25", strip_sgr(screen))
+        self.assertIn("sub-25", re.sub(r"\x1b\\[[0-9;:]*m", "", screen))
         self.assertEqual(len(cursor), 2)
         self.assertIn("sub-25", term.capture_plain(name, 80))
         self.assertIn("sub-25", term.capture_history(name, 100))
@@ -373,13 +277,19 @@ class TermHostBackendTests(unittest.TestCase):
         self.assertFalse(term.has_session(info["name"]))
 
     def test_launch_failure_is_reported_and_dead_command_vanishes_like_tmux(self):
-        with patch.object(term_host.sys, "executable", "/nonexistent/python"):
+        with patch.object(term_host, "host_binary", return_value="/nonexistent/agenthub-host"):
             with self.assertRaisesRegex(RuntimeError, "会话启动失败"):
                 term.new_session("bad", "whatever", self.tmp.name)
         self.assertEqual(term_host.list_sessions(), [])
-        # 命令本身立刻失败时与 tmux 一致: 创建成功, 会话随即消失, 由调用方复查
-        name = term.new_session("dead", ["/nonexistent/cli"], self.tmp.name)
-        deadline = time.monotonic() + 3
+        # 完全没有宿主程序时，控制台要给出可操作的原因而不是静默不可用
+        with patch.object(term_host, "host_binary", return_value=None):
+            self.assertFalse(term_host.available())
+            self.assertIn("cargo build", term_host.unavailable_reason())
+        # 命令自己退出时与 tmux 一致: 会话先出现, 随 CLI 结束而消失。
+        # 用一个短暂存活的命令,避免断言落在"宿主还没来得及被看见"的竞态上。
+        name = term.new_session("dead", ["sh", "-c", "sleep 0.5; exit 3"], self.tmp.name)
+        self.assertTrue(term.has_session(name))
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline and term.has_session(name):
             time.sleep(0.05)
         self.assertFalse(term.has_session(name))
@@ -390,6 +300,7 @@ if __name__ == "__main__":
 
 
 @unittest.skipUnless(POSIX, "服务集成测试需要 POSIX pty")
+@unittest.skipUnless(HOST_BIN, NEEDS_BIN)
 class ServerHostBackendTests(unittest.TestCase):
     """真实 HTTP 服务 + WebSocket 走宿主后端: 列表、认领、attach、输入、resize、kill。"""
 
