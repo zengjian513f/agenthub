@@ -141,6 +141,7 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn(
             f'<meta name="agenthub-build" content="{server.ASSET_VERSION}">', page)
         self.assertIn('<link rel="manifest" href="manifest.webmanifest">', page)
+        self.assertIn('src="pwa-install.js?v=', page)
         self.assertIn("navigator.serviceWorker.register('service-worker.js')", page)
         self.assertEqual(headers["Cache-Control"], "no-store")
 
@@ -153,6 +154,7 @@ class StaticIdentityTests(unittest.TestCase):
         for path, expected_type in [
             ("/manifest.webmanifest", "application/manifest+json"),
             ("/service-worker.js", "javascript"),
+            ("/pwa-install.js", "javascript"),
             ("/icons/icon-192.png", "image/png"),
             ("/icons/icon-512.png", "image/png"),
         ]:
