@@ -143,6 +143,16 @@ def ancestor_matches(pid: int, predicate, depth: int = 16) -> bool:
 
 
 def terminate(pid: int, force: bool = False) -> bool:
+    """结束一个进程。
+
+    两边的语义并不对等：POSIX 的 SIGTERM 可以被捕获，CLI 收到后能存盘再退；
+    Windows 没有对应的东西，psutil 的 terminate 走的是 TerminateProcess，
+    进程当场消失，注册的清理代码一行都不会跑（在 cetus 上实测过）。所以在
+    Windows 上 force 与否只差退出码。
+
+    被 ptyhost 托管的会话不受这点影响：那条路先从 pty 发 Ctrl-D 让 CLI 自己
+    退出（见 term.graceful_stop），只有它不理会时才轮到这里。
+    """
     if pid <= 0:
         return False
     if sys.platform == "win32":
@@ -165,7 +175,10 @@ def terminate(pid: int, force: bool = False) -> bool:
 
 
 def kill_pids(pids: list[int], timeout: float = 6.0) -> list[int]:
-    """先 TERM 让 CLI 有机会存盘, 不退再 KILL。返回真正被结束的 pid。"""
+    """先 TERM 让 CLI 有机会存盘, 不退再 KILL。返回真正被结束的 pid。
+
+    "有机会存盘"只在 POSIX 上成立，Windows 上第一下就是硬杀，原因见 terminate。
+    """
     targets = [p for p in pids if p > 0]
     killed = [p for p in targets if terminate(p)]
     deadline = time.time() + timeout
