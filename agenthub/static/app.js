@@ -2998,7 +2998,7 @@ function bindSessionActions(heading) {
 }
 
 // 会话头任何宽度都只占一行。三级排版决定哪些操作平铺在标题右侧；元信息按固定顺序
-// （消息数、大小、起止时间、机器、目录、分支、来源、模型、会话号）尽量直接跟在标题
+// （消息数、大小、起止时间、机器、目录、来源、模型、会话号、分支）尽量直接跟在标题
 // 后面（.dbrief），长标题让到标题行的 40%（不少于 8em）为止，从放不下的那一项起全部收进 ⋯ 菜单：
 //   宽屏：操作全部平铺；元信息全放得下时 ⋯ 没有内容，不显示
 //   中屏：只平铺星标，元信息同样按剩余宽度平铺
@@ -3234,10 +3234,10 @@ function head(m, total) {
       <span class="meta-secondary">${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
       ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
-      ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
+      ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
     </div>`)}
       </div>
     </div>`;

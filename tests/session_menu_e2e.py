@@ -69,7 +69,8 @@ INLINE_IDS = {
     'medium': ['a-term', 'a-star', 'a-more'],
     'narrow': ['a-term', 'a-more'],
 }
-# 元信息的固定顺序：消息数、大小、起止时间、机器、目录、来源、会话号（机器徽章只有中央站的会话才有）
+# 元信息的固定顺序：消息数、大小、起止时间、机器、目录、来源、[模型]、会话号、[分支]（机器徽章只有中央站的会话才有；
+# 模拟节点的会话没有模型和分支）
 META_ORDER = ['mcount-total', 'size', 'time', 'meta-node', 'cwd', 'meta-source', 'session-id']
 META_KEY = '''e => e.id === 'mcount-total' ? e.id
   : e.classList.contains('session-id') ? 'session-id'
