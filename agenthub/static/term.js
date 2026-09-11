@@ -1947,6 +1947,12 @@ async function attachOwnedTerm(view) {
       return;
     }
     if (view.revoked) return;
+    if (event.code !== 1000 && !settled) {
+      // 未收到任何会话字节就断开（例如宿主接不上、attach 失败）。原因写进终端本身，
+      // pty 区域直接可见并说明正在重试；按钮不再变灰，也没有拦截用的确认框。
+      const why = event.reason || `WebSocket ${event.code}`;
+      try { view.term.write(`\r\n\x1b[33m⚠ 控制台连接已关闭：${why}\r\n  正在自动重试…\x1b[0m\r\n`); } catch {}
+    }
     // 先刷新 tmux 列表再决定是否重连。若进程刚退出，旧 T.list 仍会短暂把它
     // 判为存活；先排一个重连定时器会向已消失的会话握手，产生 404/close race。
     Promise.resolve(pollLive(true)).finally(() => {

@@ -87,19 +87,26 @@ def main():
                     page.evaluate('(uid) => openSession(uid)', uid)
                     page.wait_for_function('document.querySelector("#a-star") !== null')
 
-                    # An attempted takeover reports backend errors without losing its button.
+                    # A takeover the backend rejects reports its reason, but a failed
+                    # attempt is retryable state, not structural unavailability: the button
+                    # stays live (never gray, no hover '?'), and a second click retries
+                    # directly instead of gating behind a "重新尝试打开?" confirm dialog.
                     page.route('**/api/term/takeover', lambda r: r.fulfill(status=409, json={'error': '会话文件已不存在'}))
                     with page.expect_event('dialog') as opened:
                         button.click()
                     assert '会话文件已不存在' in opened.value.message
-                    page.wait_for_function('document.querySelector("#a-term").dataset.unavailable === "true"')
-                    button.hover()
-                    assert '会话文件已不存在' in page.locator('#console-toast').inner_text()
+                    assert opened.value.type == 'alert'
+                    assert button.get_attribute('data-unavailable') == 'false'
                     assert button.is_visible() and button.is_enabled()
-                    with page.expect_event('dialog') as opened:
+                    button.hover()
+                    assert not page.locator('#console-toast').is_visible()
+                    with page.expect_event('dialog') as opened:   # second click retries, no confirm gate
                         button.click()
+                    assert opened.value.type == 'alert'
                     assert '会话文件已不存在' in opened.value.message
-                    assert opened.value.type == 'confirm'
+                    page.unroute('**/api/term/takeover')
+                    ConsoleUI_clear = 'ConsoleUI.errors.delete(S.sel)'
+                    page.evaluate(ConsoleUI_clear)
 
                     page.set_viewport_size({'width': 390, 'height': 844})
                     page.evaluate('showMobileDetail()')
@@ -110,8 +117,9 @@ def main():
 
                     # A session that is listed but whose host refuses attach (BUG-20260911-170830):
                     # the socket upgrades and then closes 1011 before any frame. That must not
-                    # count as a connection — the button keeps its explanation instead of
-                    # flashing, retries back off, and the first real frame clears the state.
+                    # count as a connection — retries back off instead of flashing, the reason
+                    # is shown INSIDE the terminal pane (not a gray button + '?' + dialog), and
+                    # the first real frame clears it. The console button stays live throughout.
                     page.set_viewport_size({'width': 1280, 'height': 900})
                     page.evaluate('(uid) => openSession(uid)', uid)
                     page.wait_for_function('document.querySelector("#a-term") !== null')
@@ -135,8 +143,17 @@ def main():
                     attempts = len(sockets)
                     assert 2 <= attempts <= 5, f'4 秒内重连 {attempts} 次，退避没有生效'
                     assert page.evaluate(f'{view}.reconnectDelay') > 900
-                    assert button.get_attribute('data-unavailable') == 'true'
-                    assert 'attach 失败' in button.get_attribute('aria-label')
+                    # Retryable attach failure never grays the button; the reason lives in the pane.
+                    assert button.get_attribute('data-unavailable') == 'false'
+                    assert button.is_enabled()
+                    pane_text = page.evaluate("""() => {
+                        const v = T.views.get(T.list.find(x => x.name.endsWith('same-terminal')).name);
+                        if (!v) return '';
+                        const buf = v.term.buffer.active, out = [];
+                        for (let i = 0; i < buf.length; i++) out.push(buf.getLine(i)?.translateToString(true) || '');
+                        return out.join('\\n');
+                    }""")
+                    assert '连接已关闭' in pane_text or '正在自动重试' in pane_text, repr(pane_text)
                     node.state['attach_error'] = ''
                     page.wait_for_function(
                         f'!ConsoleUI.errors.has(S.sel) && {view}.reconnectDelay === 500', timeout=15000)

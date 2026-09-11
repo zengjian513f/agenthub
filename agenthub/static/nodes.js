@@ -66,7 +66,10 @@ function showConsoleToast(reason) {
 }
 
 function paintConsoleAvailability(button, uid, agent = null) {
-  const reason = consoleUnavailableReason(uid, agent);
+  // 只有结构性不可用（离线机器 / 缺 CLI / 终端禁用 / 子代理 / 列表出错）才把按钮
+  // 打成灰色并给出解释。上一次连接失败是可重试状态：按钮保持正常，点击直接重连，
+  // 失败原因写进终端本身，不再用灰按钮 + 悬停问号 + 确认框拦住用户。
+  const reason = consoleUnavailableReason(uid, agent, false);
   button.classList.toggle('console-unavailable', !!reason);
   button.dataset.unavailable = String(!!reason);
   button.disabled = false; // The explanation must remain reachable by mouse and keyboard.
@@ -83,14 +86,13 @@ function consoleButtonMarkup() {
 
 function bindConsoleButton(button, uid, agent = null) {
   if (!button) return;
-  button.onmouseenter = button.onfocus = () => showConsoleToast(consoleUnavailableReason(uid, agent));
+  button.onmouseenter = button.onfocus = () => showConsoleToast(consoleUnavailableReason(uid, agent, false));
   button.onmouseleave = button.onblur = () => showConsoleToast('');
   button.onclick = async () => {
     showConsoleToast('');
     const reason = consoleUnavailableReason(uid, agent, false);
     if (reason) return alert('控制台不可用：\n' + reason);
-    const previous = ConsoleUI.errors.get(uid);
-    if (previous && !confirm('控制台不可用：\n' + previous + '\n\n是否重新尝试打开？')) return;
+    // 上次连接失败不再拦一道确认框：点击直接重新接入并显示 pty，失败原因由终端呈现。
     ConsoleUI.busy.add(uid);
     ConsoleUI.errors.delete(uid);
     paintConsoleAvailability(button, uid, agent);
