@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <meta name="agenthub-build" content="__AGENTHUB_ASSET_VERSION__">
 <meta name="agenthub-mode" content="__AGENTHUB_MODE__">
+<meta name="theme-color" content="#245de8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="AgentHub">
 <title>__AGENTHUB_HOSTNAME__ · 会话管理</title>
 <script>
   // 在样式表加载前确定明暗，避免刷新时先闪出另一套颜色。
@@ -23,6 +27,10 @@
 <link rel="stylesheet" href="vendor/katex/katex.min.css">
 <link rel="preload" href="fonts/UbuntuSansMono.ttf" as="font" type="font/ttf" crossorigin>
 <link rel="stylesheet" href="style.css?v=__AGENTHUB_ASSET_VERSION__">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<script defer src="pwa-install.js?v=__AGENTHUB_ASSET_VERSION__"
+  data-app-name="AgentHub" data-storage-key="agenthub.pwa-install-dismissed"></script>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🗂</text></svg>">
 </head>
 <body>
@@ -51,6 +59,12 @@
   <symbol id="i-eye-off" viewBox="0 0 16 16">
     <path d="M1.5 8s2.3-4 6.5-4 6.5 4 6.5 4-2.3 4-6.5 4-6.5-4-6.5-4Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
     <path d="m2 2 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="i-fork" viewBox="0 0 16 16">
+    <circle cx="4" cy="3.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <circle cx="4" cy="12.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <circle cx="12" cy="5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/>
+    <path d="M4 5.2v5.6M12 6.7c0 2.6-2.6 3.3-5.4 3.6-1.3.1-2.1.4-2.6 1" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
   </symbol>
   <symbol id="i-plus" viewBox="0 0 16 16">
     <path d="M8 2.5v11M2.5 8h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
@@ -356,10 +370,6 @@
         <option value="0">不限制</option>
       </select>
     </label>
-    <div class="setting-row">
-      <span><b>回退父会话</b><small>为服务端默认隐藏的父会话添加显示标志</small></span>
-      <button type="button" class="btn" id="restore-fork-parents">显示全部</button>
-    </div>
     <div id="setting-backends" class="setting-group" hidden>
       <p class="setting-group-title">终端后端<small>保存在各机器的服务端；只影响新建会话，已在跑的会话不受影响</small></p>
       <div id="setting-backend-rows"></div>
@@ -381,5 +391,12 @@
 <script defer src="term.js?v=__AGENTHUB_ASSET_VERSION__"></script>
 <script defer src="vendor/katex/katex.min.js"></script>
 <script defer src="vendor/katex/auto-render.min.js" onload="refreshFormulae()"></script>
+<script>
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('service-worker.js').catch(() => {});
+    });
+  }
+</script>
 </body>
 </html>

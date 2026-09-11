@@ -42,66 +42,97 @@ def assert_menu_hits(page):
     assert hits == [True] * 6, hits
 
 
-def assert_actions_menu(page):
+def open_actions(page):
+    """Wide headers keep the actions in place; only narrow ones fold them into the menu."""
     more = page.locator('#a-more')
+    if more.is_visible():
+        more.click()
+
+
+def header_ids(page):
+    return page.locator('.dhead-actions button:visible').evaluate_all(
+        'buttons => buttons.map(b => b.id || (b.hasAttribute("data-report-bug") ? "report-bug" : ""))')
+
+
+def assert_actions_menu(page, wide):
     menu = page.locator('#session-actions-menu')
-    assert page.locator('.dhead-actions button:visible').evaluate_all(
-        'buttons => buttons.map(b => b.id)') == ['a-term', 'a-more']
-    assert page.locator('.dhead').bounding_box()['height'] <= 46
+    max_height = 72 if wide else 46
+    if wide:
+        assert header_ids(page) == ['a-term', 'a-star', 'a-turns', 'report-bug',
+                                    'a-session-action'], header_ids(page)
+        assert page.locator('.dhead > .dmeta').is_visible()
+    else:
+        assert header_ids(page) == ['a-term', 'a-more'], header_ids(page)
+    assert page.locator('.dhead').bounding_box()['height'] <= max_height
     assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
-    title = page.locator('.dhead h2')
-    assert title.evaluate('''e => {
+    assert page.evaluate('''limit => {
+      const e = document.querySelector('.dhead h2');
       const text = e.querySelector('.session-view-switch > span');
       const saved = text.textContent;
       text.textContent = 'A very long session title '.repeat(20);
       const r = e.getBoundingClientRect(), controls = document.querySelector('.dhead-actions').getBoundingClientRect();
-      const fits = r.right <= controls.left && document.querySelector('.dhead').offsetHeight <= 46;
+      const fits = r.right <= controls.left && document.querySelector('.dhead').offsetHeight <= limit;
       text.textContent = saved;
       return fits;
-    }''')
-    more.click()
-    assert menu.is_visible()
+    }''', max_height)
+    open_actions(page)
+    scope = page.locator('.dhead-actions') if wide else menu
+    assert wide or menu.is_visible()
     assert page.locator('#mcount-total').is_visible()
-    hits = menu.locator('button').evaluate_all('''items => items.map(e => {
+    hits = scope.locator('button:visible').evaluate_all('''items => items.map(e => {
       const r = e.getBoundingClientRect();
       return e.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
     })''')
     assert hits and all(hits), hits
-    assert all(text.strip() for text in menu.locator('button').all_text_contents())
+    labels = scope.locator('button:visible').evaluate_all(
+        'items => items.map(e => (e.ariaLabel || e.textContent).trim())')
+    assert labels and all(labels), labels
     before = page.evaluate('S.compactTurns')
     page.locator('#a-turns').click()
     assert menu.is_hidden() and page.evaluate('S.compactTurns') != before
-    more.press('ArrowDown')
-    assert page.locator('#a-star').evaluate('e => e === document.activeElement')
-    page.keyboard.press('End')
-    assert page.locator('#a-session-action').evaluate('e => e === document.activeElement')
-    page.keyboard.press('Home')
-    page.keyboard.press('ArrowDown')
-    assert page.locator('#a-turns').evaluate('e => e === document.activeElement')
-    page.keyboard.press('Escape')
-    assert menu.is_hidden() and more.evaluate('e => e === document.activeElement')
-    more.press('ArrowUp')
-    page.keyboard.press('Tab')
-    assert menu.is_hidden()
-    more.click()
+    more = page.locator('#a-more')
+    if not wide:
+        more.press('ArrowDown')
+        assert page.locator('#a-star').evaluate('e => e === document.activeElement')
+        page.keyboard.press('End')
+        assert page.locator('#a-session-action').evaluate('e => e === document.activeElement')
+        page.keyboard.press('Home')
+        page.keyboard.press('ArrowDown')
+        assert page.locator('#a-turns').evaluate('e => e === document.activeElement')
+        page.keyboard.press('Escape')
+        assert menu.is_hidden() and more.evaluate('e => e === document.activeElement')
+        more.press('ArrowUp')
+        page.keyboard.press('Tab')
+        assert menu.is_hidden()
+    else:
+        # 平铺后每个操作自己就是 Tab 序列里的一站，不再需要菜单的方向键导航。
+        page.locator('#a-star').focus()
+        page.keyboard.press('Tab')
+        assert page.locator('#a-turns').evaluate('e => e === document.activeElement')
+    open_actions(page)
     page.locator('#a-view-switch').click()
     assert menu.is_hidden() and page.locator('#session-view-menu').is_visible()
-    more.click()
-    assert menu.is_visible() and page.locator('#session-view-menu').is_hidden()
+    if wide:
+        # 平铺后没有会与视图菜单互斥的操作菜单，点标题图标收起即可。
+        page.locator('.dhead h2 > .ico').click()
+    else:
+        open_actions(page)
+        assert menu.is_visible()
+    assert page.locator('#session-view-menu').is_hidden()
     page.locator('.dhead h2 > .ico').click()
     assert menu.is_hidden()
-    more.click()
+    open_actions(page)
     page.locator('#a-star').click()
     page.wait_for_function('document.querySelector("#a-star").ariaPressed === "true"')
-    more.click()
-    assert page.locator('#a-star').inner_text().strip() == '取消星标', page.locator('#a-star').evaluate('e => e.outerHTML')
+    open_actions(page)
+    assert page.locator('#a-star').get_attribute('aria-label') == '取消星标'
     page.locator('#a-star').click()
     page.wait_for_function('document.querySelector("#a-star").ariaPressed === "false"')
-    more.click()
-    page.locator('#session-actions-menu [data-report-bug]').click()
+    open_actions(page)
+    page.locator('.dhead [data-report-bug]').click()
     assert page.locator('#bug-report-dialog').is_visible() and menu.is_hidden()
     page.keyboard.press('Escape')
-    more.click()
+    open_actions(page)
     page.once('dialog', lambda d: d.dismiss())
     page.locator('#a-session-action').click()
     page.wait_for_function('document.querySelector("#session-actions-menu").hidden')
@@ -147,7 +178,8 @@ def main():
                           T.uid = uid; await openTermPane(name, false, 'full');
                         }''', [uid, name])
                         page.wait_for_function('T.ws?.readyState === 1')
-                        assert_actions_menu(page)
+                        wide = width > 720
+                        assert_actions_menu(page, wide)
                         for mode in (['full', 'normal', 'collapsed'] if width > 720 else ['full']):
                             page.evaluate('''mode => {
                               T.mode = mode; T.height = 10000; layoutTermPane();
@@ -173,7 +205,7 @@ def main():
                         page.wait_for_function("S.agent === 'agent-4' && document.querySelector('.dhead h2')?.textContent.includes('agent-4')")
                         assert page.locator('#termpane').is_hidden()
                         assert page.locator('#a-term').is_visible()
-                        page.locator('#a-more').click()
+                        open_actions(page)
                         assert page.locator('#a-session-action').count() == 0
                         assert page.locator('#a-star').is_visible()
                         page.keyboard.press('Escape')
@@ -191,24 +223,25 @@ def main():
                         page.locator('#settings-dialog').evaluate('e => e.close()')
                         page.evaluate('(uid) => {closeTermPane(); S.term = "MenuNode"; openSession(uid)}', uid)
                         page.locator('#mcount').wait_for(state='attached')
-                        page.locator('#a-more').click()
+                        open_actions(page)
                         assert page.locator('#mcount').is_visible()
                         page.locator('#m-next').click()
                         assert page.evaluate('S.cur >= 0')
                         assert page.locator('#session-actions-menu').is_hidden()
-                        page.locator('#a-more').click()
+                        open_actions(page)
                         page.locator('#m-prev').click()
                         assert page.locator('#session-actions-menu').is_hidden()
                         # Pending sessions share the compact header and retain
                         # report/stop actions before any native JSONL exists.
                         page.evaluate('''() => showNewSessionStage({name: 'pending-menu',
                           source: 'claude', title: 'New session', cwd: '/example/project', node_name: 'MenuNode'})''')
-                        assert page.locator('.dhead-actions button:visible').evaluate_all(
-                            'buttons => buttons.map(b => b.id)') == ['a-term', 'a-more']
-                        assert page.locator('.dhead').bounding_box()['height'] <= 46
-                        page.locator('#a-more').click()
-                        assert page.locator('#a-session-action').inner_text() == '停止会话'
-                        assert page.locator('#session-actions-menu [data-report-bug]').is_visible()
+                        assert header_ids(page) == (
+                            ['a-term', 'report-bug', 'a-session-action'] if wide
+                            else ['a-term', 'a-more']), header_ids(page)
+                        assert page.locator('.dhead').bounding_box()['height'] <= (72 if wide else 46)
+                        open_actions(page)
+                        assert page.locator('#a-session-action').get_attribute('aria-label') == '停止会话'
+                        assert page.locator('.dhead [data-report-bug]').is_visible()
                         page.keyboard.press('Escape')
                         assert not errors, errors
                         print(f'{"Hub" if scoped else "Node"} {width}x{height}: menu hit targets, view switching, resize handle and modal passed', flush=True)

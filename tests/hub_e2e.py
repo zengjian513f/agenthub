@@ -192,6 +192,9 @@ def main():
                 nodes[2].state['offline'] = True
                 page.evaluate('() => loadSessions()')
                 page.wait_for_function('S.sessions.some(s => s.node_name === "Vega" && s.stale)')
+                # 刚失联时「列表失败」提示是合理的；离线判定落地后才要求没有单独的离线横幅。
+                page.wait_for_function(
+                    'Nodes.list.find(n => n.name === "Vega")?.online === false', timeout=20000)
                 assert not page.locator('#node-notice').is_visible()
                 assert page.locator('#node-chips button.node-offline').is_visible()
                 # Bug reports with no selected session go to an online machine, and an

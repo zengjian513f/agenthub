@@ -140,7 +140,32 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn(f"style.css?v={server.ASSET_VERSION}", page)
         self.assertIn(
             f'<meta name="agenthub-build" content="{server.ASSET_VERSION}">', page)
+        self.assertIn('<link rel="manifest" href="manifest.webmanifest">', page)
+        self.assertIn('src="pwa-install.js?v=', page)
+        self.assertIn("navigator.serviceWorker.register('service-worker.js')", page)
         self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_pwa_assets_have_installable_types(self):
+        handler = object.__new__(server.Handler)
+        replies = []
+        handler._send = lambda status, data, ctype, headers=None: replies.append(
+            (status, data, ctype, headers))
+
+        for path, expected_type in [
+            ("/manifest.webmanifest", "application/manifest+json"),
+            ("/service-worker.js", "javascript"),
+            ("/pwa-install.js", "javascript"),
+            ("/icons/icon-192.png", "image/png"),
+            ("/icons/icon-512.png", "image/png"),
+        ]:
+            with self.subTest(path=path):
+                replies.clear()
+                handler._static(path)
+                status, data, ctype, headers = replies[0]
+                self.assertEqual(status, 200)
+                self.assertTrue(data)
+                self.assertIn(expected_type, ctype)
+                self.assertEqual(headers["Cache-Control"], "no-cache")
 
     def test_thinking_messages_are_compact_timeline_notes(self):
         handler = object.__new__(server.Handler)
@@ -581,6 +606,65 @@ class MessagesRouteTests(unittest.TestCase):
             {"text": "/rename 新标题", "ts": "c"},
         ])
         self.assertEqual(result["end"], 321)
+
+
+class NewSessionStatusPollTests(unittest.TestCase):
+    """A pending row that never lands must not pin the inventory scan."""
+
+    def setUp(self):
+        self.terminal = server.TERMINAL
+        server.TERMINAL = True
+        server._NEW_STATUS_REFRESH_AT.clear()
+
+    def tearDown(self):
+        server.TERMINAL = self.terminal
+        server._NEW_STATUS_REFRESH_AT.clear()
+
+    @staticmethod
+    def handler():
+        handler = object.__new__(server.Handler)
+        handler._json = lambda payload, status=200: {**payload, "_status": status}
+        return handler
+
+    def poll(self, pending, now):
+        with patch.object(server.pending_store, "get", return_value=pending), \
+                patch.object(server.index, "load", return_value=[]) as load, \
+                patch.object(server.index, "cached", return_value=[]) as cached, \
+                patch.object(server.time, "time", return_value=now):
+            self.handler()._new_session_status({"name": [pending["name"]]})
+        return load.call_count, cached.call_count
+
+    def test_a_fresh_pending_session_still_refreshes_on_every_poll(self):
+        now = 1_000_000.0
+        pending = {"name": "agenthub-codex-new-1", "source": "codex", "sid": None,
+                   "cwd": "/work", "started": now, "before": []}
+        for offset in (0.0, 0.75, 1.5):
+            self.assertEqual(self.poll(pending, now + offset), (1, 0))
+
+    def test_an_aged_pending_session_refreshes_at_the_slow_interval(self):
+        started = 1_000_000.0
+        aged = started + server.NEW_STATUS_FAST_WINDOW + 1
+        pending = {"name": "agenthub-claude-old", "source": "claude",
+                   "sid": "sid-1", "cwd": "/work", "started": started, "before": []}
+
+        self.assertEqual(self.poll(pending, aged), (1, 0))
+        # Browsers keep polling at 750ms; those polls read the published list.
+        for offset in (0.75, 1.5, 2.25):
+            self.assertEqual(self.poll(pending, aged + offset), (0, 1))
+        # The association is still discovered, just a few seconds later.
+        self.assertEqual(self.poll(pending, aged + server.NEW_STATUS_SLOW_INTERVAL), (1, 0))
+
+    def test_terminal_states_forget_their_throttle(self):
+        name = "agenthub-codex-new-2"
+        started = 1_000_000.0
+        pending = {"name": name, "source": "codex", "sid": None,
+                   "cwd": "/work", "started": started, "before": []}
+        self.poll(pending, started + server.NEW_STATUS_FAST_WINDOW + 1)
+        self.assertIn(name, server._NEW_STATUS_REFRESH_AT)
+
+        with patch.object(server.pending_store, "get", return_value=None):
+            self.assertTrue(self.handler()._new_session_status({"name": [name]})["gone"])
+        self.assertNotIn(name, server._NEW_STATUS_REFRESH_AT)
 
 
 if __name__ == "__main__":

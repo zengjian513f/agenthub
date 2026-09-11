@@ -22,6 +22,9 @@ DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
 QUEUE_FILE = DATA_DIR / "send-queue.json"
 VERSION = 1
 CONFIRM_TIMEOUT = 8.0
+# 后台追踪 rollout 的时间上限。Codex 的 compact 最多延迟几十秒写入 user 记录，
+# 一小时后再不出现就不会出现了（例如 CLI 已退出）。
+TRACK_WINDOW = 3600.0
 _lock = threading.RLock()
 _revision = 0
 _epoch = uuid.uuid4().hex
@@ -124,11 +127,25 @@ def snapshot(uid: str) -> dict:
         }
 
 
-def tracked() -> list[dict]:
-    """返回每个会话最早的未确认回执，供后台独立追踪 rollout。"""
+def _tracked_since(row: dict) -> float:
+    """回执进入待确认状态的时间（秒）。"""
+    return max(float(row.get("delivered_at") or 0),
+               float(row.get("created") or 0) / 1000)
+
+
+def tracked(now: float | None = None) -> list[dict]:
+    """返回每个会话最早的未确认回执，供后台独立追踪 rollout。
+
+    超过 TRACK_WINDOW 仍未出现原生记录的回执退出轮询：Codex 不会再为它写入
+    记录，继续每轮重读 rollout 只是白耗 CPU，而且它作为该会话“最早”的一条
+    会一直挡住后续回执的追踪。行本身保留原状态与提示，既不消失也不会因此
+    变成可重试。
+    """
+    now = time.time() if now is None else now
     with _lock:
         rows = sorted((row for row in _read()
-                       if row.get("state") != "aborted"),
+                       if row.get("state") != "aborted"
+                       and now - _tracked_since(row) < TRACK_WINDOW),
                       key=lambda x: float(x.get("created") or 0))
     first: dict[str, dict] = {}
     for row in rows:

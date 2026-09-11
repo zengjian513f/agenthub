@@ -146,7 +146,11 @@ class HubHTTPTests(unittest.TestCase):
         uid = quote(federation.qualify(node_b, 'claude:same-file-hash', True), safe='')
         with patch.object(self.registry, 'request', side_effect=dead):
             started = time.monotonic()
-            self.registry.check_all()                     # the monitor notices the outage
+            # A node that was reachable keeps its state for one grace probe, so a
+            # single slow answer cannot gray out its console; the next pass
+            # confirms the outage.
+            for _ in range(hub.OFFLINE_STRIKES):
+                self.registry.check_all()
             self.assertGreaterEqual(time.monotonic() - started, .3)
             # Page requests never wait for a node the monitor knows to be down.
             for path in ('/api/sessions', '/api/live', '/api/term/list', '/api/trash'):
@@ -279,7 +283,8 @@ class HubHTTPTests(unittest.TestCase):
                  (ValueError('private upstream details'), 'invalid_response', '无效')]
         for error, code, message in cases:
             with self.subTest(code=code), patch.object(self.registry, 'request', side_effect=error):
-                _, _, failure = self.registry.query(node, '/api/live', {})
+                for _ in range(hub.OFFLINE_STRIKES):
+                    _, _, failure = self.registry.query(node, '/api/live', {})
             self.assertEqual(failure['error_code'], code)
             _, response = self.call('/api/nodes')
             public = next(n for n in response['nodes'] if n['id'] == node['id'])
@@ -296,6 +301,51 @@ class HubHTTPTests(unittest.TestCase):
         self.assertTrue(healthy['online'])
         self.assertNotIn('error', healthy)
         self.assertNotIn('failed_path', healthy)
+
+    def test_one_slow_answer_does_not_gray_out_a_reachable_node(self):
+        """A busy machine answering late must not look switched off.
+
+        The request that failed still reports its own error; only repeated
+        failures change the node's published state, and the outage is then dated
+        from the first failure rather than the probe that gave up.
+        """
+        node = self.registry.get('b' * 32)
+        self.registry.query(node, '/api/live', {})           # known reachable
+        with patch.object(self.registry, 'request', side_effect=TimeoutError('slow')):
+            _, _, failure = self.registry.query(node, '/api/live', {})
+        self.assertEqual(failure['error_code'], 'timeout')
+        public = next(n for n in self.registry.public() if n['id'] == node['id'])
+        self.assertTrue(public['online'])
+        self.assertFalse(self.registry.offline(node['id']))
+        self.assertNotIn('offline_since', public)
+        first_failure = self.registry.state(node['id'])['failed_since']
+
+        with patch.object(self.registry, 'request', side_effect=TimeoutError('slow')):
+            for _ in range(hub.OFFLINE_STRIKES - 1):
+                self.registry.query(node, '/api/live', {})
+        public = next(n for n in self.registry.public() if n['id'] == node['id'])
+        self.assertFalse(public['online'])
+        self.assertTrue(self.registry.offline(node['id']))
+        self.assertEqual(public['offline_since'], first_failure)
+
+        self.registry.query(node, '/api/live', {})
+        recovered = self.registry.state(node['id'])
+        self.assertTrue(recovered['online'])
+        self.assertNotIn('strikes', recovered)
+        self.assertNotIn('failed_since', recovered)
+
+    def test_a_node_never_reached_is_offline_on_its_first_failure(self):
+        """The grace probe only protects a node that was actually answering."""
+        with tempfile.TemporaryDirectory() as root:
+            registry = hub.Registry(Path(root) / 'nodes.json', ['127.0.0.0/8'], monitor=False)
+            registry.register({'name': 'NodeA', 'url': f'http://127.0.0.1:{self.a.server_port}',
+                               'token': self.a.state['token']})
+            node = registry.get('a' * 32)
+            self.assertIsNone(registry.state(node['id']).get('online'))
+            with patch.object(registry, 'request', side_effect=ConnectionRefusedError('x')):
+                registry.query(node, '/api/sessions', {})
+            self.assertTrue(registry.offline(node['id']))
+            self.assertIn('offline_since', registry.state(node['id']))
 
     def search_events(self, nodes=None):
         path = '/api/search?q=needle&progress=1'
