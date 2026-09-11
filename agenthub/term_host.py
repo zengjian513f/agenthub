@@ -105,10 +105,20 @@ def _spawn(launch: list[str], name: str, scope: bool) -> subprocess.Popen:
     log = open(log_path, "wb")
     try:
         if WINDOWS:
-            flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-                     | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
-            return subprocess.Popen(launch, cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL,
-                                    stdout=log, stderr=log, creationflags=flags, close_fds=True)
+            detached = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+            def popen(flags: int) -> subprocess.Popen:
+                return subprocess.Popen(launch, cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL,
+                                        stdout=log, stderr=log, creationflags=flags, close_fds=True)
+            try:
+                return popen(detached | breakaway)
+            except PermissionError:
+                # 服务自己在一个不许脱离的 Job 里 (终端窗口和计划任务都会建这种 Job),
+                # CreateProcess 直接拒访问。脱不出去就留在里面: 会话跟着服务一起结束,
+                # 总好过控制台根本打不开。
+                if not breakaway:
+                    raise
+                return popen(detached)
         argv = list(launch)
         if scope:
             argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect",

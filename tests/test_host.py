@@ -650,6 +650,48 @@ class WindowsPortabilityTests(unittest.TestCase):
             probe.side_effect = OSError("ctypes 不可用")
             self.assertFalse(procs.gone(4242))
 
+    def test_a_job_that_forbids_breakaway_still_gets_a_session(self):
+        """cetus 上真实撞到过：服务自己跑在终端或计划任务建的 Job 里，
+        CREATE_BREAKAWAY_FROM_JOB 让 CreateProcess 直接返回拒绝访问（WinError 5），
+        控制台就一直打不开。脱不出去也得把会话起起来。"""
+        flags = {"DETACHED_PROCESS": 0x8, "CREATE_NEW_PROCESS_GROUP": 0x200,
+                 "CREATE_BREAKAWAY_FROM_JOB": 0x1000000}
+        seen = []
+
+        def fake_popen(argv, **kwargs):
+            seen.append(kwargs["creationflags"])
+            if kwargs["creationflags"] & flags["CREATE_BREAKAWAY_FROM_JOB"]:
+                raise PermissionError(5, "拒绝访问。")
+            return "popen"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(term_host, "WINDOWS", True), \
+                    patch.object(term_host.client, "host_dir", return_value=Path(tmp)), \
+                    patch.multiple(term_host.subprocess, create=True, **flags), \
+                    patch.object(term_host.subprocess, "Popen", fake_popen):
+                self.assertEqual(term_host._spawn(["ptyhost.exe"], "s", False), "popen")
+            self.assertEqual(len(seen), 2, "第一次要先试着脱离 Job")
+            self.assertTrue(seen[0] & flags["CREATE_BREAKAWAY_FROM_JOB"])
+            self.assertFalse(seen[1] & flags["CREATE_BREAKAWAY_FROM_JOB"])
+            for got in seen:      # 两次都必须脱离控制台，否则服务一关会话就跟着没
+                self.assertTrue(got & flags["DETACHED_PROCESS"])
+                self.assertTrue(got & flags["CREATE_NEW_PROCESS_GROUP"])
+
+    def test_access_denied_without_a_job_is_still_an_error(self):
+        """不是 Job 的问题时（比如程序本身不许运行），退回一次仍然失败就得报出来。"""
+        def always_denied(argv, **kwargs):
+            raise PermissionError(5, "拒绝访问。")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(term_host, "WINDOWS", True), \
+                    patch.object(term_host.client, "host_dir", return_value=Path(tmp)), \
+                    patch.multiple(term_host.subprocess, create=True,
+                                   DETACHED_PROCESS=0x8, CREATE_NEW_PROCESS_GROUP=0x200,
+                                   CREATE_BREAKAWAY_FROM_JOB=0x1000000), \
+                    patch.object(term_host.subprocess, "Popen", always_denied):
+                with self.assertRaises(PermissionError):
+                    term_host._spawn(["ptyhost.exe"], "s", False)
+
     def test_ptyhost_is_the_default_everywhere(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("AGENTHUB_TERM_BACKEND", None)
