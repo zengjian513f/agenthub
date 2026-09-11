@@ -29,7 +29,9 @@
   };
 
   const show = () => {
-    if (overlay || !installPrompt || isStandalone() || recentlyDismissed()) return;
+    if (overlay || isStandalone() || recentlyDismissed()) return;
+
+    const canPrompt = Boolean(installPrompt);
 
     overlay = document.createElement('div');
     overlay.className = 'pwa-install-overlay';
@@ -39,7 +41,9 @@
         <img class="pwa-install-icon" src="${iconUrl}" alt="">
         <div class="pwa-install-copy">
           <h2 id="pwa-install-title">安装 ${appName} 到桌面</h2>
-          <p id="pwa-install-description">安装后会作为独立应用打开，不显示浏览器地址栏。</p>
+          <p id="pwa-install-description">${canPrompt
+            ? '安装后会作为独立应用打开，不显示浏览器地址栏。'
+            : '可安装为独立桌面应用，不显示浏览器地址栏。'}</p>
         </div>
         <div class="pwa-install-actions">
           <button type="button" data-pwa-dismiss>以后再说</button>
@@ -61,7 +65,21 @@
       }
     });
     overlay.querySelector('[data-pwa-install]')?.addEventListener('click', async () => {
+      const button = overlay.querySelector('[data-pwa-install]');
+      if (button.dataset.instructions) {
+        rememberDismissal();
+        hide();
+        return;
+      }
       const prompt = installPrompt;
+      if (!prompt) {
+        overlay.querySelector('#pwa-install-description').textContent =
+          '请点击 Edge 地址栏右侧的“应用可用”图标，或打开 … → 应用 → 将此站点作为应用安装。';
+        overlay.querySelector('[data-pwa-dismiss]')?.remove();
+        button.textContent = '知道了';
+        button.dataset.instructions = 'true';
+        return;
+      }
       installPrompt = null;
       hide();
       if (!prompt) return;
@@ -75,6 +93,7 @@
     .pwa-install-overlay {
       position: fixed; inset: 0; z-index: 100000; display: grid; place-items: center;
       padding: 20px; background: rgb(15 23 42 / 45%); backdrop-filter: blur(3px);
+      pointer-events: none;
     }
     .pwa-install-card {
       box-sizing: border-box; width: min(400px, 100%); padding: 22px;
@@ -82,6 +101,7 @@
       color: var(--text, #1c2024); background: var(--panel, #fff);
       border: 1px solid var(--border, #e3e6ec); border-radius: 18px;
       box-shadow: 0 24px 70px rgb(15 23 42 / 30%);
+      pointer-events: auto;
     }
     .pwa-install-icon { width: 64px; height: 64px; border-radius: 15px; }
     .pwa-install-copy { align-self: center; min-width: 0; }
@@ -110,6 +130,7 @@
   window.addEventListener('beforeinstallprompt', event => {
     event.preventDefault();
     installPrompt = event;
+    if (overlay) hide();
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', show, { once: true });
     } else {
@@ -122,5 +143,11 @@
     hide();
     try { localStorage.removeItem(storageKey); } catch {}
   });
-})();
 
+  const showFallback = () => setTimeout(show, 1200);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', showFallback, { once: true });
+  } else {
+    showFallback();
+  }
+})();

@@ -34,7 +34,8 @@ TTL = 3.0          # 扫描结果的缓存秒数, 前端可以放心高频轮询
 _cache = {"at": 0.0, "sids": set(), "paths": set(), "bare_claude": {}}
 _scan_lock = threading.Lock()
 _boot_time: float | None = None
-_clock_ticks = os.sysconf("SC_CLK_TCK")
+# 只在解析 /proc/<pid>/stat 的启动时间时用到；Windows 没有 sysconf，也没有 /proc。
+_clock_ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 _CLI_NAMES = ("claude", "codex", "grok")

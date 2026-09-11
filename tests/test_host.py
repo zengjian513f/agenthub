@@ -588,6 +588,18 @@ class BackendSelectionTests(unittest.TestCase):
 class WindowsPortabilityTests(unittest.TestCase):
     """Windows 节点必须能起服务：导入期不能依赖 POSIX 模块，运行期不能依赖 /proc。"""
 
+    def test_the_service_imports_without_posix_only_os_functions(self):
+        """os.sysconf 之类在 Windows 上不存在；模块级调用会让整个服务导入失败。
+        （cetus 上真实撞到过：live.py 顶层 os.sysconf 让节点服务起不来。）"""
+        import importlib
+        with patch.dict(os.__dict__):
+            del os.__dict__["sysconf"]
+            self.assertFalse(hasattr(os, "sysconf"))
+            importlib.reload(live)
+            self.assertEqual(live._clock_ticks, 100)
+        importlib.reload(live)
+        self.assertGreater(live._clock_ticks, 0)
+
     def test_the_tmux_backend_imports_without_posix_pty_modules(self):
         # server → term → term_tmux 是无条件导入链。term_tmux 里曾经在模块级
         # import fcntl/pty/termios，于是 Windows 上整个节点服务根本起不来。
