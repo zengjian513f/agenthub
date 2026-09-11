@@ -140,7 +140,10 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn(f"style.css?v={server.ASSET_VERSION}", page)
         self.assertIn(
             f'<meta name="agenthub-build" content="{server.ASSET_VERSION}">', page)
-        self.assertIn('<link rel="manifest" href="manifest.webmanifest">', page)
+        self.assertIn(
+            '<link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">',
+            page,
+        )
         self.assertIn('src="pwa-install.js?v=', page)
         self.assertIn("navigator.serviceWorker.register('service-worker.js')", page)
         self.assertEqual(headers["Cache-Control"], "no-store")
