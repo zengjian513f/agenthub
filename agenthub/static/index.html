@@ -275,16 +275,16 @@
       <div><h2 id="bug-report-title">报告问题</h2><p>会自动收集当前会话链路，并启动一条处理会话排查</p></div>
       <button type="button" class="modal-close" title="关闭" aria-label="关闭">×</button>
     </div>
-    <label class="report-label" for="bug-report-description">发生了什么</label>
-    <textarea id="bug-report-description" rows="6" maxlength="50000"
-      placeholder="描述操作步骤、预期结果和实际现象，可直接粘贴截图或拖入文件。当前页面、消息状态与终端画面会自动附上。"></textarea>
-    <div id="bug-report-items" class="report-items" aria-live="polite"></div>
     <fieldset class="new-source report-source" id="bug-report-source">
       <legend>处理会话类型</legend>
       <label><input type="radio" name="bug-report-source" value="claude"><span><svg class="ico source-icon" data-source="claude" aria-hidden="true"><use href="#i-claude"/></svg>Claude</span></label>
       <label><input type="radio" name="bug-report-source" value="codex" checked><span><svg class="ico source-icon" data-source="codex" aria-hidden="true"><use href="#i-codex"/></svg>Codex</span></label>
       <label><input type="radio" name="bug-report-source" value="grok"><span><svg class="ico source-icon" data-source="grok" aria-hidden="true"><use href="#i-grok"/></svg>Grok</span></label>
     </fieldset>
+    <label class="report-label" for="bug-report-description">发生了什么</label>
+    <textarea id="bug-report-description" rows="6" maxlength="50000"
+      placeholder="描述操作步骤、预期结果和实际现象，可直接粘贴截图或拖入文件。当前页面、消息状态与终端画面会自动附上。"></textarea>
+    <div id="bug-report-items" class="report-items" aria-live="polite"></div>
     <div class="report-attach-row">
       <div class="attach-picker">
         <button class="btn" id="bug-report-add" type="button" title="添加附件" aria-expanded="false">

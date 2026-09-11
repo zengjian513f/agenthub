@@ -1801,6 +1801,13 @@ def run(pw):
     check("报告框提供 Claude/Codex/Grok 处理会话选择，默认 Codex",
           p.locator("#bug-report-source input").count() == 3
           and p.evaluate("bugReportSource()") == "codex")
+    # 与新建会话一致：处理会话类型放在标题下方、描述框之前，而不是压在附件下面。
+    report_source_box = p.locator("#bug-report-source").bounding_box()
+    report_desc_box = p.locator("#bug-report-description").bounding_box()
+    check("报告框的处理会话类型与新建会话一样排在最上面",
+          report_source_box["y"] + report_source_box["height"] <= report_desc_box["y"]
+          and p.locator("#bug-report-form > :nth-child(2)").get_attribute("id") == "bug-report-source",
+          (report_source_box, report_desc_box))
     p.locator("#bug-report-source input[value=grok]").check(force=True)
     shot_paste = p.evaluate("""() => {
       const png = Uint8Array.from(atob('%s'), c => c.charCodeAt(0));
