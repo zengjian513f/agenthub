@@ -152,6 +152,44 @@ class SessionProcessTests(unittest.TestCase):
         client.request("agenthub-t3-renamed", "kill", self.dir)
         proc.wait(timeout=5)
 
+    def test_a_cursor_query_is_answered_with_the_position_at_that_point(self):
+        """ConPTY 以 INHERIT_CURSOR 创建伪控制台：conhost 先问 ESC[6n，拿到
+        ESC[row;colR 之前既不产出输出也不消费输入。宿主不答就是双向死锁。
+        应答必须用"流里那个位置"的光标，不能用滞后的模型状态。"""
+        probe = self.dir / "probe.py"
+        probe.write_text(
+            "import sys, tty\n"
+            # 和 conhost 一样 raw 读：DSR 应答不带换行，cooked 模式会把它压在行缓冲里
+            "tty.setraw(sys.stdin.fileno())\n"
+            "sys.stdout.write('one\\r\\ntwo\\r\\nthree\\r\\n\\x1b[6n')\n"
+            "sys.stdout.flush()\n"
+            "answer = ''\n"
+            "while not answer.endswith('R'):\n"
+            "    ch = sys.stdin.read(1)\n"
+            "    if not ch: sys.exit(2)\n"
+            "    answer += ch\n"
+            "sys.stdout.write('ANSWER ' + answer[2:] + '\\r\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.stdin.read(1)\n", encoding="utf-8")
+        proc, _ = self.start("agenthub-dsr", sys.executable, "-u", str(probe),
+                            cols=80, rows=24)
+        text = self.wait_screen("agenthub-dsr", "ANSWER", timeout=8)
+        # 三行输出之后光标在第 4 行第 1 列；1 起算即 4;1
+        self.assertIn("ANSWER 4;1R", text, text)
+        # 查询本身既不进画面也不进 attach 回放，否则浏览器会再答一遍
+        self.assertNotIn("[6n", text)
+        att = client.Attach("agenthub-dsr", 80, 24, directory=self.dir)
+        replay = b""
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and b"ANSWER" not in replay:
+            replay += att.read(0.05)
+        self.assertIn(b"ANSWER", replay)
+        self.assertNotIn(b"\x1b[6n", replay)
+        att.write(b"q")
+        att.close()
+        client.request("agenthub-dsr", "kill", self.dir)
+        proc.wait(timeout=8)
+
     def test_stale_info_files_are_cleaned_when_host_is_gone(self):
         (self.dir / "agenthub-dead.json").write_text(json.dumps(
             {"name": "agenthub-dead", "host_pid": 2 ** 22 + 7, "pid": 1, "sock": "x"}))

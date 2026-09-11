@@ -11,6 +11,7 @@
 //!   agenthub-host [--dir DIR] capture NAME [--lines N] [--plain] [--join]
 
 mod client;
+mod dsr;
 mod protocol;
 mod screen;
 mod session;
@@ -119,7 +120,33 @@ fn parse() -> Args {
     args
 }
 
+/// Windows 下把 DLL 搜索范围收紧到「可执行文件所在目录 + 系统目录」。
+///
+/// portable-pty 用 `LoadLibrary("conpty.dll")` 找 sideload 版的伪控制台实现，
+/// 默认搜索顺序包含 PATH：机器上任何一个装了自带 conpty.dll 的终端（实测
+/// WezTerm）都会被优先加载，于是宿主起的是那个终端的 OpenConsole.exe 而不是
+/// 系统 conhost，行为随机器而变，kill 之后还会留下孤儿进程。
+///
+/// `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` 把 PATH 和当前目录移出搜索顺序，同时保留
+/// 可执行文件所在目录——要固定某个版本，把 conpty.dll 放到 exe 旁边即可，
+/// 这仍然是显式的部署决定，而不是碰巧在 PATH 上。
+#[cfg(windows)]
+fn pin_dll_search_path() {
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    unsafe extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+    }
+    // 失败不致命：只是退回默认搜索顺序，和打补丁前一样。
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
+}
+
+#[cfg(not(windows))]
+fn pin_dll_search_path() {}
+
 fn main() {
+    pin_dll_search_path();
     let args = parse();
     let dir = client::host_dir(args.dir.as_deref());
     let code = match args.cmd.as_str() {

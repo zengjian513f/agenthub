@@ -91,8 +91,34 @@ Rust 单测覆盖屏幕模型（滚动历史分页、软换行合并、宽字符
 改名、退出清理、宿主在启动者退出后存活、`term` 调度，以及通过真实 HTTP 服务和 WebSocket 的
 控制台往返。测试只用 `sh`，不启动付费 CLI；没有构建二进制时相关用例自动跳过。
 
-## Windows 现状
+## Windows / ConPTY
 
-ConPTY 由 `portable-pty` 统一封装，但尚未在真实 Windows 节点上验证。
-把 Windows 机器接成节点还需要：`live.py` 的运行状态检测改用 psutil、`adapters.py` 识别
+2026-09-11 在一台真实 Windows 机器（conhost，Windows SDK 10.0.26100）上验证过宿主进程本身：
+会话列表、send、capture（含历史与 ANSI）、中文、kill 与清理全部正常，Claude Code 的启动界面
+也能正确渲染；常驻内存约 7 MB。下面两条是那次验证暴露的、必须由宿主处理的 ConPTY 特性。
+
+**必须应答设备状态查询。** ConPTY 以 `PSUEDOCONSOLE_INHERIT_CURSOR` 创建伪控制台
+（`portable-pty` 硬编码），conhost 启动后先发 `ESC[6n` 问光标位置，拿到 `ESC[row;colR`
+之前既不产出输出也不消费输入。宿主不应答就是双向死锁：会话看起来活着，`send` 和 `capture`
+全部为空，也没有任何报错。Unix pty 从不主动问，所以这个依赖在 Linux 上看不见。
+
+`host-rs/src/dsr.rs` 在读线程里扫出 DSR（`ESC[5n` / `ESC[6n` / `ESC[?6n`），其余字节一概不碰。
+查询交给屏幕线程按序应答，因此报的是"流里那个位置"的光标而不是滞后的模型状态；查询本身
+不转发给浏览器，xterm.js 看不到就不会再答一遍，应答权完全在宿主这边，有没有客户端连着
+行为都一样。积压超限丢数据时绝不丢查询——丢了就等于让应用永远等不到应答。
+
+**伪控制台实现要固定。** `portable-pty` 用 `LoadLibrary("conpty.dll")` 找 sideload 版实现，
+默认搜索顺序包含 PATH，于是机器上任何自带 `conpty.dll` 的终端（实测 WezTerm）都会被优先
+加载，宿主起的就不是系统 conhost，而且 kill 之后会留下孤儿 `OpenConsole.exe`。宿主启动时
+调用 `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)` 把 PATH 和当前目录移出
+搜索顺序。要固定某个版本，把 `conpty.dll` 放到 exe 旁边——那仍然在搜索范围内，但是显式的
+部署决定。
+
+**下游解析注意**：ConPTY 把未样式的空白格输出成 `ESC[<n>C` 而不是空格，styled 文本里因此
+会出现光标前移序列；`claude_bridge` / `codex_bridge` 都先按 CSI 整段剥离，不受影响，`--plain`
+取到的也是正常空格。
+
+把 Windows 机器接成完整节点还差：`live.py` 的运行状态检测改用 psutil、`adapters.py` 识别
 Windows 项目目录 slug 与盘符路径、文件管理器的根目录判断，以及用计划任务代替 systemd。
+另外 Rust 命令行自己的 `list` 在 Windows 上不清理崩溃残留的信息文件（Linux 读 `/proc` 判断）；
+Web 服务走 Python 客户端用 psutil，不受此影响。

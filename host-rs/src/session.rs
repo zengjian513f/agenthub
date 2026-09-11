@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 
+use crate::dsr::{self, Piece};
 use crate::protocol::{
     key_bytes, pack_frame, read_frames, recv_json, send_json, FRAME_DATA, FRAME_EXIT,
     FRAME_RESIZE,
@@ -54,12 +55,43 @@ impl Client {
 
 #[derive(Default)]
 struct Backlog {
-    queue: VecDeque<Vec<u8>>,
-    inflight: Vec<u8>,
+    queue: VecDeque<Piece>,
+    inflight: Option<Piece>,
     pending: usize,
     fed: u64,
     applied: u64,
     dropped: u64,
+}
+
+impl Backlog {
+    /// 积压超限时丢最旧的数据，绝不阻塞读线程——等模型追赶会直接变成终端卡顿。
+    /// 查询必须留下：丢掉它就等于让应用永远等不到应答。
+    fn trim(&mut self, limit: usize) {
+        while self.pending > limit {
+            let at = self
+                .queue
+                .iter()
+                .position(|piece| matches!(piece, Piece::Data(_)));
+            match at.and_then(|at| self.queue.remove(at)) {
+                Some(old) => {
+                    self.pending -= old.data_len().min(self.pending);
+                    self.dropped += old.data_len() as u64;
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// attach 回放要带上尚未进入模型的原始字节；查询不是显示内容，跳过。
+    fn unapplied_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for piece in self.inflight.iter().chain(self.queue.iter()) {
+            if let Piece::Data(bytes) = piece {
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
+    }
 }
 
 pub struct Session {
@@ -327,33 +359,47 @@ impl Session {
     // ------------------------------------------------------------------ 输出
     fn read_loop(self: Arc<Self>, mut reader: Box<dyn Read + Send>) {
         let mut buf = vec![0u8; 65536];
+        let mut scanner = dsr::Scanner::default();
         loop {
             let n = match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let data = &buf[..n];
+            // 扫一遍找设备状态查询。绝大多数 chunk 里没有；扫描只跟 CSI 终止符
+            // 打交道，比后面的 VT 解析便宜几个数量级，不会拖慢这条热路径。
+            let pieces = scanner.scan(&buf[..n]);
+            // 查询不转发给客户端：浏览器的 xterm.js 看不到它就不会再答一遍，
+            // 应答权完全在宿主这边，有没有客户端连着行为都一样。
+            let frame = {
+                let mut joined: Vec<u8> = Vec::new();
+                let payload: &[u8] = match pieces.as_slice() {
+                    [Piece::Data(bytes)] => bytes,          // 常见情况：不额外拷贝
+                    _ => {
+                        for piece in &pieces {
+                            if let Piece::Data(bytes) = piece {
+                                joined.extend_from_slice(bytes);
+                            }
+                        }
+                        &joined
+                    }
+                };
+                (!payload.is_empty()).then(|| pack_frame(FRAME_DATA, payload))
+            };
             let clients: Vec<Arc<Client>> = {
                 let mut backlog = self.backlog.lock().unwrap();
-                backlog.queue.push_back(data.to_vec());
-                backlog.pending += n;
-                backlog.fed += n as u64;
-                // 积压超限时丢最旧的一段，绝不阻塞读线程
-                while backlog.pending > BACKLOG_LIMIT {
-                    match backlog.queue.pop_front() {
-                        Some(old) => {
-                            backlog.pending -= old.len();
-                            backlog.dropped += old.len() as u64;
-                        }
-                        None => break,
-                    }
+                for piece in pieces {
+                    backlog.pending += piece.data_len();
+                    backlog.fed += piece.data_len() as u64;
+                    backlog.queue.push_back(piece);
                 }
+                backlog.trim(BACKLOG_LIMIT);
                 self.backlog_cv.notify_all();
                 self.live_clients()
             };
-            let frame = pack_frame(FRAME_DATA, data);
-            for client in clients {
-                client.send(&frame);
+            if let Some(frame) = frame {
+                for client in clients {
+                    client.send(&frame);
+                }
             }
         }
         self.finish();
@@ -371,7 +417,7 @@ impl Session {
 
     fn screen_loop(self: Arc<Self>) {
         loop {
-            let chunk = {
+            let piece = {
                 let mut backlog = self.backlog.lock().unwrap();
                 while backlog.queue.is_empty() {
                     if self.exited.load(Ordering::Relaxed) {
@@ -383,21 +429,33 @@ impl Session {
                         .unwrap();
                     backlog = guard;
                 }
-                let chunk = backlog.queue.pop_front().unwrap();
+                let piece = backlog.queue.pop_front().unwrap();
                 // 出队后仍计入 pending：在途块既不在队列也没进模型，
                 // attach 的回放必须把它算上，否则客户端会丢这一段。
-                backlog.inflight = chunk.clone();
-                chunk
+                backlog.inflight = Some(piece.clone());
+                piece
+            };
+            let answer = match &piece {
+                Piece::Data(bytes) => {
+                    self.screen.lock().unwrap().feed(bytes);
+                    None
+                }
+                query => {
+                    // 在这里应答，光标就是流里这个位置的光标：前面的字节都已喂完。
+                    let (col, row) = self.screen.lock().unwrap().cursor();
+                    dsr::reply(query, col, row)
+                }
             };
             {
-                let mut screen = self.screen.lock().unwrap();
-                screen.feed(&chunk);
+                let mut backlog = self.backlog.lock().unwrap();
+                backlog.inflight = None;
+                backlog.pending -= piece.data_len().min(backlog.pending);
+                backlog.applied += piece.data_len() as u64;
+                self.backlog_cv.notify_all();
             }
-            let mut backlog = self.backlog.lock().unwrap();
-            backlog.inflight.clear();
-            backlog.pending -= chunk.len().min(backlog.pending);
-            backlog.applied += chunk.len() as u64;
-            self.backlog_cv.notify_all();
+            if let Some(answer) = answer {
+                self.write_pty(&answer);
+            }
         }
     }
 
@@ -734,10 +792,7 @@ impl Session {
             let mut replay = Vec::new();
             if req.get("replay").and_then(|v| v.as_bool()).unwrap_or(true) {
                 replay.extend_from_slice(&self.screen.lock().unwrap().replay_bytes(self.history));
-                replay.extend_from_slice(&backlog.inflight);
-                for chunk in &backlog.queue {
-                    replay.extend_from_slice(chunk);
-                }
+                replay.extend_from_slice(&backlog.unapplied_bytes());
             }
             self.clients.lock().unwrap().push(client.clone());
             replay
@@ -821,59 +876,70 @@ fn random_token() -> String {
 mod tests {
     use super::*;
 
-    /// 构造一个只有状态、没有真实 pty 的 Session 用于检查积压策略。
     fn backlog_with(chunks: &[&[u8]]) -> Backlog {
         let mut backlog = Backlog::default();
         for chunk in chunks {
-            backlog.queue.push_back(chunk.to_vec());
-            backlog.pending += chunk.len();
-            backlog.fed += chunk.len() as u64;
+            let piece = Piece::Data(chunk.to_vec());
+            backlog.pending += piece.data_len();
+            backlog.fed += piece.data_len() as u64;
+            backlog.queue.push_back(piece);
         }
         backlog
-    }
-
-    fn trim(backlog: &mut Backlog, limit: usize) {
-        while backlog.pending > limit {
-            match backlog.queue.pop_front() {
-                Some(old) => {
-                    backlog.pending -= old.len();
-                    backlog.dropped += old.len() as u64;
-                }
-                None => break,
-            }
-        }
     }
 
     #[test]
     fn backlog_over_the_limit_drops_oldest_instead_of_blocking() {
         let mut backlog = backlog_with(&[&[b'a'; 1024], &[b'b'; 1024], &[b'c'; 1024]]);
         assert_eq!(backlog.pending, 3072);
-        trim(&mut backlog, 2048);
+        backlog.trim(2048);
         assert!(backlog.pending <= 2048);
         assert_eq!(backlog.dropped, 1024);
         // 丢的是最旧的一段，最新的输出一定留下
-        assert_eq!(backlog.queue.back().unwrap()[0], b'c');
+        assert_eq!(backlog.queue.back(), Some(&Piece::Data(vec![b'c'; 1024])));
         assert_eq!(backlog.fed, 3072);
     }
 
     #[test]
     fn a_backlog_under_the_limit_is_left_alone() {
         let mut backlog = backlog_with(&[&[b'a'; 16]]);
-        trim(&mut backlog, BACKLOG_LIMIT);
+        backlog.trim(BACKLOG_LIMIT);
         assert_eq!(backlog.dropped, 0);
         assert_eq!(backlog.pending, 16);
     }
 
     #[test]
+    fn trimming_never_drops_a_pending_query() {
+        // 丢掉查询就等于让应用永远等不到应答，宁可留着晚答。
+        let mut backlog = backlog_with(&[&[b'a'; 1024]]);
+        backlog.queue.push_back(Piece::CursorReport { dec: false });
+        backlog.queue.push_back(Piece::Data(vec![b'b'; 1024]));
+        backlog.pending += 1024;
+        backlog.fed += 1024;
+        backlog.trim(512);
+        assert_eq!(backlog.dropped, 2048);
+        assert_eq!(backlog.pending, 0);
+        assert_eq!(backlog.queue.len(), 1);
+        assert_eq!(backlog.queue.front(), Some(&Piece::CursorReport { dec: false }));
+    }
+
+    #[test]
+    fn the_replay_covers_bytes_the_model_has_not_consumed_and_skips_queries() {
+        let mut backlog = backlog_with(&[b"queued"]);
+        backlog.inflight = Some(Piece::Data(b"inflight".to_vec()));
+        backlog.queue.push_front(Piece::CursorReport { dec: false });
+        // 在途块排在队列之前，查询不是显示内容所以不进回放
+        assert_eq!(backlog.unapplied_bytes(), b"inflightqueued".to_vec());
+    }
+
+    #[test]
     fn inflight_bytes_still_count_as_pending() {
-        // 出队但还没喂进模型的块必须仍计入 pending，否则 attach 的回放会漏掉它。
         let mut backlog = backlog_with(&[b"chunk"]);
-        let chunk = backlog.queue.pop_front().unwrap();
-        backlog.inflight = chunk.clone();
-        assert_eq!(backlog.pending, chunk.len());
-        backlog.inflight.clear();
-        backlog.pending -= chunk.len();
-        backlog.applied += chunk.len() as u64;
+        let piece = backlog.queue.pop_front().unwrap();
+        backlog.inflight = Some(piece.clone());
+        assert_eq!(backlog.pending, piece.data_len());
+        backlog.inflight = None;
+        backlog.pending -= piece.data_len();
+        backlog.applied += piece.data_len() as u64;
         assert_eq!(backlog.pending, 0);
         assert_eq!(backlog.applied, backlog.fed);
     }
