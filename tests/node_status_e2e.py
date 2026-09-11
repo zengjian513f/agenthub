@@ -77,6 +77,9 @@ def main():
                     page.evaluate('loadSessions()')
                     assert page.evaluate('document.activeElement === window.offlineButton')
                     page.set_viewport_size({'width': 390, 'height': 844})
+                    # 窄屏机器筛选收进下拉，展开后是同一组按钮，离线态照旧
+                    assert not button.is_visible()
+                    page.locator('#node-pick').click()
                     assert button.is_visible()
                     selection = page.evaluate('selectedNodeIds()')
                     with page.expect_event('dialog') as popup:

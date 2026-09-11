@@ -66,6 +66,8 @@ def main():
                         page.evaluate('window.oldSearch = searchAbort')
                         assert page.evaluate('''() => document.querySelector('#search-progress')
                           .getBoundingClientRect().bottom <= document.querySelector('#side').getBoundingClientRect().top''')
+                        if mobile:   # 窄屏顶栏按钮全部折进 ⋯
+                            page.locator('#header-more-btn').click()
                         page.locator('#new-session').click()
                         page.locator('#new-session-form label:has(input[value="codex"])').click()
                         page.locator('#new-cwd').fill('/same/project')

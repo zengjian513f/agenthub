@@ -58,20 +58,47 @@ def main():
                 assert page.locator('#side .item').count() == 3
                 page.locator('#allcount').click()
                 assert page.locator('#session-scope [aria-checked="true"]').count() == 1
-                def check_toolbar():
-                    styles = page.evaluate("""() => ['#node-chips','#chips','#view'].map(q=>{
+                def check_toolbar(wide=True):
+                    # 宽屏机器 chips 与其余筛选平铺成一排；窄屏收成下拉按钮，展开后才是同一组 chips
+                    groups = ['#node-chips' if wide else '#node-pick', '#chips', '#view']
+                    styles = page.evaluate("""groups => groups.map(q=>{
                       const group=document.querySelector(q), r=group.getBoundingClientRect();
-                      const s=getComputedStyle(group.querySelector('button.on'));
-                      return {top:r.top,height:r.height,background:s.backgroundColor,
+                      const s=getComputedStyle(group.querySelector('button.on') || group);
+                      return {top:r.top,height:r.height,
                         radius:getComputedStyle(group).borderRadius,buttonHeight:s.height};
-                    })""")
+                    })""", groups)
                     assert max(r['top'] for r in styles)-min(r['top'] for r in styles) < 1, styles
-                    assert all(r == styles[0] for r in styles), styles
+                    assert all(r['height'] == styles[0]['height'] for r in styles), styles
                     assert page.locator('header #node-chips').count() == 1
                     assert page.locator('#node-chips').get_by_role('button', name='全部', exact=True).count() == 0
-                    assert page.locator('#session-scope').bounding_box()['width'] == 98
-                    assert all(b.bounding_box()['width'] == 48 for b in page.locator('#session-scope button').all())
+                    assert page.locator('#node-pick').is_visible() != wide
+                    assert page.locator('#node-chips').is_visible() == wide
                     assert page.locator('.brand-name + #side-toggle + #session-scope').count() == 1
+                    assert page.locator('header').bounding_box()['height'] <= 52
+                    assert page.locator('#session-scope [role=radio]').count() == 2
+                    if wide:
+                        assert page.locator('#session-scope').bounding_box()['width'] == 98
+                        assert all(b.bounding_box()['width'] == 48 for b in page.locator('#session-scope button').all())
+                        return
+                    page.locator('#node-pick').click()
+                    assert page.locator('#node-chips').is_visible()
+                    assert page.locator('#node-chips button').count() == 3
+                    assert page.locator('#node-chips button.on').count() == 3
+                    page.locator('#node-chips button').nth(1).click()
+                    assert page.locator('#node-chips').is_visible()   # 多选：点一项不收起
+                    assert page.locator('#node-chips button.on').count() == 2
+                    assert page.locator('#node-pick .node-pick-label').inner_text() == '2 台'
+                    page.locator('#node-chips button').nth(1).click()
+                    assert page.locator('#node-pick .node-pick-label').inner_text() == '全部'
+                    page.keyboard.press('Escape')
+                    assert not page.locator('#node-chips').is_visible()
+                    # 右侧按钮全部折进 ⋯
+                    assert not page.locator('#settings').is_visible()
+                    page.locator('#header-more-btn').click()
+                    assert page.locator('#header-menu #settings').is_visible()
+                    assert page.locator('#header-menu #reload').is_visible()
+                    page.keyboard.press('Escape')
+                    assert not page.locator('#header-menu').is_visible()
                 check_toolbar()
                 page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-desktop.png')
                 # Single/multi node filters and independent Agent Type intersection.
@@ -118,9 +145,13 @@ def main():
                     page.evaluate('(uid) => openSession(uid)', uid)
                     page.wait_for_function('(name) => document.querySelector("#msgs")?.textContent.includes("reply " + name)', arg=name)
                     def check_session_identity():
-                        fields = page.locator('.dmeta > span').all_text_contents()
-                        assert fields[-4:] == [name, 'Claude', nodes[i].state['row']['cwd'],
-                                               nodes[i].state['row']['sid']], fields
+                        # 宽屏把机器和来源提到标题后的简要区，完整元信息仍在 ⋯ 菜单里
+                        brief = page.locator('.dbrief > span').all_text_contents()
+                        meta = page.locator('.dmeta > span').all_text_contents()
+                        fields = brief + meta
+                        assert brief[-2:] == [name, 'Claude'], brief
+                        assert meta[-2:] == [nodes[i].state['row']['cwd'],
+                                             nodes[i].state['row']['sid']], meta
                         assert fields.count(name) == 1, fields
                     check_session_identity()
                     page.wait_for_function('Array.from(document.querySelectorAll("#msgs img")).some(i => i.complete && i.naturalWidth > 0)')
@@ -221,8 +252,10 @@ def main():
                 page.wait_for_function('S.results?.length === 2')
                 # Mobile: same machine controls, no horizontal document overflow.
                 page.set_viewport_size({'width': 390, 'height': 844})
+                # headless 只有渲染一帧后才派发媒体查询 change，顶栏折叠靠它驱动
+                page.evaluate('new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))')
                 page.evaluate('showMobileList()')
-                check_toolbar()
+                check_toolbar(wide=False)
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
                 page.locator('header').screenshot(path='/tmp/agenthub-toolbar-after-mobile.png')
                 page.screenshot(path='/tmp/agenthub-hub-mobile.png')

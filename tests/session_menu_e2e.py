@@ -42,11 +42,13 @@ def assert_menu_hits(page):
     assert hits == [True] * 6, hits
 
 
+def tier_of(width):
+    return 'narrow' if width <= 720 else 'medium' if width <= 1199 else 'wide'
+
+
 def open_actions(page):
-    """Wide headers keep the actions in place; only narrow ones fold them into the menu."""
-    more = page.locator('#a-more')
-    if more.is_visible():
-        more.click()
+    """The ⋯ menu exists at every tier; on wide screens it only holds the full metadata."""
+    page.locator('#a-more').click()
 
 
 def header_ids(page):
@@ -54,15 +56,26 @@ def header_ids(page):
         'buttons => buttons.map(b => b.id || (b.hasAttribute("data-report-bug") ? "report-bug" : ""))')
 
 
-def assert_actions_menu(page, wide):
+INLINE_IDS = {
+    'wide': ['a-term', 'a-star', 'a-turns', 'report-bug', 'a-session-action', 'a-more'],
+    'medium': ['a-term', 'a-star', 'a-more'],
+    'narrow': ['a-term', 'a-more'],
+}
+# 标题后的简要元信息；机器徽章只有中央站的会话才有
+BRIEF_IDS = {'wide': ['mcount-total', 'dlive', 'meta-node', 'meta-source'],
+             'medium': ['meta-node'], 'narrow': []}
+
+
+def assert_actions_menu(page, tier, scoped):
     menu = page.locator('#session-actions-menu')
-    max_height = 72 if wide else 46
-    if wide:
-        assert header_ids(page) == ['a-term', 'a-star', 'a-turns', 'report-bug',
-                                    'a-session-action'], header_ids(page)
-        assert page.locator('.dhead > .dmeta').is_visible()
-    else:
-        assert header_ids(page) == ['a-term', 'a-more'], header_ids(page)
+    max_height = 46   # 会话头任何宽度都只有一行
+    wide = tier == 'wide'
+    assert header_ids(page) == INLINE_IDS[tier], header_ids(page)
+    brief = page.locator('.dbrief > *').evaluate_all(
+        'items => items.map(e => e.id || e.className.split(" ")[0])')
+    assert brief == [x for x in BRIEF_IDS[tier] if scoped or x != 'meta-node'], brief
+    assert page.locator('.dbrief').is_visible() == bool(brief)
+    assert page.locator('#a-more').get_attribute('aria-label') == ('会话信息' if wide else '更多会话操作')
     assert page.locator('.dhead').bounding_box()['height'] <= max_height
     assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
     assert page.evaluate('''limit => {
@@ -77,8 +90,9 @@ def assert_actions_menu(page, wide):
     }''', max_height)
     open_actions(page)
     scope = page.locator('.dhead-actions') if wide else menu
-    assert wide or menu.is_visible()
+    assert menu.is_visible()
     assert page.locator('#mcount-total').is_visible()
+    assert page.locator('.dmeta .session-id').is_visible()
     hits = scope.locator('button:visible').evaluate_all('''items => items.map(e => {
       const r = e.getBoundingClientRect();
       return e.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
@@ -92,13 +106,15 @@ def assert_actions_menu(page, wide):
     assert menu.is_hidden() and page.evaluate('S.compactTurns') != before
     more = page.locator('#a-more')
     if not wide:
+        first, second = ('a-star', 'a-turns') if tier == 'narrow' else ('a-turns', 'report-bug')
         more.press('ArrowDown')
-        assert page.locator('#a-star').evaluate('e => e === document.activeElement')
+        assert page.locator('#' + first).evaluate('e => e === document.activeElement')
         page.keyboard.press('End')
         assert page.locator('#a-session-action').evaluate('e => e === document.activeElement')
         page.keyboard.press('Home')
         page.keyboard.press('ArrowDown')
-        assert page.locator('#a-turns').evaluate('e => e === document.activeElement')
+        assert page.locator('.dhead').locator(f'#{second}, [data-report-bug]').first.evaluate(
+            'e => e === document.activeElement')
         page.keyboard.press('Escape')
         assert menu.is_hidden() and more.evaluate('e => e === document.activeElement')
         more.press('ArrowUp')
@@ -112,12 +128,8 @@ def assert_actions_menu(page, wide):
     open_actions(page)
     page.locator('#a-view-switch').click()
     assert menu.is_hidden() and page.locator('#session-view-menu').is_visible()
-    if wide:
-        # 平铺后没有会与视图菜单互斥的操作菜单，点标题图标收起即可。
-        page.locator('.dhead h2 > .ico').click()
-    else:
-        open_actions(page)
-        assert menu.is_visible()
+    open_actions(page)
+    assert menu.is_visible()
     assert page.locator('#session-view-menu').is_hidden()
     page.locator('.dhead h2 > .ico').click()
     assert menu.is_hidden()
@@ -178,8 +190,9 @@ def main():
                           T.uid = uid; await openTermPane(name, false, 'full');
                         }''', [uid, name])
                         page.wait_for_function('T.ws?.readyState === 1')
-                        wide = width > 720
-                        assert_actions_menu(page, wide)
+                        tier = tier_of(width)
+                        wide = tier == 'wide'
+                        assert_actions_menu(page, tier, scoped)
                         for mode in (['full', 'normal', 'collapsed'] if width > 720 else ['full']):
                             page.evaluate('''mode => {
                               T.mode = mode; T.height = 10000; layoutTermPane();
@@ -236,9 +249,9 @@ def main():
                         page.evaluate('''() => showNewSessionStage({name: 'pending-menu',
                           source: 'claude', title: 'New session', cwd: '/example/project', node_name: 'MenuNode'})''')
                         assert header_ids(page) == (
-                            ['a-term', 'report-bug', 'a-session-action'] if wide
+                            ['a-term', 'report-bug', 'a-session-action', 'a-more'] if wide
                             else ['a-term', 'a-more']), header_ids(page)
-                        assert page.locator('.dhead').bounding_box()['height'] <= (72 if wide else 46)
+                        assert page.locator('.dhead').bounding_box()['height'] <= 46
                         open_actions(page)
                         assert page.locator('#a-session-action').get_attribute('aria-label') == '停止会话'
                         assert page.locator('.dhead [data-report-bug]').is_visible()

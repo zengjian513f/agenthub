@@ -140,13 +140,61 @@ function nodeOfflineReason(node) {
   return lines.join('\n');
 }
 
+// 中窄屏机器筛选收成一个下拉按钮，按钮上概括当前选中的机器。
+function paintNodePick() {
+  const label = document.querySelector('#node-pick .node-pick-label');
+  if (!label) return;
+  const narrow = typeof MOBILE !== 'undefined' && MOBILE.matches;
+  const picked = Nodes.list.filter(n => !Nodes.off.has(n.id));
+  let text, color = '', none = false;
+  if (!Nodes.list.length) { text = '无机器'; none = true; }
+  else if (picked.length === Nodes.list.length) text = narrow ? '全部' : '全部机器';
+  else if (!picked.length) { text = '未选机器'; none = true; }
+  else if (picked.length === 1) { text = picked[0].name; color = picked[0].color || ''; }
+  else if (picked.length === 2 && !narrow) text = picked.map(n => n.name).join('、');
+  else text = `${picked.length} 台${narrow ? '' : '机器'}`;
+  label.textContent = text;
+  label.dataset.nodeColor = color;
+  label.classList.toggle('node-none', none);
+  const button = label.parentElement;
+  button.title = button.ariaLabel = `选择机器：${text}`;
+}
+
+function closeNodePick() {
+  const picker = document.querySelector('#node-picker');
+  if (!picker?.classList.contains('open')) return;
+  picker.classList.remove('open');
+  document.querySelector('#node-pick')?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleNodePick(open) {
+  const picker = document.querySelector('#node-picker');
+  const button = document.querySelector('#node-pick');
+  if (!picker || !button) return;
+  if (open === undefined) open = !picker.classList.contains('open');
+  if (!open) return closeNodePick();
+  // 列表定位在 header 下，与按钮左缘对齐；超出右边界时贴右
+  const header = button.closest('header');
+  const left = button.getBoundingClientRect().left - header.getBoundingClientRect().left;
+  const menu = document.querySelector('#node-chips');
+  menu.style.setProperty('--node-menu-left', `${Math.round(left)}px`);
+  picker.classList.add('open');
+  button.setAttribute('aria-expanded', 'true');
+  requestAnimationFrame(() => {
+    const overflow = menu.getBoundingClientRect().right - (innerWidth - 8);
+    if (overflow > 0) menu.style.setProperty('--node-menu-left', `${Math.round(Math.max(8, left - overflow))}px`);
+  });
+}
+
 function renderNodes() {
   if (!HUB_MODE) return;
   const host = document.querySelector('#node-chips');
   if (!host) return;
   const scroll = host.scrollLeft;
   const toolbarScroll = host.parentElement.scrollLeft;
-  host.hidden = false;
+  const picker = document.querySelector('#node-picker');
+  if (picker) picker.hidden = false;
+  else host.hidden = false;
   const existing = new Map([...host.children].map(b => [b.dataset.node, b]));
   let position = 0;
   const button = (id, text, on, click, title = '') => {
@@ -187,6 +235,7 @@ function renderNodes() {
   for (const [id, item] of existing) if (!Nodes.list.some(n => n.id === id)) item.remove();
   host.scrollLeft = scroll;
   host.parentElement.scrollLeft = toolbarScroll;
+  paintNodePick();
   const notice = document.querySelector('#node-notice');
   const labels = {search: '全文搜索', sessions: '会话列表', live: '运行状态', term: '终端列表'};
   const failures = [...Nodes.errors].flatMap(([context, errors]) => {
@@ -247,5 +296,31 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('#new-node').onchange = () => {
     store.set('newNode', newNodeId()); refreshNewNodeFields();
   };
+  const pick = document.querySelector('#node-pick');
+  if (pick) {
+    pick.onclick = () => toggleNodePick();
+    pick.onkeydown = event => {
+      if (event.key !== 'ArrowDown') return;
+      event.preventDefault();
+      toggleNodePick(true);
+      document.querySelector('#node-chips button')?.focus();
+    };
+    document.querySelector('#node-picker').addEventListener('focusout', event => {
+      if (!event.currentTarget.contains(event.relatedTarget)) closeNodePick();
+    });
+    document.addEventListener('click', event => {
+      if (!event.target.closest('#node-picker')) closeNodePick();
+    }, true);
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && document.querySelector('#node-picker.open')) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        closeNodePick();
+        pick.focus();
+      }
+    }, true);
+    addEventListener('resize', closeNodePick);
+    if (typeof MOBILE !== 'undefined') MOBILE.addEventListener('change', paintNodePick);
+  }
   void loadNodes().catch(() => {});
 });

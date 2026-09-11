@@ -855,28 +855,61 @@ def run(pw):
     check("新建刷新设置使用相同按钮尺寸",
           action_styles[1:] == [action_styles[0], action_styles[0]], action_styles)
 
-    p.set_viewport_size({"width": 390, "height": 780})
-    p.evaluate("dispatchEvent(new Event('resize'))")
-    p.wait_for_timeout(300)
+    # 顶栏按三级宽度排版：中屏折起回收站/报告/设置，窄屏全部折进 ⋯；每级都只有一行
+    def resize(width, height):
+        p.set_viewport_size({"width": width, "height": height})
+        p.evaluate("dispatchEvent(new Event('resize'))")
+        # headless 只有渲染一帧后才派发媒体查询 change，折叠布局靠它驱动
+        p.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+        p.wait_for_timeout(300)
+    resize(900, 780)
+    check("中屏顶栏露出新建和刷新，其余折进 ⋯",
+          p.locator("#new-session").is_visible() and p.locator("#reload").is_visible()
+          and not p.locator("#settings").is_visible() and not p.locator(".brand-name").is_visible()
+          and p.locator("#header-more-btn").is_visible()
+          and p.locator("header").bounding_box()["height"] <= 52)
+    p.locator("#header-more-btn").click()
+    check("中屏 ⋯ 菜单里是回收站、报告问题和设置",
+          p.locator("#header-menu button:visible").evaluate_all(
+              "b => b.map(x => x.id)") == ["trash", "report-bug", "settings"]
+          and p.locator("#header-menu #settings").inner_text().strip() == "设置")
+    p.keyboard.press("Escape")
+    check("Esc 关闭 ⋯ 菜单并把焦点还给按钮",
+          not p.locator("#header-menu").is_visible()
+          and p.evaluate("document.activeElement?.id") == "header-more-btn")
+    resize(390, 780)
     mobile_header = p.evaluate("""() => {
       const box = id => { const r = document.querySelector(id).getBoundingClientRect();
                           return {top: r.top, height: r.height}; };
-      return {brand: box('.brand'), chips: box('.chips'), view: box('#view'),
-              actions: box('.header-actions'), header: box('header')};
+      return {scope: box('#session-scope'), chips: box('.chips'), view: box('#view'),
+              actions: box('.header-actions'), header: box('header'),
+              overflow: document.documentElement.scrollWidth > innerWidth};
     }""")
-    check("手机筛选与视图在第一排，信息和操作在第二排",
+    check("手机顶栏只有一行：范围、筛选、视图和 ⋯ 同排",
           abs(mobile_header["chips"]["top"] - mobile_header["view"]["top"]) < 1
-          and mobile_header["brand"]["top"] > mobile_header["view"]["top"]
-          and abs(mobile_header["brand"]["top"] - mobile_header["actions"]["top"]) < 4
-          and mobile_header["header"]["height"] >= 70,
+          and abs(mobile_header["scope"]["top"] - mobile_header["view"]["top"]) < 1
+          and abs(mobile_header["actions"]["top"] - mobile_header["view"]["top"]) < 4
+          and mobile_header["header"]["height"] <= 46 and not mobile_header["overflow"],
           mobile_header)
-    check("手机顶栏保留机器名、会话数量和视图按钮标签",
-          p.locator(".brand-name").is_visible()
+    check("手机顶栏保留会话数量和视图按钮，其余按钮全部折进 ⋯",
+          not p.locator(".brand-name").is_visible()
           and p.locator("#session-total").is_visible()
           and p.locator('#view button[aria-label="项目树"]').is_visible()
           and p.locator('#view button[aria-label="时间轴"]').is_visible()
-          and p.locator(".brand-name").inner_text().strip() not in {"", "__AGENTHUB_HOSTNAME__"}
-          and p.locator("#session-scope [role=radio]").count() == 2)
+          and p.locator("#session-scope [role=radio]").count() == 2
+          and not p.locator("#reload").is_visible()
+          and p.locator("#header-more-btn").is_visible())
+    p.locator("#header-more-btn").click()
+    check("手机 ⋯ 菜单包含全部五个顶栏操作",
+          p.locator("#header-menu button:visible").evaluate_all("b => b.map(x => x.id)")
+          == ["new-session", "reload", "trash", "report-bug", "settings"])
+    p.keyboard.press("Escape")
+    resize(1280, 720)
+    check("宽屏顶栏全部按钮平铺，⋯ 不出现",
+          p.locator("#settings").is_visible() and p.locator("#trash").is_visible()
+          and not p.locator("#header-more-btn").is_visible()
+          and p.locator(".brand-name").is_visible()
+          and p.locator(".brand-name").inner_text().strip() not in {"", "__AGENTHUB_HOSTNAME__"})
     brand_style = p.locator(".brand-name").evaluate("""n => {
       const s = getComputedStyle(n);
       return {background:s.backgroundImage, family:s.fontFamily,

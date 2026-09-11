@@ -117,7 +117,13 @@
       </div>
     </div>
     <div class="header-filters">
-      <div class="seg" id="node-chips" hidden role="group" aria-label="机器筛选"></div>
+      <div class="node-picker" id="node-picker" hidden>
+        <button type="button" class="btn node-pick" id="node-pick" title="选择机器" aria-label="选择机器"
+                aria-haspopup="true" aria-expanded="false" aria-controls="node-chips">
+          <span class="node-pick-label"></span><i aria-hidden="true">⌄</i>
+        </button>
+        <div class="seg" id="node-chips" role="group" aria-label="机器筛选"></div>
+      </div>
       <div class="seg chips" id="chips" role="group" aria-label="Agent Type 筛选"></div>
       <div class="seg" id="view" role="group" aria-label="列表视图">
         <button data-v="tree" class="on" title="项目树" aria-label="项目树">📁 <span class="mobile-label">项目树</span></button>
@@ -141,6 +147,11 @@
       <button class="btn" id="settings" title="设置" aria-label="设置">
         <svg class="ui-icon" aria-hidden="true"><use href="#i-settings"/></svg>
       </button>
+      <div class="header-more" id="header-more" hidden>
+        <button type="button" class="btn" id="header-more-btn" title="更多操作" aria-label="更多操作"
+                aria-haspopup="menu" aria-expanded="false" aria-controls="header-menu"><span aria-hidden="true">⋯</span></button>
+        <div id="header-menu" class="header-menu" hidden role="menu" aria-label="更多操作"></div>
+      </div>
     </div>
   </header>
   <div id="node-notice" hidden role="status"></div>
