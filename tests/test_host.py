@@ -1,5 +1,6 @@
 """ptyhost: 协议、真实 pty 会话进程、term 调度与后端选择。"""
 
+import contextlib
 import json
 import os
 import re
@@ -8,9 +9,11 @@ import socket
 import subprocess
 import sys
 import threading
+import types
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -697,6 +700,49 @@ class BackendSelectionTests(unittest.TestCase):
         self.assertEqual({b["name"] for b in listing["backends"]}, {"tmux", "ptyhost"})
 
 
+class _FakeProcess:
+    """psutil.Process 里 live 用到的那几样，够扫描跑起来就行。"""
+
+    def __init__(self, pid, name, argv, env=None, cwd="/", started=0.0, ppid=1):
+        self.pid, self.info = pid, {"pid": pid, "name": name}
+        self._argv, self._env, self._cwd = argv, env or {}, cwd
+        self._started, self._ppid = started, ppid
+
+    def cmdline(self):
+        return list(self._argv)
+
+    def environ(self):
+        return dict(self._env)
+
+    def cwd(self):
+        return self._cwd
+
+    def create_time(self):
+        return self._started
+
+    def ppid(self):
+        return self._ppid
+
+
+@contextlib.contextmanager
+def _fake_psutil(case, processes):
+    """把一张假的进程表塞给 live，并保证缓存不漏到别的测试里。"""
+    module = types.SimpleNamespace(
+        Error=Exception,
+        process_iter=lambda attrs=None: list(processes),
+        Process=lambda pid: next(p for p in processes if p.pid == pid),
+    )
+    cached = dict(live._cache)
+    with patch.object(live, "HAS_PROC", False), \
+            patch.object(live, "_psutil", return_value=module):
+        live._cache.update(at=0.0, sids={}, paths={}, bare_claude={})
+        try:
+            yield module
+        finally:
+            live._cache.clear()
+            live._cache.update(cached)
+
+
 class WindowsPortabilityTests(unittest.TestCase):
     """Windows 节点必须能起服务：导入期不能依赖 POSIX 模块，运行期不能依赖 /proc。"""
 
@@ -729,6 +775,7 @@ class WindowsPortabilityTests(unittest.TestCase):
         cached = dict(live._cache)
         try:
             with patch.object(live, "HAS_PROC", False), \
+                    patch.object(live, "_psutil", return_value=None), \
                     patch.object(live.os, "listdir",
                                  side_effect=AssertionError("不该去扫 /proc")):
                 live._cache.update(at=0.0, sids={}, paths={}, bare_claude={})
@@ -741,6 +788,77 @@ class WindowsPortabilityTests(unittest.TestCase):
         finally:
             live._cache.clear()
             live._cache.update(cached)
+
+    def test_run_status_comes_from_psutil_where_there_is_no_proc(self):
+        """蓝点来自 live 扫描。Windows 上没有 /proc，扫描一直返回空集，
+        于是 cetus 的会话在列表里从不显示"运行中"（zj 截图指出的就是这个）。"""
+        claude = _FakeProcess(
+            4242, "claude.exe",
+            [r"C:\Users\zj\.local\bin\claude.EXE", "--settings", "C:\s.json",
+             "--resume", "0bc4f70a-b079-48ff-82a9-6408caff457c"],
+            cwd=r"D:\share\vocal", started=1000.0)
+        helper = _FakeProcess(
+            4243, "node.exe", [r"C:\Program Files\nodejs\node.exe", "codex-helper"],
+            env={"CODEX_COMPANION_SESSION_ID": "11111111-2222-3333-4444-555555555555"},
+            ppid=4242)
+        unrelated = _FakeProcess(99, "explorer.exe", [r"C:\Windows\explorer.exe"])
+
+        with _fake_psutil(self, [claude, helper, unrelated]):
+            sids, paths = live.snapshot(force=True)
+        self.assertEqual(sids.get("0bc4f70a-b079-48ff-82a9-6408caff457c"), {4242},
+                         "--resume 里的 session id 就是这个进程的身份")
+        self.assertIn("11111111-2222-3333-4444-555555555555", sids,
+                      "子进程环境变量里的 session id 也要算")
+        self.assertEqual(paths, {}, "Windows 上不翻文件句柄")
+
+        session = {"uid": "claude:x", "source": "claude", "cwd": r"D:\share\vocal",
+                   "sid": "0bc4f70a-b079-48ff-82a9-6408caff457c",
+                   "path": r"D:\none.jsonl", "created": "2026-09-11T00:00:00Z"}
+        with _fake_psutil(self, [claude, helper, unrelated]):
+            self.assertTrue(live.is_live(session, force=True), "这条会话正在跑")
+            self.assertEqual(live.pids_of(session, force=True), [4242])
+            self.assertEqual(live.started_at(session, force=True), 1000.0)
+            self.assertEqual(live.live_uids([session], force=True), ["claude:x"])
+
+    def test_a_stale_session_id_in_the_environment_is_not_trusted(self):
+        """CLI 从另一个会话里启动时会继承旧的 CLAUDE_CODE_SESSION_ID。
+        主进程已经在命令行里表明了身份，继承来的那个不能算，否则新旧两条
+        会话会一起亮起来。"""
+        claude = _FakeProcess(
+            7000, "claude.exe", ["claude.exe", "--session-id",
+                                 "aaaaaaaa-0000-0000-0000-000000000000"],
+            env={"CLAUDE_CODE_SESSION_ID": "bbbbbbbb-0000-0000-0000-000000000000"})
+        with _fake_psutil(self, [claude]):
+            sids, _ = live.snapshot(force=True)
+        self.assertIn("aaaaaaaa-0000-0000-0000-000000000000", sids)
+        self.assertNotIn("bbbbbbbb-0000-0000-0000-000000000000", sids)
+
+    def test_a_bare_claude_is_matched_by_directory_and_start_time(self):
+        """没有 --session-id 的裸 claude 只能靠 cwd 加启动时间配对。"""
+        bare = _FakeProcess(8000, "claude.exe", ["claude.exe"],
+                            cwd="/tmp/project", started=1_000_000.0)
+        with _fake_psutil(self, [bare]):
+            live.snapshot(force=True)
+            session = {"uid": "claude:y", "source": "claude", "cwd": "/tmp/project",
+                       "sid": "", "path": "/tmp/none.jsonl",
+                       "created": datetime.fromtimestamp(
+                           1_000_010.0, timezone.utc).isoformat().replace("+00:00", "Z")}
+            self.assertEqual(live.pids_of(session, force=True), [8000])
+            far = {**session, "created": datetime.fromtimestamp(
+                1_002_000.0, timezone.utc).isoformat().replace("+00:00", "Z")}
+            self.assertEqual(live.pids_of(far, force=True), [],
+                             "隔了很久创建的会话不该认领这个进程")
+
+    def test_without_psutil_the_status_is_empty_instead_of_broken(self):
+        """psutil 没装就退化为查不出运行状态，不能把列会话带崩。"""
+        with patch.object(live, "HAS_PROC", False), \
+                patch.object(live, "_psutil", return_value=None):
+            live._cache.update(at=0.0, sids={}, paths={}, bare_claude={})
+            self.assertEqual(live.snapshot(force=True), ({}, {}))
+            session = {"uid": "claude:z", "source": "claude", "sid": "z",
+                       "path": "C:/none.jsonl", "cwd": "C:/", "created": "2026-09-11T00:00:00Z"}
+            self.assertFalse(live.is_live(session, force=True))
+            self.assertIsNone(live.started_at(session, force=True))
 
     def test_liveness_on_windows_never_uses_os_kill(self):
         """os.kill(pid, 0) 在 Windows 上会终止进程：CPython 的实现是

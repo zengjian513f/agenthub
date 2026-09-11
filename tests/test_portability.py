@@ -207,6 +207,7 @@ class WindowsSandboxTests(unittest.TestCase):
             from agenthub import live
             live.PROC_FS = Path("C:/nonexistent-proc")
             live.HAS_PROC = False
+            live._psutil = lambda: None        # psutil 也没有：只能查不出运行状态
             live._cache.update(at=0.0, sids={}, paths={}, bare_claude={})
             assert live.snapshot(force=True) == ({}, {})
             session = {"uid": "claude:x", "source": "claude", "sid": "x",

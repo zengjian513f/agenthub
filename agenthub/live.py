@@ -7,15 +7,22 @@
 
 全部只读 /proc 与状态文件, 不触碰任何 CLI 进程。
 
-这套判断依赖 Linux 的 /proc。没有 /proc 的系统（Windows）上退化为"查不出运行
-状态": 会话照常列出和打开控制台, 只是不显示活跃标记。接管会因此把一条其实在
-跑的会话当成没在跑, 直接另起一个实例 —— 详见 docs/session-host.md。
+Linux 走 /proc。没有 /proc 的系统 (Windows) 改用 psutil 取同样的三样东西:
+命令行、环境变量、启动时间。两边的判定规则是同一套, 差别只在从哪里读。
+psutil 也没有时才退化为"查不出运行状态": 会话照常列出和打开控制台, 只是不显示
+活跃标记, 接管会把一条其实在跑的会话当成没在跑 —— 详见 docs/session-host.md。
+
+Windows 上不读打开的文件句柄: psutil 要为此枚举整张系统句柄表, 代价远高于
+其余几项, 而实测 Claude 并不常驻持有 jsonl, 拿不到有用的东西。因此那边认
+会话靠命令行和环境变量里的 session id。
 """
 
 from __future__ import annotations
 
 import json
+import ntpath
 import os
+import posixpath
 import re
 import threading
 import time
@@ -33,6 +40,12 @@ HAS_PROC = PROC_FS.is_dir()
 TTL = 3.0          # 扫描结果的缓存秒数, 前端可以放心高频轮询
 _cache = {"at": 0.0, "sids": set(), "paths": set(), "bare_claude": {}}
 _scan_lock = threading.Lock()
+_UNSET = object()
+_psutil_module: object = _UNSET
+# Windows 上一次性给所有进程取 cmdline 要两秒 (每个都得开句柄读 PEB), 而进程名
+# 几乎不要钱。先按名字筛出候选, 再只给候选取命令行。CLI 也可能跑在通用运行时里,
+# 所以这些名字一并作为候选。
+_WINDOWS_RUNTIMES = ("node.exe", "bun.exe", "deno.exe", "python.exe", "pythonw.exe")
 _boot_time: float | None = None
 # 只在解析 /proc/<pid>/stat 的启动时间时用到；Windows 没有 sysconf，也没有 /proc。
 _clock_ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
@@ -41,15 +54,41 @@ _clock_ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 _CLI_NAMES = ("claude", "codex", "grok")
 
 
+def _cli_name(argv0: str) -> str:
+    """命令名: 去掉目录和 Windows 的 .exe, 统一小写。两种路径分隔符都认。"""
+    head = ntpath.basename(posixpath.basename(argv0.strip())).lower()
+    return head[:-4] if head.endswith(".exe") else head
+
+
 def _is_cli(cmd: str) -> bool:
     """是不是 CLI 主进程本身 (而不是它拉起来的 shell 之类)。接管时只杀这些。"""
-    head = cmd.strip().split(" ", 1)[0].rsplit("/", 1)[-1]
+    head = _cli_name(cmd.strip().split(" ", 1)[0])
     return head in _CLI_NAMES or head.startswith(("codex-", "claude-"))
 
 
+def _psutil():
+    """只有没有 /proc 的机器才需要 psutil; 它不在就退化为查不出运行状态。"""
+    global _psutil_module
+    if _psutil_module is _UNSET:
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+        _psutil_module = psutil
+    return _psutil_module
+
+
 def _process_started_at(pid: int) -> float | None:
-    """从 /proc 读取进程启动时间（Unix 秒），避免把旧回合状态带入新进程。"""
+    """进程启动时间（Unix 秒），避免把旧回合状态带入新进程。"""
     global _boot_time
+    if not HAS_PROC:
+        psutil = _psutil()
+        if psutil is None:
+            return None
+        try:
+            return psutil.Process(pid).create_time()
+        except Exception:
+            return None
     try:
         if _boot_time is None:
             with open(PROC_FS / "stat") as fh:
@@ -63,12 +102,49 @@ def _process_started_at(pid: int) -> float | None:
         return None
 
 
+def _process_cmdline(pid: int) -> str | None:
+    """进程的完整命令行；读不到就返回 None。"""
+    if not HAS_PROC:
+        psutil = _psutil()
+        if psutil is None:
+            return None
+        try:
+            return " ".join(psutil.Process(pid).cmdline())
+        except Exception:
+            return None
+    try:
+        return open(f"/proc/{pid}/cmdline", "rb").read() \
+            .replace(b"\0", b" ").decode("utf8", "replace")
+    except OSError:
+        return None
+
+
 def _cli_ancestor(pid: int) -> int | None:
     """从一个子进程往上找它所属的 CLI 主进程。
 
     裸 `claude` 启动的会话, 命令行里没有 session id, 只有子 shell 的环境变量能认出来。
     要接管这种会话就必须顺着进程树找到真正的 CLI 进程, 否则杀不掉旧实例。
     """
+    if not HAS_PROC:
+        psutil = _psutil()
+        if psutil is None:
+            return None
+        cur = pid
+        for _ in range(12):
+            try:
+                proc = psutil.Process(cur)
+                argv = proc.cmdline()
+                parent = proc.ppid()
+            except Exception:
+                return None
+            head = _cli_name(argv[0]) if argv else ""
+            if head in _CLI_NAMES or head.startswith(("codex-", "claude-")):
+                return cur
+            if parent <= 0 or parent == cur:
+                return None
+            cur = parent
+        return None
+
     cur = pid
     for _ in range(12):
         try:
@@ -91,9 +167,7 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
     paths: dict[str, set[int]] = {}
     bare_claude: dict[int, tuple[str, float]] = {}
     if not HAS_PROC:
-        # 没有 /proc 就查不出运行状态。返回空集而不是抛异常：列表、控制台、
-        # 搜索都不依赖它，只是活跃标记不再显示。
-        return sids, paths, bare_claude
+        return _scan_psutil()
 
     def note(d, k, pid):
         d.setdefault(k, set()).add(pid)
@@ -155,7 +229,13 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
                     "/.codex/sessions/" in t or "/.claude/projects/" in t or "/.grok/" in t):
                 note(paths, t, pid if main else -pid)
 
-    try:                                    # Grok 自己就记着活跃会话
+    _note_grok_sessions(sids)
+    return sids, paths, bare_claude
+
+
+def _note_grok_sessions(sids: dict[str, set[int]]) -> None:
+    """Grok 自己就记着活跃会话，不用翻进程。"""
+    try:
         data = json.loads(GROK_ACTIVE.read_text())
         entries = data if isinstance(data, list) else data.get("sessions", [])
         for e in entries:
@@ -165,6 +245,70 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
     except Exception:
         pass
 
+
+def _scan_psutil() -> tuple[dict[str, set[int]], dict[str, set[int]],
+                            dict[int, tuple[str, float]]]:
+    """没有 /proc 时（Windows）用 psutil 做同一件事。
+
+    判定规则和上面那条路完全一样，只是命令行、环境变量、启动时间改从 psutil 取。
+    打开的文件句柄这里不看，原因见模块开头。
+    """
+    sids: dict[str, set[int]] = {}
+    paths: dict[str, set[int]] = {}
+    bare_claude: dict[int, tuple[str, float]] = {}
+    psutil = _psutil()
+    if psutil is None:
+        return sids, paths, bare_claude
+
+    def note(d, k, pid):
+        d.setdefault(k, set()).add(pid)
+
+    candidates = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        name = (proc.info.get("name") or "").lower()
+        if any(k in name for k in _KEYWORDS) or name in _WINDOWS_RUNTIMES:
+            candidates.append(proc)
+
+    for proc in candidates:
+        try:
+            pid, argv = proc.pid, proc.cmdline()
+        except Exception:
+            continue
+        cmd = " ".join(argv)
+        if not any(k in cmd.lower() for k in _KEYWORDS):
+            continue
+        head = _cli_name(argv[0]) if argv else ""
+        main = head in _CLI_NAMES or head.startswith(("codex-", "claude-"))
+
+        cmd_sids = {(m.group(1) or m.group(2)).lower() for m in _CMD_SID.finditer(cmd)}
+        for sid in cmd_sids:
+            note(sids, sid, pid)
+
+        # 裸 `claude` 没有命令行里的 session id，只能靠 cwd 加启动时间跟会话配对
+        if main and head == "claude" and not cmd_sids:
+            try:
+                started = proc.create_time()
+                bare_claude[pid] = (str(Path(proc.cwd()).resolve()), started)
+            except Exception:
+                pass
+
+        try:
+            env = proc.environ()
+        except Exception:
+            env = {}
+        for prefix in _ENV_SID:
+            value = env.get(prefix[:-1])
+            if not value:
+                continue
+            env_sid = value.strip().lower()
+            # 同 /proc 那条路：主进程若已在命令行里表明身份，环境里继承来的旧
+            # session id 不算数，否则新旧两个会话会一起被标成活跃。
+            if main and cmd_sids and env_sid not in cmd_sids:
+                continue
+            owner = pid if main else (_cli_ancestor(pid) or -pid)
+            note(sids, env_sid, owner)
+
+    _note_grok_sessions(sids)
     return sids, paths, bare_claude
 
 
@@ -237,12 +381,8 @@ def started_at(session: dict, force: bool = False,
     for pid in pids_of(session, force=force) if pids is None else pids:
         if pid <= 0:
             continue
-        try:
-            cmd = open(f"/proc/{pid}/cmdline", "rb").read() \
-                .replace(b"\0", b" ").decode("utf8", "replace")
-        except OSError:
-            continue
-        if not _is_cli(cmd):
+        cmd = _process_cmdline(pid)
+        if cmd is None or not _is_cli(cmd):
             continue
         value = _process_started_at(pid)
         if value is not None:
