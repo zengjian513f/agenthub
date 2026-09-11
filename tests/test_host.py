@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agenthub import server, term, term_host, term_tmux
+from agenthub import live, server, term, term_host, term_tmux
 from agenthub.host import client, procs
 from agenthub.host.protocol import FRAME_DATA, FRAME_RESIZE, pack_frame, read_frames
 
@@ -534,3 +534,63 @@ class BackendSelectionTests(unittest.TestCase):
             listing = self.handler()._api_get("/api/term/list", {})
         self.assertEqual(listing["backend"], "tmux")
         self.assertEqual({b["name"] for b in listing["backends"]}, {"tmux", "host"})
+
+
+class WindowsPortabilityTests(unittest.TestCase):
+    """Windows 节点必须能起服务：导入期不能依赖 POSIX 模块，运行期不能依赖 /proc。"""
+
+    def test_the_tmux_backend_imports_without_posix_pty_modules(self):
+        # server → term → term_tmux 是无条件导入链。term_tmux 里曾经在模块级
+        # import fcntl/pty/termios，于是 Windows 上整个节点服务根本起不来。
+        self.assertIsNotNone(term_tmux.select)
+        for name in ("fcntl", "pty", "termios"):
+            self.assertTrue(hasattr(term_tmux, name), name)
+        with patch.object(term_tmux, "pty", None), \
+                patch.object(term_tmux.shutil, "which", return_value="/usr/bin/tmux"):
+            self.assertFalse(term_tmux.available(), "没有 pty 时 tmux 后端不能自称可用")
+
+    def test_without_proc_the_status_degrades_instead_of_failing(self):
+        session = {"uid": "codex:x", "source": "codex", "sid": "x",
+                   "path": "/tmp/none.jsonl", "cwd": "/tmp",
+                   "created": "2026-09-11T00:00:00Z"}
+        cached = dict(live._cache)
+        try:
+            with patch.object(live, "HAS_PROC", False), \
+                    patch.object(live.os, "listdir",
+                                 side_effect=AssertionError("不该去扫 /proc")):
+                live._cache.update(at=0.0, sids={}, paths={}, bare_claude={})
+                self.assertEqual(live.snapshot(force=True), ({}, {}))
+                self.assertEqual(live.pids_of(session, force=True), [])
+                self.assertFalse(live.is_live(session, force=True))
+                self.assertIsNone(live.started_at(session, force=True))
+                self.assertEqual(live.active_processes([session], force=True),
+                                 ([], {session["uid"]: []}))
+        finally:
+            live._cache.clear()
+            live._cache.update(cached)
+
+    def test_liveness_on_windows_never_uses_os_kill(self):
+        """os.kill(pid, 0) 在 Windows 上会终止进程：CPython 的实现是
+        OpenProcess + TerminateProcess，信号值直接当退出码。列会话要对每个
+        宿主 pid 判活，用它等于每次列表都把所有会话清掉。"""
+        with patch.object(procs, "LINUX", False), \
+                patch.object(procs, "_psutil", return_value=None), \
+                patch.object(procs.sys, "platform", "win32"), \
+                patch.object(procs.os, "kill",
+                             side_effect=AssertionError("不能用 os.kill 探活")), \
+                patch.object(procs, "_windows_gone", return_value=False) as probe:
+            self.assertFalse(procs.gone(4242))
+            probe.assert_called_once_with(4242)
+            # 查不出来时必须当作"还活着"：误判已结束会把宿主的会话记录清掉
+            probe.return_value = None
+            self.assertFalse(procs.gone(4242))
+            probe.return_value = True
+            self.assertTrue(procs.gone(4242))
+            probe.side_effect = OSError("ctypes 不可用")
+            self.assertFalse(procs.gone(4242))
+
+    def test_the_host_backend_is_the_default_on_windows(self):
+        with patch.object(term, "WINDOWS", True), \
+                patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGENTHUB_TERM_BACKEND", None)
+            self.assertEqual(term.default_backend(), "host")

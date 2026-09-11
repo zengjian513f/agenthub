@@ -118,7 +118,24 @@ Rust 单测覆盖屏幕模型（滚动历史分页、软换行合并、宽字符
 会出现光标前移序列；`claude_bridge` / `codex_bridge` 都先按 CSI 整段剥离，不受影响，`--plain`
 取到的也是正常空格。
 
-把 Windows 机器接成完整节点还差：`live.py` 的运行状态检测改用 psutil、`adapters.py` 识别
-Windows 项目目录 slug 与盘符路径、文件管理器的根目录判断，以及用计划任务代替 systemd。
-另外 Rust 命令行自己的 `list` 在 Windows 上不清理崩溃残留的信息文件（Linux 读 `/proc` 判断）；
-Web 服务走 Python 客户端用 psutil，不受此影响。
+### 节点服务在 Windows 上的现状
+
+能起来了，`/api/meta`、`/api/sessions`、`/api/live`、`/api/term/list`、`/api/trash` 都正常应答，
+会话能建、能列、能开控制台。两处为此做了改动：
+
+- `term_tmux.py` 原来在模块级 `import fcntl/pty/termios`。`server → term → term_tmux`
+  是无条件导入链，所以 Windows 上整个节点服务根本起不来。现在缺这些模块时只让
+  `available()` 报 False，tmux 后端自动退出候选，主后端取宿主。
+- `live.py` 的运行状态判断依赖 `/proc`。没有 `/proc` 的系统上退化为"查不出运行状态"：
+  会话照常列出、搜索和开控制台，只是不显示活跃标记。
+
+**由此带来的两个已知限制**（接管前务必知道）：
+
+- 接管会把一条其实在跑的会话当成没在跑，直接另起一个实例。Windows 上如果手工在别处
+  开了同一条会话，再从网页接管就会出现两个实例。把 `live.py` 换成 psutil 能根除，尚未做。
+- Rust 命令行自己的 `list` 不清理崩溃残留的信息文件（Linux 靠读 `/proc` 判断宿主是否还在）。
+  Web 服务走 Python 客户端，用 psutil 判断，不受此影响。
+
+还差：`adapters.py` 识别 Windows 项目目录 slug 与盘符路径（Claude Code 会把 cwd 写进 JSONL，
+所以多数会话的分组是对的，回退解码才会出错）、文件管理器的根目录判断，以及用计划任务
+代替 systemd 常驻。

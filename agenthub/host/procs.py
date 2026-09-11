@@ -55,6 +55,35 @@ def name_of(pid: int) -> str:
         return ""
 
 
+def _windows_gone(pid: int) -> bool | None:
+    """用 OpenProcess + WaitForSingleObject 判断进程是否已结束。
+
+    绝不能在 Windows 上用 `os.kill(pid, 0)` 探活：CPython 在 Windows 的实现是
+    OpenProcess + TerminateProcess，信号值直接当退出码，所以 `os.kill(pid, 0)`
+    会把目标进程杀掉并让它以 0 退出。列会话要对每个宿主 pid 判活，那等于
+    每次列表都把所有会话清掉。返回 None 表示查不出来，交给调用方退让。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    SYNCHRONIZE = 0x0010
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    WAIT_OBJECT_0 = 0x0
+    ERROR_INVALID_PARAMETER = 87
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    handle = kernel32.OpenProcess(
+        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # 参数无效 = 没有这个 pid；其他错误（通常是权限）说明进程还在。
+        return ctypes.get_last_error() == ERROR_INVALID_PARAMETER or None
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def gone(pid: int) -> bool:
     """进程是否已经结束。僵尸也算结束。"""
     if pid <= 0:
@@ -64,6 +93,13 @@ def gone(pid: int) -> bool:
         return info is None or info[1] == "Z"
     ps = _psutil()
     if not ps:
+        if sys.platform == "win32":
+            try:
+                result = _windows_gone(pid)
+            except (OSError, AttributeError, ValueError):
+                result = None
+            # 查不出来就当它还活着：误判为"已结束"会让宿主的会话记录被清掉。
+            return bool(result)
         try:
             os.kill(pid, 0)
             return False

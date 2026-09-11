@@ -6,6 +6,10 @@
   - Grok   自己维护活跃会话清单       → ~/.grok/active_sessions.json
 
 全部只读 /proc 与状态文件, 不触碰任何 CLI 进程。
+
+这套判断依赖 Linux 的 /proc。没有 /proc 的系统（Windows）上退化为"查不出运行
+状态": 会话照常列出和打开控制台, 只是不显示活跃标记。接管会因此把一条其实在
+跑的会话当成没在跑, 直接另起一个实例 —— 详见 docs/session-host.md。
 """
 
 from __future__ import annotations
@@ -24,6 +28,8 @@ _CMD_SID = re.compile(rf"--session-id[= ]({_UUID})|--resume[= ]({_UUID})")
 _ENV_SID = ("CLAUDE_CODE_SESSION_ID=", "CODEX_COMPANION_SESSION_ID=", "GROK_SESSION_ID=")
 _KEYWORDS = ("claude", "codex", "grok")
 
+PROC_FS = Path("/proc")
+HAS_PROC = PROC_FS.is_dir()
 TTL = 3.0          # 扫描结果的缓存秒数, 前端可以放心高频轮询
 _cache = {"at": 0.0, "sids": set(), "paths": set(), "bare_claude": {}}
 _scan_lock = threading.Lock()
@@ -45,7 +51,7 @@ def _process_started_at(pid: int) -> float | None:
     global _boot_time
     try:
         if _boot_time is None:
-            with open("/proc/stat") as fh:
+            with open(PROC_FS / "stat") as fh:
                 _boot_time = float(next(
                     line.split()[1] for line in fh if line.startswith("btime ")))
         st = open(f"/proc/{pid}/stat").read()
@@ -83,11 +89,15 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
     sids: dict[str, set[int]] = {}
     paths: dict[str, set[int]] = {}
     bare_claude: dict[int, tuple[str, float]] = {}
+    if not HAS_PROC:
+        # 没有 /proc 就查不出运行状态。返回空集而不是抛异常：列表、控制台、
+        # 搜索都不依赖它，只是活跃标记不再显示。
+        return sids, paths, bare_claude
 
     def note(d, k, pid):
         d.setdefault(k, set()).add(pid)
 
-    for spid in os.listdir("/proc"):
+    for spid in os.listdir(PROC_FS):
         if not spid.isdigit():
             continue
         pid = int(spid)

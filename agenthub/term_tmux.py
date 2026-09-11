@@ -14,20 +14,27 @@ tmux 提供了合法的输入通道, 而且会话独立于 agenthub 存活 —�
 
 from __future__ import annotations
 
-import fcntl
 import os
-import pty
 import select
 import shlex
 import shutil
 import signal
 import struct
 import subprocess
-import termios
 import threading
 import time
 import uuid
 from pathlib import Path
+
+# tmux 后端需要 POSIX pty。Windows 上这三个模块不存在，但 term.py 仍然要能导入
+# 本模块（它把两个后端放在同一张表里），所以缺失时只让 available() 报 False，
+# 不能在导入期就炸掉整个服务。
+try:
+    import fcntl
+    import pty
+    import termios
+except ImportError:                     # pragma: no cover - 只在 Windows 命中
+    fcntl = pty = termios = None        # type: ignore[assignment]
 
 from . import audit
 
@@ -41,7 +48,7 @@ _submit_locks: dict[str, threading.Lock] = {}
 _submit_locks_guard = threading.Lock()
 
 def available() -> bool:
-    return shutil.which("tmux") is not None
+    return pty is not None and shutil.which("tmux") is not None
 
 
 def _tmux_argv(server: str, *args: str, no_start: bool = False) -> list[str]:
