@@ -145,13 +145,13 @@ def main():
                     page.evaluate('(uid) => openSession(uid)', uid)
                     page.wait_for_function('(name) => document.querySelector("#msgs")?.textContent.includes("reply " + name)', arg=name)
                     def check_session_identity():
-                        # 宽屏把机器和来源提到标题后的简要区，完整元信息仍在 ⋯ 菜单里
+                        # 元信息按 消息数、大小、时间、机器、目录、来源、会话号 的顺序放在标题后，
+                        # 放不下的才进 ⋯ 菜单；两处合起来正好一份
                         brief = page.locator('.dbrief > span').all_text_contents()
                         meta = page.locator('.dmeta > span').all_text_contents()
                         fields = brief + meta
-                        assert brief[-2:] == [name, 'Claude'], brief
-                        assert meta[-2:] == [nodes[i].state['row']['cwd'],
-                                             nodes[i].state['row']['sid']], meta
+                        assert fields[-4:] == [name, nodes[i].state['row']['cwd'], 'Claude',
+                                               nodes[i].state['row']['sid']], fields
                         assert fields.count(name) == 1, fields
                     check_session_identity()
                     page.wait_for_function('Array.from(document.querySelectorAll("#msgs img")).some(i => i.complete && i.naturalWidth > 0)')

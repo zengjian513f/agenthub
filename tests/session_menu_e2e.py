@@ -20,6 +20,11 @@ class MenuNode(NodeHandler):
                                'sessions': [{'name': 'menu-terminal',
                                              'uid': self.state['row']['uid']}],
                                'pending': []})
+        if urlparse(self.path).path == '/api/live':
+            uid = self.state['row']['uid']
+            live = self.state.get('live')   # None / 'direct' / 'tmux'
+            return self._json({'uids': [uid] if live else [],
+                               'tmux_uids': [uid] if live == 'tmux' else [], 'started_at': {}})
         return super().do_GET()
 
     def messages(self, q):
@@ -47,8 +52,11 @@ def tier_of(width):
 
 
 def open_actions(page):
-    """The ⋯ menu exists at every tier; on wide screens it only holds the full metadata."""
-    page.locator('#a-more').click()
+    """The ⋯ menu holds whatever the title row could not fit; on a wide screen with
+    every action and metadata item inline there is nothing to open."""
+    more = page.locator('#a-more')
+    if more.is_visible():
+        more.click()
 
 
 def header_ids(page):
@@ -57,25 +65,112 @@ def header_ids(page):
 
 
 INLINE_IDS = {
-    'wide': ['a-term', 'a-star', 'a-turns', 'report-bug', 'a-session-action', 'a-more'],
+    'wide': ['a-term', 'a-star', 'a-turns', 'report-bug', 'a-session-action'],
     'medium': ['a-term', 'a-star', 'a-more'],
     'narrow': ['a-term', 'a-more'],
 }
-# 标题后的简要元信息；机器徽章只有中央站的会话才有
-BRIEF_IDS = {'wide': ['mcount-total', 'dlive', 'meta-node', 'meta-source'],
-             'medium': ['meta-node'], 'narrow': []}
+# 元信息的固定顺序：消息数、大小、起止时间、机器、目录、来源、会话号（机器徽章只有中央站的会话才有）
+META_ORDER = ['mcount-total', 'size', 'time', 'meta-node', 'cwd', 'meta-source', 'session-id']
+META_KEY = '''e => e.id === 'mcount-total' ? e.id
+  : e.classList.contains('session-id') ? 'session-id'
+  : e.classList.contains('meta-node') ? 'meta-node'
+  : e.classList.contains('meta-source') ? 'meta-source'
+  : e.querySelector('code') ? 'cwd' : e.textContent.includes('→') ? 'time' : 'size' '''
+
+
+def meta_split(page):
+    """(标题后的简要项, ⋯ 菜单里的项)，都按 META_KEY 归类。"""
+    brief = page.locator('.dbrief > *').evaluate_all(f'items => items.map({META_KEY})')
+    menu = page.locator('#session-actions-menu .dmeta > *').evaluate_all(f'items => items.map({META_KEY})')
+    return brief, menu
+
+
+def assert_meta_fit(page, tier, scoped):
+    """标题后放得下的元信息都要放出来，只有放不下的才进 ⋯；顺序固定，标题行不换行。"""
+    brief, menu = meta_split(page)
+    expected = [k for k in META_ORDER if scoped or k != 'meta-node']
+    assert brief + menu == expected, (brief, menu)
+    assert page.locator('.dbrief').is_visible() == bool(brief)
+    if tier == 'narrow':
+        assert not brief, brief
+    more = page.locator('#a-more')
+    if tier == 'wide':
+        # 操作全平铺后 ⋯ 只剩元信息；元信息也都放下了就不显示
+        assert more.is_visible() == bool(menu), (menu, more.is_visible())
+        if menu:
+            assert more.get_attribute('aria-label') == '会话信息'
+    else:
+        assert more.is_visible() and more.get_attribute('aria-label') == '更多会话操作'
+    layout = page.evaluate('''() => {
+      const h2 = document.querySelector('.dhead h2'), brief = document.querySelector('.dbrief');
+      const actions = document.querySelector('.dhead-actions');
+      const last = brief && !brief.hidden ? brief : h2;
+      return {free: actions.getBoundingClientRect().left - last.getBoundingClientRect().right,
+              overlap: brief && !brief.hidden && brief.getBoundingClientRect().right > actions.getBoundingClientRect().left,
+              gap: parseFloat(getComputedStyle(document.querySelector('.dtitle')).columnGap)};
+    }''')
+    assert not layout['overlap'], layout
+    if menu and tier != 'narrow':
+        # 菜单里第一项确实放不下：剩余空间小于它的宽度（加上间距和留给消息数变宽的余量）
+        open_actions(page)
+        width = page.locator('#session-actions-menu .dmeta > *').first.evaluate('e => e.getBoundingClientRect().width')
+        page.keyboard.press('Escape')
+        assert layout['free'] < width + layout['gap'] * 2 + 24, (layout, width, brief, menu)
+
+
+def assert_live_dot(page, node, uid):
+    """运行点挂在标题图标右上角，和左栏一致；绿=直接进程，蓝=tmux。"""
+    dot = page.locator('.dhead h2 > .ico > #dlive')
+    assert dot.count() == 1 and dot.is_hidden()
+    for kind, tmux in [('tmux', True), ('direct', False), (None, None)]:
+        node.state['live'] = kind
+        page.evaluate('refreshLive(true)')
+        page.wait_for_function('(on) => document.querySelector("#dlive").classList.contains("visible") === on', arg=bool(kind))
+        if not kind:
+            continue
+        state = page.evaluate('''() => {
+          const dot = document.querySelector('#dlive'), ico = dot.parentElement;
+          const d = dot.getBoundingClientRect(), i = ico.getBoundingClientRect();
+          const side = document.querySelector('#side .item.sel > .ico > .item-status');
+          const s = side.getBoundingClientRect(), si = side.parentElement.getBoundingClientRect();
+          const offset = [d.x + d.width / 2 - (i.x + i.width), d.y + d.height / 2 - i.y];
+          return {tmux: dot.classList.contains('tmux'), label: dot.title, offset,
+            // 手机详情页左栏不显示，量不到左栏的点
+            sideOffset: side.offsetWidth ? [s.x + s.width / 2 - (si.x + si.width), s.y + s.height / 2 - si.y] : offset,
+            hit: document.elementFromPoint(d.x + d.width / 2, d.y + d.height / 2) === dot,
+            color: getComputedStyle(dot).backgroundColor, sideColor: getComputedStyle(side).backgroundColor};
+        }''')
+        assert state['tmux'] == tmux and state['label'] == ('运行于 tmux' if tmux else '运行中'), state
+        assert state['hit'], state   # 没被标题的 overflow 裁掉
+        assert state['offset'] == state['sideOffset'], state
+        assert state['color'] == state['sideColor'], state
+        assert not page.locator('.dbrief, .dmeta').locator('text=●').count()
+
+
+def assert_menu_text_selectable(page):
+    """⋯ 里的元信息可以用鼠标划选（复制会话号）；划选时菜单不能因为焦点落到 body 而关闭。"""
+    open_actions(page)
+    target = page.locator('#session-actions-menu .dmeta .session-id code')
+    box = target.bounding_box()
+    y = box['y'] + box['height'] / 2
+    page.mouse.move(box['x'] + 2, y)
+    page.mouse.down()
+    page.mouse.move(box['x'] + box['width'] - 2, y, steps=5)
+    during = page.evaluate('({hidden: document.querySelector("#session-actions-menu").hidden, text: getSelection().toString()})')
+    page.mouse.up()
+    assert not during['hidden'] and during['text'] == 'same-native-id', during
+    assert page.evaluate('getSelection().toString()') == 'same-native-id'
+    assert page.locator('#session-actions-menu').is_visible()
+    page.locator('.dhead h2 > .ico').click()   # 点菜单外面才关
+    assert page.locator('#session-actions-menu').is_hidden()
 
 
 def assert_actions_menu(page, tier, scoped):
     menu = page.locator('#session-actions-menu')
     max_height = 46   # 会话头任何宽度都只有一行
     wide = tier == 'wide'
-    assert header_ids(page) == INLINE_IDS[tier], header_ids(page)
-    brief = page.locator('.dbrief > *').evaluate_all(
-        'items => items.map(e => e.id || e.className.split(" ")[0])')
-    assert brief == [x for x in BRIEF_IDS[tier] if scoped or x != 'meta-node'], brief
-    assert page.locator('.dbrief').is_visible() == bool(brief)
-    assert page.locator('#a-more').get_attribute('aria-label') == ('会话信息' if wide else '更多会话操作')
+    assert header_ids(page) == INLINE_IDS[tier] + (['a-more'] if wide and meta_split(page)[1] else []), header_ids(page)
+    assert_meta_fit(page, tier, scoped)
     assert page.locator('.dhead').bounding_box()['height'] <= max_height
     assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
     assert page.evaluate('''limit => {
@@ -90,9 +185,9 @@ def assert_actions_menu(page, tier, scoped):
     }''', max_height)
     open_actions(page)
     scope = page.locator('.dhead-actions') if wide else menu
-    assert menu.is_visible()
+    assert menu.is_visible() == (not wide or bool(meta_split(page)[1]))
     assert page.locator('#mcount-total').is_visible()
-    assert page.locator('.dmeta .session-id').is_visible()
+    assert page.locator('.session-id').is_visible()
     hits = scope.locator('button:visible').evaluate_all('''items => items.map(e => {
       const r = e.getBoundingClientRect();
       return e.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
@@ -104,6 +199,8 @@ def assert_actions_menu(page, tier, scoped):
     before = page.evaluate('S.compactTurns')
     page.locator('#a-turns').click()
     assert menu.is_hidden() and page.evaluate('S.compactTurns') != before
+    if not wide or meta_split(page)[1]:
+        assert_menu_text_selectable(page)
     more = page.locator('#a-more')
     if not wide:
         first, second = ('a-star', 'a-turns') if tier == 'narrow' else ('a-turns', 'report-bug')
@@ -128,8 +225,10 @@ def assert_actions_menu(page, tier, scoped):
     open_actions(page)
     page.locator('#a-view-switch').click()
     assert menu.is_hidden() and page.locator('#session-view-menu').is_visible()
-    open_actions(page)
-    assert menu.is_visible()
+    open_actions(page)   # 打开 ⋯ 会收起视图菜单；没有 ⋯ 可开时视图开关自己收起
+    if not page.locator('#a-more').is_visible():
+        page.locator('#a-view-switch').click()
+    assert menu.is_visible() == (not wide or bool(meta_split(page)[1]))
     assert page.locator('#session-view-menu').is_hidden()
     page.locator('.dhead h2 > .ico').click()
     assert menu.is_hidden()
@@ -193,6 +292,20 @@ def main():
                         tier = tier_of(width)
                         wide = tier == 'wide'
                         assert_actions_menu(page, tier, scoped)
+                        assert_live_dot(page, node, uid)
+                        if wide:
+                            # 拖分割线：详情区变窄时放不下的项进 ⋯，拉回去后再出来
+                            page.evaluate('setSideWidth(innerWidth - 560, true)')
+                            page.wait_for_function('document.querySelector("#a-more").offsetWidth > 0')
+                            assert_actions_menu(page, tier, scoped)
+                            assert meta_split(page)[1], meta_split(page)
+                            page.evaluate('setSideWidth(200, true)')
+                            page.wait_for_function('!document.querySelector("#a-more").offsetWidth')
+                            assert_actions_menu(page, tier, scoped)
+                            assert meta_split(page) == ([k for k in META_ORDER if scoped or k != 'meta-node'], [])
+                            page.evaluate('setSideWidth(340, true)')
+                            page.wait_for_timeout(100)
+                            assert_actions_menu(page, tier, scoped)
                         for mode in (['full', 'normal', 'collapsed'] if width > 720 else ['full']):
                             page.evaluate('''mode => {
                               T.mode = mode; T.height = 10000; layoutTermPane();
@@ -249,9 +362,14 @@ def main():
                         page.evaluate('''() => showNewSessionStage({name: 'pending-menu',
                           source: 'claude', title: 'New session', cwd: '/example/project', node_name: 'MenuNode'})''')
                         assert header_ids(page) == (
-                            ['a-term', 'report-bug', 'a-session-action', 'a-more'] if wide
+                            ['a-term', 'report-bug', 'a-session-action'] if wide
                             else ['a-term', 'a-more']), header_ids(page)
                         assert page.locator('.dhead').bounding_box()['height'] <= 46
+                        assert page.locator('.dhead h2 > .ico > #dlive.visible.tmux').count() == 1
+                        pending_meta = ['mcount-total', 'meta-node', 'cwd', 'meta-source']   # 上面显式给了 node_name
+                        brief, folded = meta_split(page)
+                        assert brief + folded == pending_meta, (brief, folded)
+                        assert (not folded) if wide else (not brief) if tier == 'narrow' else True, (brief, folded)
                         open_actions(page)
                         assert page.locator('#a-session-action').get_attribute('aria-label') == '停止会话'
                         assert page.locator('.dhead [data-report-bug]').is_visible()

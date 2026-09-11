@@ -954,7 +954,7 @@ function showNewSessionStage(info) {
   const pendingTitle = info.title || `新建 ${src.name} 会话`;
   $('#detail').innerHTML = `<div class="dhead"><div class="dtitle">
     <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
-    <h2>${icon(info.source)}<span>${esc(pendingTitle)}</span></h2>
+    <h2>${sessionIconMarkup(info.source, true, true)}<span>${esc(pendingTitle)}</span></h2>
     <div class="dhead-actions" aria-label="会话操作">
       <button class="iconbtn" id="a-term" title="切换到终端" aria-label="切换到终端">${uiIcon('terminal')}</button>
       ${sessionActionsMarkup(`
@@ -962,9 +962,10 @@ function showNewSessionStage(info) {
         aria-label="报告当前会话问题">${uiIcon('bug')}</button>
       <button class="session-menu-action danger" id="a-session-action" title="停止会话" aria-label="停止会话">${uiIcon('power')}</button>
       `, `
-    <div class="dmeta">${info.node_name ? `<span class="meta-node">${esc(info.node_name)}</span>` : ''}<span class="meta-source">${esc(src.name)}</span><span id="mcount-total">0 条消息</span>
-      <span id="dlive" class="dlive on tmux" title="运行于 tmux" aria-label="运行于 tmux">●</span>
-      <span class="meta-secondary"><code>${esc(info.cwd)}</code></span></div>`)}
+    <div class="dmeta"><span id="mcount-total">0 条消息</span>
+      ${info.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(info.node_name)}">${esc(info.node_name)}</span>` : ''}
+      <span class="meta-secondary"><code>${esc(shortCwd(info.cwd, 999))}</code></span>
+      <span class="meta-source">${esc(src.name)}</span></div>`)}
     </div></div>
   </div><div class="empty new-session-wait">终端已启动，正在等待会话记录落盘…</div>`;
   $('#detail .mobile-back').onclick = showMobileList;
@@ -1206,8 +1207,6 @@ function renderTakeoverBtn() {
   b.title = b.ariaLabel = label;
   b.setAttribute('aria-expanded', String(terminalVisible));
   b.classList.toggle('on', !!name);
-  b.classList.toggle('session-live', S.live.has(S.sel));
-  b.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
   paintConsoleAvailability(b, S.sel, S.agent);
   renderComposer();
 }

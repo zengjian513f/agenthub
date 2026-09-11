@@ -57,10 +57,15 @@ def check_hidden_stays_invisible(p, where):
 
 
 def open_session_menu(p):
-    """宽屏会话操作已摊在标题栏上；只有窄屏需要先展开「⋯」菜单。"""
+    """宽屏会话操作已摊在标题栏上，放得下的元信息也在标题后；只有放不下的才要先展开「⋯」菜单。"""
     more = p.locator("#a-more")
     if more.is_visible():
         more.click()
+
+
+def session_meta_text(p):
+    """标题后的简要元信息加 ⋯ 菜单里的其余部分。"""
+    return " ".join(p.locator(".dbrief, .dmeta").all_inner_texts())
 
 
 def tmux_run(server, *args, **kwargs):
@@ -1271,10 +1276,10 @@ def run(pw):
           p.evaluate("S.sel") == selected_before_unstar
           and p.locator("#a-star.on").count() == 0)
     open_session_menu(p)
-    check("详情元信息含 cwd", "/tmp/agenthub-selftest" in p.locator(".dmeta").inner_text())
-    check("详情菜单显示会话 UUID",
-          "00000000-dead-beef-0000-000000000001" in p.locator(".dmeta").inner_text())
-    meta_codes = p.locator(".dmeta code").all_inner_texts()
+    check("详情元信息含 cwd", "/tmp/agenthub-selftest" in session_meta_text(p))
+    check("详情元信息显示会话 UUID",
+          "00000000-dead-beef-0000-000000000001" in session_meta_text(p))
+    meta_codes = p.locator(".dbrief code, .dmeta code").all_inner_texts()
     check("目录在前且 UUID 内容在后",
           meta_codes[-2:] == ["/tmp/agenthub-selftest", "00000000-dead-beef-0000-000000000001"], meta_codes)
     p.keyboard.press("Escape")

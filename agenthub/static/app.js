@@ -276,6 +276,10 @@ const el = (tag, cls, html) => {
 };
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const icon = src => `<svg class="ico source-icon" data-source="${src}" aria-hidden="true" style="color:${SOURCES[src].color}"><use href="#${SOURCES[src].icon}"/></svg>`;
+// 会话头的图标：右上角的运行点和左栏列表一致（绿=直接进程，蓝=tmux）
+const sessionIconMarkup = (src, live, tmux) => `<span class="ico">${icon(src)}<span
+  class="item-status${live ? ' visible' : ''}${tmux ? ' tmux' : ''}" id="dlive"
+  title="${tmux ? '运行于 tmux' : '运行中'}" aria-label="${tmux ? '运行于 tmux' : '运行中'}"></span></span>`;
 const uiIcon = name => `<svg class="ui-icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 
 let staleBuildShown = false;
@@ -1576,16 +1580,13 @@ function paintLive() {
   }
   const h = $('#dlive');
   if (h) {
-    const tmux = S.liveTmux.has(S.sel);
-    h.classList.toggle('on', S.live.has(S.sel));
+    // 临时会话（还没有 JSONL）按左栏同样的规则算运行中
+    const row = document.querySelector(`.item[data-uid="${CSS.escape(S.sel || '')}"]`);
+    const live = row ? row.classList.contains('live') : S.live.has(S.sel);
+    const tmux = row ? row.classList.contains('live-tmux') : S.liveTmux.has(S.sel);
+    h.classList.toggle('visible', live);
     h.classList.toggle('tmux', tmux);
-    h.textContent = '●';
     h.title = h.ariaLabel = tmux ? '运行于 tmux' : '运行中';
-  }
-  const termButton = $('#a-term');
-  if (termButton) {
-    termButton.classList.toggle('session-live', S.live.has(S.sel));
-    termButton.classList.toggle('session-tmux', S.liveTmux.has(S.sel));
   }
   const selected = S.sessions.find(x => x.uid === S.sel);
   if (selected) {
@@ -1831,6 +1832,7 @@ function refreshSessionMeta() {
     renderSession(current.meta, current.msgs, current.activity);
   } else if (current && oldHead && headerKey(current.meta) !== beforeKey) {
     oldHead.replaceWith(head(current.meta, entryTotal(current)));
+    layoutSessionHead();
   }
 }
 
@@ -2874,6 +2876,7 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
   const entry = cache.get(viewKey(uid, agent));
   if (!agent) reconcileQueuedMessages(uid, msgs);
   d.appendChild(head(meta, entryTotal(entry || {msgs})));
+  layoutSessionHead();
   const box = el('div', 'msgs');
   box.id = 'msgs';
   d.appendChild(box);
@@ -2956,14 +2959,8 @@ function bindSessionActions(heading) {
     labelSessionAction(item);
   });
   // 记住菜单里的原始顺序，layoutSessionHead 在各级排版之间搬动后还能按它归位
-  const briefKind = item => item.id === 'mcount-total' ? 'count' : item.id === 'dlive' ? 'live'
-    : item.classList.contains('meta-node') ? 'node'
-    : item.classList.contains('meta-source') ? 'source' : '';
   [...menu.querySelector('[role="menu"]').children].forEach((node, i) => { node.dataset.order = i; });
-  [...menu.querySelector('.dmeta')?.children || []].forEach((item, i) => {
-    item.dataset.order = i;
-    item.dataset.brief = briefKind(item);
-  });
+  [...menu.querySelector('.dmeta')?.children || []].forEach((item, i) => { item.dataset.order = i; });
   const items = () => [...menu.querySelectorAll('button:not(:disabled)')];
   const open = () => {
     menu.hidden = false;
@@ -2993,21 +2990,26 @@ function bindSessionActions(heading) {
     rows[next]?.focus();
   };
   button.parentElement.addEventListener('focusout', event => {
-    if (!button.parentElement?.contains(event.relatedTarget)) closeSessionActions();
+    // 在菜单的元信息上按下鼠标选字时焦点落到 body（relatedTarget 为空），不算离开菜单；
+    // 点到菜单外面由 document 的 click 兜底关闭
+    if (event.relatedTarget && !button.parentElement?.contains(event.relatedTarget)) closeSessionActions();
   });
   layoutSessionHead(heading);
 }
 
-// 会话头任何宽度都只占一行。三级排版决定哪些操作平铺在标题右侧、哪些元信息
-// 直接跟在标题后面（.dbrief），其余都收进 ⋯ 菜单：
-//   宽屏：操作全部平铺，简要元信息是 消息数、运行点、机器、来源；菜单里只剩完整元信息
-//   中屏：只平铺星标，简要元信息只有机器
-//   窄屏：全部收进菜单（运行状态由控制台按钮上的圆点表示）
+// 会话头任何宽度都只占一行。三级排版决定哪些操作平铺在标题右侧；元信息按固定顺序
+// （消息数、大小、起止时间、机器、目录、分支、来源、模型、会话号）尽量直接跟在标题
+// 后面（.dbrief），长标题让到标题行的 40%（不少于 8em）为止，从放不下的那一项起全部收进 ⋯ 菜单：
+//   宽屏：操作全部平铺；元信息全放得下时 ⋯ 没有内容，不显示
+//   中屏：只平铺星标，元信息同样按剩余宽度平铺
+//   窄屏：全部收进菜单
 const HEAD_INLINE = {
-  wide: {actions: null, brief: ['count', 'live', 'node', 'source']},
-  medium: {actions: ['a-star'], brief: ['node']},
-  narrow: {actions: [], brief: []},
+  wide: {actions: null, brief: true},
+  medium: {actions: ['a-star'], brief: true},
+  narrow: {actions: [], brief: false},
 };
+// 消息数会随新消息变宽，留一点余量免得刚好放下的一项被裁掉
+const HEAD_BRIEF_SLACK = 24;
 function layoutSessionHead(heading = $('#detail .dhead')) {
   const wrap = heading?.querySelector('.session-actions');
   const menu = heading?.querySelector('#session-actions-menu');
@@ -3039,20 +3041,47 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
   heading.classList.toggle('head-flat', plan.actions === null);
   const menuEmpty = !list.children.length;
   const more = wrap.querySelector('#a-more');
-  if (more) more.title = more.ariaLabel = menuEmpty ? '会话信息' : '更多会话操作';
-  // 元信息同理：简要项跟在标题后，其余留在菜单里
+  if (more) {
+    more.title = more.ariaLabel = menuEmpty ? '会话信息' : '更多会话操作';
+    more.hidden = false;   // 量宽度时按 ⋯ 在场算，免得它的显隐反过来改变放得下的项数
+  }
+  // 元信息：全部先收回菜单，量出标题和操作区后按顺序往标题后放，放不下的留在菜单里
   const meta = menu.querySelector('.dmeta');
   let brief = heading.querySelector('.dbrief');
   if (meta) {
     if (!brief) {
       brief = el('div', 'dbrief');
-      heading.querySelector('.dhead-actions').before(brief);
+      actions.before(brief);
     }
     const items = [...meta.children, ...brief.children]
       .sort((a, b) => a.dataset.order - b.dataset.order);
-    for (const item of items) (plan.brief.includes(item.dataset.brief) ? brief : meta).appendChild(item);
-    brief.hidden = !brief.children.length;
+    for (const item of items) meta.appendChild(item);
+    brief.hidden = true;
+    let keep = 0;
+    if (plan.brief && heading.isConnected) {
+      const title = heading.querySelector('.dtitle');
+      const h2 = title.querySelector('h2');
+      const gap = parseFloat(getComputedStyle(title).columnGap) || 0;
+      // 长标题最多占标题行的 40%（不少于 8em），其余让给元信息；短标题只占自己的宽度
+      const titleMax = Math.max(8 * parseFloat(getComputedStyle(h2).fontSize), title.clientWidth * 0.4);
+      const titleWidth = Math.min(h2.getBoundingClientRect().width, titleMax);
+      const room = actions.getBoundingClientRect().left - h2.getBoundingClientRect().left
+        - titleWidth - gap * 2 - HEAD_BRIEF_SLACK;
+      brief.hidden = false;
+      for (const item of items) brief.appendChild(item);
+      const briefGap = parseFloat(getComputedStyle(brief).columnGap) || 0;
+      let used = 0;
+      for (const item of items) {
+        const width = item.getBoundingClientRect().width + (keep ? briefGap : 0);
+        if (used + width > room) break;
+        used += width;
+        keep++;
+      }
+      for (const item of items.slice(keep)) meta.appendChild(item);
+    }
+    brief.hidden = !keep;
   }
+  if (more) more.hidden = menuEmpty && !meta?.children.length;
 }
 
 document.addEventListener('click', event => {
@@ -3067,6 +3096,17 @@ document.addEventListener('keydown', event => {
 }, true);
 addEventListener('resize', () => closeSessionActions());
 for (const media of [MOBILE, MEDIUM]) media.addEventListener('change', () => layoutSessionHead());
+// 拖分割线、开合左栏、改窗口都会改变详情区宽度，元信息随之在标题后和 ⋯ 之间进出
+{
+  let detailWidth = -1;
+  new ResizeObserver(entries => {
+    const width = entries.at(-1)?.contentRect.width ?? -1;
+    if (width === detailWidth) return;
+    detailWidth = width;
+    layoutSessionHead();
+  }).observe($('#detail'));
+  document.fonts?.ready.then(() => layoutSessionHead());   // 字体换过之后文字宽度会变
+}
 
 // 顶栏右侧按钮按三级宽度折进 ⋯ 菜单：宽屏全露出，中屏折起回收站/报告/设置，窄屏全折起。
 const HEADER_FOLD = {
@@ -3169,7 +3209,8 @@ function head(m, total) {
   h.innerHTML = `
     <div class="dtitle">
       <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
-      <h2 class="${hasAgents ? 'has-session-views' : ''}">${icon(m.source)}${titleView}</h2>
+      <h2 class="${hasAgents ? 'has-session-views' : ''}">${sessionIconMarkup(m.source,
+        S.live.has(m.uid), tmuxLive)}${titleView}</h2>
       ${menuView}
       <div class="dhead-actions" aria-label="会话操作">
         ${forkChainButtonMarkup(m)}
@@ -3189,15 +3230,13 @@ function head(m, total) {
         `, `
     <div class="dmeta">
       <span id="mcount-total">${total} 条消息</span>
-      <span id="dlive" class="dlive${S.live.has(m.uid) ? ' on' : ''}${tmuxLive ? ' tmux' : ''}"
-        title="${tmuxLive ? '运行于 tmux' : '运行中'}" aria-label="${tmuxLive ? '运行于 tmux' : '运行中'}">●</span>
-      <span class="meta-secondary">${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
       <span class="meta-secondary">${fmtSize(m.size)}</span>
-      ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
-      ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
+      <span class="meta-secondary">${esc(fmtTime(m.created))} → ${esc(fmtTime(m.updated))}</span>
       ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
-      <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
+      ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
+      <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
+      ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
     </div>`)}
       </div>

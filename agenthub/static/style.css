@@ -611,12 +611,6 @@ button.machine-swatch:hover { box-shadow: 0 0 0 3px color-mix(in srgb, var(--nod
 }
 .item.live .t { font-weight: 600; }
 
-.dlive {
-  display: none; color: var(--live-direct); font-weight: 600;
-}
-.dlive.on { display: inline; }
-.dlive.tmux { color: var(--live-tmux); }
-
 main { display: flex; flex: 1; min-height: 0; }
 
 #left {
@@ -819,14 +813,21 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
   flex: 0 1 auto; min-width: min(8em, 40%); margin: 0;
   font-size: 16px; font-weight: 600;
 }
+/* 放进来的每一项都由 layoutSessionHead 量过宽度，不再参与 flex 收缩：标题先省略到下限，
+   之后（字体切换等瞬间）多出的几像素只裁不换行 */
 .dbrief {
-  display: flex; align-items: center; gap: 10px; flex: 0 0.25 auto; min-width: 0;
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto; min-width: 0;
   overflow: hidden; white-space: nowrap;
-  color: var(--muted); font-size: 12px;
+  color: var(--muted); font-size: 12px; cursor: text;
 }
 .dbrief[hidden] { display: none; }
 .dbrief > * { flex: none; }
-.dtitle h2 > .ico { flex: none; }
+.dbrief code { font-size: 11.5px; background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+/* 标题图标和左栏列表一样：右上角挂运行点（上面 h2 > span 的 overflow:hidden 会裁掉它） */
+.dtitle h2 > .ico {
+  position: relative; flex: none; width: 30px; height: 30px; display: grid; place-items: center;
+  overflow: visible;
+}
 .dtitle h2 > span, .session-view-switch > span {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -879,6 +880,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .session-actions { position: relative; }
 #a-more { font-size: 24px; line-height: 1; }
+#a-more[hidden] { display: none; }
 .session-actions-menu {
   position: absolute; z-index: 12; top: calc(100% + 6px); right: 0;
   width: min(320px, calc(100vw - 24px)); max-height: calc(100dvh - 100px);
@@ -903,7 +905,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .session-actions-menu .dmeta {
   display: flex; flex-flow: row wrap; align-items: center; gap: 6px 10px;
   border-top: 1px solid var(--border); margin-top: 5px; padding: 10px;
-  overflow-wrap: anywhere; font-size: 11.5px;
+  overflow-wrap: anywhere; font-size: 11.5px; cursor: text; user-select: text;
 }
 .session-actions-menu [role="menu"]:empty + .dmeta { border-top: 0; margin-top: 0; }
 .session-actions-menu .dmeta > span { min-width: 0; max-width: 100%; }
@@ -936,15 +938,6 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .dhead-actions > .session-menu-search > .session-menu-action > span { display: none; }
 .dhead-actions > .session-menu-search > .session-menu-action:hover { background: var(--hover); color: var(--text); }
-/* 中窄屏运行状态不再平铺在标题后，改画在控制台按钮角上 */
-@media (max-width: 1199px) {
-  #a-term.session-live::before {
-    content: ""; position: absolute; z-index: 1; top: 1px; left: 1px;
-    width: 8px; height: 8px; border: 2px solid var(--panel); border-radius: 50%;
-    background: var(--live-direct);
-  }
-  #a-term.session-live.session-tmux::before { background: var(--live-tmux); }
-}
 .iconbtn {
   display: inline-flex; align-items: center; justify-content: center; flex: none;
   border: 0; background: transparent; color: var(--muted); cursor: pointer;
@@ -1737,9 +1730,9 @@ body.dragging-v { cursor: row-resize; user-select: none; }
 :root[data-tool-icons="boss"] .source-icon > use { visibility: hidden; }
 #side .item > .ico { width: 30px; height: 30px; }
 #side .item > .ico > .source-icon { width: 26px; height: 26px; }
-#side .item-status { right: -4px; }
+#side .item-status, .dtitle h2 .item-status { right: -4px; }
 .dtitle h2 { align-items: center; }
-.dtitle h2 > .source-icon {
+.dtitle h2 > .ico > .source-icon {
   width: 26px; height: 26px; margin-top: 0;
 }
 .avatar-credits { align-self: flex-end; font-size: 11px; color: var(--muted); }
@@ -1788,7 +1781,7 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   .mobile-back:hover { background: var(--hover); }
   .dtitle h2, .dtitle h2.has-session-views {
     display: flex; align-items: center; gap: 6px; overflow: hidden;
-    margin: 3px 0 2px; font-size: 14.5px; line-height: 1.35;
+    margin: 0; font-size: 14.5px; line-height: 1.35;
     overflow-wrap: normal; text-overflow: ellipsis; white-space: nowrap;
   }
   .dtitle h2 > .ico, .dtitle h2.has-session-views > .ico {
