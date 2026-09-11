@@ -281,6 +281,10 @@ body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix
 #new-session-dialog::backdrop, .app-dialog::backdrop { background: rgba(10, 14, 22, .48); backdrop-filter: blur(2px); }
 #new-session-form { display: flex; flex-direction: column; gap: 8px; padding: 14px; overflow-y: auto; }
 .settings-form, .report-form { display: flex; flex-direction: column; gap: 8px; padding: 17px; }
+.settings-form {
+  box-sizing: border-box; max-height: inherit; overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
 .report-label { margin-top: 3px; color: var(--muted); font-size: 12px; font-weight: 600; }
 #bug-report-description {
   width: 100%; min-height: 132px; resize: vertical; padding: 9px 10px;
