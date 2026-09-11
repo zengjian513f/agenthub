@@ -34,7 +34,12 @@ SEARCH_IDLE_TIMEOUT = 60
 # Machines being switched off is normal, so the last session list of each node
 # is persisted and shown as an offline cache until the node is back.
 PROBE_INTERVAL = 10
-RECHECK_TIMEOUT = 2
+RECHECK_TIMEOUT = 5
+# A node that is currently online is only painted offline after this many
+# consecutive failed checks. One slow answer from a busy machine, or a service
+# restart during deployment, must not gray out its console; a machine that is
+# really gone still shows up within PROBE_INTERVAL * OFFLINE_STRIKES seconds.
+OFFLINE_STRIKES = 2
 CACHED_PATHS = {"/api/sessions", "/api/term/list"}
 
 
@@ -333,10 +338,22 @@ class Registry:
                 # A failed search says nothing about the node's live/terminal APIs.
                 if path != "/api/search":
                     now = time.time()
-                    self.health[node["id"]] = {
-                        **prior, "online": False, "error": reason, "error_code": code,
+                    strikes = int(prior.get("strikes") or 0) + 1
+                    failed_since = float(prior.get("failed_since") or now)
+                    # Hold a previously reachable node visible for one more
+                    # probe; its own requests still report their real error.
+                    tentative = prior.get("online") is True and strikes < OFFLINE_STRIKES
+                    state = {
+                        **prior, "online": tentative, "error": reason, "error_code": code,
                         "failed_path": path, "checked_at": now,
-                        "offline_since": prior.get("offline_since", now) if prior.get("online") is False else now}
+                        "strikes": strikes, "failed_since": failed_since}
+                    if tentative:
+                        state.pop("offline_since", None)
+                    else:
+                        # Report the outage from its first failure, not from the
+                        # probe that finally gave up on the node.
+                        state["offline_since"] = prior.get("offline_since") or failed_since
+                    self.health[node["id"]] = state
                 cached = self.cache.get(key) if path in CACHED_PATHS else None
                 if cached is None and path == "/api/sessions":
                     cached = self.cache.get((node["id"], path, ""))

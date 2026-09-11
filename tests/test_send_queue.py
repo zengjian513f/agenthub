@@ -1,5 +1,6 @@
 import hashlib
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -393,6 +394,74 @@ class SendQueueTests(unittest.TestCase):
         wake.assert_not_called()
         stop.assert_called_once_with("claude:u")
         self.assertEqual(result, stopped)
+
+    def test_tracking_stops_after_the_window_without_making_the_row_retryable(self):
+        """A receipt Codex will never record must not poll its rollout forever.
+
+        The stuck row is also the session's earliest one, so leaving it tracked
+        starves every later send to the same session.
+        """
+        send_queue.enqueue("codex:u", "agenthub-codex-u", "stuck", None, None,
+                           request_id="stuck")
+        send_queue.mark_delivering("stuck")
+        send_queue.mark_confirming("stuck")
+        now = time.time()
+        self.assertEqual([x["id"] for x in send_queue.tracked(now)], ["stuck"])
+
+        later = now + send_queue.TRACK_WINDOW + 1
+        self.assertEqual(send_queue.tracked(later), [])
+        # The row stays visible in its non-retryable state; only polling stops.
+        row = send_queue.list_for("codex:u")[0]
+        self.assertEqual(row["state"], "confirming")
+        self.assertIsNone(send_queue.retry("stuck"))
+
+        with patch.object(send_queue.time, "time", return_value=later):
+            send_queue.enqueue("codex:u", "agenthub-codex-u", "fresh", None, None,
+                               request_id="fresh")
+        self.assertEqual([x["id"] for x in send_queue.tracked(later)], ["fresh"])
+
+    def test_codex_confirmation_replay_is_rate_limited_like_claude(self):
+        """The fixed-cursor re-read grows with the rollout; it must not run per poll."""
+        send_queue.enqueue("codex:u", "agenthub-codex-u", "hello", None, None,
+                           request_id="item",
+                           cursor={"start": 9_000_000, "head": "h", "anchor": "a"})
+        send_queue.mark_delivering("item")
+        send_queue.mark_confirming("item")
+        session = {"uid": "codex:u", "source": "codex", "path": "/tmp/rollout.jsonl"}
+        overdue = time.time() + send_queue.CONFIRM_TIMEOUT + 1
+        reads = []
+
+        def messages_for(s, **kwargs):
+            reads.append(kwargs.get("start"))
+            return {"messages": [], "end": 0, "anchor": "a",
+                    "version": {"head": "h"}, "activity": None}
+
+        server._CODEX_CONFIRM_REPLAY_AT.clear()
+        with patch.object(send_queue, "_read", wraps=send_queue._read) as read, \
+                patch.object(server.index, "get", return_value=session), \
+                patch.object(server.index, "messages_for", side_effect=messages_for), \
+                patch.object(server.claude_queue, "tracked", return_value=[]), \
+                patch.object(send_queue, "observe"), \
+                patch.object(server.time, "time", return_value=overdue):
+            del read
+            row = send_queue.tracked(overdue)[0]
+            confirm_start = int(row["confirm_start"])
+            watch_start = int(row["watch_start"] or 0)
+            for _ in range(4):
+                server._poll_outbox()
+        # One expensive replay from the injection point, then cheap tail reads.
+        self.assertEqual(reads, [confirm_start] + [watch_start] * 3)
+
+        reads.clear()
+        with patch.object(server.index, "get", return_value=session), \
+                patch.object(server.index, "messages_for", side_effect=messages_for), \
+                patch.object(server.claude_queue, "tracked", return_value=[]), \
+                patch.object(send_queue, "observe"), \
+                patch.object(server.time, "time",
+                             return_value=overdue + send_queue.CONFIRM_TIMEOUT):
+            server._poll_outbox()
+        self.assertEqual(reads, [confirm_start])
+        server._CODEX_CONFIRM_REPLAY_AT.clear()
 
 
 if __name__ == "__main__":

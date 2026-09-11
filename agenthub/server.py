@@ -52,6 +52,11 @@ OUTBOX_WAKE = threading.Event()
 CODEX_SEND_LOCK = threading.Lock()
 TERM_OWNERS = term_ownership.Registry()
 _CLAUDE_CONFIRM_REPLAY_AT: dict[str, float] = {}
+_CODEX_CONFIRM_REPLAY_AT: dict[str, float] = {}
+_NEW_STATUS_REFRESH_AT: dict[str, float] = {}
+# 新建后这段时间内，状态轮询照旧每次刷新索引；之后限频到 SLOW_INTERVAL。
+NEW_STATUS_FAST_WINDOW = 120.0
+NEW_STATUS_SLOW_INTERVAL = 5.0
 
 
 def _add_allowed(value: str) -> None:
@@ -195,8 +200,13 @@ def _poll_outbox() -> None:
         except (OSError, ValueError, KeyError):
             continue
 
-    for item in send_queue.tracked():
+    tracked_codex = send_queue.tracked()
+    for stale in set(_CODEX_CONFIRM_REPLAY_AT) - {str(x.get("id") or "")
+                                                  for x in tracked_codex}:
+        _CODEX_CONFIRM_REPLAY_AT.pop(stale, None)
+    for item in tracked_codex:
         uid = str(item.get("uid") or "")
+        item_id = str(item.get("id") or "")
         s = index.get(uid)
         if not s or s.get("source") != "codex":
             continue
@@ -204,9 +214,18 @@ def _poll_outbox() -> None:
             # 正常情况下从持续前移的 watch 游标读。到确认期限时，改从实际
             # 注入前的固定游标持续复核；即使 compact 延迟 user 记录或某次
             # 解析遗漏，也不能把已经写入终端的消息重新暴露为可重试。
-            replay = (item.get("state") in {"delivering", "confirming"}
-                      and time.time() - float(item.get("delivered_at") or 0)
+            # 固定游标复核要重读注入点之后的全部记录，开销随 rollout 增长。
+            # 和 Claude 分支一样按 CONFIRM_TIMEOUT 限频，其余轮次只读增量，
+            # 否则一条长期未确认的回执会让本线程持续占满一个核心。
+            now = time.time()
+            overdue = (item.get("state") in {"delivering", "confirming"}
+                       and now - float(item.get("delivered_at") or 0)
+                       >= send_queue.CONFIRM_TIMEOUT)
+            replay = (overdue
+                      and now - _CODEX_CONFIRM_REPLAY_AT.get(item_id, 0.0)
                       >= send_queue.CONFIRM_TIMEOUT)
+            if replay:
+                _CODEX_CONFIRM_REPLAY_AT[item_id] = now
             prefix = ("confirm" if replay and item.get("confirm_start") is not None
                       else "watch")
             start = int(item.get(f"{prefix}_start") or 0)
@@ -2208,17 +2227,30 @@ class Handler(BaseHTTPRequestHandler):
         name = q.get("name", [""])[0]
         pending = pending_store.get(name)
         if pending and pending.get("resolved"):
+            _NEW_STATUS_REFRESH_AT.pop(name, None)
             return self._json(pending["resolved"])
         if not pending:
             # This is a polling state, not an exceptional resource lookup.  A
             # kill can race with an already-dispatched poll; return a normal
             # terminal state so browsers and reverse proxies do not report a
             # spurious HTTP error after a successful shutdown.
+            _NEW_STATUS_REFRESH_AT.pop(name, None)
             return self._json({"gone": True})
 
         # 签名包含路径、mtime 和大小；新文件/首条消息会自然触发重建。
         # 不能在 750ms 状态轮询里强制全量解析所有会话。
-        sessions = index.load()
+        # 刚建出的会话要尽快关联，仍每次走 index.load()（本身有 CHECK_TTL）。
+        # 但一条长时间没落盘的记录（例如停在提示符、从未发过消息的 CLI）会让
+        # 浏览器把 inventory 扫描永久钉在 750ms 轮询上；超过快速窗口后改为
+        # 限频刷新，关联最多晚几秒，不影响正常新建体验。
+        now = time.time()
+        started = float(pending.get("started") or now)
+        if (now - started <= NEW_STATUS_FAST_WINDOW
+                or now - _NEW_STATUS_REFRESH_AT.get(name, 0.0) >= NEW_STATUS_SLOW_INTERVAL):
+            _NEW_STATUS_REFRESH_AT[name] = now
+            sessions = index.load()
+        else:
+            sessions = index.cached()
         source, sid, cwd = pending["source"], pending["sid"], pending["cwd"]
 
         def same_cwd(s):
