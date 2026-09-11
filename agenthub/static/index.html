@@ -331,9 +331,16 @@
 <dialog id="settings-dialog" class="app-dialog" aria-labelledby="settings-title">
   <form method="dialog" class="settings-form">
     <div class="modal-head">
-      <div><h2 id="settings-title">设置</h2><p>界面偏好保存在浏览器，父会话状态与终端后端保存在服务端</p></div>
+      <div><h2 id="settings-title">设置</h2><p id="settings-sub">界面偏好保存在浏览器</p></div>
       <button type="submit" class="modal-close" title="关闭" aria-label="关闭">×</button>
     </div>
+    <div class="settings-tabs" role="tablist" aria-label="设置分类">
+      <button type="button" class="settings-tab on" role="tab" aria-selected="true"
+              aria-controls="settings-appearance" data-tab="appearance">外观</button>
+      <button type="button" class="settings-tab" role="tab" aria-selected="false"
+              aria-controls="settings-machines" data-tab="machines">机器</button>
+    </div>
+    <div id="settings-appearance" class="settings-pane" role="tabpanel">
     <label class="setting-row" for="setting-font">
       <span><b>等宽字体</b><small>终端与工具输出共同使用</small></span>
       <select id="setting-font">
@@ -374,10 +381,11 @@
       <span><b>桌面应用</b><small>安装后以独立窗口运行，不显示浏览器地址栏</small></span>
       <button type="button" class="btn" data-pwa-install-button>安装到桌面</button>
     </div>
-    <div id="setting-backends" class="setting-group" hidden>
-      <p class="setting-group-title">终端后端<small>保存在各机器的服务端；只影响新建会话，已在跑的会话不受影响</small></p>
-      <div id="setting-backend-rows"></div>
-      <p id="setting-backend-note" class="setting-note" hidden role="status" aria-live="polite"></p>
+    </div>
+    <div id="settings-machines" class="settings-pane" role="tabpanel" hidden>
+      <p class="setting-group-title">机器<small>保存在中央服务端，所有浏览器一致。接入和移除机器仍在服务器上操作</small></p>
+      <div id="machine-rows"></div>
+      <p id="machine-note" class="setting-note" hidden role="status" aria-live="polite"></p>
     </div>
     <div class="modal-actions"><button type="submit" class="btn go">完成</button></div>
   </form>

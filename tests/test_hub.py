@@ -538,6 +538,54 @@ class HubHTTPTests(unittest.TestCase):
             fresh = hub.Registry(Path(root) / 'nodes.json', ['127.0.0.0/8'], monitor=False)
             self.assertEqual(fresh.public()[0]['color'], 'teal')
 
+    def test_the_web_can_rename_and_recolour_a_machine(self):
+        """网页能改的只有名称和配色；接机器、下机器、地址和凭据仍是服务器端操作。"""
+        node_a, node_b = 'a' * 32, 'b' * 32
+        original = {n['id']: (n['name'], n.get('color', '')) for n in self.registry.all()}
+        try:
+            status, body = self.call(f'/api/nodes/{node_a}/display',
+                                     {'name': '机房 A', 'color': 'teal'})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body['node'], {'id': node_a, 'name': '机房 A', 'color': 'teal'})
+            _, listing = self.call('/api/nodes')
+            row = next(n for n in listing['nodes'] if n['id'] == node_a)
+            self.assertEqual((row['name'], row['color']), ('机房 A', 'teal'))
+            self.assertNotIn('url', row)
+            self.assertNotIn('token', row)
+
+            # 只给一个字段时，另一个保持不变
+            self.assertEqual(self.call(f'/api/nodes/{node_a}/display',
+                                       {'color': 'rose'})[1]['node']['name'], '机房 A')
+            # 空颜色表示清掉
+            self.assertEqual(self.call(f'/api/nodes/{node_a}/display',
+                                       {'color': ''})[1]['node']['color'], '')
+
+            for bad, hint in [({'name': ''}, '不能为空'),
+                              ({'name': 'x' * 81}, '80'),
+                              ({'color': '#ff0000'}, '机器颜色'),
+                              ({'name': 'NodeB'}, '已有机器')]:
+                with self.subTest(bad=bad):
+                    status, body = self.call(f'/api/nodes/{node_a}/display', bad)
+                    self.assertEqual(status, 400, body)
+                    self.assertIn(hint, body['error'])
+
+            # 地址和凭据改不了：即使带上也不生效
+            self.call(f'/api/nodes/{node_a}/display',
+                      {'name': '机房 A', 'url': 'http://127.0.0.1:1', 'token': 'x' * 40})
+            stored = self.registry.get(node_a)
+            self.assertEqual(stored['url'], f'http://127.0.0.1:{self.a.server_port}')
+            self.assertEqual(stored['token'], self.a.state['token'])
+
+            self.assertEqual(self.call(f'/api/nodes/{"c" * 32}/display', {'name': 'x'})[0], 404)
+        finally:
+            for nid, (name, color) in original.items():
+                self.registry.update_display(nid, name=name, color=color)
+        self.assertEqual({n['id']: (n['name'], n.get('color', '')) for n in self.registry.all()},
+                         original)
+        # 机器自身的存在性仍然只能在服务器端改：HTTP 上没有这样的接口
+        self.assertEqual(self.call('/api/nodes', {'name': 'X'})[0], 400)
+        self.assertEqual(len(self.registry.all()), 2)
+
     def test_terminal_backend_is_reported_and_switched_per_machine(self):
         """终端后端是每台机器各自的设置，网页按机器读取和切换。"""
         self.registry.check_all()
@@ -587,14 +635,6 @@ class HubHTTPTests(unittest.TestCase):
             self.registry.register({'name': 'bad', 'url': 'http://127.0.0.1', 'token': bad_token})
         self.assertNotIn('sensitive', str(caught.exception))
 
-    def test_machine_management_is_not_exposed_over_http(self):
-        before = self.registry.all()
-        status, _ = self.call('/api/nodes', {'name': 'Changed',
-            'url': before[0]['url'], 'token': before[0]['token']})
-        self.assertEqual(status, 405)
-        status, _ = self.call('/api/nodes/' + before[0]['id'], method='DELETE')
-        self.assertEqual(status, 405)
-        self.assertEqual(self.registry.all(), before)
 
 
 

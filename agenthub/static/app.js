@@ -5502,85 +5502,200 @@ $('#trash-dialog').addEventListener('click', e => {
 });
 
 // 终端后端是每台机器的服务端设置，不进 localStorage：换个浏览器看到的必须是同一份。
-function backendTargets() {
+// 机器的名称、配色和终端后端都保存在中央服务端；接入和移除机器仍是服务器操作。
+const MACHINE_COLORS = [
+  ['', '默认'], ['blue', '蓝'], ['violet', '紫'], ['amber', '琥珀'], ['teal', '青'],
+  ['rose', '玫红'], ['lime', '青柠'], ['cyan', '天蓝'], ['fuchsia', '品红'],
+];
+
+function machineTargets() {
   if (typeof T === 'undefined' || !T.listLoaded) return [];
   if (!HUB_MODE) {
     return T.enabled && (T.backends || []).length
-      ? [{id: '', name: '', backends: T.backends, backend: T.backend}] : [];
+      ? [{id: '', name: '本机', color: '', online: true, local: true,
+          backends: T.backends, backend: T.backend}] : [];
   }
-  return Nodes.list
-    .map(node => ({node, cap: Nodes.capabilities[node.id] || {}}))
-    .filter(({cap}) => cap.enabled && (cap.backends || []).length)
-    .map(({node, cap}) => ({id: node.id, name: node.name,
-                            backends: cap.backends, backend: cap.backend}));
+  return Nodes.list.map(node => {
+    const cap = Nodes.capabilities[node.id] || {};
+    return {id: node.id, name: node.name, color: node.color || '',
+            online: node.online, local: false,
+            backends: cap.backends || [], backend: cap.backend || ''};
+  });
 }
 
-function setBackendNote(text, isError = false) {
-  const note = $('#setting-backend-note');
+function setMachineNote(text, isError = false) {
+  const note = $('#machine-note');
   note.textContent = text || '';
   note.hidden = !text;
   note.dataset.state = isError ? 'error' : 'ok';
 }
 
-function renderBackendSettings() {
-  const group = $('#setting-backends'), rows = $('#setting-backend-rows');
-  const targets = backendTargets();
-  group.hidden = !targets.length;
+function renderMachineSettings() {
+  const rows = $('#machine-rows');
+  const targets = machineTargets();
+  const active = document.activeElement;
+  // 正在输入机器名时不要重绘，否则光标和未提交的文字都会没
+  if (active && rows.contains(active) && active.tagName === 'INPUT') return;
   rows.textContent = '';
+  if (!targets.length) {
+    const empty = document.createElement('p');
+    empty.className = 'setting-note';
+    empty.textContent = '暂无可用机器。';
+    rows.append(empty);
+    return;
+  }
   for (const target of targets) {
-    const row = document.createElement('label');
-    row.className = 'setting-row';
-    const label = document.createElement('span');
-    const title = document.createElement('b');
-    title.textContent = target.name || '本机';
-    const hint = document.createElement('small');
-    const blocked = target.backends.filter(b => !b.available);
-    hint.textContent = blocked.length
-      ? blocked.map(b => `${b.label}不可用：${b.unavailable_reason}`).join('；')
-      : '新建会话将由所选后端托管';
-    label.append(title, hint);
-    const select = document.createElement('select');
-    for (const backend of target.backends) {
-      const option = document.createElement('option');
-      option.value = backend.name;
-      option.textContent = backend.label + (backend.available ? '' : '（不可用）');
-      option.disabled = !backend.available && backend.name !== target.backend;
-      select.append(option);
-    }
-    select.value = target.backend || '';
-    select.onchange = () => void chooseBackend(target, select);
-    row.append(label, select);
-    rows.append(row);
+    rows.append(machineRow(target));
   }
 }
 
-async function chooseBackend(target, select) {
-  const wanted = select.value, previous = target.backend;
-  if (wanted === previous) return;
-  select.disabled = true;
-  setBackendNote('正在切换…');
+function machineRow(target) {
+  const row = document.createElement('div');
+  row.className = 'machine-row';
+
+  const head = document.createElement('div');
+  head.className = 'machine-head';
+  const swatch = document.createElement('span');
+  swatch.className = 'machine-swatch';
+  swatch.dataset.nodeColor = target.color;
+  head.append(swatch);
+
+  if (target.local) {
+    const label = document.createElement('b');
+    label.textContent = target.name;
+    head.append(label);
+  } else {
+    const name = document.createElement('input');
+    name.type = 'text';
+    name.value = target.name;
+    name.maxLength = 80;
+    name.setAttribute('aria-label', `${target.name} 的名称`);
+    name.onchange = () => void saveMachine(target, {name: name.value}, name);
+    name.onkeydown = event => { if (event.key === 'Enter') { event.preventDefault(); name.blur(); } };
+    head.append(name);
+  }
+  row.append(head);
+
+  const fields = document.createElement('div');
+  fields.className = 'machine-fields';
+  if (!target.local) {
+    const color = document.createElement('select');
+    color.setAttribute('aria-label', `${target.name} 的颜色`);
+    for (const [value, label] of MACHINE_COLORS) {
+      const option = document.createElement('option');
+      option.value = value; option.textContent = label;
+      color.append(option);
+    }
+    color.value = target.color;
+    color.onchange = () => void saveMachine(target, {color: color.value}, color);
+    fields.append(color);
+  }
+
+  const backend = document.createElement('select');
+  backend.setAttribute('aria-label', `${target.name} 的终端后端`);
+  if (!target.backends.length) {
+    const option = document.createElement('option');
+    option.textContent = target.online === false ? '离线' : '控制台未启用';
+    backend.append(option);
+    backend.disabled = true;
+  } else {
+    for (const item of target.backends) {
+      const option = document.createElement('option');
+      option.value = item.name;
+      option.textContent = item.label + (item.available ? '' : '（不可用）');
+      option.disabled = !item.available && item.name !== target.backend;
+      backend.append(option);
+    }
+    backend.value = target.backend || '';
+    backend.onchange = () => void chooseBackend(target, backend);
+  }
+  fields.append(backend);
+  row.append(fields);
+
+  const blocked = target.backends.filter(b => !b.available);
+  const state = document.createElement('p');
+  state.className = 'machine-state';
+  state.textContent = target.online === false
+    ? (typeof nodeOfflineReason === 'function'
+        ? nodeOfflineReason(Nodes.list.find(n => n.id === target.id) || {}) : '离线')
+    : blocked.map(b => `${b.label}不可用：${b.unavailable_reason}`).join('；')
+      || '新建会话将由所选后端托管';
+  row.append(state);
+  return row;
+}
+
+// 两类请求的路径不同：展示属性是中央自己的接口，终端后端要转发给那台机器。
+async function machinePost(url, body, control) {
+  control.disabled = true;
+  setMachineNote('正在保存…');
   try {
-    const url = (HUB_MODE && target.id ? `api/nodes/${target.id}/` : '') + 'api/term/backend';
     const response = await fetch(appUrl(url), {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({backend: wanted}),
+      body: JSON.stringify(body),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.error) throw new Error(
       data.error || `请求失败（HTTP ${response.status}）`);
+    return data;
+  } finally {
+    control.disabled = false;
+  }
+}
+
+async function saveMachine(target, patch, control) {
+  if (target.local) return;                 // 本机模式没有注册表，没有可改的机器身份
+  const before = {name: target.name, color: target.color};
+  if ((patch.name ?? target.name) === target.name && (patch.color ?? target.color) === target.color) return;
+  try {
+    const data = await machinePost(`api/nodes/${target.id}/display`, patch, control);
+    Object.assign(target, {name: data.node.name, color: data.node.color});
+    const node = Nodes.list.find(n => n.id === target.id);
+    if (node) Object.assign(node, {name: data.node.name, color: data.node.color});
+    setMachineNote(`已保存 ${data.node.name}。`);
+    if (typeof renderNodes === 'function') renderNodes();
+    renderMachineSettings();
+  } catch (error) {
+    if (control.tagName === 'INPUT') control.value = before.name;
+    else control.value = before.color;
+    setMachineNote(`保存失败：${error.message || error}`, true);
+  }
+}
+
+async function chooseBackend(target, select) {
+  const previous = target.backend;
+  if (select.value === previous) return;
+  try {
+    const data = await machinePost(
+      (HUB_MODE && target.id ? `api/nodes/${target.id}/` : '') + 'api/term/backend',
+      {backend: select.value}, select);
     target.backend = data.backend;
     if (Array.isArray(data.backends)) target.backends = data.backends;
     const label = (target.backends.find(b => b.name === data.backend) || {}).label || data.backend;
-    setBackendNote(`${target.name ? target.name + '：' : ''}新建会话改用 ${label}；`
-      + '已在运行的会话不受影响。');
+    setMachineNote(`${target.name}：新建会话改用 ${label}；已在运行的会话不受影响。`);
     if (typeof loadTermList === 'function') void loadTermList();
   } catch (error) {
     select.value = previous;
-    setBackendNote(`${target.name ? target.name + '：' : ''}切换失败：`
-      + (error.message || String(error)), true);
-  } finally {
-    select.disabled = false;
+    setMachineNote(`${target.name}：切换失败：${error.message || error}`, true);
   }
+}
+
+function showSettingsTab(name) {
+  for (const tab of document.querySelectorAll('.settings-tab')) {
+    const on = tab.dataset.tab === name;
+    tab.classList.toggle('on', on);
+    tab.ariaSelected = String(on);
+  }
+  $('#settings-appearance').hidden = name !== 'appearance';
+  $('#settings-machines').hidden = name !== 'machines';
+  $('#settings-sub').textContent = name === 'machines'
+    ? '机器设置保存在中央服务端，所有浏览器一致'
+    : '界面偏好保存在浏览器';
+  store.set('settingsTab', name);
+  if (name === 'machines') renderMachineSettings();
+}
+
+for (const tab of document.querySelectorAll('.settings-tab')) {
+  tab.onclick = () => showSettingsTab(tab.dataset.tab);
 }
 
 function openSettings() {
@@ -5588,8 +5703,8 @@ function openSettings() {
   $('#setting-theme').value = store.get('theme', 'system');
   $('#setting-tool-icons').value = document.documentElement.dataset.toolIcons;
   $('#setting-cache').value = String(cacheLimitMb);
-  setBackendNote('');
-  renderBackendSettings();
+  setMachineNote('');
+  showSettingsTab(store.get('settingsTab', 'appearance'));
   $('#settings-dialog').showModal();
 }
 

@@ -56,8 +56,9 @@ Hub 默认只监听 `127.0.0.1:8720`，放在 hub-host **已有登录鉴权**的
    原来的单机反代入口可以继续保留。Hub 自己提供 HTML/JS/CSS，Nginx 将 API、SSE、
    WebSocket 和附件请求交给 Hub，Hub 再路由到节点。
 
-3. 节点注册、改名和移除只在服务器上操作。网页不提供管理入口，HTTP 注册和删除接口返回 405；
-   公开机器列表也不返回节点连接地址。注册信息仍保存为权限 `0600` 的
+3. 节点注册和移除只在服务器上操作，通过中央 checkout 里的 `Registry`，凭据不经过网页。
+   公开机器列表不返回节点连接地址。网页能改的是机器的名称、配色和终端后端，
+   见「设置 → 机器」；地址和凭据不在网页的可改范围内。注册信息仍保存为权限 `0600` 的
    `~/.local/share/agenthub/hub-nodes.json`，节点凭据不会发送到浏览器。
 
    在中央服务器的 checkout 内，可以用本地管理类注册节点。凭据文件通过可信方式传到中央，
@@ -123,6 +124,7 @@ GET /api/search?nodes=...&q=...        汇总全文搜索
 GET /api/live                         汇总实时状态
 GET /api/term/list                    汇总终端和逐节点能力（含各机器的终端后端）
 POST /api/nodes/<node_id>/api/term/backend  切换指定机器的终端后端
+POST /api/nodes/<node_id>/display      改机器名称与配色（不含地址和凭据）
 /api/nodes/<node_id>/api/...           指定节点，携带本地引用的直接代理
 ```
 

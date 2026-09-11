@@ -239,6 +239,30 @@ class Registry:
         self.nudge()
         return {"id": node["id"], "name": name, "color": node.get("color", "")}
 
+    def update_display(self, nid, name=None, color=None):
+        """改机器的名称和配色。地址和凭据不在这里，它们只在服务器端注册时设定。"""
+        with self.lock:
+            node = next((n for n in self.nodes if n["id"] == nid), None)
+            if not node:
+                raise KeyError(nid)
+            if name is not None:
+                clean = str(name).strip()
+                if not clean or len(clean) > 80:
+                    raise ValueError("机器名称不能为空，且不超过 80 个字符")
+                if any(n["id"] != nid and n["name"] == clean for n in self.nodes):
+                    raise ValueError(f"已有机器叫 {clean}")
+                node["name"] = clean
+            if color is not None:
+                clean = str(color).strip().lower()
+                if clean and clean not in NODE_PALETTE:
+                    raise ValueError(f"机器颜色只能取 {'、'.join(NODE_PALETTE)}")
+                if clean:
+                    node["color"] = clean
+                else:
+                    node.pop("color", None)
+            self.save()
+            return {"id": node["id"], "name": node["name"], "color": node.get("color", "")}
+
     def remove(self, nid):
         with self.lock:
             self.nodes = [n for n in self.nodes if n["id"] != nid]
@@ -451,15 +475,11 @@ class HubHandler(server.Handler):
             if self.command == "GET" and path == "/api/meta":
                 return self._json({"mode": "hub", "protocol": fed.PROTOCOL,
                                    "build": server.ASSET_VERSION, "hostname": "AgentHub"})
-            if path == "/api/nodes":
-                if self.command == "GET":
-                    return self._json({"mode": "hub", "nodes": self.registry.public()})
-                self.close_connection = True
-                return self._json({"error": "machine management is not available over HTTP"}, 405)
-            if re.fullmatch(r"/api/nodes/[a-f0-9]{32}", path):
-                self.close_connection = True
-                return self._json({"error": "machine management is not available over HTTP"},
-                                  404 if self.command == "GET" else 405)
+            if path == "/api/nodes" and self.command == "GET":
+                return self._json({"mode": "hub", "nodes": self.registry.public()})
+            display = re.fullmatch(r"/api/nodes/([a-f0-9]{32})/display", path)
+            if display and self.command == "POST":
+                return self.set_display(display[1], self.read_body())
             explicit = None
             match = re.fullmatch(r"/api/nodes/([a-f0-9]{32})(/api/.*)", path)
             if match:
@@ -797,6 +817,26 @@ class HubHandler(server.Handler):
             except (OSError, ValueError, http.client.HTTPException):
                 result["errors"].append(f'{node["name"]}: 请求失败，请核对结果')
         return self._json(result)
+
+    def set_display(self, nid, body):
+        """网页只改机器的名称和配色；接机器、下机器、地址和凭据仍是服务器端操作。"""
+        body = body if isinstance(body, dict) else {}
+        node = self.registry.get(nid)
+        if not node:
+            return self._json({"error": "机器未注册或已移除"}, 404)
+        before = {"name": node["name"], "color": node.get("color", "")}
+        try:
+            row = self.registry.update_display(
+                nid, name=body.get("name"), color=body.get("color"))
+        except KeyError:
+            return self._json({"error": "机器未注册或已移除"}, 404)
+        except ValueError as error:
+            return self._json({"error": str(error)}, 400)
+        if row != {"id": nid, **before}:
+            server.audit.record("hub.node.display.changed", category="terminal",
+                                data={"node_id": nid, "from": before,
+                                      "to": {k: row[k] for k in ("name", "color")}})
+        return self._json({"ok": True, "node": row})
 
     def browser_audit(self, body):
         groups = {}

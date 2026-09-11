@@ -270,8 +270,9 @@ async function loadTermList() {
     T.pending = [];
   }
   // 设置面板开着时，后端清单要跟着刷新，否则显示的是上一轮的状态。
-  if (typeof renderBackendSettings === 'function'
-      && document.querySelector('#settings-dialog')?.open) renderBackendSettings();
+  if (typeof renderMachineSettings === 'function'
+      && document.querySelector('#settings-dialog')?.open
+      && !document.querySelector('#settings-machines')?.hidden) renderMachineSettings();
   if (loaded) {
     const valid = new Set([...T.list, ...T.pending].map(x => x.name));
     const kept = new Map([...T.openViews].filter(([name]) => valid.has(name)));

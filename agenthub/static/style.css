@@ -339,6 +339,37 @@ body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix
   outline: none; background: var(--panel-2); color: var(--text); font: inherit;
 }
 .setting-row select:focus { border-color: var(--accent); }
+.settings-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 2px; }
+.settings-tab {
+  padding: 7px 14px; border: 0; border-bottom: 2px solid transparent; border-radius: 6px 6px 0 0;
+  background: transparent; color: var(--muted); font: inherit; font-size: 13px; cursor: pointer;
+}
+.settings-tab:hover { background: var(--hover); color: var(--text); }
+.settings-tab.on { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+.settings-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.settings-pane { display: flex; flex-direction: column; gap: 8px; }
+.machine-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px;
+  align-items: center; padding: 11px 0; border-bottom: 1px solid var(--border);
+}
+.machine-row:last-child { border-bottom: 0; }
+.machine-row .machine-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.machine-row input[type="text"] {
+  min-width: 0; flex: 1; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); color: var(--text); font: inherit; font-weight: 600;
+}
+.machine-row input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.machine-row .machine-fields { display: flex; gap: 8px; align-items: center; }
+.machine-row select {
+  padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); color: var(--text); font: inherit;
+}
+.machine-row select:focus { outline: none; border-color: var(--accent); }
+.machine-swatch {
+  width: 12px; height: 12px; border-radius: 3px; flex: none;
+  background: var(--node-color, var(--muted));
+}
+.machine-row .machine-state { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 11.5px; }
 .setting-group { padding: 11px 0; border-bottom: 1px solid var(--border); }
 .setting-group-title { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
 .setting-group-title small {
