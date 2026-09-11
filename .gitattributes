@@ -1,0 +1,9 @@
+# 服务按字节哈希静态资源算 ASSET_VERSION，行尾一变 build 就对不上，
+# Windows 节点上 core.autocrlf=true 真的把它算歪过。仓库里一律 LF。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
