@@ -226,13 +226,20 @@ class WindowsSandboxTests(unittest.TestCase):
             from agenthub import audit, index
             with tempfile.TemporaryDirectory() as root:
                 audit._global_store = audit.EventStore(Path(root) / "audit.sqlite3")
-                assert audit.record("test.event", data={"where": "sandbox"}) is True, "审计写不进去"
-                assert audit.flush(5.0) is True, "审计没刷盘"
-                assert (Path(root) / "audit.sqlite3").exists(), "审计库没建起来"
-                index.CACHE_DIR = Path(root) / "cache"
-                index.CACHE_FILE = index.CACHE_DIR / "index.json"
-                rows = index.load(force=True)
-                assert isinstance(rows, list), rows
+                try:
+                    assert audit.record("test.event", data={"where": "sandbox"}) is True, \
+                        "审计写不进去"
+                    assert audit.flush(5.0) is True, "审计没刷盘"
+                    assert (Path(root) / "audit.sqlite3").exists(), "审计库没建起来"
+                    index.CACHE_DIR = Path(root) / "cache"
+                    index.CACHE_FILE = index.CACHE_DIR / "index.json"
+                    rows = index.load(force=True)
+                    assert isinstance(rows, list), rows
+                finally:
+                    # Windows 不让删还开着的文件，写线程不收掉这里就 WinError 32。
+                    # 真机上跑才暴露得出来，沙箱模拟不了文件锁。
+                    audit._global_store.close()
+                    audit._global_store = None
             print("STORES OK")
         ''', "STORES OK")
 
