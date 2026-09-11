@@ -98,9 +98,6 @@ const S = {
 
 const $ = s => document.querySelector(s);
 const MOBILE = matchMedia('(max-width: 720px)');
-// 顶栏和会话头按三级宽度排版：窄屏 ≤720，中屏 721–1199，宽屏 ≥1200。断点与 style.css 一致。
-const MEDIUM = matchMedia('(max-width: 1199px)');
-function layoutTier() { return MOBILE.matches ? 'narrow' : MEDIUM.matches ? 'medium' : 'wide'; }
 // 页面既可挂在站点根目录，也可由反代放到 /agenthub/ 之类的子路径。
 const APP_BASE = new URL('.', location.href);
 const DEBUG_RUN = /^[A-Za-z0-9_-]{1,64}$/.test(
@@ -2955,15 +2952,6 @@ function bindSessionActions(heading) {
     item.setAttribute('role', 'menuitem');
     labelSessionAction(item);
   });
-  // 记住菜单里的原始顺序，layoutSessionHead 在各级排版之间搬动后还能按它归位
-  const briefKind = item => item.id === 'mcount-total' ? 'count' : item.id === 'dlive' ? 'live'
-    : item.classList.contains('meta-node') ? 'node'
-    : item.classList.contains('meta-source') ? 'source' : '';
-  [...menu.querySelector('[role="menu"]').children].forEach((node, i) => { node.dataset.order = i; });
-  [...menu.querySelector('.dmeta')?.children || []].forEach((item, i) => {
-    item.dataset.order = i;
-    item.dataset.brief = briefKind(item);
-  });
   const items = () => [...menu.querySelectorAll('button:not(:disabled)')];
   const open = () => {
     menu.hidden = false;
@@ -2998,60 +2986,36 @@ function bindSessionActions(heading) {
   layoutSessionHead(heading);
 }
 
-// 会话头任何宽度都只占一行。三级排版决定哪些操作平铺在标题右侧、哪些元信息
-// 直接跟在标题后面（.dbrief），其余都收进 ⋯ 菜单：
-//   宽屏：操作全部平铺，简要元信息是 消息数、运行点、机器、来源；菜单里只剩完整元信息
-//   中屏：只平铺星标，简要元信息只有机器
-//   窄屏：全部收进菜单（运行状态由控制台按钮上的圆点表示）
-const HEAD_INLINE = {
-  wide: {actions: null, brief: ['count', 'live', 'node', 'source']},
-  medium: {actions: ['a-star'], brief: ['node']},
-  narrow: {actions: [], brief: []},
-};
+// 桌面把会话操作和元信息直接摆在标题栏上，只有窄屏才收进 ⋯ 菜单。
 function layoutSessionHead(heading = $('#detail .dhead')) {
   const wrap = heading?.querySelector('.session-actions');
   const menu = heading?.querySelector('#session-actions-menu');
   const list = menu?.querySelector('[role="menu"]');
   if (!wrap || !menu || !list) return;
   const actions = wrap.parentElement;
-  const tier = layoutTier();
-  const plan = HEAD_INLINE[tier];
+  const flat = !MOBILE.matches;
   const menuButtons = node => node.matches('button') ? [node] : [...node.querySelectorAll('button')];
-  const inline = node => plan.actions === null
-    || menuButtons(node).some(item => plan.actions.includes(item.id));
-  closeSessionActions();
-  // 先把平铺出去的都收回菜单（保持原始顺序），再按本级挑出要平铺的
-  for (const node of actions.querySelectorAll(':scope > [data-from-menu]')) {
-    delete node.dataset.fromMenu;
-    for (const item of menuButtons(node)) {
-      item.setAttribute('role', 'menuitem');
-      labelSessionAction(item);
+  heading.classList.toggle('head-flat', flat);
+  if (flat) {
+    closeSessionActions();
+    for (const node of [...list.children]) {
+      node.dataset.fromMenu = '1';
+      for (const item of menuButtons(node)) item.removeAttribute('role');
+      actions.insertBefore(node, wrap);
     }
-    list.appendChild(node);
-  }
-  list.replaceChildren(...[...list.children].sort((a, b) => a.dataset.order - b.dataset.order));
-  for (const node of [...list.children]) {
-    if (!inline(node)) continue;
-    node.dataset.fromMenu = '1';
-    for (const item of menuButtons(node)) item.removeAttribute('role');
-    actions.insertBefore(node, wrap);
-  }
-  heading.classList.toggle('head-flat', plan.actions === null);
-  const menuEmpty = !list.children.length;
-  const more = wrap.querySelector('#a-more');
-  if (more) more.title = more.ariaLabel = menuEmpty ? '会话信息' : '更多会话操作';
-  // 元信息同理：简要项跟在标题后，其余留在菜单里
-  const meta = menu.querySelector('.dmeta');
-  let brief = heading.querySelector('.dbrief');
-  if (meta) {
-    if (!brief) {
-      brief = el('div', 'dbrief');
-      heading.querySelector('.dhead-actions').before(brief);
+    const meta = menu.querySelector('.dmeta');
+    if (meta) heading.appendChild(meta);
+  } else {
+    for (const node of actions.querySelectorAll(':scope > [data-from-menu]')) {
+      delete node.dataset.fromMenu;
+      for (const item of menuButtons(node)) {
+        item.setAttribute('role', 'menuitem');
+        labelSessionAction(item);
+      }
+      list.appendChild(node);
     }
-    const items = [...meta.children, ...brief.children]
-      .sort((a, b) => a.dataset.order - b.dataset.order);
-    for (const item of items) (plan.brief.includes(item.dataset.brief) ? brief : meta).appendChild(item);
-    brief.hidden = !brief.children.length;
+    const meta = heading.querySelector(':scope > .dmeta');
+    if (meta) menu.appendChild(meta);
   }
 }
 
@@ -3066,84 +3030,7 @@ document.addEventListener('keydown', event => {
   }
 }, true);
 addEventListener('resize', () => closeSessionActions());
-for (const media of [MOBILE, MEDIUM]) media.addEventListener('change', () => layoutSessionHead());
-
-// 顶栏右侧按钮按三级宽度折进 ⋯ 菜单：宽屏全露出，中屏折起回收站/报告/设置，窄屏全折起。
-const HEADER_FOLD = {
-  wide: [],
-  medium: ['trash', 'report-bug', 'settings'],
-  narrow: ['new-session', 'reload', 'trash', 'report-bug', 'settings'],
-};
-function closeHeaderMenu(restoreFocus = false) {
-  const menu = $('#header-menu');
-  if (!menu || menu.hidden) return;
-  menu.hidden = true;
-  const button = $('#header-more-btn');
-  button?.setAttribute('aria-expanded', 'false');
-  if (restoreFocus) button?.focus();
-}
-function layoutHeader() {
-  const more = $('#header-more'), menu = $('#header-menu');
-  if (!more || !menu) return;
-  const fold = HEADER_FOLD[layoutTier()];
-  closeHeaderMenu();
-  for (const id of ['new-session', 'reload', 'trash', 'report-bug', 'settings']) {
-    const button = document.getElementById(id);
-    if (!button) continue;
-    if (fold.includes(id)) {
-      let label = button.querySelector(':scope > span.menu-label');
-      if (!label) button.appendChild(label = el('span', 'menu-label'));
-      label.textContent = button.ariaLabel || button.title;
-      button.setAttribute('role', 'menuitem');
-      menu.appendChild(button);
-    } else {
-      button.querySelector(':scope > span.menu-label')?.remove();
-      button.removeAttribute('role');
-      more.before(button);
-    }
-  }
-  more.hidden = !fold.length;
-}
-{
-  const button = $('#header-more-btn'), menu = $('#header-menu');
-  const items = () => [...menu.querySelectorAll('button:not(:disabled):not(.hidden)')];
-  const open = () => { menu.hidden = false; button.setAttribute('aria-expanded', 'true'); };
-  button.onclick = () => menu.hidden ? open() : closeHeaderMenu();
-  button.onkeydown = event => {
-    if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
-    event.preventDefault();
-    open();
-    const rows = items();
-    (event.key === 'ArrowUp' ? rows.at(-1) : rows[0])?.focus();
-  };
-  menu.addEventListener('click', event => {
-    if (event.target.closest('button')) closeHeaderMenu(true);
-  });
-  menu.onkeydown = event => {
-    const rows = items(), index = rows.indexOf(document.activeElement);
-    const next = {ArrowDown: (index + 1) % rows.length,
-      ArrowUp: (index - 1 + rows.length) % rows.length, Home: 0, End: rows.length - 1}[event.key];
-    if (next === undefined) return;
-    event.preventDefault();
-    rows[next]?.focus();
-  };
-  $('#header-more').addEventListener('focusout', event => {
-    if (event.relatedTarget && !$('#header-more').contains(event.relatedTarget)) closeHeaderMenu();
-  });
-  document.addEventListener('click', event => {
-    if (!event.target.closest('#header-more')) closeHeaderMenu();
-  }, true);
-  document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && menu.hidden === false) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      closeHeaderMenu(true);
-    }
-  }, true);
-  addEventListener('resize', () => closeHeaderMenu());
-  for (const media of [MOBILE, MEDIUM]) media.addEventListener('change', layoutHeader);
-  layoutHeader();
-}
+MOBILE.addEventListener('change', () => layoutSessionHead());
 
 function head(m, total) {
   const h = el('div', 'dhead');

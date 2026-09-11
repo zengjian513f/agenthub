@@ -791,19 +791,11 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .dtitle { display: flex; align-items: center; gap: 10px; position: relative; }
 .mobile-back { display: none; }
-/* 标题不主动撑满，简要元信息紧跟其后；空间不够时标题先省略，压到下限后才轮到元信息 */
 .dtitle h2 {
   display: flex; align-items: center; gap: 7px;
-  flex: 0 1 auto; min-width: min(8em, 40%); margin: 0;
+  flex: 1; min-width: 0; margin: 0;
   font-size: 16px; font-weight: 600;
 }
-.dbrief {
-  display: flex; align-items: center; gap: 10px; flex: 0 0.25 auto; min-width: 0;
-  overflow: hidden; white-space: nowrap;
-  color: var(--muted); font-size: 12px;
-}
-.dbrief[hidden] { display: none; }
-.dbrief > * { flex: none; }
 .dtitle h2 > .ico { flex: none; }
 .dtitle h2 > span, .session-view-switch > span {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -853,7 +845,7 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 #a-fork-chain[aria-expanded="true"] { background: var(--hover); color: var(--text); }
 .dhead-actions {
   flex: none; display: flex; align-items: center; justify-content: flex-end;
-  gap: 2px; position: relative; margin-left: auto;
+  gap: 2px; position: relative;
 }
 .session-actions { position: relative; }
 #a-more { font-size: 24px; line-height: 1; }
@@ -886,41 +878,33 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 .session-actions-menu .dmeta > span { min-width: 0; max-width: 100%; }
 .session-actions-menu .dmeta code { overflow-wrap: anywhere; }
 
-/* 从 ⋯ 菜单平铺到标题栏上的操作按图标按钮显示；完整元信息始终留在菜单里 */
-.dhead.head-flat .dhead-actions { gap: 3px; }
-.dhead-actions > .session-menu-action {
+/* 宽屏把操作和元信息摊在标题栏上，窄屏才收回 ⋯ 菜单 */
+.dhead.head-flat .session-actions { display: none; }
+.dhead.head-flat > .dmeta {
+  flex-wrap: nowrap; margin-top: 5px;
+  overflow-x: auto; scrollbar-width: none; overscroll-behavior-x: contain;
+}
+.dhead.head-flat > .dmeta::-webkit-scrollbar { display: none; }
+.dhead.head-flat > .dmeta > * { flex: none; }
+.head-flat .dhead-actions { gap: 3px; }
+.head-flat .dhead-actions .session-menu-action {
   width: 28px; height: 28px; min-height: 0; padding: 0; gap: 0;
   justify-content: center; border-radius: 6px; color: var(--muted);
 }
-.dhead-actions > .session-menu-action > span { display: none; }
-.dhead-actions > .session-menu-action:hover { background: var(--hover); color: var(--text); }
-.dhead-actions > .session-menu-action.on { background: var(--accent); color: #fff; }
-.dhead-actions > .session-menu-action.star-toggle.on,
-.dhead-actions > .session-menu-action.star-toggle.on:hover {
+.head-flat .dhead-actions .session-menu-action > span { display: none; }
+.head-flat .dhead-actions .session-menu-action:hover { background: var(--hover); color: var(--text); }
+.head-flat .dhead-actions .session-menu-action.on { background: var(--accent); color: #fff; }
+.head-flat .dhead-actions .session-menu-action.star-toggle.on,
+.head-flat .dhead-actions .session-menu-action.star-toggle.on:hover {
   background: transparent; color: var(--star);
 }
-.dhead-actions > .session-menu-action.danger:hover { background: #e5484d; color: #fff; }
-.dhead-actions > .session-menu-search {
+.head-flat .dhead-actions .session-menu-action.danger:hover { background: #e5484d; color: #fff; }
+.head-flat .dhead-actions > .session-menu-search {
   display: flex; align-items: center; gap: 2px; margin: 0; padding: 0; border: 0;
 }
-.dhead-actions > .session-menu-search > b {
+.head-flat .dhead-actions > .session-menu-search > b {
   display: inline-block; padding: 0 3px; color: var(--muted);
   font-size: 11.5px; font-weight: 500; font-variant-numeric: tabular-nums;
-}
-.dhead-actions > .session-menu-search > .session-menu-action {
-  width: 28px; height: 28px; min-height: 0; padding: 0; gap: 0;
-  justify-content: center; border-radius: 6px; color: var(--muted);
-}
-.dhead-actions > .session-menu-search > .session-menu-action > span { display: none; }
-.dhead-actions > .session-menu-search > .session-menu-action:hover { background: var(--hover); color: var(--text); }
-/* 中窄屏运行状态不再平铺在标题后，改画在控制台按钮角上 */
-@media (max-width: 1199px) {
-  #a-term.session-live::before {
-    content: ""; position: absolute; z-index: 1; top: 1px; left: 1px;
-    width: 8px; height: 8px; border: 2px solid var(--panel); border-radius: 50%;
-    background: var(--live-direct);
-  }
-  #a-term.session-live.session-tmux::before { background: var(--live-tmux); }
 }
 .iconbtn {
   display: inline-flex; align-items: center; justify-content: center; flex: none;
@@ -1792,6 +1776,13 @@ body.dragging-v { cursor: row-resize; user-select: none; }
   .turn-nav-btn::after { font-size: 11px; }
   .turn-to-start::after { content: "↑"; }
   .turn-to-conclusion::after { content: "↓"; }
+  #a-term.session-live::before {
+    content: ""; position: absolute; z-index: 1; top: 1px; left: 1px;
+    width: 8px; height: 8px; border: 2px solid var(--panel); border-radius: 50%;
+    background: var(--live-direct);
+  }
+  #a-term.session-live.session-tmux::before { background: var(--live-tmux); }
+
   .msgs { max-width: none; padding: 10px 8px max(20px, env(safe-area-inset-bottom)); }
   .msg { max-width: 100%; }
   .diff-split { grid-template-columns: minmax(0, 1fr); min-width: 0; }
