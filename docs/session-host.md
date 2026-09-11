@@ -150,6 +150,8 @@ Rust 单测覆盖屏幕模型（滚动历史分页、软换行合并、宽字符
 - Rust 命令行自己的 `list` 不清理崩溃残留的信息文件（Linux 靠读 `/proc` 判断宿主是否还在）。
   Web 服务走 Python 客户端，用 psutil 判断，不受此影响。
 
+Windows 上节点服务由用户自己启动，没有做自启。注意不要用计划任务：它把服务放进不允许
+breakaway 的 Job，ptyhost 接管会话时 `CREATE_BREAKAWAY_FROM_JOB` 会被拒（WinError 5）。
+
 还差：`adapters.py` 识别 Windows 项目目录 slug 与盘符路径（Claude Code 会把 cwd 写进 JSONL，
-所以多数会话的分组是对的，回退解码才会出错）、文件管理器的根目录判断，以及用计划任务
-代替 systemd 常驻。
+所以多数会话的分组是对的，回退解码才会出错）、文件管理器的根目录判断。
