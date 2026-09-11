@@ -128,76 +128,6 @@ async function prepareTerminalFont() {
   return resolved;
 }
 
-function reflectedLightRgb(r, g, b, background = false) {
-  r /= 255; g /= 255; b /= 255;
-  const hi = Math.max(r, g, b), lo = Math.min(r, g, b);
-  const sourceLight = (hi + lo) / 2;
-  let h = 0, s = 0;
-  if (hi !== lo) {
-    const d = hi - lo;
-    s = d / (1 - Math.abs(2 * sourceLight - 1));
-    if (hi === r) h = ((g - b) / d) % 6;
-    else if (hi === g) h = (b - r) / d + 2;
-    else h = (r - g) / d + 4;
-    h = (h * 60 + 360) % 360;
-  }
-  // 保持色相、反射亮度；轻微曲线把中间色拉回 50%，避免彩色文字过艳。
-  const reflected = 1 - sourceLight;
-  const sign = Math.sign(reflected - .5);
-  let l = .5 + sign * .5 * Math.pow(Math.abs(reflected - .5) / .5, 1.35);
-  if (background) l = Math.min(l, .96);   // 显式黑底随亮色方案恢复为接近白色
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
-  const m = l - c / 2;
-  let rr = 0, gg = 0, bb = 0;
-  if (h < 60) [rr, gg, bb] = [c, x, 0];
-  else if (h < 120) [rr, gg, bb] = [x, c, 0];
-  else if (h < 180) [rr, gg, bb] = [0, c, x];
-  else if (h < 240) [rr, gg, bb] = [0, x, c];
-  else if (h < 300) [rr, gg, bb] = [x, 0, c];
-  else [rr, gg, bb] = [c, 0, x];
-  return [rr, gg, bb].map(v => Math.max(0, Math.min(255, Math.round((v + m) * 255))));
-}
-
-function indexedTerminalRgb(n) {
-  if (n >= 232 && n <= 255) {
-    const v = 8 + (n - 232) * 10;
-    return [v, v, v];
-  }
-  if (n < 16 || n > 231) return null;    // 前 16 色直接由 xterm theme 精确控制
-  const steps = [0, 95, 135, 175, 215, 255];
-  n -= 16;
-  return [steps[Math.floor(n / 36)], steps[Math.floor(n / 6) % 6], steps[n % 6]];
-}
-
-function lightTerminalAnsi(s) {
-  const rgb = (kind, r, g, b) => {
-    const out = reflectedLightRgb(+r, +g, +b, kind === '48');
-    return `${kind};2;${out.join(';')}`;
-  };
-  s = s.replace(/(38|48);2;(\d{1,3});(\d{1,3});(\d{1,3})/g, (_, ...v) => rgb(...v.slice(0, 4)));
-  s = s.replace(/(38|48):2(?::\d*)?:(\d{1,3}):(\d{1,3}):(\d{1,3})/g,
-    (_, ...v) => rgb(...v.slice(0, 4)));
-  return s.replace(/(38|48);5;(\d{1,3})/g, (all, kind, value) => {
-    const source = indexedTerminalRgb(+value);
-    if (!source) return all;
-    return rgb(kind, ...source);
-  });
-}
-
-function terminalColorChunk(view, s) {
-  s = (view.ansiTail || '') + s;
-  view.ansiTail = '';
-  if (document.documentElement.dataset.theme !== 'light') return s;
-  // PTY/WebSocket 可能恰好在 CSI 中间断包，留下不完整尾巴等下一块再处理。
-  const tail = s.match(/\x1b\[[0-9;:]*$/)?.[0] || '';
-  if (tail) {
-    view.ansiTail = tail;
-    s = s.slice(0, -tail.length);
-  }
-  return lightTerminalAnsi(s);
-}
-
 async function refreshTerminalPreferences(redraw = false) {
   terminalFontReady = prepareTerminalFont();
   try { await terminalFontReady; } catch {}
@@ -1406,7 +1336,7 @@ function ensureTerm(name) {
   const fit = new FitAddon.FitAddon();
   view = {
     name, host, term, fit, ws: null, reconnectTimer: null,
-    reconnectDelay: 500, scrollPos: 0, ansiTail: '',
+    reconnectDelay: 500, scrollPos: 0,
     outputBuffer: '', outputTimer: null, fitFrame: null,
     lastResizeKey: '', lastResizeWs: null,
     activationEpoch: 0,
@@ -1525,7 +1455,10 @@ function flushTermOutput(view) {
   let s = view.outputBuffer;
   view.outputBuffer = '';
   if (!s) return;
-  view.term.write(terminalColorChunk(view, s));
+  // Explicit RGB/indexed colors belong to the PTY application, which may already
+  // use a light palette. Reflecting them here turns pale diffs and prompts dark.
+  // xterm preserves SGR state across writes; termTheme controls default/ANSI colors.
+  view.term.write(s);
 }
 
 function queueTermOutput(view, chunk) {
@@ -1857,7 +1790,6 @@ async function attachOwnedTerm(view) {
   }
   view.revoked = false;
   clearTermOutput(view);
-  view.ansiTail = '';
   view.selectionLocked = false;
   view.selectionSnapshot = null;
   view.term.reset();

@@ -1703,21 +1703,7 @@ def run(pw):
           light_terminal_surface["filter"] == "none"
           and light_terminal_surface["sourceBackground"] == "rgb(244, 246, 248)",
           light_terminal_surface)
-    ansi_colors = p.evaluate("""() => {
-      const values = s => [...s.matchAll(/(?:38|48);2;(\\d+);(\\d+);(\\d+)/g)]
-        .map(m => m.slice(1).map(Number));
-      return {
-        truecolor: values(lightTerminalAnsi('\x1b[38;2;255;123;114m'))[0],
-        background: values(lightTerminalAnsi('\x1b[48;2;0;0;0m'))[0],
-        indexed: values(lightTerminalAnsi('\x1b[38;5;231m'))[0],
-        ansi16: lightTerminalAnsi('\x1b[38;5;1m'),
-      };
-    }""")
-    check("浅色终端在 ANSI 层反射真彩色和 256 色亮度",
-          sum(ansi_colors["truecolor"]) < 255 + 123 + 114
-          and max(ansi_colors["background"]) <= 245
-          and ansi_colors["indexed"] == [0, 0, 0]
-          and "38;5;1" in ansi_colors["ansi16"], ansi_colors)
+    # Explicit PTY colors and split SGR writes: tests/terminal_colors_e2e.py.
     p.emulate_media(color_scheme="dark")
     p.wait_for_timeout(50)
     dark_tool_skin = single_tool.evaluate("""n => ({
@@ -3654,7 +3640,7 @@ def run(pw):
         p.evaluate("T.term.focus()")
         render_batch = p.evaluate("""async () => {
           const writes = [];
-          const view = {outputBuffer:'', outputTimer:null, ansiTail:'',
+          const view = {outputBuffer:'', outputTimer:null,
             term:{write:s => writes.push(s)}};
           queueTermOutput(view, '先清除');
           queueTermOutput(view, '再重画');
@@ -3666,7 +3652,7 @@ def run(pw):
               render_batch)
         history_flush = p.evaluate("""() => {
           const writes = [];
-          const view = {outputBuffer:'', outputTimer:null, ansiTail:'',
+          const view = {outputBuffer:'', outputTimer:null,
             term:{write:s => writes.push(s)}};
           queueTermOutput(view, 'x'.repeat(TERM_RENDER_BATCH_MAX));
           return {count:writes.length, size:writes[0]?.length || 0,
