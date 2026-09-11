@@ -367,7 +367,11 @@ class Manager:
             shutil.copystat(source, dest, follow_symlinks=False)
         elif source.is_file():
             # O_NOFOLLOW prevents a symlink swap from silently changing the source.
-            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            # Windows defines neither flag (and needs O_BINARY instead); the fstat
+            # below is what actually rejects a source that changed type.
+            flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+            fd = os.open(source, flags)
             with os.fdopen(fd, 'rb') as incoming, dest.open('xb') as outgoing:
                 if not stat.S_ISREG(os.fstat(incoming.fileno()).st_mode):
                     raise ValueError('源文件类型已改变')

@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 
 DATA_DIR = Path.home() / ".local/share/agenthub/create-requests"
+WINDOWS = os.name == "nt"
 _lock = threading.RLock()
 
 
@@ -39,11 +40,14 @@ def run(body, execute):
                 out.flush()
                 os.fsync(out.fileno())
             temp.replace(path)
-            directory = os.open(DATA_DIR, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            # 目录 fsync 是 POSIX 的写法。Windows 上 os.open 一个目录直接是
+            # PermissionError，新建会话就卡在这里；那边 replace 本身已是原子的。
+            if not WINDOWS:
+                directory = os.open(DATA_DIR, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
         write({"state": "started"})
         status, response = execute()
         write({"state": "complete", "status": status, "response": response})

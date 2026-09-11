@@ -1,5 +1,6 @@
 import json
 import errno
+import os
 import tempfile
 import threading
 import time
@@ -54,6 +55,26 @@ class FederationTests(unittest.TestCase):
                 create_requests.run({**body, 'request_id': 'request-456'}, interrupted)
             self.assertEqual(create_requests.run({**body, 'request_id': 'request-456'}, execute)[0], 409)
             self.assertEqual(calls, [1])
+
+    def test_a_receipt_is_written_where_directories_cannot_be_opened(self):
+        """Windows 上 os.open(目录) 是 PermissionError：收据写到一半炸了，
+        新建会话就只剩一句 [Errno 13] Permission denied（cetus 上真实撞到过）。"""
+        real_open = os.open
+
+        def no_directories(path, *args, **kwargs):
+            if Path(path).is_dir():
+                raise PermissionError(13, 'Permission denied')   # Windows 的行为
+            return real_open(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(create_requests, 'DATA_DIR', Path(root)), \
+                patch.object(create_requests, 'WINDOWS', True), \
+                patch.object(create_requests.os, 'open', no_directories):
+            body = {'request_id': 'request-win', 'source': 'claude', 'cwd': 'C:\\Users\\zj'}
+            self.assertEqual(create_requests.run(body, lambda: (200, {'name': 't'})),
+                             (200, {'name': 't'}))
+            self.assertEqual(create_requests.run(body, lambda: (200, {'name': 't2'})),
+                             (200, {'name': 't'}), '收据仍然要挡住重复启动')
 
     def test_hub_protocol_requires_credential_and_supported_version(self):
         handler = object.__new__(server.Handler)

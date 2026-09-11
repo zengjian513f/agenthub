@@ -59,14 +59,16 @@ def _write(rows: list[dict]) -> None:
     tmp.replace(QUEUE_FILE)
     # The file is already safe for process crashes. Persisting the rename across
     # a sudden power loss is best effort because some filesystems reject dir fsync.
-    try:
-        directory = os.open(QUEUE_FILE.parent, os.O_RDONLY | os.O_DIRECTORY)
+    # Windows has neither O_DIRECTORY nor openable directories, so it skips this.
+    if os.name != "nt":
         try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError:
-        pass
+            directory = os.open(QUEUE_FILE.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            pass
     _revision += 1
     audit.record_ledger_changes("claude", before, rows)
 
