@@ -215,7 +215,7 @@ class DirectoryCompletionRouteTests(unittest.TestCase):
         cases = [
             (False, 'tmux', missing_tmux, '--terminal'),   # 没加 --terminal
             (True, 'tmux', missing_tmux, 'tmux'),          # 缺依赖时要点名后端
-            (True, 'host', missing_host, 'cargo build'),
+            (True, 'ptyhost', missing_host, 'cargo build'),
         ]
         for enabled, backend, missing, expected in cases:
             with self.subTest(enabled=enabled, backend=backend), missing, \

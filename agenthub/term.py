@@ -3,7 +3,8 @@
 后端选择 (决定新会话建在哪里, 按优先级):
   - 网页设置里选过的值, 持久化在本机数据目录, 重启后仍然生效。
   - ``AGENTHUB_TERM_BACKEND`` 或 server ``--terminal-backend`` 给出的初始默认值。
-  - 默认 Windows 用宿主 (host), 其他平台仍用 tmux。
+  - 默认 ptyhost。配置的后端在这台机器上不可用 (例如还没拷 ptyhost 二进制)
+    时退到另一个可用的, 控制台不会因此整个消失。
 
 按名称操作的接口会在两个后端里查找会话, 因此切换主后端只影响新建, 旧后端里
 仍在跑的会话继续可用, 直到自然结束。
@@ -41,11 +42,14 @@ CODEX_QUESTION_ARGS = (
     "-c", "suppress_unstable_features_warning=true",
 )
 
-BACKENDS = {"tmux": term_tmux, "host": term_host}
-BACKEND_LABELS = {"tmux": "tmux", "host": "自制会话宿主"}
+BACKENDS = {"tmux": term_tmux, "ptyhost": term_host}
+BACKEND_LABELS = {"tmux": "tmux", "ptyhost": "ptyhost"}
+# 早期版本把宿主后端叫 host；已经落盘的选择和旧启动参数要继续认。
+BACKEND_ALIASES = {"host": "ptyhost"}
 BACKEND_FILE = Path.home() / ".local" / "share" / "agenthub" / "terminal-backend"
 _default: str | None = None        # 启动参数给的初始默认值
 _chosen: str | None = None         # 网页里选过的值, 覆盖默认
+_loaded = False                    # 是否已经尝试读过持久化的选择
 
 
 class DirectoryCreationRequired(ValueError):
@@ -57,16 +61,21 @@ class DirectoryCreationRequired(ValueError):
 
 
 # ----------------------------------------------------------------- 后端选择
+def _normalize(name: str) -> str:
+    value = str(name or "").strip().lower()
+    return BACKEND_ALIASES.get(value, value)
+
+
 def default_backend() -> str:
-    raw = (os.environ.get("AGENTHUB_TERM_BACKEND") or "").strip().lower()
+    raw = _normalize(os.environ.get("AGENTHUB_TERM_BACKEND") or "")
     if raw in BACKENDS:
         return raw
-    return "host" if WINDOWS else "tmux"
+    return "ptyhost"
 
 
 def _read_choice() -> str | None:
     try:
-        value = BACKEND_FILE.read_text(encoding="utf-8").strip().lower()
+        value = _normalize(BACKEND_FILE.read_text(encoding="utf-8"))
     except OSError:
         return None
     return value if value in BACKENDS else None
@@ -74,43 +83,70 @@ def _read_choice() -> str | None:
 
 def configure(backend: str | None) -> str:
     """server 启动时设定初始默认后端; 网页选过的值优先。返回实际生效的名称。"""
-    global _default, _chosen
-    name = (backend or "").strip().lower()
+    global _default, _chosen, _loaded
+    name = _normalize(backend or "")
     if name in ("", "auto"):
         name = default_backend()
     if name not in BACKENDS:
         raise ValueError(f"未知终端后端: {backend}")
     _default = name
     _chosen = _read_choice()
+    _loaded = True
     return backend_name()
 
 
-def backend_name() -> str:
+def configured_backend() -> str:
+    """持久化的选择是这台机器的唯一事实来源。
+
+    没调过 configure() 的进程（脚本、工具）也必须看到同一个答案，否则会悄悄
+    按默认值建会话, 落到用户没选的那个后端里。只读一次, 之后由 API 更新。
+    """
+    global _chosen, _loaded
+    if _chosen is None and not _loaded:
+        _chosen = _read_choice()
+        _loaded = True
     return _chosen or _default or default_backend()
+
+
+def backend_name() -> str:
+    """实际生效的后端: 配置的那个可用就用它, 否则退到任何一个可用的。
+
+    默认是 ptyhost, 但一台刚部署、还没拷二进制的节点上它不可用; 若因此把整个
+    终端功能关掉, 连已有的 tmux 会话都会从列表里消失。退让只发生在"配置的
+    不可用"这一种情况, 网页里能选中的永远是可用的。
+    """
+    wanted = configured_backend()
+    if BACKENDS[wanted].available():
+        return wanted
+    for name, module in BACKENDS.items():
+        if module.available():
+            return name
+    return wanted
 
 
 def set_backend(name: str) -> str:
     """网页选择主后端。只影响新建会话, 已在跑的会话不受影响。"""
-    global _chosen
-    value = str(name or "").strip().lower()
+    global _chosen, _loaded
+    value = _normalize(name)
     if value not in BACKENDS:
         raise ValueError(f"未知终端后端: {name}")
     module = BACKENDS[value]
     if not module.available():
         raise ValueError(backend_unavailable_reason(value)
                          or f"{BACKEND_LABELS[value]} 当前不可用")
-    if value != backend_name():
+    if value != configured_backend():
         try:
             BACKEND_FILE.parent.mkdir(parents=True, exist_ok=True)
             BACKEND_FILE.write_text(value + "\n", encoding="utf-8")
         except OSError as e:
             raise ValueError(f"无法保存终端后端选择：{getattr(e, 'strerror', None) or e}") from None
     _chosen = value
+    _loaded = True
     return value
 
 
 def backend_unavailable_reason(name: str) -> str:
-    if name == "tmux":
+    if _normalize(name) == "tmux":
         return "" if term_tmux.available() else "服务器未安装 tmux。"
     return term_host.unavailable_reason()
 

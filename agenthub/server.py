@@ -2496,8 +2496,10 @@ def main():
                     help="除本机外允许访问的 IP 或 CIDR, 逗号分隔")
     ap.add_argument("--terminal", action="store_true",
                     help="开启远程终端。这等于给白名单 IP 开放本机 shell, 谨慎使用")
-    ap.add_argument("--terminal-backend", default="auto", choices=["auto", "tmux", "host"],
-                    help="终端后端: tmux 或自制会话宿主 (host)。auto = Windows 用 host, 其他用 tmux")
+    ap.add_argument("--terminal-backend", default="auto",
+                    choices=["auto", "tmux", "ptyhost", "host"],
+                    help="终端后端初始默认值: ptyhost 或 tmux（host 是 ptyhost 的旧名）。"
+                         "auto = ptyhost；网页里选过的值优先于此参数")
     ap.add_argument("--node-token-file", type=Path, help="Hub 节点凭据文件（至少 32 字符）")
     ap.add_argument("--node-id-file", type=Path, help="持久节点身份文件；默认保存在本机数据目录")
     args = ap.parse_args()

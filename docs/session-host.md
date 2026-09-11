@@ -1,16 +1,15 @@
-# 会话宿主（tmux 的替代后端）
+# ptyhost（tmux 的替代终端后端）
 
 网页控制台之前完全依赖 tmux：会话独立于 Web 服务存活、字节流 attach、`send-keys`
 输入，以及 `capture-pane` 加光标位置的屏幕读取。为了让 Windows 机器也能作为节点托管
-原生 Claude / Codex 会话，`host-rs/` 提供了一个自制的会话宿主，覆盖同样四件事，
-不依赖 tmux。
+原生 Claude / Codex 会话，`host-rs/` 提供了 **ptyhost**，覆盖同样四件事，不依赖 tmux。
 
-宿主本体是 Rust 二进制；Python 侧只保留客户端（`agenthub/host/`），由 Web 服务用来
+ptyhost 本体是 Rust 二进制；Python 侧只保留客户端（`agenthub/host/`），由 Web 服务用来
 扫描会话目录、发控制请求和转发 attach 字节流。
 
 ## 结构
 
-- **每个会话一个独立进程**（`agenthub-host run …`），没有中央守护进程。
+- **每个会话一个独立进程**（`ptyhost run …`），没有中央守护进程。
   进程持有 pty 跑 CLI，把输出喂给自带的 VT 屏幕模型，并在本地 socket 上接受连接。
   Web 服务重启不影响 CLI；CLI 退出时宿主随之退出并清理文件（对应 tmux 的 `remain-on-exit off`）。
   每会话常驻内存 2–3 MB。
@@ -36,44 +35,59 @@
 - 与 `agenthub-tmux-host` 一样，CLI 经 `~/.local/bin/with-zshrc` 之类的包装启动以获得交互 shell
   的环境；`AGENTHUB_HOST_ENV_WRAPPER` 可以改路径，设为空字符串则不包装。
 
-## 构建与定位
+## 构建与分发
+
+二进制**一次构建、多机复用**，节点上不需要 Rust 工具链。Linux 用静态链接的 musl
+目标，这样不依赖各机器的 glibc 版本：
 
 ```bash
-cd host-rs && cargo build --release      # 产物: host-rs/target/release/agenthub-host
+rustup target add x86_64-unknown-linux-musl        # 只在构建机上做一次
+cd host-rs && cargo build --release --target x86_64-unknown-linux-musl
+cp host-rs/target/x86_64-unknown-linux-musl/release/ptyhost bin/ptyhost
 ```
+
+产物 1.1 MB、`static-pie linked`，拷到每台机器的 `<代码目录>/bin/ptyhost` 即可
+（`chmod +x`）。`bin/` 在 `.gitignore` 里，二进制不进 git。Windows 要在该机器上自行
+`cargo build --release`（ConPTY 走 MSVC，不做交叉编译）。
 
 `term_host.py` 按以下顺序定位二进制，找不到就报告控制台不可用并给出构建命令：
 
 1. `AGENTHUB_HOST_BIN`（绝对路径）
-2. `host-rs/target/release/agenthub-host`，然后 `host-rs/target/debug/agenthub-host`
-3. 仓库内 `bin/agenthub-host`
-4. `PATH` 上的 `agenthub-host`
+2. `host-rs/target/release/ptyhost`，然后 `host-rs/target/debug/ptyhost`
+3. 仓库内 `bin/ptyhost` ← 部署分发用这个
+4. `PATH` 上的 `ptyhost`
+
+二进制是否存在不影响服务启动：缺它时自动退到 tmux，设置面板里 ptyhost 那一项显示
+不可用并给出构建命令。
 
 ## 后端选择与共存
 
-`agenthub/term.py` 是调度层：`term_tmux.py` 是原有的 tmux 后端，`term_host.py` 驱动会话宿主。
+`agenthub/term.py` 是调度层：`term_tmux.py` 是原有的 tmux 后端，`term_host.py` 驱动 ptyhost。
 
-- 主后端在网页「设置 → 终端后端」里按机器选择，保存在各机器服务端的
+- **默认后端是 ptyhost。** 主后端在网页「设置 → 终端后端」里按机器选择，保存在各机器服务端的
   `~/.local/share/agenthub/terminal-backend`，重启后仍然生效。没选过时用
-  `python3 -m agenthub.server --terminal-backend {auto,tmux,host}` 或环境变量
-  `AGENTHUB_TERM_BACKEND` 给的初始默认值；`auto` 在 Windows 取 `host`，其他平台取 `tmux`。
-  要让启动参数重新说了算，删掉那个文件即可。
+  `python3 -m agenthub.server --terminal-backend {auto,tmux,ptyhost}` 或环境变量
+  `AGENTHUB_TERM_BACKEND` 给的初始默认值，`auto` 即 ptyhost。要让启动参数重新说了算，
+  删掉那个文件即可。
+- 配置的后端在这台机器上不可用时（典型：还没把 ptyhost 二进制拷到 `bin/`），实际生效的
+  退到另一个可用的后端，控制台不会整个消失；设置面板里标为当前的是实际生效的那个，
+  不可用的一项附带原因。二进制到位后自动回到配置值。
 - 切换只影响新建会话。不可用的后端不能被选中，`/api/term/list` 的 `backends` 会带上原因
   （例如没构建宿主二进制、没装 tmux），网页把它显示在该机器那一行下面。
 - 按名称操作（发送、截屏、attach、结束、改名）会在两个后端里查找会话，因此把节点切到 `host`
-  之后，仍在 tmux 里跑的旧会话继续可用，直到自然结束。`/api/term/list` 里宿主会话的
-  `server` 字段为 `host`。
-- 宿主没有 copy-mode，`scroll`/`leave_copy_mode` 是空操作；`submit_text` 只在应用请求了
+  之后，仍在 tmux 里跑的旧会话继续可用，直到自然结束。`/api/term/list` 里 ptyhost 会话的
+  `server` 字段为 `ptyhost`。
+- ptyhost 没有 copy-mode，`scroll`/`leave_copy_mode` 是空操作；`submit_text` 只在应用请求了
   bracketed paste 时才包起止序列，和 tmux `paste-buffer -p` 的行为一致。
 
 ## 命令行
 
 ```bash
-agenthub-host list                       # 列出宿主会话
-agenthub-host attach agenthub-claude-1234 # 手工接管, Ctrl-\ 退出且不影响会话
-agenthub-host capture NAME --lines 200 --plain
-agenthub-host send NAME "文本" --enter
-agenthub-host kill NAME [--force]
+ptyhost list                       # 列出 ptyhost 会话
+ptyhost attach agenthub-claude-1234 # 手工接管, Ctrl-\ 退出且不影响会话
+ptyhost capture NAME --lines 200 --plain
+ptyhost send NAME "文本" --enter
+ptyhost kill NAME [--force]
 ```
 
 全局 `--dir` 可覆盖会话目录，与 `AGENTHUB_HOST_DIR` 等价。

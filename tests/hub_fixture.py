@@ -84,7 +84,7 @@ class NodeHandler(server.Handler):
                                'backend': current,
                                'backends': [{'name': n, 'label': n, 'available': True,
                                              'current': n == current, 'unavailable_reason': ''}
-                                            for n in ('tmux', 'host')]})
+                                            for n in ('tmux', 'ptyhost')]})
         if u.path == '/api/term/complete-dir':
             return self._json({'directories': ['/home/' + s['name'] + '/work/']})
         if u.path == '/api/term/new-status':
@@ -172,13 +172,13 @@ class NodeHandler(server.Handler):
             return self._json(info)
         if u.path == '/api/term/backend':
             wanted = str(body.get('backend') or '')
-            if wanted not in ('tmux', 'host'):
+            if wanted not in ('tmux', 'ptyhost'):
                 return self._json({'error': f'未知终端后端: {wanted}'}, 400)
             self.state['backend'] = wanted
             return self._json({'ok': True, 'backend': wanted,
                                'backends': [{'name': n, 'label': n, 'available': True,
                                              'current': n == wanted, 'unavailable_reason': ''}
-                                            for n in ('tmux', 'host')]})
+                                            for n in ('tmux', 'ptyhost')]})
         if u.path == '/api/term/claim':
             return self._json({'ok': True, 'token': 'fixture-lease'})
         if u.path == '/api/sessions/delete':

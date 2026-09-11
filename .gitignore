@@ -21,3 +21,5 @@ agenthub_attachments/
 /.env.*
 !/.env.example
 /deploy/*.local.conf
+# 随部署分发的会话宿主二进制，一次构建多机复用，不进 git
+/bin/

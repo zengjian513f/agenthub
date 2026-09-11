@@ -1,4 +1,4 @@
-"""自制会话宿主: 屏幕模型、协议、真实 pty 会话进程与 term 调度。"""
+"""ptyhost: 协议、真实 pty 会话进程、term 调度与后端选择。"""
 
 import json
 import os
@@ -80,7 +80,7 @@ class SessionProcessTests(unittest.TestCase):
         self.assertEqual(info["cols"], 40)
         rows = client.list_sessions(self.dir)
         self.assertEqual([(r["name"], r["pid"], r["owned"], r["server"]) for r in rows],
-                         [("agenthub-t1", info["pid"], True, "host")])
+                         [("agenthub-t1", info["pid"], True, "ptyhost")])
         self.assertTrue(stat.S_ISSOCK(os.stat(info["sock"]).st_mode))
         self.assertEqual(stat.S_IMODE(os.stat(self.dir).st_mode), 0o700)
 
@@ -222,11 +222,18 @@ class TermHostBackendTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="agenthub-termhost-")
         self.env = patch.dict(os.environ, {
             "AGENTHUB_HOST_DIR": self.tmp.name, "AGENTHUB_HOST_SCOPE": "0",
-            "AGENTHUB_HOST_ENV_WRAPPER": "", "AGENTHUB_TERM_BACKEND": "host"})
+            "AGENTHUB_HOST_ENV_WRAPPER": "", "AGENTHUB_TERM_BACKEND": "ptyhost"})
         self.env.start()
+        # 必须隔离真实的后端选择文件：它是这台机器的持久设置，优先于环境变量。
+        # 不隔离的话，开发机上一旦在网页里选过 tmux，这组测试就会把会话建到
+        # 真实的 tmux server 里，污染生产会话列表。
+        self.backend_file = patch.object(
+            term, "BACKEND_FILE", Path(self.tmp.name) / "terminal-backend")
+        self.backend_file.start()
         self.audit = patch.object(term_host.audit, "record")
         self.audit.start()
         term.configure(None)
+        self.assertIs(term.primary(), term_host, "这组测试必须跑在宿主后端上")
 
     def tearDown(self):
         for row in term_host.list_sessions():
@@ -235,6 +242,7 @@ class TermHostBackendTests(unittest.TestCase):
             except RuntimeError:
                 pass
         self.audit.stop()
+        self.backend_file.stop()
         self.env.stop()
         term.configure(None)
         self.tmp.cleanup()
@@ -244,9 +252,9 @@ class TermHostBackendTests(unittest.TestCase):
         self.assertEqual(name, "agenthub-shell-a")
         row = term.session_info(name)
         self.assertEqual((row["cols"], row["rows"], row["owned"], row["server"]),
-                         (50, 12, True, "host"))
+                         (50, 12, True, "ptyhost"))
         self.assertTrue(term.has_session(name))
-        self.assertEqual(term.backend_name(), "host")
+        self.assertEqual(term.backend_name(), "ptyhost")
         self.assertEqual(term.cursor_position(name)[1], 0)
         term.submit_text(name, "echo sub-$((5*5))")
         deadline = time.monotonic() + 3
@@ -348,11 +356,17 @@ class ServerHostBackendTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="agenthub-termsrv-")
         self.env = patch.dict(os.environ, {
             "AGENTHUB_HOST_DIR": self.tmp.name, "AGENTHUB_HOST_SCOPE": "0",
-            "AGENTHUB_HOST_ENV_WRAPPER": "", "AGENTHUB_TERM_BACKEND": "host"})
+            "AGENTHUB_HOST_ENV_WRAPPER": "", "AGENTHUB_TERM_BACKEND": "ptyhost"})
         self.env.start()
+        # 同 TermHostBackendTests：真实的后端选择文件优先于环境变量，必须隔离，
+        # 否则开发机选过 tmux 后这组测试会去污染生产的 tmux 会话列表。
+        self.backend_file = patch.object(
+            term, "BACKEND_FILE", Path(self.tmp.name) / "terminal-backend")
+        self.backend_file.start()
         self.audit = patch.object(term_host.audit, "record")
         self.audit.start()
         term.configure(None)
+        self.assertIs(term.primary(), term_host, "这组测试必须跑在宿主后端上")
         self.terminal = server.TERMINAL
         server.TERMINAL = True
         server.ALLOWED_IPS.add("127.0.0.1")
@@ -373,6 +387,7 @@ class ServerHostBackendTests(unittest.TestCase):
         self.server.TERMINAL = self.terminal
         self.server.ALLOWED_IPS.discard("127.0.0.1")
         self.audit.stop()
+        self.backend_file.stop()
         self.env.stop()
         term.configure(None)
         self.tmp.cleanup()
@@ -398,7 +413,7 @@ class ServerHostBackendTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(listing["enabled"], listing)
         row = next(x for x in listing["sessions"] if x["name"] == name)
-        self.assertEqual((row["server"], row["cols"]), ("host", 60))
+        self.assertEqual((row["server"], row["cols"]), ("ptyhost", 60))
 
         status, claim = self.api("/api/term/claim", {"name": name, "page": "page-1"})
         self.assertEqual(status, 200, claim)
@@ -449,9 +464,13 @@ class BackendSelectionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="agenthub-backend-")
         self.file = patch.object(term, "BACKEND_FILE", Path(self.tmp.name) / "terminal-backend")
         self.file.start()
+        # 切换走 API 会写审计账本；不打桩的话测试会把事件写进生产的 audit.sqlite3。
+        self.audit = patch.object(server.audit, "record")
+        self.audit.start()
         term.configure(None)
 
     def tearDown(self):
+        self.audit.stop()
         self.file.stop()
         term.configure(None)
         self.tmp.cleanup()
@@ -466,12 +485,42 @@ class BackendSelectionTests(unittest.TestCase):
         with patch.object(server, "TERMINAL", True):
             return self.handler()._set_terminal_backend({"backend": backend})
 
+    def test_a_process_that_never_configured_still_sees_the_choice(self):
+        """持久化的选择是这台机器的唯一事实来源。脚本或工具直接 import term 时
+        若退回默认值，就会把会话建到用户没选的那个后端里。"""
+        term.configure("tmux")
+        term.set_backend("ptyhost")
+        # 模拟一个全新进程：三个模块级状态都没初始化过
+        with patch.object(term, "_chosen", None), patch.object(term, "_default", None), \
+                patch.object(term, "_loaded", False):
+            self.assertEqual(term.backend_name(), "ptyhost")
+            self.assertIs(term.primary(), term_host)
+
+    def test_a_missing_binary_falls_back_instead_of_disabling_the_console(self):
+        """默认是 ptyhost，但一台还没拷二进制的节点上它不可用；若因此关掉整个
+        终端功能，连已有的 tmux 会话都会从列表里消失。"""
+        term.configure(None)
+        self.assertEqual(term.configured_backend(), "ptyhost")
+        with patch.object(term_host, "host_binary", return_value=None), \
+                patch.object(term_tmux, "available", return_value=True):
+            self.assertEqual(term.backend_name(), "tmux")
+            self.assertIs(term.primary(), term_tmux)
+            self.assertTrue(term.available())
+            rows = {b["name"]: b for b in term.backends()}
+            self.assertTrue(rows["tmux"]["current"])
+            self.assertFalse(rows["ptyhost"]["available"])
+            # 退让不会被写成用户的选择
+            self.assertFalse(term.BACKEND_FILE.exists())
+        # 二进制到位后自动回到配置的默认
+        with patch.object(term_host, "host_binary", return_value="/usr/local/bin/ptyhost"):
+            self.assertEqual(term.backend_name(), "ptyhost")
+
     def test_a_choice_outlives_the_startup_default(self):
         self.assertEqual(term.configure("tmux"), "tmux")
-        self.assertEqual(term.set_backend("host"), "host")
+        self.assertEqual(term.set_backend("ptyhost"), "ptyhost")
         # 重启时启动参数仍是 tmux，但网页选过的值优先
-        self.assertEqual(term.configure("tmux"), "host")
-        self.assertEqual(term.backend_name(), "host")
+        self.assertEqual(term.configure("tmux"), "ptyhost")
+        self.assertEqual(term.backend_name(), "ptyhost")
         self.assertIs(term.primary(), term_host)
 
     def test_the_listing_marks_the_current_backend_and_explains_the_others(self):
@@ -480,9 +529,9 @@ class BackendSelectionTests(unittest.TestCase):
                 patch.object(term_host, "unavailable_reason", return_value="没装宿主程序。"):
             rows = {row["name"]: row for row in term.backends()}
         self.assertTrue(rows["tmux"]["current"])
-        self.assertFalse(rows["host"]["current"])
-        self.assertFalse(rows["host"]["available"])
-        self.assertEqual(rows["host"]["unavailable_reason"], "没装宿主程序。")
+        self.assertFalse(rows["ptyhost"]["current"])
+        self.assertFalse(rows["ptyhost"]["available"])
+        self.assertEqual(rows["ptyhost"]["unavailable_reason"], "没装宿主程序。")
         self.assertEqual(rows["tmux"]["label"], "tmux")
 
     def test_an_unavailable_or_unknown_backend_is_refused(self):
@@ -490,7 +539,7 @@ class BackendSelectionTests(unittest.TestCase):
         with patch.object(term_host, "available", return_value=False), \
                 patch.object(term_host, "unavailable_reason", return_value="没装宿主程序。"):
             with self.assertRaisesRegex(ValueError, "没装宿主程序"):
-                term.set_backend("host")
+                term.set_backend("ptyhost")
         with self.assertRaisesRegex(ValueError, "未知终端后端"):
             term.set_backend("nope")
         self.assertEqual(term.backend_name(), "tmux")
@@ -506,7 +555,7 @@ class BackendSelectionTests(unittest.TestCase):
                 patch.object(term_tmux, "send_keys") as keys, \
                 patch.object(term_host, "list_sessions", return_value=[]), \
                 patch.object(term_host, "has_session", return_value=False):
-            term.set_backend("host")
+            term.set_backend("ptyhost")
             self.assertIs(term.primary(), term_host)
             # 新建走宿主，但旧 tmux 会话仍在列表里，也仍然能操作
             self.assertEqual([r["name"] for r in term.list_sessions()], ["agenthub-legacy"])
@@ -515,14 +564,14 @@ class BackendSelectionTests(unittest.TestCase):
 
     def test_the_api_reports_the_change_and_refuses_a_bad_value(self):
         term.configure("tmux")
-        result = self.post("host")
+        result = self.post("ptyhost")
         self.assertEqual(result["_status"], 200)
-        self.assertEqual(result["backend"], "host")
-        self.assertEqual([b["name"] for b in result["backends"] if b["current"]], ["host"])
+        self.assertEqual(result["backend"], "ptyhost")
+        self.assertEqual([b["name"] for b in result["backends"] if b["current"]], ["ptyhost"])
         bad = self.post("nope")
         self.assertEqual(bad["_status"], 400)
         self.assertIn("未知终端后端", bad["error"])
-        self.assertEqual(term.backend_name(), "host")
+        self.assertEqual(term.backend_name(), "ptyhost")
 
     def test_the_terminal_listing_carries_the_backend_for_the_settings_panel(self):
         term.configure("tmux")
@@ -533,7 +582,7 @@ class BackendSelectionTests(unittest.TestCase):
                 patch.object(server.debug_runs, "filter_rows", side_effect=lambda rows, _="": rows):
             listing = self.handler()._api_get("/api/term/list", {})
         self.assertEqual(listing["backend"], "tmux")
-        self.assertEqual({b["name"] for b in listing["backends"]}, {"tmux", "host"})
+        self.assertEqual({b["name"] for b in listing["backends"]}, {"tmux", "ptyhost"})
 
 
 class WindowsPortabilityTests(unittest.TestCase):
@@ -589,8 +638,11 @@ class WindowsPortabilityTests(unittest.TestCase):
             probe.side_effect = OSError("ctypes 不可用")
             self.assertFalse(procs.gone(4242))
 
-    def test_the_host_backend_is_the_default_on_windows(self):
-        with patch.object(term, "WINDOWS", True), \
-                patch.dict(os.environ, {}, clear=False):
+    def test_ptyhost_is_the_default_everywhere(self):
+        with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("AGENTHUB_TERM_BACKEND", None)
-            self.assertEqual(term.default_backend(), "host")
+            self.assertEqual(term.default_backend(), "ptyhost")
+            with patch.object(term, "WINDOWS", True):
+                self.assertEqual(term.default_backend(), "ptyhost")
+            with patch.dict(os.environ, {"AGENTHUB_TERM_BACKEND": "tmux"}):
+                self.assertEqual(term.default_backend(), "tmux")

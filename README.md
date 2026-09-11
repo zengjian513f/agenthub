@@ -6,8 +6,8 @@ Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务
 统一筛选机器、搜索和管理会话；本地 Web 仍可独立运行。部署与协议说明见
 [多机器架构](docs/multi-node.md)。中央入口需放在已有登录鉴权的反代后。
 
-网页控制台默认由 tmux 托管会话；可在设置里按机器切换到不依赖 tmux 的自制会话宿主
-（Rust，见 [会话宿主](docs/session-host.md)），为 Windows 节点做准备。
+网页控制台默认由 **ptyhost** 托管会话，这是一个不依赖 tmux 的终端后端（Rust，见
+[ptyhost](docs/session-host.md)），Linux 与 Windows 通用；也可在设置里按机器切回 tmux。
 
 开发与发布遵循 [AGENTS.md](AGENTS.md)。影响线上行为的更新需同步中央站及相关节点，
 不能以本机更新或 GitHub 推送代替部署；目标、步骤与验证见 [生产更新说明](docs/deployment.md)。

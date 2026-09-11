@@ -74,7 +74,7 @@ def public_row(info: dict) -> dict:
         "attached": bool(info.get("attached")), "pid": int(info.get("pid") or 0),
         "cwd": info.get("cwd") or "", "cmd": info.get("cmd") or "",
         "cols": int(info.get("cols") or 80), "rows": int(info.get("rows") or 24),
-        "owned": True, "server": "host", "backend": "host",
+        "owned": True, "server": "ptyhost", "backend": "ptyhost",
         "host_pid": int(info.get("host_pid") or 0), "meta": info.get("meta") or {},
     }
 

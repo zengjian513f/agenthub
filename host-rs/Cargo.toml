@@ -1,11 +1,11 @@
 [package]
-name = "agenthub-host"
+name = "ptyhost"
 version = "0.1.0"
 edition = "2024"
-description = "AgentHub 会话宿主：每个 CLI 会话一个独立进程，pty + 本地 socket"
+description = "ptyhost：AgentHub 的终端后端，每个 CLI 会话一个独立进程，pty + 本地 socket"
 
 [[bin]]
-name = "agenthub-host"
+name = "ptyhost"
 path = "src/main.rs"
 
 [dependencies]

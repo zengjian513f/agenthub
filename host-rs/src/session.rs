@@ -326,7 +326,7 @@ impl Session {
             "rows": rows,
             "attached": attached,
             "meta": self.meta,
-            "backend": "rust",
+            "backend": "ptyhost",
         });
         let map = info.as_object_mut().unwrap();
         if cfg!(windows) {

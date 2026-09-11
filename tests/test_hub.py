@@ -520,19 +520,19 @@ class HubHTTPTests(unittest.TestCase):
         _, listing = self.call('/api/term/list')
         self.assertEqual(listing['capabilities'][node_a]['backend'], 'tmux')
         self.assertEqual({b['name'] for b in listing['capabilities'][node_b]['backends']},
-                         {'tmux', 'host'})
+                         {'tmux', 'ptyhost'})
         try:
             status, body = self.call(f'/api/nodes/{node_b}/api/term/backend',
-                                     {'backend': 'host'})
+                                     {'backend': 'ptyhost'})
             self.assertEqual(status, 200, body)
-            self.assertEqual(body['backend'], 'host')
+            self.assertEqual(body['backend'], 'ptyhost')
 
             _, listing = self.call('/api/term/list')
-            self.assertEqual(listing['capabilities'][node_b]['backend'], 'host')
+            self.assertEqual(listing['capabilities'][node_b]['backend'], 'ptyhost')
             # 只改了这台，另一台不受影响
             self.assertEqual(listing['capabilities'][node_a]['backend'], 'tmux')
             self.assertEqual([b['current'] for b in listing['capabilities'][node_b]['backends']
-                              if b['name'] == 'host'], [True])
+                              if b['name'] == 'ptyhost'], [True])
 
             status, body = self.call(f'/api/nodes/{node_b}/api/term/backend',
                                      {'backend': 'nope'})

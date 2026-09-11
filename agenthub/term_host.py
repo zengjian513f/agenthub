@@ -1,7 +1,7 @@
-"""自制会话宿主后端: 每个会话一个独立进程 + 本地 socket。
+"""ptyhost 后端: 每个会话一个独立进程 + 本地 socket。
 
-对外提供与 tmux 后端相同的函数面, 由 term.py 统一调度。宿主本体是 Rust 二进制
-(见 host-rs/), 这里只负责把它拉起来并作为客户端和它对话。宿主进程与 Web 服务
+对外提供与 tmux 后端相同的函数面, 由 term.py 统一调度。ptyhost 本体是 Rust 二进制
+(源码在 host-rs/), 这里只负责把它拉起来并作为客户端和它对话。宿主进程与 Web 服务
 互不牵连, Linux 下尽量放进独立的 systemd scope, Windows 下以脱离作业对象的
 独立进程启动, 这样重启 agenthub 服务不会结束 CLI。
 """
@@ -25,7 +25,7 @@ from .host import client, procs
 PREFIX = "agenthub-"
 WINDOWS = sys.platform == "win32"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-BINARY_NAME = "agenthub-host.exe" if WINDOWS else "agenthub-host"
+BINARY_NAME = "ptyhost.exe" if WINDOWS else "ptyhost"
 _submit_locks: dict[str, threading.Lock] = {}
 _submit_locks_guard = threading.Lock()
 
@@ -50,8 +50,8 @@ def available() -> bool:
 
 def unavailable_reason() -> str:
     if host_binary() is None:
-        return ("服务器未安装会话宿主程序，无法打开控制台"
-                "（在 host-rs/ 执行 cargo build --release）。")
+        return ("服务器未安装 ptyhost，无法打开控制台"
+                "（在 host-rs/ 执行 cargo build --release，或从构建机拷一份到 bin/）。")
     return ""
 
 

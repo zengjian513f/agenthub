@@ -1,14 +1,14 @@
-//! agenthub 会话宿主（Rust 实现）。
+//! ptyhost：AgentHub 的终端后端，tmux 的替代。
 //!
-//! 命令行与协议和 Python 参考实现 `python3 -m agenthub.host` 完全一致：
+//! 每个会话一个独立进程，持有一个 pty 跑 CLI，并在本地 socket 上接受连接：
 //!
-//!   agenthub-host [--dir DIR] run --name N [--cwd DIR] [--cols C] [--rows R]
-//!                                 [--meta JSON] [--history N] -- CMD...
-//!   agenthub-host [--dir DIR] list
-//!   agenthub-host [--dir DIR] attach NAME
-//!   agenthub-host [--dir DIR] kill NAME [--force]
-//!   agenthub-host [--dir DIR] send NAME TEXT [--enter]
-//!   agenthub-host [--dir DIR] capture NAME [--lines N] [--plain] [--join]
+//!   ptyhost [--dir DIR] run --name N [--cwd DIR] [--cols C] [--rows R]
+//!                           [--meta JSON] [--history N] -- CMD...
+//!   ptyhost [--dir DIR] list
+//!   ptyhost [--dir DIR] attach NAME
+//!   ptyhost [--dir DIR] kill NAME [--force]
+//!   ptyhost [--dir DIR] send NAME TEXT [--enter]
+//!   ptyhost [--dir DIR] capture NAME [--lines N] [--plain] [--join]
 
 mod client;
 mod dsr;
@@ -43,7 +43,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "用法: agenthub-host [--dir DIR] <run|list|attach|kill|send|capture> ...\n\
+        "用法: ptyhost [--dir DIR] <run|list|attach|kill|send|capture> ...\n\
          详见 docs/session-host.md"
     );
     std::process::exit(2);
@@ -193,7 +193,7 @@ fn cmd_run(args: &Args, dir: PathBuf) -> i32 {
     ) {
         Ok(session) => session.serve(),
         Err(e) => {
-            eprintln!("agenthub-host: {e}");
+            eprintln!("ptyhost: {e}");
             1
         }
     }
