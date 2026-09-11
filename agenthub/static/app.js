@@ -5649,6 +5649,7 @@ function renderMachineSettings() {
   const active = document.activeElement;
   // 正在输入机器名时不要重绘，否则光标和未提交的文字都会没
   if (active && rows.contains(active) && active.tagName === 'INPUT') return;
+  closeMachinePalette();
   rows.textContent = '';
   if (!targets.length) {
     const empty = document.createElement('p');
@@ -5662,16 +5663,92 @@ function renderMachineSettings() {
   }
 }
 
+// 机器的配色就是名字左边那个色块：点开直接挑，右边不再重复一栏下拉。
+let machinePalette = null;
+
+function closeMachinePalette() {
+  if (!machinePalette) return;
+  machinePalette.palette.hidden = true;
+  machinePalette.button.setAttribute('aria-expanded', 'false');
+  machinePalette = null;
+}
+
+function machineColor(target) {
+  const wrap = document.createElement('div');
+  wrap.className = 'machine-color';
+  if (target.local) {                  // 本机没有注册表，也就没有可改的配色
+    const swatch = document.createElement('span');
+    swatch.className = 'machine-swatch';
+    swatch.dataset.nodeColor = target.color;
+    wrap.append(swatch);
+    return wrap;
+  }
+
+  const label = (MACHINE_COLORS.find(([value]) => value === target.color) || ['', '默认'])[1];
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'machine-swatch';
+  button.dataset.nodeColor = target.color;
+  button.dataset.machineColor = target.id;
+  button.setAttribute('aria-haspopup', 'true');
+  button.setAttribute('aria-expanded', 'false');
+  button.setAttribute('aria-label', `${target.name} 的配色：${label}`);
+
+  const palette = document.createElement('div');
+  palette.className = 'machine-palette';
+  palette.setAttribute('role', 'listbox');
+  palette.setAttribute('aria-label', `${target.name} 的配色`);
+  palette.hidden = true;
+  for (const [value, name] of MACHINE_COLORS) {
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.className = 'machine-swatch';
+    option.dataset.nodeColor = value;
+    option.setAttribute('role', 'option');
+    option.setAttribute('aria-selected', String(value === target.color));
+    option.setAttribute('aria-label', name);
+    option.title = name;
+    option.onclick = async () => {
+      closeMachinePalette();
+      await saveMachine(target, {color: value}, button);
+      $(`[data-machine-color="${target.id}"]`)?.focus();
+    };
+    palette.append(option);
+  }
+
+  button.onclick = () => {
+    const wasOpen = !palette.hidden;
+    closeMachinePalette();
+    if (wasOpen) return;
+    palette.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    machinePalette = {wrap, button, palette};
+    palette.querySelector('[aria-selected="true"]')?.focus();
+  };
+  wrap.append(button, palette);
+  return wrap;
+}
+
+document.addEventListener('pointerdown', event => {
+  if (machinePalette && !machinePalette.wrap.contains(event.target)) closeMachinePalette();
+});
+
+$('#settings-dialog').addEventListener('keydown', event => {
+  if (event.key !== 'Escape' || !machinePalette) return;
+  const button = machinePalette.button;   // Esc 先收调色板，别顺手把设置框也关了
+  closeMachinePalette();
+  button.focus();
+  event.preventDefault();
+  event.stopPropagation();
+});
+
 function machineRow(target) {
   const row = document.createElement('div');
   row.className = 'machine-row';
 
   const head = document.createElement('div');
   head.className = 'machine-head';
-  const swatch = document.createElement('span');
-  swatch.className = 'machine-swatch';
-  swatch.dataset.nodeColor = target.color;
-  head.append(swatch);
+  head.append(machineColor(target));
 
   if (target.local) {
     const label = document.createElement('b');
@@ -5691,20 +5768,6 @@ function machineRow(target) {
 
   const fields = document.createElement('div');
   fields.className = 'machine-fields';
-  if (!target.local) {
-    const color = document.createElement('select');
-    color.className = 'machine-color';
-    color.setAttribute('aria-label', `${target.name} 的颜色`);
-    for (const [value, label] of MACHINE_COLORS) {
-      const option = document.createElement('option');
-      option.value = value; option.textContent = label;
-      color.append(option);
-    }
-    color.value = target.color;
-    color.onchange = () => void saveMachine(target, {color: color.value}, color);
-    fields.append(color);
-  }
-
   const backend = document.createElement('select');
   backend.className = 'machine-backend';
   backend.setAttribute('aria-label', `${target.name} 的终端后端`);
@@ -5771,7 +5834,7 @@ async function saveMachine(target, patch, control) {
     renderMachineSettings();
   } catch (error) {
     if (control.tagName === 'INPUT') control.value = before.name;
-    else control.value = before.color;
+    else renderMachineSettings();       // 色块回到服务端仍然认的那个颜色
     setMachineNote(`保存失败：${error.message || error}`, true);
   }
 }
