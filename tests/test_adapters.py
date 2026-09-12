@@ -564,6 +564,53 @@ class ClaudeProtocolTests(unittest.TestCase):
              ("status", "working"), ("user", "之后的新输入"),
              ("assistant", "新回答")])
 
+    def test_interrupted_sibling_with_tools_stays_visible(self):
+        """Esc 中断后新输入若挂回上一个 turn_duration，中断那一轮仍应显示。
+
+        真实会话里「第一条，明显前后矛盾」已经有 tool/thinking，随后用户打断，
+        再发的「原来写需要授权」parentUuid 却指向上一轮 turn_duration。旧逻辑
+        把它当成双 Esc 完成枝丢掉，网页少轮、和 tmux 对不上。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "interrupted-sibling.jsonl"
+
+            def row(kind, uid, parent, text, **extra):
+                record = {
+                    "type": kind, "uuid": uid, "parentUuid": parent,
+                    "isSidechain": False, "timestamp": "2026-09-12T12:00:00Z",
+                    **extra,
+                }
+                if kind in {"user", "assistant"}:
+                    record["message"] = {"role": kind, "content": text}
+                return record
+
+            rows = [
+                row("user", "u0", None, "共同开头"),
+                row("assistant", "a0", "u0", "全部搜了一遍"),
+                row("system", "t0", "a0", "", subtype="turn_duration"),
+                row("user", "u-work", "t0", "第一条，明显前后矛盾"),
+                row("assistant", "a-work", "u-work", "开始核对文档"),
+                row("user", "interrupt", "a-work",
+                    "[Request interrupted by user]"),
+                row("user", "u-replace", "t0", "原来写需要授权"),
+                row("assistant", "a-replace", "u-replace", "已改正"),
+            ]
+            transcript.write_text("\n".join(
+                json.dumps(item, ensure_ascii=False) for item in rows) + "\n")
+            messages, _ = adapters.ClaudeAdapter().read(str(transcript))
+
+        interrupted = next(item for item in messages
+                           if item.get("text") == "第一条，明显前后矛盾")
+        self.assertTrue(interrupted["interrupted"])
+        self.assertEqual(
+            [(item["role"], item["text"]) for item in messages],
+            [("status", "working"), ("user", "共同开头"),
+             ("assistant", "全部搜了一遍"), ("status", "idle"),
+             ("user", "第一条，明显前后矛盾"),
+             ("assistant", "开始核对文档"), ("status", "aborted"),
+             ("status", "working"), ("user", "原来写需要授权"),
+             ("assistant", "已改正")])
+
     def test_compaction_keeps_selected_precompact_branch_visible(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "compacted-tree.jsonl"

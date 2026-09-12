@@ -689,6 +689,32 @@ def _is_claude_interrupt(text: str) -> bool:
     return bool(_CLAUDE_INTERRUPT.fullmatch(text.strip()))
 
 
+def _claude_user_texts(rec: dict) -> list[str]:
+    if rec.get("type") != "user":
+        return []
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    texts = []
+    for part in content:
+        if isinstance(part, str):
+            texts.append(part)
+        elif isinstance(part, dict) and part.get("type") == "text":
+            texts.append(str(part.get("text") or ""))
+    return texts
+
+
+def _is_claude_interrupt_record(rec: dict) -> bool:
+    """JSONL 里一轮被 Esc 打断的原生标记，不是用户新输入。"""
+    if rec.get("type") != "user":
+        return False
+    if rec.get("interruptedMessageId"):
+        return True
+    return any(_is_claude_interrupt(text) for text in _claude_user_texts(rec))
+
+
 def _strip_codex_abort_prefix(text: str) -> str:
     """Codex 会把一轮或多轮中断控制块拼到下一条真实 user 正文前。"""
     while match := _CODEX_ABORT_PREFIX.match(text):
@@ -1012,6 +1038,7 @@ class ClaudeAdapter:
         user_parents: dict[str, str | None] = {}
         user_offsets: dict[str, int] = {}
         response_nodes: list[str] = []
+        interrupt_nodes: list[str] = []
         tip = str(declared_tip) if declared_tip else None
         scan_tip = None
         end = start
@@ -1031,6 +1058,8 @@ class ClaudeAdapter:
                 if not agent and rec.get("type") == "user":
                     user_parents[uid] = parents[uid]
                     user_offsets[uid] = off
+                    if _is_claude_interrupt_record(rec):
+                        interrupt_nodes.append(uid)
                 elif (rec.get("type") == "assistant"
                       and (rec.get("message") or {}).get("content")):
                     response_nodes.append(uid)
@@ -1043,7 +1072,7 @@ class ClaudeAdapter:
                 if not declared_tip:
                     tip = signal
         if not tip:
-            return None, set(), end
+            return None, set(), set(), set(), end
         active: set[str] = set()
         node = tip
         while node and node not in active:
@@ -1065,6 +1094,7 @@ class ClaudeAdapter:
         active_user_parents = {
             parent for uid, parent in user_parents.items() if uid in active
         }
+        stale_after = max(0, int(abandoned_after or 0))
         abandoned = {
             uid for uid, parent in user_parents.items()
             if uid not in active and uid not in responded
@@ -1072,9 +1102,53 @@ class ClaudeAdapter:
             # A confirmed double-Esc rewind records the old EOF.  Inputs at or
             # before that boundary were deliberately removed from the display
             # lineage and must stay hidden after a later replacement arrives.
-            and user_offsets.get(uid, 0) > max(0, int(abandoned_after or 0))
+            and user_offsets.get(uid, 0) > stale_after
         }
-        return active, abandoned, end
+        # Esc 中断时助手往往已经写了 tool/thinking。随后若新输入挂回上一个
+        # turn_duration（看起来像双 Esc），整棵中断枝会被当成“已完成旧分支”
+        # 丢掉。tmux 仍显示那一轮；把它和未回答的 sibling 一样留在时间线。
+        for interrupt_uid in interrupt_nodes:
+            node = interrupt_uid
+            seen: set[str] = set()
+            while node and node not in seen:
+                seen.add(node)
+                parent = parents.get(node)
+                if (node in user_parents and node not in active
+                        and parent in active and parent in active_user_parents
+                        and user_offsets.get(node, 0) > stale_after):
+                    abandoned.add(node)
+                    break
+                node = parent
+        children: dict[str, list[str]] = {}
+        for uid, parent in parents.items():
+            if parent:
+                children.setdefault(parent, []).append(uid)
+        offshoot: set[str] = set()
+        stack = list(abandoned)
+        while stack:
+            node = stack.pop()
+            for child in children.get(node, ()):
+                if child in active or child in abandoned or child in offshoot:
+                    continue
+                offshoot.add(child)
+                stack.append(child)
+        for uid in offshoot:
+            if uid in user_parents and uid not in responded:
+                abandoned.add(uid)
+        deferred_abort: set[str] = set()
+        for uid in abandoned:
+            stack = list(children.get(uid, ()))
+            seen: set[str] = set()
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node in interrupt_nodes or node in response_nodes:
+                    deferred_abort.add(uid)
+                    break
+                stack.extend(children.get(node, ()))
+        return active, abandoned, offshoot, deferred_abort, end
 
     @classmethod
     def latest_tip_after(cls, path: str, start: int, end: int | None = None,
@@ -1392,9 +1466,10 @@ class ClaudeAdapter:
                   abandoned_after: int = 0, search_only: bool = False):
         # 先用轻量父指针表确定当前分支，再做原有消息解析。这样双 Esc 后留在
         # append-only 文件里的旧输入/回答不会继续混入当前时间线。
-        active, abandoned, end = self._active_lineage(
+        active, abandoned, offshoot, deferred_abort, end = self._active_lineage(
             path, start=start, agent=agent, declared_tip=declared_tip,
             abandoned_after=abandoned_after)
+        visible_extra = abandoned | offshoot
         msgs, calls = [], {}
         current_turn = None
         previous_custom_title = None
@@ -1404,7 +1479,7 @@ class ClaudeAdapter:
             uid = self._graph_uuid(rec, agent)
             interrupted_branch = bool(uid and uid in abandoned)
             if (active is not None and uid and uid not in active
-                    and not interrupted_branch):
+                    and uid not in visible_extra):
                 continue
             t = rec.get("type")
             ts = None if search_only else _norm_ts(rec.get("timestamp"))
@@ -1436,15 +1511,16 @@ class ClaudeAdapter:
                         and not _is_timeline_protocol(x))
                     for x, notice, command, output in zip(
                         text_parts, notifications, bash_inputs, bash_outputs))
+                is_interrupt = t == "user" and not tag and (
+                    rec.get("interruptedMessageId")
+                    or any(_is_claude_interrupt(x) for x in text_parts))
                 starts_turn = (t == "user" and (not tag or agent)
-                               and not interrupted_branch
+                               and not is_interrupt
                                and (visible_user_text
                                     or any(p["kind"] == "image" for p in parts)))
                 if starts_turn:
                     current_turn = rec.get("uuid") or off
-                if t == "user" and not tag and (
-                        rec.get("interruptedMessageId")
-                        or any(_is_claude_interrupt(x) for x in text_parts)):
+                if is_interrupt:
                     msgs.append(_status("aborted", ts, **_turn_fields(current_turn)))
                     continue
                 if t == "user" and not tag and not interrupted_branch and visible_user_text:
@@ -1543,7 +1619,7 @@ class ClaudeAdapter:
                         if is_answer and not tag:
                             msgs.append(_status("working", ts,
                                                 **_turn_fields(current_turn)))
-                if emitted_interrupted_user:
+                if emitted_interrupted_user and uid not in deferred_abort:
                     msgs.append(_status("aborted", ts,
                                         reason="输入已中断，未进入当前 Claude 分支",
                                         **_turn_fields(current_turn)))
