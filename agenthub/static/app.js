@@ -338,12 +338,15 @@ window.addEventListener('pagehide', () => {
 document.addEventListener('visibilitychange', () => browserAuditEvent(
   'visibility.changed', {visibility: document.visibilityState}));
 document.addEventListener('click', event => {
-  const target = event.target?.closest?.('button, .item, .ghead, a, [role="button"]');
+  const target = event.target?.closest?.(
+    'button, a, [role="button"], .item, .ghead, summary, label, input, select, textarea, [data-action], [data-term-key], [data-term-modifier], .fold-preview, .turn-toolbar');
   if (!target) return;
   browserAuditEvent('ui.clicked', {
     tag: target.tagName, id: target.id || '', classes: target.className || '',
     title: target.getAttribute('title') || '', uid: target.dataset?.uid || '',
     action: target.dataset?.v || target.dataset?.termKey || target.dataset?.attach || '',
+    text: (target.textContent || '').trim().slice(0, 80),
+    x: Math.round(event.clientX), y: Math.round(event.clientY),
   });
 }, true);
 let auditResizeTimer = 0;
