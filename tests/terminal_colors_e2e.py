@@ -7,8 +7,10 @@ from playwright.sync_api import sync_playwright
 from hub_fixture import start_node, stop
 
 
-# Light diff/prompt colors from BUG-20260911-213006-ddc5ef, plus dark,
-# indexed and colon-form colors. Text resembling SGR parameters is plain text.
+# Light Codex diffs must stay native (BUG-20260911-213006-ddc5ef). Dark Claude
+# user prompts, indexed dark greens and SGR 40/OSC 11 black must lighten only
+# in the light web theme (BUG-20260912-125351-a8c06b). Literal SGR-like text
+# is not a CSI sequence and must not be rewritten.
 SCREEN = (
     '\x1b[0m\x1b[H\x1b[2J'
     '\x1b[48;2;218;251;225;38;2;76;79;105m+ added\x1b[0m\r\n'
@@ -18,8 +20,17 @@ SCREEN = (
     '\x1b[48;5;22;38;5;231mindexed\x1b[0m\r\n'
     '\x1b[48:2::218:251:225m\x1b[38:2::76:79:105mcolon\x1b[0m\r\n'
     'literal 38;2;255;123;114 and 48;5;22\r\n'
-    '\x1b[31mred\x1b[0m default'
+    '\x1b[31mred\x1b[0m default\r\n'
+    '\x1b[48;2;55;55;55;38;2;255;255;255muser\x1b[0m\r\n'
+    '\x1b[40mblackbg\x1b[0m\r\n'
+    '\x1b]11;#000000\x07'
 )
+LIGHT_NATIVE = [(0, 0xDAFBE1, 0x4C4F69), (1, 0xFFEBE9, 0x1F2328),
+                (2, 0xEAECEE, 0x252A32), (5, 0xDAFBE1, 0x4C4F69)]
+LIGHT_REMAPPED = [(3, 0xC1FBCF, 0xA90B00), (8, 0xBBBBBB, 0x000000)]
+DARK_NATIVE = [(0, 0xDAFBE1, 0x4C4F69), (1, 0xFFEBE9, 0x1F2328),
+               (2, 0xEAECEE, 0x252A32), (3, 0x03300E, 0xFF7B72),
+               (5, 0xDAFBE1, 0x4C4F69), (8, 0x373737, 0xFFFFFF)]
 
 
 def main():
@@ -52,14 +63,16 @@ def main():
                 for fragmented in [False, True]:
                     # Separate browser writes exercise xterm's own streaming parser,
                     # including a chunk ending with ESC and one inside a color number.
-                    cuts = [0, 1, 17, 25, 44, 180, 249, len(SCREEN)] if fragmented else [0, len(SCREEN)]
+                    cuts = ([0, 1, 17, 25, 44, 180, 249, 346, 400, len(SCREEN)]
+                            if fragmented else [0, len(SCREEN)])
                     for start, end in zip(cuts, cuts[1:]):
                         sockets[-1].send(SCREEN[start:end].encode())
                         page.wait_for_timeout(45)
-                    page.wait_for_function('T.term.buffer.active.getLine(7)?.translateToString(true).endsWith("default")')
+                    page.wait_for_function(
+                        'T.term.buffer.active.getLine(9)?.translateToString(true).includes("blackbg")')
                     actual = page.evaluate('''() => {
                         const b = T.term.buffer.active;
-                        const rows = Array.from({length: 8}, (_, y) => {
+                        const rows = Array.from({length: 10}, (_, y) => {
                             const line = b.getLine(y), c = line.getCell(0);
                             return {text: line.translateToString(true), fg: c.getFgColor(),
                                 bg: c.getBgColor(), rgb: !!c.isBgRGB(),
@@ -68,13 +81,19 @@ def main():
                         return {rows, theme: T.term.options.theme,
                             filter: getComputedStyle(document.querySelector('#xterm')).filter};
                     }''')
-                    for y, bg, fg in [(0, 0xDAFBE1, 0x4C4F69), (1, 0xFFEBE9, 0x1F2328),
-                                      (2, 0xEAECEE, 0x252A32), (3, 0x03300E, 0xFF7B72),
-                                      (5, 0xDAFBE1, 0x4C4F69)]:
+                    expected_rgb = LIGHT_NATIVE + LIGHT_REMAPPED if theme == 'light' else DARK_NATIVE
+                    for y, bg, fg in expected_rgb:
                         row = actual['rows'][y]
-                        assert (row['bg'], row['fg'], row['rgb']) == (bg, fg, True), (theme, fragmented, y, row)
-                    assert actual['rows'][4]['bg'] == 22 and actual['rows'][4]['fg'] == 231
-                    assert actual['rows'][4]['palette']
+                        assert (row['bg'], row['fg'], row['rgb']) == (bg, fg, True), (
+                            theme, fragmented, y, row)
+                    if theme == 'light':
+                        row = actual['rows'][4]
+                        assert (row['bg'], row['fg'], row['rgb']) == (0x88FF88, 0x000000, True), row
+                        assert actual['rows'][9]['bg'] == 0xC3CAD1 and actual['rows'][9]['rgb']
+                    else:
+                        assert actual['rows'][4]['bg'] == 22 and actual['rows'][4]['fg'] == 231
+                        assert actual['rows'][4]['palette']
+                        assert actual['rows'][9]['bg'] == 0 and not actual['rows'][9]['rgb']
                     assert actual['rows'][6]['text'] == 'literal 38;2;255;123;114 and 48;5;22'
                     assert actual['rows'][7]['fg'] == 1 and actual['rows'][7]['palette']
                     expected_bg, expected_red = (('#f4f6f8', '#a8323b') if theme == 'light'

@@ -4587,8 +4587,8 @@ def run(pw):
               p.evaluate("T.term.buffer.normal.baseY") > 100,
               p.evaluate("T.term.buffer.normal.baseY"))
 
-        # 对话气泡和 xterm 都响应颜色方案；两套终端颜色直接交给 xterm 绘制，
-        # 不再滤整张 Canvas，以免浅色模式的抗锯齿像素发粗、出毛边。
+        # 对话气泡和 xterm 都响应颜色方案。默认色与 ANSI 16 色走 termTheme；
+        # 亮色页面只反射冲突的深底/浅字，不给整张 Canvas 套反色滤镜。
         p.emulate_media(color_scheme="dark")
         p.wait_for_function("T.term.options.theme.background === '#000000'")
         check("已打开的 tmux 使用统一黑底源主题且不套反色滤镜",

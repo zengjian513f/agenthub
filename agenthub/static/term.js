@@ -128,6 +128,161 @@ async function prepareTerminalFont() {
   return resolved;
 }
 
+function hexToRgb(hex) {
+  const value = (hex || '').trim().replace('#', '');
+  if (value.length === 3) {
+    return [...value].map(ch => parseInt(ch + ch, 16));
+  }
+  if (value.length !== 6) return null;
+  return [0, 2, 4].map(i => parseInt(value.slice(i, i + 2), 16));
+}
+
+function hslLightness(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  return (Math.max(r, g, b) + Math.min(r, g, b)) / 2;
+}
+
+// 保持色相、反射亮度；轻微曲线把中间色拉回 50%，避免彩色文字过艳。
+function reflectedLightRgb(r, g, b, background = false) {
+  r /= 255; g /= 255; b /= 255;
+  const hi = Math.max(r, g, b), lo = Math.min(r, g, b);
+  const sourceLight = (hi + lo) / 2;
+  let h = 0, s = 0;
+  if (hi !== lo) {
+    const d = hi - lo;
+    s = d / (1 - Math.abs(2 * sourceLight - 1));
+    if (hi === r) h = ((g - b) / d) % 6;
+    else if (hi === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h = (h * 60 + 360) % 360;
+  }
+  const reflected = 1 - sourceLight;
+  const sign = Math.sign(reflected - .5);
+  let l = .5 + sign * .5 * Math.pow(Math.abs(reflected - .5) / .5, 1.35);
+  if (background) l = Math.min(l, .96);   // 显式黑底随亮色方案恢复为接近白色
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let rr = 0, gg = 0, bb = 0;
+  if (h < 60) [rr, gg, bb] = [c, x, 0];
+  else if (h < 120) [rr, gg, bb] = [x, c, 0];
+  else if (h < 180) [rr, gg, bb] = [0, c, x];
+  else if (h < 240) [rr, gg, bb] = [0, x, c];
+  else if (h < 300) [rr, gg, bb] = [x, 0, c];
+  else [rr, gg, bb] = [c, 0, x];
+  return [rr, gg, bb].map(v => Math.max(0, Math.min(255, Math.round((v + m) * 255))));
+}
+
+function indexedTerminalRgb(n) {
+  if (n >= 0 && n <= 15) {
+    const theme = termTheme();
+    const keys = [
+      'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+      'brightBlack', 'brightRed', 'brightGreen', 'brightYellow',
+      'brightBlue', 'brightMagenta', 'brightCyan', 'brightWhite',
+    ];
+    return hexToRgb(theme[keys[n]]);
+  }
+  if (n >= 232 && n <= 255) {
+    const v = 8 + (n - 232) * 10;
+    return [v, v, v];
+  }
+  if (n < 16 || n > 231) return null;
+  const steps = [0, 95, 135, 175, 215, 255];
+  n -= 16;
+  return [steps[Math.floor(n / 36)], steps[Math.floor(n / 6) % 6], steps[n % 6]];
+}
+
+function adaptRgbForLight(r, g, b, background) {
+  r = Math.max(0, Math.min(255, +r));
+  g = Math.max(0, Math.min(255, +g));
+  b = Math.max(0, Math.min(255, +b));
+  const light = hslLightness(r, g, b);
+  // 已是浅底/深字的真彩色（Codex diff、浅色 prompt）保持原样；
+  // 只有和亮色页面冲突的深底/浅字才反射亮度。
+  if (background ? light >= .5 : light < .5) return [r, g, b];
+  return reflectedLightRgb(r, g, b, background);
+}
+
+function adaptColonRgb(token) {
+  const match = token.match(/^(38|48):2(?::\d*)?:(\d{1,3}):(\d{1,3}):(\d{1,3})$/);
+  if (!match) return token;
+  const rgb = adaptRgbForLight(+match[2], +match[3], +match[4], match[1] === '48');
+  return `${match[1]};2;${rgb.join(';')}`;
+}
+
+function adaptSgrBody(body) {
+  const tokens = body.split(';');
+  const out = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const raw = tokens[i];
+    if (/^(38|48):2/.test(raw)) {
+      out.push(adaptColonRgb(raw));
+      continue;
+    }
+    const code = raw === '' ? 0 : Number(raw);
+    if ((code === 38 || code === 48) && tokens[i + 1] === '2' && i + 4 < tokens.length) {
+      const rgb = adaptRgbForLight(tokens[i + 2], tokens[i + 3], tokens[i + 4], code === 48);
+      out.push(String(code), '2', ...rgb.map(String));
+      i += 4;
+      continue;
+    }
+    if ((code === 38 || code === 48) && tokens[i + 1] === '5' && i + 2 < tokens.length) {
+      const source = indexedTerminalRgb(+tokens[i + 2]);
+      if (!source) {
+        out.push(String(code), '5', tokens[i + 2]);
+      } else {
+        const rgb = adaptRgbForLight(...source, code === 48);
+        out.push(String(code), '2', ...rgb.map(String));
+      }
+      i += 2;
+      continue;
+    }
+    let palette = -1, background = false;
+    if (code >= 40 && code <= 47) { palette = code - 40; background = true; }
+    else if (code >= 100 && code <= 107) { palette = code - 100 + 8; background = true; }
+    else if (code >= 30 && code <= 37) palette = code - 30;
+    else if (code >= 90 && code <= 97) palette = code - 90 + 8;
+    if (palette >= 0) {
+      const source = indexedTerminalRgb(palette);
+      if (source) {
+        const light = hslLightness(...source);
+        const clashes = background ? light < .5 : light >= .5;
+        if (clashes) {
+          const rgb = adaptRgbForLight(...source, background);
+          out.push(background ? '48' : '38', '2', ...rgb.map(String));
+          continue;
+        }
+      }
+    }
+    out.push(raw);
+  }
+  return out.join(';');
+}
+
+function stripOscColorSets(s) {
+  // 丢掉 CLI 把默认前景/背景/光标改成黑底的 OSC。查询（11;?）仍交给 xterm。
+  return s.replace(/\x1b\](?:10|11|12|104|110|111|112);(?!\?)[^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
+}
+
+function lightTerminalAnsi(s) {
+  return s.replace(/\x1b\[([0-9;:]*)m/g, (_, body) => `\x1b[${adaptSgrBody(body)}m`);
+}
+
+function terminalColorChunk(view, s) {
+  s = (view.ansiTail || '') + s;
+  view.ansiTail = '';
+  // PTY/WebSocket 可能恰好在 CSI/OSC 中间断包，留下不完整尾巴等下一块再处理。
+  const tail = s.match(/\x1b(?:\[[0-9;:]*|\][^\x07\x1b]*)$/)?.[0] || '';
+  if (tail) {
+    view.ansiTail = tail;
+    s = s.slice(0, -tail.length);
+  }
+  s = stripOscColorSets(s);
+  if (document.documentElement.dataset.theme !== 'light') return s;
+  return lightTerminalAnsi(s);
+}
+
 async function refreshTerminalPreferences(redraw = false) {
   terminalFontReady = prepareTerminalFont();
   try { await terminalFontReady; } catch {}
@@ -1209,6 +1364,18 @@ function renderTakeoverBtn() {
   b.classList.toggle('on', !!name);
   paintConsoleAvailability(b, S.sel, S.agent);
   renderComposer();
+  if (typeof auditConsoleButton === 'function') auditConsoleButton('takeover-btn');
+}
+
+/** 终端面板每次开合/换模式都记一笔 terminal.pane：谁触发的、之前之后什么状态。 */
+function auditTermPane(action, extra = {}) {
+  if (typeof browserAuditEvent !== 'function') return;
+  const pane = $('#termpane');
+  browserAuditEvent('terminal.pane', {
+    action, name: T.name, uid: T.uid, mode: T.mode, mobile: MOBILE.matches,
+    visible: !!pane && !pane.classList.contains('hidden'),
+    views: [...T.views.keys()], open_views: [...T.openViews.keys()], ...extra,
+  }, null, {uid: T.uid || S.sel || ''});
 }
 
 // ---------------------------------------------------------------- 终端面板
@@ -1335,7 +1502,7 @@ function ensureTerm(name) {
   const fit = new FitAddon.FitAddon();
   view = {
     name, host, term, fit, ws: null, reconnectTimer: null,
-    reconnectDelay: 500, scrollPos: 0,
+    reconnectDelay: 500, scrollPos: 0, ansiTail: '',
     outputBuffer: '', outputTimer: null, fitFrame: null,
     lastResizeKey: '', lastResizeWs: null,
     activationEpoch: 0,
@@ -1454,10 +1621,9 @@ function flushTermOutput(view) {
   let s = view.outputBuffer;
   view.outputBuffer = '';
   if (!s) return;
-  // Explicit RGB/indexed colors belong to the PTY application, which may already
-  // use a light palette. Reflecting them here turns pale diffs and prompts dark.
-  // xterm preserves SGR state across writes; termTheme controls default/ANSI colors.
-  view.term.write(s);
+  // 亮色页面只反射“深底/浅字”的显式颜色；Codex 已是浅色的 diff 保持原样。
+  // 暗色页面与默认/ANSI 16 色仍交给 termTheme。xterm 会跨 write 保留 SGR 状态。
+  view.term.write(terminalColorChunk(view, s));
 }
 
 function queueTermOutput(view, chunk) {
@@ -1605,11 +1771,13 @@ function restoreTermPane(uid, agent = null) {
     renderTakeoverBtn();
     return;
   }
+  auditTermPane('restore', {target: name});
   openTermPane(name, false);
 }
 
 async function openTermPane(name, autoFocus = true, requestedMode = null) {
   const openEpoch = ++termOpenEpoch;
+  auditTermPane('open', {target: name, requested_mode: requestedMode, auto_focus: autoFocus});
   const focusSource = autoFocus ? document.activeElement : null;
   const saved = T.openViews.get(name);
   if (!MOBILE.matches && ['normal', 'collapsed', 'full'].includes(requestedMode)) {
@@ -1647,6 +1815,7 @@ async function openTermPane(name, autoFocus = true, requestedMode = null) {
 /** 顶栏按钮只切纯对话/纯终端；normal 分屏只能由用户拖动分界线产生。 */
 function toggleTermPane(name) {
   const pane = $('#termpane');
+  auditTermPane('toggle', {target: name});
   if (pane.classList.contains('hidden')) {
     return openTermPane(name, true, MOBILE.matches ? null : 'full');
   }
@@ -1682,6 +1851,7 @@ function revealConversationForPrompt(uid, prompt) {
   if (!pane || pane.classList.contains('hidden')) return false;
   if (revealedTermPrompts.get(uid) === id) return false;
   revealedTermPrompts.set(uid, id);
+  auditTermPane('prompt-reveal', {prompt: id});
   if (MOBILE.matches) {
     closeTermPane(true);
     return true;
@@ -1696,6 +1866,7 @@ function revealConversationForPrompt(uid, prompt) {
 }
 
 function closeTermPane(preserveView = false) {
+  auditTermPane('close', {preserve_view: preserveView});
   termOpenEpoch++;                       // 令仍在等待字体/连接的旧 openTermPane 作废
   if (preserveView) rememberTermLayout();
   else rememberTermOpen(T.name, false);
@@ -1757,6 +1928,7 @@ async function claimTermOwnership(name, uid = T.uid) {
 function handleTermRevoked(view, ip = '') {
   if (view.revoked) return;
   view.revoked = true;
+  auditTermPane('revoked', {target: view.name, by: ip});
   cancelTermReconnect(view);
   if (T.name === view.name) closeTermPane();
   try { view.ws?.close(); } catch {}
@@ -1789,6 +1961,7 @@ async function attachOwnedTerm(view) {
   }
   view.revoked = false;
   clearTermOutput(view);
+  view.ansiTail = '';
   view.selectionLocked = false;
   view.selectionSnapshot = null;
   view.term.reset();
