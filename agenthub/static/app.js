@@ -364,7 +364,8 @@ function consoleButtonState() {
       && r.top >= rr.top - .5 && r.bottom <= rr.bottom + .5;
     // 页面不可见时 elementFromPoint 一律 null，不算被遮
     state.hit = hit === undefined ? null : !!hit && button.contains(hit);
-    state.hit_target = hit ? (hit.id ? '#' + hit.id : hit.className ? '.' + String(hit.className).split(' ')[0]
+    // SVG 元素的 className 是 SVGAnimatedString，只能从 classList 取
+    state.hit_target = hit ? (hit.id ? '#' + hit.id : hit.classList?.[0] ? '.' + hit.classList[0]
       : hit.tagName.toLowerCase()) : null;
   }
   // 不在 DOM 一定算丢；在 DOM 但页面可见时被隐藏/裁掉/盖住也算丢
@@ -3330,11 +3331,12 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
 // 标题行有没有横向溢出（溢出就意味着右侧按钮会被 #right 裁掉）。
 let headerLayoutSignature = '';
 function auditHeaderLayout(heading, tier, actions) {
+  if (!heading.isConnected) return;   // head() 构建时先量一次，挂上之后才是真实排版
   try {
     const title = heading.querySelector('.dtitle');
     const brief = heading.querySelector('.dbrief');
     const data = {
-      tier, connected: heading.isConnected,
+      tier,
       inline: [...actions.querySelectorAll('button')].filter(b => !b.hidden && b.offsetWidth)
         .map(b => b.id || (b.dataset.reportBug !== undefined ? 'report-bug' : b.className.split(' ')[0])),
       brief: brief && !brief.hidden ? brief.children.length : 0,
