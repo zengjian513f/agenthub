@@ -3711,7 +3711,6 @@ function head(m, total) {
       ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
-      ${spawnerMarkup(m)}
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
       ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
@@ -3719,10 +3718,6 @@ function head(m, total) {
       </div>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
-  h.addEventListener('click', event => {
-    const link = event.target.closest('.meta-spawner');
-    if (link) openSession(link.dataset.uid);
-  });
   h.querySelector('#a-star').onclick = () => toggleSessionStar(m.uid);
   const turnMode = h.querySelector('#a-turns');
   turnMode.onclick = () => {
@@ -3770,16 +3765,6 @@ function head(m, total) {
   renderSessionAction(m, h.querySelector('#a-session-action'));
   bindSessionActions(h);
   return h;
-}
-
-/** 标题栏元信息里的发起者：由哪条会话把它派出来的，点击就跳过去。 */
-function spawnerMarkup(m) {
-  if (m.agent_id || !m.spawned_by) return '';
-  const byKey = new Map(S.sessions.map(s => [spawnKey(s.node_id, s.source, s.sid), s]));
-  const parent = spawnParentOf(m, byKey);
-  if (!parent || parent.continued_in === m.uid) return '';
-  return `<span class="meta-secondary"><button type="button" class="meta-spawner" data-uid="${esc(parent.uid)}"
-    title="由「${esc(parent.title)}」发起，点击打开">↰ ${esc(SOURCES[parent.source].name)} · ${esc(parent.title)}</button></span>`;
 }
 
 /* ---------- 回退父会话链 ---------- */

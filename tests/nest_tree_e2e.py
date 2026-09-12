@@ -4,7 +4,7 @@
   - 关掉分层时列表与从前一样：没有子代理行，所有行 depth 0，孩子按自己的目录归组。
   - 开分层后孩子紧跟在发起者后面、depth 加一，跨目录的孩子离开自己的组；
     还在跑的子代理排最前，其余按活动时间倒序；发起者不在列表里的会话仍作根。
-  - 子代理行可点开、单独高亮；三角收起整棵子树并持久化；标题栏给出发起者链接。
+  - 子代理行可点开、单独高亮；三角收起整棵子树并持久化；回到发起者走左栏。
 """
 import sys
 import tempfile
@@ -146,18 +146,15 @@ def check_page(page, node, scoped, width):
     assert page.evaluate('[S.sel, S.agent]') == [q('claude:aaa'), 'y']
     assert [r['key'] for r in rows(page) if r['sel']] == [q('claude:aaa') + '#y']
 
-    # 打开孙辈 C：标题栏说明它由 B 发起，点过去就到 B
+    # 打开孙辈 C：标题栏不再放发起者链接，左栏可以点回 B
     to_list(page)
     page.evaluate('(uid) => openSession(uid)', q('codex:ccc'))
     page.wait_for_function('document.querySelector(".dhead h2")?.textContent.includes("Grandchild C")')
-    link = page.locator('.dhead .meta-spawner')
-    assert 'Child B' in link.text_content() and 'Grok' in link.text_content(), link.text_content()
-    if not link.is_visible():                    # 窄屏元信息折进 ⋯ 菜单
-        page.locator('#a-more').click()
-    link.click()
+    assert page.locator('.dhead .meta-spawner').count() == 0
+    to_list(page)
+    page.locator(f'#side .item[data-uid="{q("grok:bbb")}"]').click()
     page.wait_for_function('document.querySelector(".dhead h2")?.textContent.includes("Child B")')
     assert page.evaluate('[S.sel, S.agent]') == [q('grok:bbb'), None]
-    assert page.locator('.dhead .meta-spawner').text_content().endswith('Root A')
 
     # 三角：收起 A 的整棵子树（4 项），状态持久化；再点展开
     to_list(page)
