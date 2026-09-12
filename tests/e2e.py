@@ -2331,11 +2331,56 @@ def run(pw):
       const openBeforeIdle = !idle.querySelector('.grp').classList.contains('folded');
       sealToolTail(idle);
       const idleSealsGroup = idle.querySelector('.grp').classList.contains('folded');
+
+      const manual = document.createElement('div');
+      appendMessages(manual, [tool(6), tool(7)], null, {openTail:false});
+      const foldedAtRest = manual.querySelector('.grp').classList.contains('folded');
+      const sameNode = manual.querySelector('.grp');
+      sameNode.querySelector('.fold-toggle').click();
+      const openedByUser = !sameNode.classList.contains('folded') && sameNode._userOpened === true;
+      appendMessages(manual, [tool(8)], null, {openTail:false});
+      const afterAppend = manual.querySelector('.grp');
+      const staysOpenOnAppend = afterAppend === sameNode
+        && !afterAppend.classList.contains('folded')
+        && afterAppend._userOpened === true
+        && afterAppend._toolItems.length === 3;
+      const innerKept = afterAppend.querySelectorAll(':scope > .tool-entry').length === 3;
+      sealToolTail(manual);
+      const sealRespectsUser = !manual.querySelector('.grp').classList.contains('folded')
+        && manual.querySelector('.grp')._userOpened === true;
+      manual.querySelector('.grp .disclosure').click();
+      const userCanRefold = manual.querySelector('.grp').classList.contains('folded')
+        && !manual.querySelector('.grp')._userOpened;
+
+      const pairing = document.createElement('div');
+      appendMessages(pairing, [tool(9), tool(10)], null, {openTail:false});
+      const pairGroup = pairing.querySelector('.grp');
+      pairGroup.querySelector('.fold-toggle').click();
+      appendMessages(pairing, [{role:'tool_result', call_id:'call-10', text:'done 10'}],
+                     null, {openTail:false});
+      const afterResult = pairing.querySelector('.grp');
+      const resultKeepsUserOpen = afterResult === pairGroup
+        && !afterResult.classList.contains('folded')
+        && afterResult._userOpened === true
+        && afterResult._toolItems.length === 2
+        && !!afterResult._toolItems[1].result
+        && afterResult.querySelectorAll(':scope > .tool-entry').length === 2
+        && afterResult.querySelectorAll(':scope > .tool-entry .tool-status').length === 1;
       return {firstIsSingle, twoBecomeOpenGroup, nextBatchJoinsTail,
-              nonToolSealsGroup, openBeforeIdle, idleSealsGroup};
+              nonToolSealsGroup, openBeforeIdle, idleSealsGroup,
+              foldedAtRest, openedByUser, staysOpenOnAppend, innerKept,
+              sealRespectsUser, userCanRefold, resultKeepsUserOpen};
     }""")
     check("连续黑色工具段工作中展开、跨推送合并并在结束后折叠",
-          all(live_tool_grouping.values()), live_tool_grouping)
+          all(live_tool_grouping[k] for k in (
+              "firstIsSingle", "twoBecomeOpenGroup", "nextBatchJoinsTail",
+              "nonToolSealsGroup", "openBeforeIdle", "idleSealsGroup")),
+          live_tool_grouping)
+    check("用户展开的工具组在追加工具和封口后保持展开",
+          all(live_tool_grouping[k] for k in (
+              "foldedAtRest", "openedByUser", "staysOpenOnAppend", "innerKept",
+              "sealRespectsUser", "userCanRefold", "resultKeepsUserOpen")),
+          live_tool_grouping)
 
     grp = p.locator('.msg[data-role="toolgroup"]').first
     check("连续工具调用合并成组", grp.count() > 0)

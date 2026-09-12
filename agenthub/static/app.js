@@ -4253,8 +4253,24 @@ function trailingToolNodes(box, before = null) {
   return nodes;
 }
 
+function trailingGroupOpenState(trailing) {
+  return {
+    userOpened: trailing.some(node => node._userOpened),
+    wasOpen: trailing.some(node => node.matches('.grp') && !node.classList.contains('folded')),
+  };
+}
+
+function restoreGroupOpen(nodes, {userOpened = false, keepOpen = false} = {}) {
+  for (const node of nodes) {
+    if (!node.matches?.('.grp')) continue;
+    if (userOpened) node._userOpened = true;
+    if (keepOpen || userOpened) node._open?.();
+  }
+}
+
 /** 增量批次可能把同一段工具输出切开。把现有尾段取回来一起规划，保证它们
- *  仍是一组；一旦本批出现普通消息，这个尾段立即变成已完成的折叠组。 */
+ *  仍是一组；一旦本批出现普通消息，这个尾段立即变成已完成的折叠组。
+ *  用户亲手展开过的组不能因为后续工具结果或封口而被拆掉重建成折叠态。 */
 function appendMessages(box, msgs, before = null, { openTail = false } = {}) {
   let rest = [...msgs];
   const trailing = trailingToolNodes(box, before);
@@ -4262,12 +4278,27 @@ function appendMessages(box, msgs, before = null, { openTail = false } = {}) {
   while (lead < rest.length && isGroupableTool(rest[lead])) lead++;
   const built = [];
   if (trailing.length) {
-    const oldItems = trailing.flatMap(node => node._toolItems);
-    const combined = [...oldItems, ...rest.slice(0, lead)];
-    const remainsOpen = lead === rest.length && openTail;
-    const anchor = before || trailing[trailing.length - 1].nextElementSibling;
-    trailing.forEach(node => node.remove());
-    built.push(...buildPlan(box, planMessages(combined, {openTail: remainsOpen}), anchor));
+    const extra = rest.slice(0, lead);
+    const combined = [...trailing.flatMap(node => node._toolItems), ...extra];
+    const onlyTools = lead === rest.length;
+    const {userOpened, wasOpen} = trailingGroupOpenState(trailing);
+    const keepOpen = onlyTools && (openTail || wasOpen || userOpened);
+    const planned = planMessages(combined, {openTail: keepOpen});
+    const grp = trailing.length === 1 && trailing[0].matches('.grp') ? trailing[0] : null;
+    if (grp && planned.length === 1 && planned[0].g) {
+      syncGroupNode(grp, planned[0].g);
+      stampMessageTime(grp, planned[0].g);
+      if (keepOpen || userOpened) grp._open?.();
+      else if (!onlyTools && !userOpened) grp._fold?.();
+      if (userOpened) grp._userOpened = true;
+      built.push(grp);
+    } else {
+      const anchor = before || trailing[trailing.length - 1].nextElementSibling;
+      trailing.forEach(node => node.remove());
+      const nodes = buildPlan(box, planned, anchor);
+      restoreGroupOpen(nodes, {userOpened, keepOpen: keepOpen || userOpened});
+      built.push(...nodes);
+    }
     rest = rest.slice(lead);
   }
   built.push(...buildPlan(box, planMessages(rest, {openTail}), before));
@@ -4278,14 +4309,17 @@ function sealToolTail(box) {
   const trailing = trailingToolNodes(box);
   if (!trailing.length) return [];
   if (trailing.length === 1 && trailing[0].matches('.grp')) {
-    trailing[0]._fold?.();
+    if (!trailing[0]._userOpened) trailing[0]._fold?.();
     return trailing;
   }
   const items = trailing.flatMap(node => node._toolItems);
   if (items.length < GROUP_MIN) return trailing;
+  const {userOpened} = trailingGroupOpenState(trailing);
   const anchor = trailing[trailing.length - 1].nextElementSibling;
   trailing.forEach(node => node.remove());
-  return buildPlan(box, planMessages(items), anchor);
+  const nodes = buildPlan(box, planMessages(items), anchor);
+  restoreGroupOpen(nodes, {userOpened, keepOpen: userOpened});
+  return nodes;
 }
 
 function lastRawTurn(messages) {
@@ -4554,22 +4588,24 @@ function toolEntry(m) {
   entry.appendChild(closeArgs);
   setArgsOpen(!args.hidden);
   if (m.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(m.media));
-  const r = m.result;
-  if (r) {
-    if (r.counted !== false) entry.dataset.result = '1'; // 吸收的结果单独补入计数
-    const status = [r.error ? '✗ 出错' : '✓ 完成'];
-    if (Number.isInteger(r.exit_code)) status.push(`exit ${r.exit_code}`);
-    if (Number.isFinite(+r.duration_s)) status.push(formatDuration(+r.duration_s * 1000));
-    const stats = outputStats(r.text || '');
-    status.push(stats.lines > 1 ? `${stats.lines.toLocaleString()} 行`
-      : `${stats.chars.toLocaleString()} 字符`);
-    entry.appendChild(el('div', 'tool-status' + (r.error ? ' err' : ''), status.join(' · ')));
-    if (String(r.text || '').trim()) {
-      addClippedPre(entry, 'tool-out' + (r.error ? ' err' : ''), r.text, toolOutputPath(m));
-    }
-    if (r.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(r.media));
-  }
+  appendToolResult(entry, m.result, m);
   return entry;
+}
+
+function appendToolResult(entry, r, m) {
+  if (!entry || !r || entry.dataset.result === '1') return;
+  if (r.counted !== false) entry.dataset.result = '1'; // 吸收的结果单独补入计数
+  const status = [r.error ? '✗ 出错' : '✓ 完成'];
+  if (Number.isInteger(r.exit_code)) status.push(`exit ${r.exit_code}`);
+  if (Number.isFinite(+r.duration_s)) status.push(formatDuration(+r.duration_s * 1000));
+  const stats = outputStats(r.text || '');
+  status.push(stats.lines > 1 ? `${stats.lines.toLocaleString()} 行`
+    : `${stats.chars.toLocaleString()} 字符`);
+  entry.appendChild(el('div', 'tool-status' + (r.error ? ' err' : ''), status.join(' · ')));
+  if (String(r.text || '').trim()) {
+    addClippedPre(entry, 'tool-out' + (r.error ? ' err' : ''), r.text, toolOutputPath(m));
+  }
+  if (r.media?.length) entry.insertAdjacentHTML('beforeend', mediaGallery(r.media));
 }
 
 const CHANGE_LABEL = {
@@ -4864,21 +4900,11 @@ function turnProcessNode(turn, initiallyOpen = false) {
   return n;
 }
 
-function groupNode(items, initiallyOpen = false) {
-  // 工具协议不属于对话正文搜索范围。历史段默认折叠；正在增长的尾段展开。
-  const n = el('div', 'msg grp' + (initiallyOpen ? '' : ' folded'));
-  n.dataset.role = 'toolgroup';
-  n._toolItems = items;
+function paintGroupPreview(peek, items) {
   const calls = items.filter(m => m.role === 'tool');
-  // 预览行直接给前几条语义摘要(`$ cmd` 一类), 比"Bash ×3"信息量大
   const visible = calls.length ? calls : items;
   const heads = visible.slice(0, 3).map(m => m.summary || m.name || 'tool');
   const hasErr = items.some(m => m.result?.error || (m.role === 'tool_result' && m.error));
-  const preview = addFoldPreview(n, '', '工具调用组');
-  preview.classList.add('group-preview');
-  const toggle = preview.querySelector('.fold-toggle');
-  const peek = preview.querySelector('.peek');
-  peek.classList.add('group-peek');
   const count = el('span', 'group-count', `🔧 ×${visible.length}${hasErr ? ' ⚠' : ''}`);
   const outline = el('span', 'group-outline');
   heads.forEach((head, i) => {
@@ -4894,6 +4920,50 @@ function groupNode(items, initiallyOpen = false) {
     `… 另有 ${visible.length - heads.length} 项`));
   peek.replaceChildren(count, outline);
   paintSyntax(outline);
+}
+
+/** 同一组继续增长时复用现有 DOM，避免拆掉重建把用户展开和内部“展开全文”冲掉。 */
+function syncGroupNode(n, items) {
+  const old = n._toolItems || [];
+  const entries = [...n.querySelectorAll(':scope > .tool-entry')];
+  const byId = new Map();
+  old.forEach((m, i) => {
+    if (!entries[i]) return;
+    byId.set(m.call_id || `#${i}`, {m, entry: entries[i]});
+  });
+  const action = n.querySelector(':scope > .disclosure');
+  const next = [];
+  const reused = new Set();
+  items.forEach((m, i) => {
+    const prev = byId.get(m.call_id || `#${i}`);
+    if (prev?.entry && prev.m.role === m.role && !reused.has(prev.entry)) {
+      if (m.role === 'tool' && m.result && !prev.m.result) {
+        appendToolResult(prev.entry, m.result, m);
+      }
+      reused.add(prev.entry);
+      next.push(prev.entry);
+    } else {
+      next.push(toolEntry(m));
+    }
+  });
+  entries.forEach(entry => { if (!reused.has(entry)) entry.remove(); });
+  next.forEach(entry => n.insertBefore(entry, action));
+  n._toolItems = items;
+  const peek = n.querySelector(':scope > .fold-preview .group-peek');
+  if (peek) paintGroupPreview(peek, items);
+}
+
+function groupNode(items, initiallyOpen = false) {
+  // 工具协议不属于对话正文搜索范围。历史段默认折叠；正在增长的尾段展开。
+  const n = el('div', 'msg grp' + (initiallyOpen ? '' : ' folded'));
+  n.dataset.role = 'toolgroup';
+  n._toolItems = items;
+  const preview = addFoldPreview(n, '', '工具调用组');
+  preview.classList.add('group-preview');
+  const toggle = preview.querySelector('.fold-toggle');
+  const peek = preview.querySelector('.peek');
+  peek.classList.add('group-peek');
+  paintGroupPreview(peek, items);
   items.forEach(m => n.appendChild(toolEntry(m))); // 直接铺在组内，不再套 grp-body + 内层 msg
   const setAction = addAction(n);
   const fold = () => {
@@ -4904,11 +4974,17 @@ function groupNode(items, initiallyOpen = false) {
   const open = () => {
     n.classList.remove('folded');
     toggle.setAttribute('aria-expanded', 'true');
-    setAction('收起', fold, true);
+    setAction('收起', () => {
+      n._userOpened = false;
+      fold();
+    }, true);
   };
   n._fold = fold;
   n._open = open;
-  toggle.onclick = open;
+  toggle.onclick = () => {
+    n._userOpened = true;
+    open();
+  };
   initiallyOpen ? open() : fold();
   return n;
 }
