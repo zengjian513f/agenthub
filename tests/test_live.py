@@ -1,7 +1,9 @@
+import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from agenthub import live
@@ -90,6 +92,73 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(results), worker_count)
         self.assertTrue(all(result == results[0] for result in results))
+
+
+class FakeProc:
+    """一棵可控的 /proc 树：只放 _scan 与 _cli_ancestor 会读的文件。"""
+
+    def __init__(self, root: Path):
+        self.root = root
+
+    def add(self, pid: int, comm: str, ppid: int, cmdline: str, env: dict | None = None):
+        d = self.root / str(pid)
+        (d / "fd").mkdir(parents=True)
+        (d / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n")
+        (d / "environ").write_bytes(b"".join(
+            f"{k}={v}".encode() + b"\0" for k, v in (env or {}).items()))
+
+
+class InheritedSessionEnvTests(unittest.TestCase):
+    """CLI 退出后遗留的后台脚本带着 session id，但不是会话的运行实例。"""
+
+    SID_RUNNING = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    SID_STOPPED = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        proc = FakeProc(Path(self.tmp.name))
+        proc.add(1, "systemd", 0, "/sbin/init")
+        proc.add(4856, "systemd", 1, "/usr/lib/systemd/systemd --user")
+        # 还在跑的会话：CLI 主进程 + 它的工具子进程
+        proc.add(100, "claude", 4856, f"claude --resume {self.SID_RUNNING}")
+        proc.add(101, "bash", 100, "bash /tmp/claude-1000/x/tool.sh",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_RUNNING})
+        # 已停止的会话：CLI 没了，setsid 起的守护脚本被 systemd --user 收养
+        proc.add(200, "bash", 4856, "bash /tmp/claude-1000/y/dispatch.sh",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_STOPPED})
+        proc.add(201, "sleep", 200, "sleep 15",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_STOPPED})
+        patches = [
+            patch.object(live, "PROC_FS", proc.root),
+            patch.object(live, "HAS_PROC", True),
+            patch.object(live, "GROK_ACTIVE", proc.root / "missing-grok.json"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def session(self, sid):
+        return {"uid": f"claude:{sid[:8]}", "source": "claude", "sid": sid,
+                "cwd": "/tmp/project", "created": "2026-09-12T12:00:00+08:00",
+                "path": f"/tmp/{sid}.jsonl"}
+
+    def test_orphaned_helper_does_not_keep_a_stopped_session_live(self):
+        sids, paths, _bare = live._scan()
+
+        self.assertEqual(sids.get(self.SID_RUNNING), {100})
+        self.assertNotIn(self.SID_STOPPED, sids)
+        self.assertEqual(paths, {})
+
+        cache = {"at": time.monotonic(), "sids": sids, "paths": paths, "bare_claude": {}}
+        with patch.dict(live._cache, cache, clear=True):
+            running, stopped = self.session(self.SID_RUNNING), self.session(self.SID_STOPPED)
+            uids, owned = live.active_processes([running, stopped])
+            self.assertEqual(uids, [running["uid"]])
+            self.assertEqual(owned[stopped["uid"]], [])
+            self.assertFalse(live.is_live(stopped))
+            self.assertEqual(live.pids_of(stopped), [])
 
 
 class CodexForkOwnershipTests(unittest.TestCase):

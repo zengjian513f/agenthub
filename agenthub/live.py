@@ -3,6 +3,7 @@
 三家留下的痕迹各不相同, 所以三种信号都收:
   - Codex  常驻持有会话文件的 fd     → /proc/<pid>/fd 直接给出文件路径
   - Claude 进程参数带 session id     → --session-id / --resume, 子进程还有 CLAUDE_CODE_SESSION_ID
+    (子进程只在能沿进程树找到活着的 CLI 时才算数; CLI 退出后遗留的后台脚本不算)
   - Grok   自己维护活跃会话清单       → ~/.grok/active_sessions.json
 
 全部只读 /proc 与状态文件, 不触碰任何 CLI 进程。
@@ -94,7 +95,7 @@ def _process_started_at(pid: int) -> float | None:
             with open(PROC_FS / "stat") as fh:
                 _boot_time = float(next(
                     line.split()[1] for line in fh if line.startswith("btime ")))
-        st = open(f"/proc/{pid}/stat").read()
+        st = (PROC_FS / str(pid) / "stat").read_text()
         # 去掉可能含空格的 comm；余下从字段 3(state) 开始，starttime 是索引 19。
         start_ticks = int(st[st.rindex(")") + 2:].split()[19])
         return _boot_time + start_ticks / _clock_ticks
@@ -113,7 +114,7 @@ def _process_cmdline(pid: int) -> str | None:
         except Exception:
             return None
     try:
-        return open(f"/proc/{pid}/cmdline", "rb").read() \
+        return (PROC_FS / str(pid) / "cmdline").read_bytes() \
             .replace(b"\0", b" ").decode("utf8", "replace")
     except OSError:
         return None
@@ -148,7 +149,7 @@ def _cli_ancestor(pid: int) -> int | None:
     cur = pid
     for _ in range(12):
         try:
-            st = open(f"/proc/{cur}/stat").read()
+            st = (PROC_FS / str(cur) / "stat").read_text()
             name = st[st.index("(") + 1:st.rindex(")")]
             ppid = int(st[st.rindex(")") + 2:].split()[1])
         except (OSError, ValueError):
@@ -177,7 +178,7 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
             continue
         pid = int(spid)
         try:
-            cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf8", "replace")
+            cmd = (PROC_FS / spid / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf8", "replace")
         except OSError:
             continue
         if not any(k in cmd.lower() for k in _KEYWORDS):
@@ -197,7 +198,7 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
         head = cmd.strip().split(" ", 1)[0].rsplit("/", 1)[-1]
         if main and head == "claude" and not cmd_sids:
             try:
-                cwd = str(Path(os.readlink(f"/proc/{pid}/cwd")).resolve())
+                cwd = str(Path(os.readlink(PROC_FS / spid / "cwd")).resolve())
                 started = _process_started_at(pid)
                 if started is not None:
                     bare_claude[pid] = (cwd, started)
@@ -205,24 +206,29 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
                 pass
 
         try:
-            for e in open(f"/proc/{pid}/environ", "rb").read().decode("utf8", "replace").split("\0"):
+            for e in (PROC_FS / spid / "environ").read_bytes().decode("utf8", "replace").split("\0"):
                 if e.startswith(_ENV_SID):
                     env_sid = e.split("=", 1)[1].strip().lower()
                     if main and cmd_sids and env_sid not in cmd_sids:
                         continue
-                    owner = pid if main else (_cli_ancestor(pid) or -pid)
+                    owner = pid if main else _cli_ancestor(pid)
+                    if owner is None:
+                        # 环境变量只是继承来的。CLI 退出后被 setsid/nohup 留下的
+                        # 后台脚本仍带着 session id，但它们不是会话的运行实例：
+                        # 沿进程树找不到活着的 CLI，就不能把会话标成活跃。
+                        continue
                     note(sids, env_sid, owner)
         except OSError:
             pass
 
-        fd_dir = f"/proc/{pid}/fd"
+        fd_dir = PROC_FS / spid / "fd"
         try:
             fds = os.listdir(fd_dir)
         except OSError:
             continue
         for fd in fds:
             try:
-                t = os.readlink(f"{fd_dir}/{fd}")
+                t = os.readlink(fd_dir / fd)
             except OSError:
                 continue
             if t.endswith(".jsonl") and (
@@ -305,7 +311,9 @@ def _scan_psutil() -> tuple[dict[str, set[int]], dict[str, set[int]],
             # session id 不算数，否则新旧两个会话会一起被标成活跃。
             if main and cmd_sids and env_sid not in cmd_sids:
                 continue
-            owner = pid if main else (_cli_ancestor(pid) or -pid)
+            owner = pid if main else _cli_ancestor(pid)
+            if owner is None:                 # 同上：找不到活着的 CLI 就不算
+                continue
             note(sids, env_sid, owner)
 
     _note_grok_sessions(sids)
