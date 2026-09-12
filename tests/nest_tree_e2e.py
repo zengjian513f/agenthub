@@ -137,6 +137,10 @@ def check_page(page, node, scoped, width):
     assert page.evaluate('(key) => [...document.querySelectorAll(".group")].find(g => g.dataset.key === key).querySelector(".gcount").textContent', tree[0]['group']) == '4'
     assert [r['caret'] for r in tree] == [True, False, True, False, False, False, False], tree
     assert tree[1]['dot'] and not tree[4]['dot'], '在跑的子代理带点，结束的不带'
+    marks = page.evaluate('''() => [...document.querySelectorAll('#side .item.agent')].map(n =>
+      ({mark: !!n.querySelector(':scope > .ico > .agent-mark svg'), icon: n.querySelector(':scope > .ico > .source-icon')?.dataset.source,
+        opacity: getComputedStyle(n.querySelector(':scope > .ico > .source-icon')).opacity}))''')
+    assert marks and all(m['mark'] and m['icon'] == 'claude' and m['opacity'] == '1' for m in marks), marks
     # 缩进：图标位置随深度递增、同深度对齐；根行的三角与分组标题的三角同一列，不能一前一后
     pads = [r['pad'] for r in tree]
     assert pads[0] > base_pad and pads[1] > pads[0] and pads[3] > pads[2] == pads[1] == pads[4], pads

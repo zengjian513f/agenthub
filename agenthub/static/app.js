@@ -1699,16 +1699,18 @@ function closeWatch() {
 
 function unreadRow(uid) {
   const value = S.unread.get(uid);
-  if (typeof value === 'number') return { count: value, tmux: false };
+  if (typeof value === 'number') return { count: value };
   return value && typeof value === 'object'
-    ? { count: Math.max(0, +value.count || 0), tmux: !!value.tmux }
-    : { count: 0, tmux: false };
+    ? { count: Math.max(0, +value.count || 0) }    // 旧记录里的 tmux 标志不再使用
+    : { count: 0 };
 }
 
 function saveUnread() {
   store.set('unread', [...S.unread].filter(([, row]) => (+row?.count || +row || 0) > 0));
 }
 
+/** 角标颜色只说现在：绿 = 在跑，蓝 = 在跑且在受管终端里，灰 = 已退出但还有没看的新内容。
+ *  颜色不随计数固化——以前把计数时的 tmux 态存进 localStorage，会话退出后角标还是蓝的。 */
 function paintItemStatus(node) {
   if (!node) return;
   const badge = node.querySelector(':scope > .ico > .item-status');
@@ -1716,20 +1718,21 @@ function paintItemStatus(node) {
   const row = unreadRow(node.dataset.uid);
   const pending = !!node.dataset.tmuxName;
   const active = pending || S.live.has(node.dataset.uid);
-  const tmux = pending || S.liveTmux.has(node.dataset.uid) || (row.count > 0 && row.tmux);
+  const tmux = pending || S.liveTmux.has(node.dataset.uid);
   badge.textContent = row.count > 99 ? '99+' : (row.count || '');
   badge.classList.toggle('visible', active || row.count > 0);
   badge.classList.toggle('counted', row.count > 0);
   badge.classList.toggle('tmux', tmux);
+  badge.classList.toggle('idle', !active);
   badge.title = badge.ariaLabel = row.count
-    ? `${row.count} 条新内容${tmux ? '，tmux 会话' : ''}`
+    ? `${row.count} 条新内容，${!active ? '会话已退出' : tmux ? 'tmux 会话运行中' : '运行中'}`
     : (tmux ? 'tmux 会话运行中' : '会话运行中');
 }
 
 function addUnread(uid, count) {
   if (!uid || count <= 0) return;
   const row = unreadRow(uid);
-  S.unread.set(uid, { count: row.count + count, tmux: S.liveTmux.has(uid) || row.tmux });
+  S.unread.set(uid, { count: row.count + count });
   saveUnread();
   paintItemStatus(document.querySelector(`.item[data-uid="${CSS.escape(uid)}"]`));
 }
@@ -2782,7 +2785,7 @@ function nestLeadMarkup(r) {
 function agentRow(s, a, depth) {
   const it = el('div', 'item agent tree',
     `${nestLeadMarkup({s, agent: a, depth, kids: 0, closed: false})}
-     <span class="ico">${icon(s.source)}<span class="item-status"></span></span>
+     <span class="ico">${icon(s.source)}<span class="item-status"></span><span class="agent-mark" title="子代理" aria-hidden="true">${uiIcon('fork')}</span></span>
      <div class="body">
        <div class="t" title="${esc(a.title)}">${hl(a.title)}</div>
        <div class="m">${esc(agentMeta(s.uid, a))}</div>

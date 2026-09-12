@@ -3189,6 +3189,16 @@ def run(pw):
     check("未选中的 Claude 新回复显示在左栏",
           "counted" in (extra_badge.get_attribute("class") or "")
           and extra_badge.inner_text() == "1", unread_debug)
+    # 角标颜色只说现在：这条自测会话没有进程在跑，未读角标必须是灰底，不能沿用计数时的绿/蓝。
+    badge_state = p.evaluate("""uid => {
+      const n = document.querySelector(`.item[data-uid="${uid}"] .item-status`);
+      return {cls: n.className, bg: getComputedStyle(n).backgroundColor, live: S.live.has(uid),
+              muted: getComputedStyle(document.body).getPropertyValue('--muted').trim()};
+    }""", extra_uid)
+    muted_rgb = tuple(int(badge_state["muted"].lstrip('#')[i:i + 2], 16) for i in (0, 2, 4))
+    check("已退出会话的未读角标是灰底",
+          not badge_state["live"] and "idle" in badge_state["cls"] and "tmux" not in badge_state["cls"]
+          and badge_state["bg"] == f"rgb({muted_rgb[0]}, {muted_rgb[1]}, {muted_rgb[2]})", badge_state)
 
     # 活跃会话每隔几秒就变一次, 列表要是每次都重建就会一直闪。
     # 结构没变时只改文字, DOM 节点必须原地不动。
