@@ -63,7 +63,7 @@ def public_payload(data, node: dict, path: str):
             return obj
         result = {}
         for k, v in obj.items():
-            if k in {"uid", "from_uid", "to_uid"} and isinstance(v, str) and v:
+            if k in {"uid", "from_uid", "to_uid", "continued_in"} and isinstance(v, str) and v:
                 result[k] = qualify(nid, v, True)
             elif k == "src" and isinstance(v, str) and v.startswith("/api/media/"):
                 result[k] = f"/api/nodes/{nid}{v}"

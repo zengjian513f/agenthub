@@ -1384,6 +1384,7 @@ class ClaudeAdapter:
                       and txt.strip() and not _is_injected(txt)):
                     first_user = txt
         custom_title = latest_ai_title = None
+        continued_in_sid = None
         tail_cwds = {}
         tail_records = _tail_lines(f, strict=True)
         for rec in tail_records:
@@ -1394,6 +1395,8 @@ class ClaudeAdapter:
                 custom_title = rec["customTitle"]
             elif rec.get("type") == "ai-title" and rec.get("aiTitle"):
                 latest_ai_title = rec["aiTitle"]
+            elif rec.get("type") == "continued-in" and rec.get("continuedInSessionId"):
+                continued_in_sid = str(rec["continuedInSessionId"])
         title = custom_title or latest_ai_title or generated_title
         if not title:
             title = _title_from_text(first_user) if first_user else f.stem[:8]
@@ -1446,13 +1449,30 @@ class ClaudeAdapter:
             })
         updated = _latest_jsonl_timestamp(f, tail_records, strict=True) \
             or created or _iso(st.st_mtime)
-        return {
+        row = {
             "uid": _uid("claude", str(f)), "source": "claude", "sid": sid or f.stem,
             "title": title, "cwd": cwd, "created": created or _iso(st.st_mtime),
             "updated": updated, "size": st.st_size, "path": str(f),
             "model": None, "branch": branch, "agents": len(agent_items),
             "agent_items": agent_items,
         }
+        if continued_in_sid:
+            row["continued_in_sid"] = continued_in_sid
+        return row
+
+    def finalize_sessions(self, rows: list[dict]) -> list[dict]:
+        """把 Claude ``continued-in`` 的原生 sid 收成列表里的 uid。"""
+        out = [dict(row) for row in rows]
+        by_sid = {str(row.get("sid") or ""): row["uid"]
+                  for row in out if row.get("sid") and row.get("uid")}
+        for row in out:
+            native = row.pop("continued_in_sid", None)
+            if not native:
+                continue
+            target = by_sid.get(str(native))
+            if target and target != row["uid"]:
+                row["continued_in"] = target
+        return out
 
     def read(self, path: str, start: int = 0, agent: str | None = None,
              declared_tip: str | None = None, abandoned_after: int = 0,

@@ -611,6 +611,35 @@ class ClaudeProtocolTests(unittest.TestCase):
              ("status", "working"), ("user", "原来写需要授权"),
              ("assistant", "已改正")])
 
+    def test_continued_in_session_is_resolved_to_uid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp)
+            parent = proj / "sid-parent.jsonl"
+            child = proj / "sid-child.jsonl"
+            parent.write_text("\n".join((
+                json.dumps({"type": "user", "sessionId": "sid-parent",
+                            "timestamp": "2026-09-12T10:00:00Z", "cwd": "/repo",
+                            "message": {"role": "user", "content": "hello"}}),
+                json.dumps({"type": "continued-in", "sessionId": "sid-parent",
+                            "continuedInSessionId": "sid-child",
+                            "timestamp": "2026-09-12T12:00:00Z"}),
+            )) + "\n")
+            child.write_text(json.dumps({
+                "type": "user", "sessionId": "sid-child",
+                "timestamp": "2026-09-12T12:00:01Z", "cwd": "/repo",
+                "message": {"role": "user", "content": "continued"},
+            }) + "\n")
+            adapter = adapters.ClaudeAdapter()
+            rows = adapter.finalize_sessions([
+                adapter._meta(parent, parent.stat(), "proj"),
+                adapter._meta(child, child.stat(), "proj"),
+            ])
+        parent_row = next(row for row in rows if row["sid"] == "sid-parent")
+        child_row = next(row for row in rows if row["sid"] == "sid-child")
+        self.assertEqual(parent_row["continued_in"], child_row["uid"])
+        self.assertNotIn("continued_in_sid", parent_row)
+        self.assertNotIn("continued_in", child_row)
+
     def test_compaction_keeps_selected_precompact_branch_visible(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = Path(tmp) / "compacted-tree.jsonl"

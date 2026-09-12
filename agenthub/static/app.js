@@ -2850,8 +2850,10 @@ function renderSide() {
       const s = r.s;
       const meta = itemMeta(s);
       const pickable = S.picking && sessionPickable(s);
-      // 分层时正在看的子代理有自己那一行，主会话行不再一起亮
-      const selected = S.sel === s.uid && !(S.nest && S.agent);
+      // 分层时正在看的子代理有自己那一行，主会话行不再一起亮。
+      // 收起时续写会话藏在父行下，父行要跟着亮，否则点开后续写会话却看不到选中。
+      const selected = (S.sel === s.uid && !(S.nest && S.agent))
+        || (!S.agent && r.closed && followContinuedSession(s.uid) === S.sel);
       const it = el('div', 'item' + (selected ? ' sel' : '') + (r.closed ? ' nest-closed' : '')
                               + (s.pending ? (s.stale ? ' pending' : ' pending live live-tmux') : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
@@ -3009,8 +3011,23 @@ function ensureConsolePlaceholder() {
   showConsoleToast('');
 }
 
+/** Claude compact/continue 会另起一份 JSONL。父会话点开时跟到当前续写会话，
+ *  与点控制台时 followReplacement 同一条身份，避免气泡停在已封口的旧文件上。 */
+function followContinuedSession(uid) {
+  const seen = new Set();
+  let cur = uid;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const next = S.sessions.find(s => s.uid === cur)?.continued_in;
+    if (!next || next === cur || !S.sessions.some(s => s.uid === next)) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
 async function openSession(uid, agent = null) {
   const selectedAgent = agent || null;
+  if (!selectedAgent) uid = followContinuedSession(uid);
   browserAuditEvent('session.opened', {agent: selectedAgent || '', cached: cache.has(viewKey(uid, selectedAgent))},
     null, {uid});
   showMobileDetail();

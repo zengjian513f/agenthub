@@ -39,6 +39,17 @@ class FederationTests(unittest.TestCase):
         self.assertIn(node['id'], out['messages'][0]['media'][0]['src'])
         self.assertEqual(data['meta']['uid'], 'codex:abc')
 
+    def test_continued_in_uid_is_qualified_for_hub_clients(self):
+        node = {'id': 'a' * 32, 'name': 'A'}
+        data = {'sessions': [{'uid': 'claude:old', 'continued_in': 'claude:new',
+                              'title': 'same title'}]}
+        out = federation.public_payload(data, node, '/api/sessions')
+        self.assertEqual(out['sessions'][0]['uid'],
+                         federation.qualify(node['id'], 'claude:old', True))
+        self.assertEqual(out['sessions'][0]['continued_in'],
+                         federation.qualify(node['id'], 'claude:new', True))
+        self.assertEqual(data['sessions'][0]['continued_in'], 'claude:new')
+
     def test_creation_receipt_survives_retry_and_uncertain_launch_is_not_repeated(self):
         with tempfile.TemporaryDirectory() as root, patch.object(create_requests, 'DATA_DIR', Path(root)):
             body = {'request_id': 'request-123', 'source': 'claude', 'cwd': '/same'}
