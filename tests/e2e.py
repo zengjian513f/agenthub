@@ -913,12 +913,14 @@ def run(pw):
     check("中屏顶栏放得下就全部平铺，机器名收起",
           header_fold()["menu"] == [] and p.locator("#settings").is_visible()
           and not p.locator(".brand-name").is_visible())
-    check_header_fold("中屏")
+    medium_fold = check_header_fold("中屏")
     resize(608, 780)
     check("608px 宽的顶栏放得下五个按钮，不折叠、不留白",
           header_fold()["menu"] == [] and p.locator("#new-session").is_visible()
           and p.locator("#settings").is_visible())
-    check_header_fold("608px")
+    narrow_fold = check_header_fold("608px")
+    check("中屏与窄屏顶栏同高，跨过 720px 不跳高",
+          medium_fold["height"] == narrow_fold["height"], (medium_fold["height"], narrow_fold["height"]))
     resize(390, 780)
     mobile_header = p.evaluate("""() => {
       const box = id => { const r = document.querySelector(id).getBoundingClientRect();
