@@ -95,6 +95,46 @@ class SpawnWatchTests(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
 
 
+class PaneLinkingTests(unittest.TestCase):
+    """pane 归谁：自己的 CLI、续写过继的原会话 pane 算；pane 里派出的孙辈会话不算。"""
+
+    ORIGIN = {"uid": "claude:origin", "source": "claude", "sid": "origin-sid",
+              "continued_in": "claude:next"}
+    NEXT = {"uid": "claude:next", "source": "claude", "sid": "next-sid"}
+    SPAWNED = {"uid": "grok:child", "source": "grok", "sid": "child-sid"}
+    PANES = [{"name": "agenthub-claude-origin-s", "pid": 10, "owned": True}]
+
+    def setUp(self):
+        from agenthub import index, live
+        # 进程树：pane 根 10 → claude 11（origin）→ daemon 12 → claude 13（next 的进程）；
+        # 11 又派出 grok 14。有 CLI 隔着就不属于 pane：13、14 都不直接属于 10。
+        belongs = {(11, 10): True, (10, 10): True, (13, 10): False, (14, 10): False}
+        patches = [
+            patch.object(server.term, "session_name_for",
+                         side_effect=lambda source, sid: f"agenthub-{source}-{sid[:8]}"),
+            patch.object(server.term, "process_belongs_to",
+                         side_effect=lambda pid, root: belongs.get((pid, root), False)),
+            patch.object(live, "pids_of", side_effect=lambda s, force=False:
+                         {"claude:origin": [11], "claude:next": [13], "grok:child": [14]}[s["uid"]]),
+            patch.object(index, "cached", return_value=[self.ORIGIN, self.NEXT, self.SPAWNED]),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_origin_keeps_its_own_pane(self):
+        self.assertEqual(server._pane_for_session(self.ORIGIN, self.PANES)["name"],
+                         "agenthub-claude-origin-s")
+
+    def test_continued_session_inherits_the_origin_pane(self):
+        self.assertEqual(server._pane_for_session(self.NEXT, self.PANES)["name"],
+                         "agenthub-claude-origin-s")
+
+    def test_spawned_child_in_the_pane_has_no_console(self):
+        self.assertIsNone(server._pane_for_session(self.SPAWNED, self.PANES))
+        self.assertIsNone(server._pane_for_session(self.SPAWNED, self.PANES, [14]))
+
+
 class BulkSessionDeleteTests(unittest.TestCase):
     """左栏多选删除: 一条失败不能把其余会话一起拖住。"""
 

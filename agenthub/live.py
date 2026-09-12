@@ -100,6 +100,17 @@ def _is_cli(cmd: str) -> bool:
     return head in _CLI_NAMES or head.startswith(("codex-", "claude-"))
 
 
+def is_cli_process(pid: int) -> bool:
+    """这个 pid 是不是某条会话的 CLI 主进程 (claude / codex / grok 本身)。
+
+    受管终端里的 CLI 又派出 `grok -p`、`codex exec` 之类的孙辈时, 它们的进程树仍在
+    那个 pane 底下, 但控制台是父 CLI 的, 不是它们的。pane 归属判定沿祖先链上行时
+    以此为界: 中途撞到别的 CLI 主进程, 就不再算这个 pane 的会话。
+    """
+    cmd = _process_cmdline(int(pid))
+    return bool(cmd) and _is_cli(cmd)
+
+
 def _psutil():
     """只有没有 /proc 的机器才需要 psutil; 它不在就退化为查不出运行状态。"""
     global _psutil_module

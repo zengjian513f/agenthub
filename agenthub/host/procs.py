@@ -112,15 +112,21 @@ def gone(pid: int) -> bool:
         return True
 
 
-def descendant_of(pid: int, root_pid: int, depth: int = 16) -> bool:
-    """pid 是否等于或派生自 root_pid。"""
+def descendant_of(pid: int, root_pid: int, depth: int = 16, barrier=None) -> bool:
+    """pid 是否等于或派生自 root_pid。
+
+    barrier(p) 为真的中间进程 (不含起点与根) 会切断关系: 会话 A 的 CLI 在自己的
+    pane 里再起一条会话 B 时, B 的进程树虽在 A 的根下面, 但不属于 A 的 pane。
+    """
     cur = abs(int(pid))
     root = abs(int(root_pid))
     if root <= 0:
         return False
-    for _ in range(depth):
+    for step in range(depth):
         if cur == root:
             return True
+        if step and barrier is not None and barrier(cur):
+            return False
         parent = parent_pid(cur)
         if parent is None:
             return False
@@ -130,11 +136,14 @@ def descendant_of(pid: int, root_pid: int, depth: int = 16) -> bool:
     return False
 
 
-def ancestor_matches(pid: int, predicate, depth: int = 16) -> bool:
+def ancestor_matches(pid: int, predicate, depth: int = 16, barrier=None) -> bool:
+    """从 pid 起沿祖先链找满足 predicate 的进程; 中途 (不含起点) 撞到 barrier 即失败。"""
     cur = abs(int(pid))
-    for _ in range(depth):
+    for step in range(depth):
         if predicate(cur):
             return True
+        if step and barrier is not None and barrier(cur):
+            return False
         parent = parent_pid(cur)
         if parent is None or parent <= 1:
             return False

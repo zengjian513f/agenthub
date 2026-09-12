@@ -36,7 +36,7 @@ try:
 except ImportError:                     # pragma: no cover - 只在 Windows 命中
     fcntl = pty = termios = None        # type: ignore[assignment]
 
-from . import audit
+from . import audit, live
 
 PREFIX = "agenthub-"          # agenthub 起的会话用这个前缀, 便于识别
 MANAGED_SERVER = "agenthub"   # 独立 socket，不继承用户默认 tmux server 的交互配置
@@ -360,10 +360,13 @@ def set_window_size_policy(name: str, policy: str = "latest") -> bool:
 
 
 def hosts(pids: list[int]) -> bool:
-    """这些进程是不是跑在 tmux 里 (祖先有 tmux server)。"""
+    """这些进程是不是跑在 tmux 里 (祖先有 tmux server, 且中途没有别的 CLI 主进程)。
+
+    pane 里的 CLI 再派出的 `grok -p` / `codex exec` 孙辈不算: 它们的控制台是父 CLI 的。
+    """
     for pid in pids:
         cur = abs(pid)
-        for _ in range(12):
+        for step in range(12):
             try:
                 with open(f"/proc/{cur}/stat") as fh:
                     st = fh.read()
@@ -373,6 +376,8 @@ def hosts(pids: list[int]) -> bool:
                 break
             if name.startswith("tmux"):
                 return True
+            if step and live.is_cli_process(cur):
+                break
             if ppid <= 1:
                 break
             cur = ppid

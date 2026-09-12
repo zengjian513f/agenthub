@@ -382,6 +382,43 @@ class TermHostBackendTests(unittest.TestCase):
         self.assertFalse(term.has_session(name))
 
 
+class PaneOwnershipTests(unittest.TestCase):
+    """pane 只属于它自己的那条 CLI：CLI 在 pane 里再派出的 grok -p / codex exec 不算受管会话。
+
+    进程树：root(sh 10) → claude 11 → bash 12 → grok 13 → codebase-memory 14；
+    同一 pane 里 claude 的工具子进程 bash 12 属于 claude，grok 13 及其子进程不属于这个 pane。
+    """
+
+    PARENTS = {10: 4856, 11: 10, 12: 11, 13: 12, 14: 13, 4856: 1}
+    CLI = {11, 13}
+
+    def setUp(self):
+        from agenthub import live
+        from agenthub.host import procs
+        patches = [
+            patch.object(procs, "parent_pid", side_effect=lambda pid: self.PARENTS.get(pid)),
+            patch.object(live, "is_cli_process", side_effect=lambda pid: pid in self.CLI),
+            patch.object(term_host, "list_sessions", return_value=[{"pid": 10}]),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_own_cli_and_its_helpers_belong_to_the_pane(self):
+        self.assertTrue(term.process_belongs_to(11, 10))
+        self.assertTrue(term.process_belongs_to(10, 10))
+        self.assertTrue(term_host.hosts([11]))
+        self.assertTrue(term_host.hosts([-12]) is False and term_host.hosts([11, -12]))
+
+    def test_spawned_cli_under_the_pane_is_not_hosted_by_it(self):
+        self.assertFalse(term.process_belongs_to(13, 10))
+        self.assertFalse(term.process_belongs_to(14, 10))
+        self.assertFalse(term_host.hosts([13]))
+        self.assertFalse(term_host.hosts([13, 14]))
+        # 由 grok 自己的角度看，它的子进程仍属于它
+        self.assertTrue(term.process_belongs_to(14, 13))
+
+
 if __name__ == "__main__":
     unittest.main()
 

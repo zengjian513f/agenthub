@@ -2741,7 +2741,7 @@ function patchSide(list) {
       if (n.dataset.depth !== String(r.depth)) return false;   // 挂到别人下面去了，整体重画
       ul.appendChild(n);                     // 按新顺序挪位置, 节点本身不动
       if (r.agent) { patchAgentRow(n, r); continue; }
-      if (!!n.querySelector(':scope > .nest-caret') !== r.kids > 0) return false;
+      if (!!n.querySelector('.nest-caret') !== r.kids > 0) return false;
       const s = r.s;
       const m = n.querySelector('.m');
       const t = itemMeta(s);
@@ -2770,9 +2770,19 @@ function patchSide(list) {
 /* ---------- 子代理行 ---------- */
 const agentMeta = (uid, a) => `子代理 · ${a.type} · ${fmtSpan(a.created, agentRunning(uid, a) ? null : a.updated)}`;
 
+/** 分层模式下每行前面的引导区：每一级祖先一根竖线，再一个放三角的槽位（叶子留空）。
+ *  槽位与分组标题的三角同列，深一层的槽位正好落在上一层图标的下方。 */
+function nestLeadMarkup(r) {
+  if (!S.nest) return '';
+  const caret = r.kids ? `<button type="button" class="nest-caret" aria-expanded="${!r.closed}"
+      title="${r.closed ? '展开' : '收起'} ${r.kids} 项" aria-label="${r.closed ? '展开' : '收起'}「${esc(r.s.title)}」下的 ${r.kids} 项"></button>` : '';
+  return `<span class="nest-lead" aria-hidden="${r.kids ? 'false' : 'true'}">${'<i class="nest-guide"></i>'.repeat(r.depth)}<span class="nest-slot">${caret}</span></span>`;
+}
+
 function agentRow(s, a, depth) {
-  const it = el('div', 'item agent',
-    `<span class="ico" aria-hidden="true">⑂<span class="item-status"></span></span>
+  const it = el('div', 'item agent tree',
+    `${nestLeadMarkup({s, agent: a, depth, kids: 0, closed: false})}
+     <span class="ico">${icon(s.source)}<span class="item-status"></span></span>
      <div class="body">
        <div class="t" title="${esc(a.title)}">${hl(a.title)}</div>
        <div class="m">${esc(agentMeta(s.uid, a))}</div>
@@ -2781,7 +2791,6 @@ function agentRow(s, a, depth) {
   it.dataset.owner = s.uid;
   it.dataset.agent = a.id;
   it.dataset.depth = depth;
-  it.style.setProperty('--depth', depth);
   it.onclick = () => { if (!S.picking) openSession(s.uid, a.id); };
   paintAgentStatus(it);
   return it;
@@ -2858,13 +2867,12 @@ function renderSide() {
       const pickable = S.picking && sessionPickable(s);
       // 分层时正在看的子代理有自己那一行，主会话行不再一起亮
       const selected = S.sel === s.uid && !(S.nest && S.agent);
-      const it = el('div', 'item' + (selected ? ' sel' : '') + (r.closed ? ' nest-closed' : '')
+      const it = el('div', 'item' + (S.nest ? ' tree' : '') + (selected ? ' sel' : '') + (r.closed ? ' nest-closed' : '')
                               + (s.pending ? (s.stale ? ' pending' : ' pending live live-tmux') : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
                               + (!s.pending && S.liveTmux.has(s.uid) ? ' live-tmux' : '')
                               + (pickable && picked.has(s.uid) ? ' picked' : ''),
-        `${r.kids ? `<button type="button" class="nest-caret" aria-expanded="${!r.closed}"
-           title="${r.closed ? '展开' : '收起'} ${r.kids} 项" aria-label="${r.closed ? '展开' : '收起'}「${esc(s.title)}」下的 ${r.kids} 项"></button>` : ''}
+        `${nestLeadMarkup(r)}
          ${pickable ? `<input type="checkbox" class="item-pick" tabindex="-1"
            ${picked.has(s.uid) ? 'checked' : ''} aria-label="选中「${esc(s.title)}」">` : ''}
          <span class="ico">${icon(s.source)}<span class="item-status"></span></span>
@@ -2879,7 +2887,6 @@ function renderSide() {
       it.dataset.uid = s.uid;
       it.dataset.key = s.uid;
       it.dataset.depth = r.depth;
-      it.style.setProperty('--depth', r.depth);
       if (s.pending) it.dataset.tmuxName = s.tmuxName;
       it.onclick = () => {
         if (pickable) return toggleSessionPick(s.uid);

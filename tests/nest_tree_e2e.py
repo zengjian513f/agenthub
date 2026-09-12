@@ -82,8 +82,10 @@ ROWS_JS = '''() => [...document.querySelectorAll('#side .item')].map(n => ({
   key: n.dataset.key, uid: n.dataset.uid || null, agent: n.dataset.agent || null,
   depth: +n.dataset.depth, group: n.closest('.group').dataset.key,
   sel: n.classList.contains('sel'), closed: n.classList.contains('nest-closed'),
-  caret: !!n.querySelector(':scope > .nest-caret'),
-  pad: parseFloat(getComputedStyle(n).paddingLeft),
+  caret: !!n.querySelector('.nest-caret'),
+  pad: n.querySelector(':scope > .ico').getBoundingClientRect().left - n.getBoundingClientRect().left,
+  caretX: (c => c ? c.getBoundingClientRect().left + c.getBoundingClientRect().width / 2 : null)(n.querySelector('.nest-caret')),
+  gheadCaretX: (c => c.getBoundingClientRect().left + c.getBoundingClientRect().width / 2)(n.closest('.group').querySelector('.ghead .caret')),
   dot: !!n.querySelector('.item-status.visible')}))'''
 
 
@@ -115,7 +117,7 @@ def check_page(page, node, scoped, width):
     assert [r['uid'] for r in flat] == [q(x) for x in ('grok:bbb', 'claude:aaa', 'codex:ccc',
                                                         'claude:ddd', 'claude:eee')], flat
     assert len({r['group'] for r in flat}) == 3, flat
-    base_pad = flat[0]['pad']
+    base_pad = flat[0]['pad']       # 平铺时图标离行左沿的距离
 
     # 开分层：A 活着，子代理 x 在跑、排最前；B 带着 C 从 beta 组搬到 A 下面；D、E 仍是根
     node.state['live'] = ['claude:aaa']            # 节点回本地 uid，经中央时由它加机器前缀
@@ -135,9 +137,13 @@ def check_page(page, node, scoped, width):
     assert page.evaluate('(key) => [...document.querySelectorAll(".group")].find(g => g.dataset.key === key).querySelector(".gcount").textContent', tree[0]['group']) == '4'
     assert [r['caret'] for r in tree] == [True, False, True, False, False, False, False], tree
     assert tree[1]['dot'] and not tree[4]['dot'], '在跑的子代理带点，结束的不带'
+    # 缩进：图标位置随深度递增、同深度对齐；根行的三角与分组标题的三角同一列，不能一前一后
     pads = [r['pad'] for r in tree]
-    assert pads[0] == base_pad and pads[1] > pads[0] and pads[3] > pads[2] == pads[1], pads
+    assert pads[0] > base_pad and pads[1] > pads[0] and pads[3] > pads[2] == pads[1] == pads[4], pads
+    assert pads[5] == pads[6] == pads[0], pads
     assert all(r['pad'] < width / 3 for r in tree), pads
+    assert abs(tree[0]['caretX'] - tree[0]['gheadCaretX']) < 1, (tree[0]['caretX'], tree[0]['gheadCaretX'])
+    assert abs(tree[2]['caretX'] - (tree[0]['caretX'] + (pads[1] - pads[0]))) < 1, (tree[2]['caretX'], tree[0]['caretX'], pads)
     assert not [r for r in tree if r['sel']]
 
     # 点子代理行：打开它，只有它那一行亮
@@ -158,7 +164,7 @@ def check_page(page, node, scoped, width):
 
     # 三角：收起 A 的整棵子树（4 项），状态持久化；再点展开
     to_list(page)
-    caret = page.locator(f'#side .item[data-uid="{q("claude:aaa")}"] > .nest-caret')
+    caret = page.locator(f'#side .item[data-uid="{q("claude:aaa")}"] .nest-caret')
     assert caret.get_attribute('aria-expanded') == 'true' and '4 项' in caret.get_attribute('title')
     caret.click()
     folded = rows(page)
@@ -168,7 +174,7 @@ def check_page(page, node, scoped, width):
     page.reload()
     page.wait_for_function('S.sessions.length === 5')
     assert page.evaluate('S.nest') and [r['depth'] for r in rows(page)] == [0, 0, 0]
-    page.locator(f'#side .item[data-uid="{q("claude:aaa")}"] > .nest-caret').click()
+    page.locator(f'#side .item[data-uid="{q("claude:aaa")}"] .nest-caret').click()
     assert [r['depth'] for r in rows(page)] == [0, 1, 1, 2, 1, 0, 0]
 
     # 只看活跃：B 活着而 A 不活，B 没有可挂的父亲就当根

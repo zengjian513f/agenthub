@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import claude_bridge, term_host, term_tmux
+from . import claude_bridge, live, term_host, term_tmux
 from .host import procs
 
 PREFIX = "agenthub-"
@@ -512,8 +512,12 @@ def Attach(name: str, cols: int = 120, rows: int = 32):   # noqa: N802 - 保持�
 
 # ----------------------------------------------------------------- 进程
 def process_belongs_to(pid: int, root_pid: int) -> bool:
-    """pid 是否等于或派生自指定会话的根进程。"""
-    return procs.descendant_of(pid, root_pid)
+    """pid 是否等于或派生自指定会话的根进程。
+
+    中间隔着别的 CLI 主进程就不算: pane 里的 Claude 派出的 `grok -p` 仍在这棵进程树
+    下, 但那是 Claude 的控制台, 不是 Grok 会话的。
+    """
+    return procs.descendant_of(pid, root_pid, barrier=live.is_cli_process)
 
 
 def in_tmux(pids: list[int]) -> bool:

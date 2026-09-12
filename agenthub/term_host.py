@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import audit
+from . import audit, live
 from .host import client, procs
 
 PREFIX = "agenthub-"
@@ -287,11 +287,15 @@ def cursor_position(name: str) -> tuple[int, int]:
 
 
 def hosts(pids: list[int]) -> bool:
-    """这些进程是否跑在某个宿主会话里 (祖先链含会话的 CLI 根进程)。"""
+    """这些进程是否就是某个宿主会话里的那条 CLI (祖先链直达会话根进程, 中途没有别的 CLI)。
+
+    pane 里的 CLI 再派出的 `grok -p` / `codex exec` 孙辈不算: 它们的控制台是父 CLI 的。
+    """
     roots = {row["pid"] for row in list_sessions() if row["pid"] > 0}
     if not roots:
         return False
-    return any(procs.ancestor_matches(pid, lambda p: p in roots) for pid in pids if pid > 0)
+    return any(procs.ancestor_matches(pid, lambda p: p in roots, barrier=live.is_cli_process)
+               for pid in pids if pid > 0)
 
 
 Attach = client.Attach

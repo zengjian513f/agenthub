@@ -364,7 +364,7 @@ def _view_signature(rows: list[dict], run_id: str) -> str:
 
 
 def _pane_for_session(session: dict, panes: list[dict],
-                      pids: list[int] | None = None) -> dict | None:
+                      pids: list[int] | None = None, _hops: int = 0) -> dict | None:
     """按规范名或真实进程树找会话所在的 agenthub tmux pane。
 
     Codex 双 Esc 会换新 UUID，但进程仍留在旧 UUID 命名的 tmux session 中；
@@ -377,9 +377,25 @@ def _pane_for_session(session: dict, panes: list[dict],
             for pid in pids)):
         return exact
     pids = live.pids_of(session) if pids is None else pids
-    return next((pane for pane in panes if pane.get("owned") and any(
+    pane = next((pane for pane in panes if pane.get("owned") and any(
         pid > 0 and term.process_belongs_to(pid, pane["pid"]) for pid in pids
     )), None)
+    if pane:
+        return pane
+    # Claude 续写 (continued-in)：新 JSONL 的进程跑在原会话 TUI 的守护子进程下，
+    # 按进程树它不是这个 pane 的 CLI，但列表只显示续写后的会话，控制台随之过继。
+    # 反过来，pane 里的 CLI 自己派出的 grok -p / codex exec 不在此列，它们没有控制台。
+    origin = _continued_origin(session) if _hops < 8 else None
+    return _pane_for_session(origin, panes, _hops=_hops + 1) if origin else None
+
+
+def _continued_origin(session: dict) -> dict | None:
+    """列表里 continued_in 指向这条会话的那条原会话（没有就是 None）。"""
+    if session.get("source") != "claude":
+        return None
+    uid = str(session.get("uid") or "")
+    return next((row for row in index.cached()
+                 if row.get("continued_in") == uid and row.get("uid") != uid), None)
 
 
 def _codex_prompt(session: dict, pane_name: str = "") -> dict | None:
@@ -1243,9 +1259,14 @@ class Handler(BaseHTTPRequestHandler):
             uids, owned_pids = live.active_processes(sessions, force=force)
             _record_spawn_parents(sessions, owned_pids)   # 趁每次判活顺手记下
             live_set = set(uids)
+            # 受管 = 它自己就是某个 pane 里的 CLI，或是续写过继了原会话的 pane；
+            # pane 里的 CLI 派出的孙辈会话不算，它们没有自己的控制台。
+            panes = term.list_sessions() if TERMINAL else []
             tmux_uids = [s["uid"] for s in sessions
                          if s["uid"] in live_set
-                         and term.in_tmux(owned_pids.get(s["uid"], []))]
+                         and (term.in_tmux(owned_pids.get(s["uid"], []))
+                              or (panes and _pane_for_session(
+                                  s, panes, owned_pids.get(s["uid"], [])) is not None))]
             started_at = {}
             for s in sessions:
                 if s["uid"] not in live_set:
