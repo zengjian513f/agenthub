@@ -5984,12 +5984,17 @@ function machineTargets() {
       ? [{id: '', name: '本机', color: '', online: true, local: true,
           backends: T.backends, backend: T.backend}] : [];
   }
-  return Nodes.list.map(node => {
+  const live = Nodes.list.map(node => {
     const cap = Nodes.capabilities[node.id] || {};
     return {id: node.id, name: node.name, color: node.color || '',
-            online: node.online, local: false,
+            online: node.online, local: false, enabled: true,
             backends: cap.backends || [], backend: cap.backend || ''};
   });
+  // 停用的机器排在后面：不显示、不检查、视同不存在，只留一个勾选框能把它接回来
+  const off = Nodes.disabled.map(node => ({
+    id: node.id, name: node.name, color: node.color || '', online: null,
+    local: false, enabled: false, backends: [], backend: ''}));
+  return [...live, ...off];
 }
 
 function setMachineNote(text, isError = false) {
@@ -6004,7 +6009,7 @@ function renderMachineSettings() {
   const targets = machineTargets();
   const active = document.activeElement;
   // 正在输入机器名时不要重绘，否则光标和未提交的文字都会没
-  if (active && rows.contains(active) && active.tagName === 'INPUT') return;
+  if (active && rows.contains(active) && active.tagName === 'INPUT' && active.type === 'text') return;
   closeMachinePalette();
   rows.textContent = '';
   if (!targets.length) {
@@ -6100,10 +6105,21 @@ $('#settings-dialog').addEventListener('keydown', event => {
 
 function machineRow(target) {
   const row = document.createElement('div');
-  row.className = 'machine-row';
+  row.className = 'machine-row' + (target.enabled === false ? ' machine-off' : '');
 
   const head = document.createElement('div');
   head.className = 'machine-head';
+  if (!target.local) {
+    // 双系统的两台机器一台开着另一台必然关着：没勾选的不显示、不检查，就当不存在
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.className = 'machine-enabled';
+    toggle.checked = target.enabled !== false;
+    toggle.title = toggle.checked ? '取消勾选后这台机器不显示、不检查' : '勾选后重新接入这台机器';
+    toggle.setAttribute('aria-label', `启用 ${target.name}`);
+    toggle.onchange = () => void saveMachine(target, {enabled: toggle.checked}, toggle);
+    head.append(toggle);
+  }
   head.append(machineColor(target));
 
   if (target.local) {
@@ -6129,7 +6145,8 @@ function machineRow(target) {
   backend.setAttribute('aria-label', `${target.name} 的终端后端`);
   if (!target.backends.length) {
     const option = document.createElement('option');
-    option.textContent = target.online === false ? '离线' : '控制台未启用';
+    option.textContent = target.enabled === false ? '已停用'
+      : target.online === false ? '离线' : '控制台未启用';
     backend.append(option);
     backend.disabled = true;
   } else {
@@ -6149,7 +6166,9 @@ function machineRow(target) {
   const blocked = target.backends.filter(b => !b.available);
   const state = document.createElement('p');
   state.className = 'machine-state';
-  state.textContent = target.online === false
+  state.textContent = target.enabled === false
+    ? '已停用：不显示、不检查，视同不存在；勾选后重新接入'
+    : target.online === false
     ? (typeof nodeOfflineReason === 'function'
         ? nodeOfflineReason(Nodes.list.find(n => n.id === target.id) || {}) : '离线')
     : blocked.map(b => `${b.label}不可用：${b.unavailable_reason}`).join('；')
@@ -6178,18 +6197,31 @@ async function machinePost(url, body, control) {
 
 async function saveMachine(target, patch, control) {
   if (target.local) return;                 // 本机模式没有注册表，没有可改的机器身份
-  const before = {name: target.name, color: target.color};
-  if ((patch.name ?? target.name) === target.name && (patch.color ?? target.color) === target.color) return;
+  const before = {name: target.name, color: target.color, enabled: target.enabled !== false};
+  if ((patch.name ?? target.name) === target.name && (patch.color ?? target.color) === target.color
+      && (patch.enabled ?? before.enabled) === before.enabled) return;
   try {
     const data = await machinePost(`api/nodes/${target.id}/display`, patch, control);
-    Object.assign(target, {name: data.node.name, color: data.node.color});
+    Object.assign(target, {name: data.node.name, color: data.node.color, enabled: data.node.enabled});
     const node = Nodes.list.find(n => n.id === target.id);
     if (node) Object.assign(node, {name: data.node.name, color: data.node.color});
+    if (data.node.enabled !== before.enabled) {
+      // 机器出现或消失：机器筛选、会话列表、终端能力都要按新的机器集合重来
+      setMachineNote(data.node.enabled ? `已重新接入 ${data.node.name}，正在检查…`
+        : `已停用 ${data.node.name}：不显示、不检查，视同不存在。`);
+      await loadNodes();
+      renderMachineSettings();
+      await Promise.allSettled([loadSessions(true), refreshLive(true),
+        typeof loadTermList === 'function' ? loadTermList() : null]);
+      renderMachineSettings();
+      return;
+    }
     setMachineNote(`已保存 ${data.node.name}。`);
     if (typeof renderNodes === 'function') renderNodes();
     renderMachineSettings();
   } catch (error) {
-    if (control.tagName === 'INPUT') control.value = before.name;
+    if (control.type === 'checkbox') control.checked = before.enabled;
+    else if (control.tagName === 'INPUT') control.value = before.name;
     else renderMachineSettings();       // 色块回到服务端仍然认的那个颜色
     setMachineNote(`保存失败：${error.message || error}`, true);
   }

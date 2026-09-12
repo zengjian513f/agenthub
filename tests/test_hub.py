@@ -582,14 +582,14 @@ class HubHTTPTests(unittest.TestCase):
             self.assertEqual(fresh.public()[0]['color'], 'teal')
 
     def test_the_web_can_rename_and_recolour_a_machine(self):
-        """网页能改的只有名称和配色；接机器、下机器、地址和凭据仍是服务器端操作。"""
+        """网页能改的只有名称、配色和是否启用；接机器、下机器、地址和凭据仍是服务器端操作。"""
         node_a, node_b = 'a' * 32, 'b' * 32
         original = {n['id']: (n['name'], n.get('color', '')) for n in self.registry.all()}
         try:
             status, body = self.call(f'/api/nodes/{node_a}/display',
                                      {'name': '机房 A', 'color': 'teal'})
             self.assertEqual(status, 200, body)
-            self.assertEqual(body['node'], {'id': node_a, 'name': '机房 A', 'color': 'teal'})
+            self.assertEqual(body['node'], {'id': node_a, 'name': '机房 A', 'color': 'teal', 'enabled': True})
             _, listing = self.call('/api/nodes')
             row = next(n for n in listing['nodes'] if n['id'] == node_a)
             self.assertEqual((row['name'], row['color']), ('机房 A', 'teal'))
@@ -628,6 +628,55 @@ class HubHTTPTests(unittest.TestCase):
         # 机器自身的存在性仍然只能在服务器端改：HTTP 上没有这样的接口
         self.assertEqual(self.call('/api/nodes', {'name': 'X'})[0], 400)
         self.assertEqual(len(self.registry.all()), 2)
+
+    def test_a_machine_unticked_in_settings_does_not_exist_to_the_hub(self):
+        """双系统的两台机器有一台开着另一台必然关着：设置页取消勾选后，那台机器不显示、
+        不检查、不能被访问，视同不存在；再勾上就回来。"""
+        node_b = 'b' * 32
+        self.registry.check_all()
+        self.assertTrue(self.registry.state(node_b))
+        probes = lambda: sum(1 for path, _ in self.b.state['gets'] if path.startswith('/api/'))
+        try:
+            status, body = self.call(f'/api/nodes/{node_b}/display', {'enabled': False})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body['node']['enabled'], False)
+
+            # 公开列表里没有它，只在停用名单里留个名字供重新勾选；健康状态一并清掉
+            _, listing = self.call('/api/nodes')
+            self.assertEqual([n['id'] for n in listing['nodes']], ['a' * 32])
+            self.assertEqual([(n['id'], n['name']) for n in listing['disabled']], [(node_b, 'NodeB')])
+            self.assertEqual(self.registry.state(node_b), {})
+            self.assertEqual([n['id'] for n in self.registry.all()], ['a' * 32])
+
+            # 聚合不带它的会话，也不把它算作离线或失败
+            _, data = self.call('/api/sessions?force=1')
+            self.assertEqual({r['node_id'] for r in data['sessions']}, {'a' * 32})
+            self.assertEqual([n['id'] for n in data['nodes']], ['a' * 32])
+            self.assertFalse(data['partial'])
+            # 监控不再探它，按 id 直连也当它不存在
+            before = probes()
+            self.registry.check_all()
+            self.assertEqual(probes(), before)
+            self.assertEqual(self.call(f'/api/nodes/{node_b}/api/live')[0], 404)
+            # 浏览器仍把它塞进机器筛选也不认
+            self.assertEqual(self.call(f'/api/sessions?nodes={node_b}')[0], 400)
+
+            # 停用状态随注册表落盘，重启后仍然停用
+            fresh = hub.Registry(self.registry.path, ['127.0.0.0/8'], monitor=False)
+            self.assertEqual([n['id'] for n in fresh.all()], ['a' * 32])
+            self.assertEqual([n['id'] for n in fresh.disabled()], [node_b])
+
+            self.assertEqual(self.call(f'/api/nodes/{node_b}/display', {'enabled': 'yes'})[0], 400)
+        finally:
+            status, body = self.call(f'/api/nodes/{node_b}/display', {'enabled': True})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['node']['enabled'], True)
+        self.assertEqual({n['id'] for n in self.registry.all()}, {'a' * 32, node_b})
+        self.assertEqual(self.call('/api/nodes')[1]['disabled'], [])
+        self.registry.check_all()
+        self.assertTrue(self.registry.state(node_b).get('online'))
+        self.assertEqual({r['node_id'] for r in self.call('/api/sessions?force=1')[1]['sessions']},
+                         {'a' * 32, node_b})
 
     def test_terminal_backend_is_reported_and_switched_per_machine(self):
         """终端后端是每台机器各自的设置，网页按机器读取和切换。"""

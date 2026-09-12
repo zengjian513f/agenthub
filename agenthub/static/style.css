@@ -418,6 +418,10 @@ header .header-actions .header-menu .btn:focus-visible { outline: 2px solid var(
 }
 .machine-row:last-child { border-bottom: 0; }
 .machine-row .machine-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.machine-row .machine-enabled { flex: none; width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+/* 停用的机器只剩勾选框是实的，其余压暗：它此刻对页面其它部分不存在 */
+.machine-row.machine-off .machine-head > :not(.machine-enabled),
+.machine-row.machine-off .machine-fields, .machine-row.machine-off .machine-state { opacity: .5; }
 .machine-row input[type="text"] {
   min-width: 0; flex: 1; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--panel-2); color: var(--text); font: inherit; font-weight: 600;

@@ -2,7 +2,8 @@
 
 const HUB_MODE = document.querySelector('meta[name="agenthub-mode"]')?.content === 'hub';
 const STORAGE_PREFIX = HUB_MODE ? `agenthub.hub.${location.pathname}.` : 'agenthub.';
-const Nodes = {list: [], off: new Set(), capabilities: {}, errors: new Map()};
+// list 只有启用的机器；停用的机器只在设置页露面（disabled），别处视同不存在
+const Nodes = {list: [], disabled: [], off: new Set(), capabilities: {}, errors: new Map()};
 try { Nodes.off = new Set(JSON.parse(localStorage.getItem(STORAGE_PREFIX + 'nodesOff')) || []); } catch {}
 
 function nodeOf(uid) {
@@ -114,6 +115,7 @@ function bindConsoleButton(button, uid, agent = null) {
 function applyNodeState(data, context = 'nodes') {
   if (!HUB_MODE || !data) return;
   if (Array.isArray(data.nodes)) Nodes.list = data.nodes;
+  if (Array.isArray(data.disabled)) Nodes.disabled = data.disabled;
   if (data.capabilities) Nodes.capabilities = data.capabilities;
   if (Array.isArray(data.errors)) Nodes.errors.set(context, data.errors);
   renderNodes();

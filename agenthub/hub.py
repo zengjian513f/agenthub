@@ -65,6 +65,11 @@ def request_failure(error, status=None, timeout=5):
     return "connection_failed", "无法建立节点连接"
 
 
+def enabled(node):
+    """注册表里没写 enabled 的机器都算启用；只有设置页明确停用过才是 False。"""
+    return node.get("enabled", True) is not False
+
+
 class Registry:
     def __init__(self, path: Path, networks, monitor=True):
         self.path = path
@@ -79,7 +84,8 @@ class Registry:
         self.nodes = json.loads(path.read_text()) if path.exists() else []
         for node in self.nodes:
             self.validate_url(node["url"])
-            self.load_snapshot(node)
+            if enabled(node):
+                self.load_snapshot(node)
         if monitor:
             self.start_monitor()
 
@@ -193,11 +199,18 @@ class Registry:
         return u
 
     def all(self):
+        """只含启用的机器：聚合、监控、代理和 uid 解析都从这里取，停用的机器对它们
+        不存在（双系统的两台机器有一台开着另一台必然关着，不必反复去探）。"""
         with self.lock:
-            return copy.deepcopy(self.nodes)
+            return copy.deepcopy([n for n in self.nodes if enabled(n)])
 
     def get(self, nid):
         return next((n for n in self.all() if n["id"] == nid), None)
+
+    def find(self, nid):
+        """包括停用的机器；只有设置页改属性（含重新启用）用它。"""
+        with self.lock:
+            return next((copy.deepcopy(n) for n in self.nodes if n["id"] == nid), None)
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,8 +252,9 @@ class Registry:
         self.nudge()
         return {"id": node["id"], "name": name, "color": node.get("color", "")}
 
-    def update_display(self, nid, name=None, color=None):
-        """改机器的名称和配色。地址和凭据不在这里，它们只在服务器端注册时设定。"""
+    def update_display(self, nid, name=None, color=None, enabled_flag=None):
+        """改机器的名称、配色和启用状态。地址和凭据不在这里，它们只在服务器端注册时设定。"""
+        wake = False
         with self.lock:
             node = next((n for n in self.nodes if n["id"] == nid), None)
             if not node:
@@ -260,8 +274,22 @@ class Registry:
                     node["color"] = clean
                 else:
                     node.pop("color", None)
+            if enabled_flag is not None and bool(enabled_flag) != enabled(node):
+                if enabled_flag:
+                    node.pop("enabled", None)
+                    self.load_snapshot(node)   # 磁盘快照没删，重新启用后先把上次的列表拿回来
+                    wake = True
+                else:
+                    # 停用即视同不存在：内存里的健康状态和缓存一并清掉，监控不再探它
+                    node["enabled"] = False
+                    self.cache = {k: v for k, v in self.cache.items() if k[0] != nid}
+                    self.health.pop(nid, None)
             self.save()
-            return {"id": node["id"], "name": node["name"], "color": node.get("color", "")}
+            row = {"id": node["id"], "name": node["name"], "color": node.get("color", ""),
+                   "enabled": enabled(node)}
+        if wake:
+            self.nudge()
+        return row
 
     def remove(self, nid):
         with self.lock:
@@ -436,7 +464,14 @@ class Registry:
     def public(self):
         with self.lock:
             return [{"id": n["id"], "name": n["name"], "color": n.get("color", ""),
-                     **self.health.get(n["id"], {"online": None})} for n in self.nodes]
+                     **self.health.get(n["id"], {"online": None})}
+                    for n in self.nodes if enabled(n)]
+
+    def disabled(self):
+        """停用的机器只在设置页露面，供重新勾选；没有健康状态。"""
+        with self.lock:
+            return [{"id": n["id"], "name": n["name"], "color": n.get("color", "")}
+                    for n in self.nodes if not enabled(n)]
 
 
 class HubHandler(server.Handler):
@@ -481,7 +516,8 @@ class HubHandler(server.Handler):
                 return self._json({"mode": "hub", "protocol": fed.PROTOCOL,
                                    "build": server.ASSET_VERSION, "hostname": "AgentHub"})
             if path == "/api/nodes" and self.command == "GET":
-                return self._json({"mode": "hub", "nodes": self.registry.public()})
+                return self._json({"mode": "hub", "nodes": self.registry.public(),
+                                   "disabled": self.registry.disabled()})
             display = re.fullmatch(r"/api/nodes/([a-f0-9]{32})/display", path)
             if display and self.command == "POST":
                 return self.set_display(display[1], self.read_body())
@@ -824,15 +860,18 @@ class HubHandler(server.Handler):
         return self._json(result)
 
     def set_display(self, nid, body):
-        """网页只改机器的名称和配色；接机器、下机器、地址和凭据仍是服务器端操作。"""
+        """网页只改机器的名称、配色和是否启用；接机器、下机器、地址和凭据仍是服务器端操作。"""
         body = body if isinstance(body, dict) else {}
-        node = self.registry.get(nid)
+        node = self.registry.find(nid)
         if not node:
             return self._json({"error": "机器未注册或已移除"}, 404)
-        before = {"name": node["name"], "color": node.get("color", "")}
+        before = {"name": node["name"], "color": node.get("color", ""), "enabled": enabled(node)}
+        flag = body.get("enabled")
+        if flag is not None and not isinstance(flag, bool):
+            return self._json({"error": "enabled 只能是 true 或 false"}, 400)
         try:
             row = self.registry.update_display(
-                nid, name=body.get("name"), color=body.get("color"))
+                nid, name=body.get("name"), color=body.get("color"), enabled_flag=flag)
         except KeyError:
             return self._json({"error": "机器未注册或已移除"}, 404)
         except ValueError as error:
@@ -840,7 +879,7 @@ class HubHandler(server.Handler):
         if row != {"id": nid, **before}:
             server.audit.record("hub.node.display.changed", category="terminal",
                                 data={"node_id": nid, "from": before,
-                                      "to": {k: row[k] for k in ("name", "color")}})
+                                      "to": {k: row[k] for k in ("name", "color", "enabled")}})
         return self._json({"ok": True, "node": row})
 
     def _remember_page_node(self, page_id, nid):

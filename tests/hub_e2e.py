@@ -300,6 +300,46 @@ def main():
                 assert '离线' in report_target['refused'], report_target
                 page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
                 page.wait_for_function('S.results?.length === 2')
+                # Settings → machines: unticking a machine makes it cease to exist for the
+                # page and the hub — no chip, no sessions, no new-session target, no probes —
+                # while its row stays in settings so it can be ticked back.
+                page.evaluate('cancelSearch(true)')
+                page.click('#settings')
+                page.click(".settings-tab[data-tab='machines']")
+                page.wait_for_selector('#settings-machines:not([hidden])')
+                rows = page.locator('#machine-rows .machine-row')
+                assert rows.count() == 3, rows.count()
+                vega_row = rows.filter(has=page.locator('input[aria-label="Vega 的名称"]'))
+                assert vega_row.count() == 1
+                assert page.locator('#machine-rows .machine-enabled:checked').count() == 3
+                probes = lambda: len([p for p, _ in nodes[2].state['gets'] if p.startswith('/api/')])
+                vega_row.locator('.machine-enabled').uncheck()
+                page.wait_for_function('!Nodes.list.some(n => n.name === "Vega") && Nodes.disabled.some(n => n.name === "Vega")')
+                page.wait_for_function('!S.sessions.some(s => s.node_name === "Vega")')
+                assert page.locator('#node-chips button', has_text='Vega').count() == 0
+                assert not page.locator('#node-chips button.node-offline').is_visible()
+                assert not page.locator('#node-notice').is_visible()
+                off_row = page.locator('#machine-rows .machine-row.machine-off')
+                assert off_row.count() == 1 and '已停用' in off_row.locator('.machine-state').inner_text()
+                assert off_row.locator('.machine-backend option').first.inner_text() == '已停用'
+                assert not off_row.locator('.machine-enabled').is_checked()
+                page.evaluate('prepareNewNode()')
+                assert not any('Vega' in text for text in page.locator('#new-node option').all_inner_texts())
+                before = probes()
+                registry.check_all()
+                assert probes() == before, (before, probes())
+                assert page.evaluate('fetch("api/nodes/" + "c".repeat(32) + "/api/live").then(r => r.status)') == 404
+                # Ticking it back brings it back online and into the list.
+                nodes[2].state['offline'] = False
+                off_row.locator('.machine-enabled').check()
+                page.wait_for_function('Nodes.list.some(n => n.name === "Vega") && !Nodes.disabled.length')
+                page.wait_for_function('Nodes.list.find(n => n.name === "Vega")?.online === true', timeout=20000)
+                page.wait_for_function('S.sessions.some(s => s.node_name === "Vega" && !s.stale)', timeout=20000)
+                assert page.locator('#machine-rows .machine-enabled:checked').count() == 3
+                assert page.locator('#node-chips button', has_text='Vega').count() == 1
+                page.locator('#settings-dialog .modal-actions button').click()
+                page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
+                page.wait_for_function('S.results?.length === 3')
                 # Mobile: same machine controls, no horizontal document overflow.
                 page.set_viewport_size({'width': 390, 'height': 844})
                 # headless 只有渲染一帧后才派发媒体查询 change，顶栏折叠靠它驱动
@@ -316,7 +356,7 @@ def main():
                 assert local.evaluate('S.sessions[0].uid') == 'claude:same-file-hash'
                 assert not errors, errors
                 browser.close()
-                print('PASS: three-node DOM, filtering, search, SSE, media, create routing, WebSocket, upload, offline, mobile, standalone')
+                print('PASS: three-node DOM, filtering, search, SSE, media, create routing, WebSocket, upload, offline, machine toggle, mobile, standalone')
         finally:
             for item in [srv, *nodes]: stop(item)
 
