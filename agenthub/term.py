@@ -42,8 +42,9 @@ CODEX_QUESTION_ARGS = (
     "-c", "suppress_unstable_features_warning=true",
 )
 
-BACKENDS = {"tmux": term_tmux, "ptyhost": term_host}
-BACKEND_LABELS = {"tmux": "tmux", "ptyhost": "ptyhost"}
+# 字典顺序就是设置页下拉的顺序：ptyhost 是默认宿主，排在前面
+BACKENDS = {"ptyhost": term_host, "tmux": term_tmux}
+BACKEND_LABELS = {"ptyhost": "默认宿主", "tmux": "tmux"}
 # 早期版本把宿主后端叫 host；已经落盘的选择和旧启动参数要继续认。
 BACKEND_ALIASES = {"host": "ptyhost"}
 BACKEND_FILE = Path.home() / ".local" / "share" / "agenthub" / "terminal-backend"

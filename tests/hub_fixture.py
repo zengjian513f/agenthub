@@ -83,9 +83,9 @@ class NodeHandler(server.Handler):
                                'home': '/home/' + s['name'], 'sessions': s.get('term_sessions', []),
                                'pending': s['pending'],
                                'backend': current,
-                               'backends': [{'name': n, 'label': n, 'available': True,
+                               'backends': [{'name': n, 'label': label, 'available': True,
                                              'current': n == current, 'unavailable_reason': ''}
-                                            for n in ('tmux', 'ptyhost')]})
+                                            for n, label in (('ptyhost', '默认宿主'), ('tmux', 'tmux'))]})
         if u.path == '/api/term/complete-dir':
             return self._json({'directories': ['/home/' + s['name'] + '/work/']})
         if u.path == '/api/term/new-status':
@@ -181,9 +181,9 @@ class NodeHandler(server.Handler):
                 return self._json({'error': f'未知终端后端: {wanted}'}, 400)
             self.state['backend'] = wanted
             return self._json({'ok': True, 'backend': wanted,
-                               'backends': [{'name': n, 'label': n, 'available': True,
+                               'backends': [{'name': n, 'label': label, 'available': True,
                                              'current': n == wanted, 'unavailable_reason': ''}
-                                            for n in ('tmux', 'ptyhost')]})
+                                            for n, label in (('ptyhost', '默认宿主'), ('tmux', 'tmux'))]})
         if u.path == '/api/term/claim':
             return self._json({'ok': True, 'token': 'fixture-lease'})
         if u.path == '/api/sessions/delete':

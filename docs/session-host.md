@@ -62,8 +62,8 @@ cp host-rs/target/x86_64-unknown-linux-musl/release/ptyhost bin/ptyhost
 3. 仓库内 `bin/ptyhost` ← 部署分发用这个
 4. `PATH` 上的 `ptyhost`
 
-二进制是否存在不影响服务启动：缺它时自动退到 tmux，设置面板里 ptyhost 那一项显示
-不可用并给出构建命令。
+二进制是否存在不影响服务启动：缺它时自动退到 tmux，设置面板里「默认宿主」（即 ptyhost，
+下拉里排第一）那一项显示不可用并给出构建命令。
 
 ## 后端选择与共存
 

@@ -648,6 +648,9 @@ class BackendSelectionTests(unittest.TestCase):
         self.assertFalse(rows["ptyhost"]["available"])
         self.assertEqual(rows["ptyhost"]["unavailable_reason"], "没装宿主程序。")
         self.assertEqual(rows["tmux"]["label"], "tmux")
+        # 默认宿主排第一，名字也叫默认宿主
+        self.assertEqual([(row["name"], row["label"]) for row in term.backends()],
+                         [("ptyhost", "默认宿主"), ("tmux", "tmux")])
 
     def test_an_unavailable_or_unknown_backend_is_refused(self):
         term.configure("tmux")
