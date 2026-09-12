@@ -132,52 +132,123 @@ window.__agenthubPageId = AUDIT_PAGE_ID;
 let browserAuditQueue = [];
 let browserAuditTimer = 0;
 let browserAuditSending = false;
+let browserAuditFailCount = 0;
+const AUDIT_BATCH_BYTES = 48 * 1024;
+const AUDIT_BATCH_COUNT = 20;
+const AUDIT_CONTENT_LIMIT = 32 * 1024;
+
+function auditEventBytes(event) {
+  try { return JSON.stringify(event).length; } catch { return AUDIT_BATCH_BYTES + 1; }
+}
+
+function spliceAuditBatch(queue) {
+  if (!queue.length) return [];
+  if (auditEventBytes(queue[0]) > AUDIT_BATCH_BYTES) return queue.splice(0, 1);
+  const batch = [];
+  let bytes = 0;
+  while (queue.length && batch.length < AUDIT_BATCH_COUNT) {
+    const size = auditEventBytes(queue[0]);
+    if (bytes + size > AUDIT_BATCH_BYTES) break;
+    batch.push(queue.shift());
+    bytes += size;
+  }
+  return batch;
+}
+
+function capAuditQueue() {
+  if (browserAuditQueue.length > 500) browserAuditQueue.splice(0, browserAuditQueue.length - 500);
+}
 
 function browserAuditEvent(event, data = {}, content = null, fields = {}) {
   try {
+    let auditContent = content;
+    let auditData = data;
+    try {
+      if (content != null) {
+        const serialized = JSON.stringify(content);
+        if (serialized.length > AUDIT_CONTENT_LIMIT) {
+          auditContent = {truncated: true, bytes: serialized.length,
+            head: serialized.slice(0, 8 * 1024)};
+          auditData = {...data, content_truncated: true};
+        }
+      }
+    } catch {
+      auditContent = null;
+    }
     browserAuditQueue.push({
       event, ts: new Date().toISOString(), uid: fields.uid ?? S.sel ?? '',
       trace_id: fields.traceId || '', request_id: fields.requestId || '',
       connection_id: fields.connectionId || '', severity: fields.severity || 'info',
-      data, content,
+      data: auditData, content: auditContent,
     });
-    if (browserAuditQueue.length > 500) browserAuditQueue.splice(0, browserAuditQueue.length - 500);
+    capAuditQueue();
     if (!browserAuditTimer) browserAuditTimer = setTimeout(flushBrowserAudit, 750);
   } catch { /* diagnostics never change UI behavior */ }
 }
 
-async function flushBrowserAudit(useBeacon = false) {
-  clearTimeout(browserAuditTimer);
-  browserAuditTimer = 0;
-  if ((!useBeacon && browserAuditSending) || !browserAuditQueue.length) return;
-  const events = browserAuditQueue.splice(0, 20);
-  const payload = JSON.stringify({
+function auditPayload(events) {
+  return JSON.stringify({
     page_id: AUDIT_PAGE_ID, uid: S.sel || '', _build: BUILD_ID, events,
   });
-  if (useBeacon && navigator.sendBeacon) {
-    navigator.sendBeacon(appUrl('api/audit/browser'),
-      new Blob([payload], {type: 'application/json'}));
-    return;
-  }
+}
+
+async function flushBrowserAudit() {
+  clearTimeout(browserAuditTimer);
+  browserAuditTimer = 0;
+  if (browserAuditSending || !browserAuditQueue.length) return;
+  const events = spliceAuditBatch(browserAuditQueue);
+  if (!events.length) return;
   browserAuditSending = true;
   try {
     const response = await fetch(appUrl('api/audit/browser'), {
-      method: 'POST', keepalive: true,
+      method: 'POST',
       headers: {
         'Content-Type': 'application/json', 'X-AgentHub-Page': AUDIT_PAGE_ID,
         'X-AgentHub-Build': BUILD_ID,
       },
-      body: payload,
+      body: auditPayload(events),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  } catch {
-    browserAuditQueue.unshift(...events);
-    if (browserAuditQueue.length > 500) browserAuditQueue.length = 500;
+    browserAuditFailCount = 0;
+  } catch (error) {
+    browserAuditFailCount += 1;
+    if (browserAuditFailCount >= 3) {
+      browserAuditFailCount = 0;
+      const bytes = events.reduce((n, ev) => n + auditEventBytes(ev), 0);
+      browserAuditQueue.push({
+        event: 'audit.dropped', ts: new Date().toISOString(), uid: S.sel ?? '',
+        trace_id: '', request_id: '', connection_id: '', severity: 'info',
+        data: {events: events.length, bytes,
+          reason: String(error?.message || error || '').slice(0, 200)},
+        content: null,
+      });
+      capAuditQueue();
+    } else {
+      browserAuditQueue.unshift(...events);
+      if (browserAuditQueue.length > 500) browserAuditQueue.length = 500;
+    }
   } finally {
     browserAuditSending = false;
     if (browserAuditQueue.length && !browserAuditTimer) {
       browserAuditTimer = setTimeout(flushBrowserAudit, 1500);
     }
+  }
+}
+
+function flushBrowserAuditBeacon() {
+  clearTimeout(browserAuditTimer);
+  browserAuditTimer = 0;
+  if (!navigator.sendBeacon || !browserAuditQueue.length) return;
+  const leftover = [];
+  while (browserAuditQueue.length) {
+    const events = spliceAuditBatch(browserAuditQueue);
+    const ok = navigator.sendBeacon(appUrl('api/audit/browser'),
+      new Blob([auditPayload(events)], {type: 'application/json'}));
+    if (!ok) leftover.push(...events);
+  }
+  if (leftover.length) {
+    browserAuditQueue.unshift(...leftover);
+    if (browserAuditQueue.length > 500) browserAuditQueue.length = 500;
   }
 }
 
@@ -246,7 +317,7 @@ window.addEventListener('offline', () => browserAuditEvent('network.offline', {}
 window.addEventListener('pagehide', () => {
   const snapshot = browserStateSnapshot('pagehide');
   browserAuditEvent('page.hidden', snapshot.data, snapshot.content);
-  flushBrowserAudit(true);
+  flushBrowserAuditBeacon();
 });
 document.addEventListener('visibilitychange', () => browserAuditEvent(
   'visibility.changed', {visibility: document.visibilityState}));
