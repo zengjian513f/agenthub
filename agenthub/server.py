@@ -1208,6 +1208,11 @@ class Handler(BaseHTTPRequestHandler):
             force = q.get("force", ["0"])[0] == "1"
             sessions = debug_runs.filter_rows(index.cached(), _debug_run(q))
             uids, owned_pids = live.active_processes(sessions, force=force)
+            # 发起关系只在双方进程都在时能从进程树看出来; 趁每次判活顺手记下。
+            spawned = live.spawn_parents(sessions, owned_pids,
+                                         skip=session_meta.spawned_uids())
+            if spawned:
+                session_meta.record_spawn_parents(spawned)
             live_set = set(uids)
             tmux_uids = [s["uid"] for s in sessions
                          if s["uid"] in live_set
@@ -2524,6 +2529,10 @@ def main():
         if not re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,256}", NODE_TOKEN):
             ap.error("node token must contain 32–256 characters")
     TERMINAL = args.terminal
+    # 服务本身不是 CLI 会话。若它是从某条 Claude/Codex/Grok 会话里启动的, 继承的
+    # 身份会一路传给 ptyhost 宿主, 让网页新建的每条会话都被认成那条会话的孩子。
+    for key in live.SPAWN_ENV_KEYS:
+        os.environ.pop(key, None)
     backend = term.configure(args.terminal_backend)
     if TERMINAL and not term.available():
         print(f"[agenthub] 警告: 终端后端 {backend} 不可用, 终端功能关闭 ({term.unavailable_reason()})")

@@ -274,5 +274,92 @@ class GrokHeadlessLiveTests(unittest.TestCase):
         self.assertNotIn(200, sids.get(self.SID_CLAUDE, set()))
 
 
+class SpawnParentTests(unittest.TestCase):
+    """由别的会话发起的会话要认出发起者；网页新建的和 tmux 里的不能被乱认亲。"""
+
+    SID_CLAUDE = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    SID_CODEX = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+    SID_GROK = "cccccccc-3333-4333-8333-cccccccccccc"
+    SID_CHILD = "dddddddd-4444-4444-8444-dddddddddddd"
+    SID_WEB = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
+    SID_TMUX = "ffffffff-6666-4666-8666-ffffffffffff"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        proc = FakeProc(Path(self.tmp.name))
+        proc.add(1, "systemd", 0, "/sbin/init")
+        proc.add(4856, "systemd", 1, "/usr/lib/systemd/systemd --user")
+        # 用户自己开的 Claude；它的 Bash 工具里 `codex exec` 直接起了一条 Codex
+        proc.add(100, "claude", 4856, f"claude --session-id {self.SID_CLAUDE}")
+        proc.add(101, "bash", 100, "bash -c codex exec do-something",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_CLAUDE, "CLAUDE_PID": "100"})
+        proc.add(102, "codex", 101, "codex exec do-something",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_CLAUDE, "CLAUDE_PID": "100"})
+        # Codex 又通过 ptyhost 派了一条 Grok：宿主被 systemd 收养，CLI 的会话变量
+        # 被宿主剥掉，但宿主自己还带着 Codex 和最初那条 Claude 的身份
+        proc.add(200, "ptyhost", 4856, "ptyhost run --name agenthub-grok-cccccccc -- grok",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_CLAUDE, "CLAUDE_PID": "100",
+                  "CODEX_THREAD_ID": self.SID_CODEX})
+        proc.add(201, "grok", 200, f"grok --session-id {self.SID_GROK}",
+                 {"CLAUDE_PID": "100"})
+        # Claude 直接派的子 Claude：命令行是自己的 id，环境里是父亲的
+        proc.add(300, "claude", 101, f"claude -p --session-id {self.SID_CHILD}",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_CLAUDE, "CLAUDE_PID": "100"})
+        # 网页新建的会话：宿主由服务启动，环境里没有任何会话身份
+        proc.add(400, "ptyhost", 4856, "ptyhost run --name agenthub-claude-eeeeeeee -- claude")
+        proc.add(401, "claude", 400, f"claude --session-id {self.SID_WEB}")
+        # tmux 里的会话：server 是从某条 Claude 会话里第一次起的，它的环境不算数
+        proc.add(500, "tmux: server", 1, "tmux -L agenthub",
+                 {"CLAUDE_CODE_SESSION_ID": self.SID_CLAUDE, "CLAUDE_PID": "100"})
+        proc.add(501, "claude", 500, f"claude --session-id {self.SID_TMUX}")
+        patches = [
+            patch.object(live, "PROC_FS", proc.root),
+            patch.object(live, "HAS_PROC", True),
+            patch.object(live, "GROK_ACTIVE", proc.root / "missing-grok.json"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    @staticmethod
+    def session(source, sid, created):
+        return {"uid": f"{source}:{sid[:8]}", "source": source, "sid": sid,
+                "created": created, "cwd": "/tmp/project", "path": f"/tmp/{sid}.jsonl"}
+
+    def test_ancestry_and_inherited_identity_name_the_nearest_spawner(self):
+        claude = self.session("claude", self.SID_CLAUDE, "2026-09-12T10:00:00+08:00")
+        codex = self.session("codex", self.SID_CODEX, "2026-09-12T10:30:00+08:00")
+        grok = self.session("grok", self.SID_GROK, "2026-09-12T11:00:00+08:00")
+        child = self.session("claude", self.SID_CHILD, "2026-09-12T11:10:00+08:00")
+        web = self.session("claude", self.SID_WEB, "2026-09-12T11:20:00+08:00")
+        in_tmux = self.session("claude", self.SID_TMUX, "2026-09-12T11:30:00+08:00")
+        sessions = [claude, codex, grok, child, web, in_tmux]
+        owned = {claude["uid"]: [100], codex["uid"]: [102], grok["uid"]: [201],
+                 child["uid"]: [300], web["uid"]: [401], in_tmux["uid"]: [501]}
+        with patch.dict(live._cache, {"at": 1.0}), \
+                patch.dict(live._spawn_cache, {"at": -1.0, "found": {}}):
+            found = live.spawn_parents(sessions, owned)
+        self.assertEqual(found, {
+            codex["uid"]: {"source": "claude", "sid": self.SID_CLAUDE},
+            # 宿主环境里同时有祖父 Claude 与父亲 Codex，父亲更晚出生
+            grok["uid"]: {"source": "codex", "sid": self.SID_CODEX},
+            child["uid"]: {"source": "claude", "sid": self.SID_CLAUDE},
+        })
+
+    def test_results_are_memoised_per_scan_and_skip_recorded(self):
+        claude = self.session("claude", self.SID_CLAUDE, "2026-09-12T10:00:00+08:00")
+        codex = self.session("codex", self.SID_CODEX, "2026-09-12T10:30:00+08:00")
+        owned = {claude["uid"]: [100], codex["uid"]: [102]}
+        with patch.dict(live._cache, {"at": 1.0}), \
+                patch.dict(live._spawn_cache, {"at": -1.0, "found": {}}):
+            first = live.spawn_parents([claude, codex], owned)
+            self.assertEqual(list(first), [codex["uid"]])
+            with patch.object(live, "_spawn_candidates", side_effect=AssertionError("rescanned")):
+                again = live.spawn_parents([claude, codex], owned)
+                self.assertEqual(again, first)
+                self.assertEqual(live.spawn_parents([claude, codex], owned, skip={codex["uid"]}), {})
+
+
 if __name__ == "__main__":
     unittest.main()

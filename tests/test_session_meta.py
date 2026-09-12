@@ -31,6 +31,31 @@ class SessionMetaTests(unittest.TestCase):
             saved = json.loads(session_meta.META_FILE.read_text())
             self.assertEqual(saved, {"version": 1, "sessions": {}})
 
+    def test_spawn_parent_is_recorded_once_and_enriches_rows(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"):
+            self.assertEqual(session_meta.spawned_uids(), set())
+            parent = {"source": "claude", "sid": "parent-sid"}
+            self.assertEqual(session_meta.record_spawn_parents({"grok:child": parent}), 1)
+            self.assertEqual(session_meta.spawned_uids(), {"grok:child"})
+            # 发起者只有一个；后来的进程线索不能改写首次记录的关系
+            self.assertEqual(session_meta.record_spawn_parents(
+                {"grok:child": {"source": "codex", "sid": "other"}}), 0)
+            self.assertEqual(session_meta.record_spawn_parents(
+                {"grok:child": parent, "codex:bad": {"source": "", "sid": ""}}), 0)
+            original = {"uid": "grok:child", "title": "demo"}
+            enriched = session_meta.enrich([original, {"uid": "claude:root"}])
+            self.assertEqual(enriched[0]["spawned_by"], parent)
+            self.assertNotIn("spawned_by", enriched[1])
+            self.assertNotIn("spawned_by", original)
+            self.assertEqual(session_meta.enrich_one(original)["spawned_by"], parent)
+            # 星标等其他元数据与发起关系互不覆盖
+            session_meta.set_starred("grok:child", True)
+            self.assertEqual(session_meta.enrich([original])[0]["spawned_by"], parent)
+            session_meta.set_starred("grok:child", False)
+            self.assertEqual(session_meta.snapshot("grok:child"), {"spawned_by": parent})
+
     def test_discard_only_removes_target_session(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(session_meta, "DATA_DIR", Path(tmp)), \

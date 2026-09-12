@@ -69,6 +69,8 @@ applyToolIcons();
 const S = {
   sessions: [],
   view: store.get('view', 'tree'),
+  nest: store.get('nest', false),  // 左栏分层：子代理和由会话发起的会话缩进在发起者下
+  nestClosed: new Set(store.get('nestClosed', [])),  // 分层里手动收起的发起者 uid
   off: new Set(store.get('off', [])),
   closed: new Set(store.get('closed', [])),
   sel: null,
@@ -1807,7 +1809,8 @@ async function runLivePoll(force) {
 
 /** 只改小圆点, 不重渲染整个列表 —— 否则每几秒就会打断滚动和选中。 */
 function paintLive() {
-  for (const n of document.querySelectorAll('.item')) {
+  for (const n of document.querySelectorAll('.item.agent')) paintAgentStatus(n);
+  for (const n of document.querySelectorAll('.item[data-uid]')) {
     const pendingRunning = n.dataset.tmuxName
       && typeof T !== 'undefined' && T.list?.some(t => t.name === n.dataset.tmuxName && !t.stale);
     n.classList.toggle('live', !!pendingRunning || S.live.has(n.dataset.uid));
@@ -1837,7 +1840,7 @@ function paintLive() {
 function syncActiveOnlyList() {
   if (!S.activeOnly) return;
   const wanted = new Set(visible().map(s => s.uid));
-  const shown = new Set([...document.querySelectorAll('#side .item')].map(n => n.dataset.uid));
+  const shown = new Set([...document.querySelectorAll('#side .item[data-uid]')].map(n => n.dataset.uid));
   if (wanted.size === shown.size && [...wanted].every(uid => shown.has(uid))) return;
   const side = $('#side'), top = side?.scrollTop || 0;
   renderSide();
@@ -2035,7 +2038,7 @@ function mergeSessionMetaEvent(entry, session) {
 /** 列表元数据变更后同步缓存和当前详情标题，不重绘消息正文。 */
 function refreshSessionMeta() {
   const headerKey = m => JSON.stringify([
-    m.title, m.parent_title, m.sid, m.agent_type, !!m.starred,
+    m.title, m.parent_title, m.sid, m.agent_type, !!m.starred, m.spawned_by || null,
     (m.agent_items || []).map(a => [a.id, a.title, a.type]),
   ]);
   const before = cache.get(viewKey(S.sel, S.agent));
@@ -2591,26 +2594,116 @@ function renderChips() {
   }
 }
 
+/* ---------- 分层：发起关系 ---------- */
+// 会话由谁发起（spawned_by）是服务端从进程树看出来并记住的；这里只在同机器、
+// 同来源内按原生 sid 解析成列表里的那一行，和 forkAncestors 一个规矩。
+const spawnKey = (nodeId, source, sid) => JSON.stringify([nodeId || '', source, String(sid)]);
+function spawnParentOf(session, byKey) {
+  const parent = session.spawned_by;
+  if (!parent?.source || !parent.sid) return null;
+  const row = byKey.get(spawnKey(session.node_id, parent.source, parent.sid));
+  return row && row !== session ? row : null;
+}
+
+/** 分层模式下的树：每条会话直接发起的会话，以及哪些会话已挂在别人下面。
+ *  发起者不在当前列表里（被筛掉、已删除）的会话仍作根显示。 */
+function nestTree(list) {
+  const children = new Map(), nested = new Set();
+  if (!S.nest) return {children, nested};
+  const byKey = new Map(list.map(s => [spawnKey(s.node_id, s.source, s.sid), s]));
+  const parentOf = new Map();
+  for (const s of list) {
+    const parent = spawnParentOf(s, byKey);
+    if (!parent) continue;
+    // 数据出环（A 由 B 发起、B 又由 A 发起）时后处理的那条留作根，树不会吞掉它
+    let cur = parent, looped = false;
+    for (let i = 0; cur && i < list.length; i++) {
+      if (cur === s) { looped = true; break; }
+      cur = parentOf.get(cur.uid) || null;
+    }
+    if (looped) continue;
+    parentOf.set(s.uid, parent);
+    if (!children.has(parent.uid)) children.set(parent.uid, []);
+    children.get(parent.uid).push(s);
+    nested.add(s.uid);
+  }
+  return {children, nested};
+}
+
+/** 一条会话连同它的子代理和它发起的会话，按活动时间倒序、还在跑的在前。 */
+function nestStamp(s, children, memo = new Map()) {
+  if (memo.has(s.uid)) return memo.get(s.uid);
+  let stamp = +new Date(s.updated) || 0;
+  memo.set(s.uid, stamp);   // 先占位，环再深也只算一遍
+  for (const a of s.agent_items || []) stamp = Math.max(stamp, +new Date(a.updated) || 0);
+  for (const c of children.get(s.uid) || []) stamp = Math.max(stamp, nestStamp(c, children, memo));
+  memo.set(s.uid, stamp);
+  return stamp;
+}
+
+function expandRows(s, depth, children, out, seen) {
+  const row = {s, agent: null, depth, kids: 0, closed: false};
+  out.push(row);
+  if (!S.nest) return;
+  const when = v => +new Date(v) || 0;
+  const kids = [
+    ...(s.agent_items || []).map(agent => ({agent, running: agentRunning(s.uid, agent),
+      when: when(agent.updated)})),
+    ...(children.get(s.uid) || []).map(c => ({session: c, running: S.live.has(c.uid),
+      when: nestStamp(c, children)})),
+  ].sort((a, b) => (b.running - a.running) || (b.when - a.when));
+  row.closed = kids.length > 0 && S.nestClosed.has(s.uid);
+  const start = out.length;
+  for (const k of kids) {
+    if (k.agent) out.push({s, agent: k.agent, depth: depth + 1});
+    else if (!seen.has(k.session.uid)) {
+      seen.add(k.session.uid);
+      expandRows(k.session, depth + 1, children, out, seen);
+    }
+  }
+  // 三角上写的是收起后消失的整棵子树行数；收起时这些行只用来数数，不进列表
+  row.kids = out.length - start;
+  if (row.closed) out.length = start;
+}
+
+const rowKey = row => row.agent ? `${row.s.uid}#${row.agent.id}` : row.s.uid;
+
+/** 左栏分组：[组键, 行数组]。行 = {s, agent, depth}；平铺模式下 depth 恒为 0 且没有子代理行。
+ *  分层模式按整棵子树的最新活动排位和归组，发起的孩子刚有动静时父亲跟着浮上来。 */
 function groupBy(list) {
+  const {children, nested} = nestTree(list);
+  const memo = new Map();
+  const stamp = s => S.nest ? nestStamp(s, children, memo) : (+new Date(s.updated) || 0);
   const m = new Map();
   for (const s of list) {
-    const k = S.view === 'tree' ? (s.node_id ? JSON.stringify([s.node_id, s.cwd || '(未知)']) : (s.cwd || '(未知)')) : dayKey(s.updated);
+    if (nested.has(s.uid)) continue;
+    const k = S.view === 'tree' ? (s.node_id ? JSON.stringify([s.node_id, s.cwd || '(未知)']) : (s.cwd || '(未知)'))
+      : dayKey(new Date(stamp(s)).toISOString());
     if (!m.has(k)) m.set(k, []);
     m.get(k).push(s);
   }
   const keys = [...m.keys()];
   if (S.view === 'date') keys.sort().reverse();
   else keys.sort((a, b) => {
-    const ta = Math.max(...m.get(a).map(x => +new Date(x.updated)));
-    const tb = Math.max(...m.get(b).map(x => +new Date(x.updated)));
+    const ta = Math.max(...m.get(a).map(stamp));
+    const tb = Math.max(...m.get(b).map(stamp));
     return tb - ta;
   });
   for (const k of keys) m.get(k).sort((a, b) =>
     // 项目树的顺序只表达真实活动时间，点星不应让会话突然跳位。
     // 时间轴才在同一日期内将收藏置前；收藏时间不参与排序。
     (S.view === 'date' ? Number(!!b.starred) - Number(!!a.starred) : 0)
-    || new Date(b.updated) - new Date(a.updated));
-  return keys.map(k => [k, m.get(k)]);
+    || stamp(b) - stamp(a));
+  const seen = new Set();
+  return keys.map(k => {
+    const rows = [];
+    for (const s of m.get(k)) {
+      if (seen.has(s.uid)) continue;
+      seen.add(s.uid);
+      expandRows(s, 0, children, rows, seen);
+    }
+    return [k, rows];
+  });
 }
 
 const itemMeta = s => (s.stale ? '离线缓存 · ' : '') + (s.pending ? `${fmtTime(s.updated)} · 等待首条消息`
@@ -2631,15 +2724,19 @@ function patchSide(list) {
   const have = new Map([...side.querySelectorAll(':scope > .group')].map(g => [g.dataset.key, g]));
   if (have.size !== groups.length || groups.some(([k]) => !have.has(k))) return false;
 
-  for (const [key, items] of groups) {
+  for (const [key, rows] of groups) {
     const g = have.get(key);
     const ul = g.querySelector('.glist');
     if (!ul) return false;
-    const nodes = new Map([...ul.children].map(n => [n.dataset.uid, n]));
-    if (nodes.size !== items.length || items.some(s => !nodes.has(s.uid))) return false;
-    for (const s of items) {
-      const n = nodes.get(s.uid);
+    const nodes = new Map([...ul.children].map(n => [n.dataset.key, n]));
+    if (nodes.size !== rows.length || rows.some(r => !nodes.has(rowKey(r)))) return false;
+    for (const r of rows) {
+      const n = nodes.get(rowKey(r));
+      if (n.dataset.depth !== String(r.depth)) return false;   // 挂到别人下面去了，整体重画
       ul.appendChild(n);                     // 按新顺序挪位置, 节点本身不动
+      if (r.agent) { patchAgentRow(n, r); continue; }
+      if (!!n.querySelector(':scope > .nest-caret') !== r.kids > 0) return false;
+      const s = r.s;
       const m = n.querySelector('.m');
       const t = itemMeta(s);
       if (m && m.textContent !== t) m.textContent = t;
@@ -2656,11 +2753,56 @@ function patchSide(list) {
         cwd.innerHTML = timelineDirectoryMarkup(s);
       }
     }
+    const count = rows.filter(r => !r.agent).length;
     const c = g.querySelector('.gcount');
-    if (c && c.textContent !== String(items.length)) c.textContent = items.length;
+    if (c && c.textContent !== String(count)) c.textContent = count;
   }
   fitTimelineDirectories();
   return true;
+}
+
+/* ---------- 子代理行 ---------- */
+const agentMeta = (uid, a) => `子代理 · ${a.type} · ${fmtSpan(a.created, agentRunning(uid, a) ? null : a.updated)}`;
+
+function agentRow(s, a, depth) {
+  const it = el('div', 'item agent',
+    `<span class="ico" aria-hidden="true">⑂<span class="item-status"></span></span>
+     <div class="body">
+       <div class="t" title="${esc(a.title)}">${hl(a.title)}</div>
+       <div class="m">${esc(agentMeta(s.uid, a))}</div>
+     </div>`);
+  it.dataset.key = rowKey({s, agent: a});
+  it.dataset.owner = s.uid;
+  it.dataset.agent = a.id;
+  it.dataset.depth = depth;
+  it.style.setProperty('--depth', depth);
+  it.onclick = () => { if (!S.picking) openSession(s.uid, a.id); };
+  paintAgentStatus(it);
+  return it;
+}
+
+function patchAgentRow(node, row) {
+  const title = node.querySelector('.t');
+  if (title && title.textContent !== row.agent.title) {
+    title.title = row.agent.title;
+    title.innerHTML = hl(row.agent.title);
+  }
+  const m = node.querySelector('.m'), t = agentMeta(row.s.uid, row.agent);
+  if (m && m.textContent !== t) m.textContent = t;
+  paintAgentStatus(node);
+}
+
+/** 子代理行的绿点和选中态：跑没跑由服务端按 transcript 判断，父进程不在则一律不算。 */
+function paintAgentStatus(node) {
+  const uid = node.dataset.owner, id = node.dataset.agent;
+  const item = (S.sessions.find(s => s.uid === uid)?.agent_items || []).find(a => a.id === id);
+  const running = !!item && agentRunning(uid, item);
+  node.classList.toggle('live', running);
+  node.classList.toggle('sel', S.sel === uid && S.agent === id);
+  const badge = node.querySelector(':scope > .ico > .item-status');
+  if (!badge) return;
+  badge.classList.toggle('visible', running);
+  badge.title = badge.ariaLabel = running ? '子代理运行中' : '';
 }
 
 function renderSide() {
@@ -2677,7 +2819,8 @@ function renderSide() {
     side.appendChild(el('div', 'empty', text));
     return;
   }
-  for (const [key, items] of groupBy(list)) {
+  for (const [key, rows] of groupBy(list)) {
+    const items = rows.filter(r => !r.agent).map(r => r.s);
     const g = el('div', 'group' + (S.closed.has(key) ? ' closed' : ''));
     g.dataset.key = key;
     const label = S.view === 'tree' ? nodeDirectory(items[0]) : key;   // 分组标题不缩写, 只换 ~
@@ -2702,15 +2845,21 @@ function renderSide() {
     }
     g.appendChild(head);
     const ul = el('div', 'glist');
-    for (const s of items) {
+    for (const r of rows) {
+      if (r.agent) { ul.appendChild(agentRow(r.s, r.agent, r.depth)); continue; }
+      const s = r.s;
       const meta = itemMeta(s);
       const pickable = S.picking && sessionPickable(s);
-      const it = el('div', 'item' + (S.sel === s.uid ? ' sel' : '')
+      // 分层时正在看的子代理有自己那一行，主会话行不再一起亮
+      const selected = S.sel === s.uid && !(S.nest && S.agent);
+      const it = el('div', 'item' + (selected ? ' sel' : '') + (r.closed ? ' nest-closed' : '')
                               + (s.pending ? (s.stale ? ' pending' : ' pending live live-tmux') : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
                               + (!s.pending && S.liveTmux.has(s.uid) ? ' live-tmux' : '')
                               + (pickable && picked.has(s.uid) ? ' picked' : ''),
-        `${pickable ? `<input type="checkbox" class="item-pick" tabindex="-1"
+        `${r.kids ? `<button type="button" class="nest-caret" aria-expanded="${!r.closed}"
+           title="${r.closed ? '展开' : '收起'} ${r.kids} 项" aria-label="${r.closed ? '展开' : '收起'}「${esc(s.title)}」下的 ${r.kids} 项"></button>` : ''}
+         ${pickable ? `<input type="checkbox" class="item-pick" tabindex="-1"
            ${picked.has(s.uid) ? 'checked' : ''} aria-label="选中「${esc(s.title)}」">` : ''}
          <span class="ico">${icon(s.source)}<span class="item-status"></span></span>
          <div class="body">
@@ -2722,6 +2871,9 @@ function renderSide() {
          </div>
          ${s.pending ? '' : starButtonMarkup(s.uid, !!s.starred, 'item-star')}`);
       it.dataset.uid = s.uid;
+      it.dataset.key = s.uid;
+      it.dataset.depth = r.depth;
+      it.style.setProperty('--depth', r.depth);
       if (s.pending) it.dataset.tmuxName = s.tmuxName;
       it.onclick = () => {
         if (pickable) return toggleSessionPick(s.uid);
@@ -2732,6 +2884,11 @@ function renderSide() {
       if (star) star.onclick = event => {
         event.stopPropagation();
         toggleSessionStar(s.uid);
+      };
+      const caret = it.querySelector('.nest-caret');
+      if (caret) caret.onclick = event => {
+        event.stopPropagation();
+        toggleNestFold(s.uid);
       };
       paintItemStatus(it);
       ul.appendChild(it);
@@ -3535,6 +3692,7 @@ function head(m, total) {
       ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
+      ${spawnerMarkup(m)}
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
       ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
@@ -3542,6 +3700,10 @@ function head(m, total) {
       </div>
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
+  h.addEventListener('click', event => {
+    const link = event.target.closest('.meta-spawner');
+    if (link) openSession(link.dataset.uid);
+  });
   h.querySelector('#a-star').onclick = () => toggleSessionStar(m.uid);
   const turnMode = h.querySelector('#a-turns');
   turnMode.onclick = () => {
@@ -3589,6 +3751,16 @@ function head(m, total) {
   renderSessionAction(m, h.querySelector('#a-session-action'));
   bindSessionActions(h);
   return h;
+}
+
+/** 标题栏元信息里的发起者：由哪条会话把它派出来的，点击就跳过去。 */
+function spawnerMarkup(m) {
+  if (m.agent_id || !m.spawned_by) return '';
+  const byKey = new Map(S.sessions.map(s => [spawnKey(s.node_id, s.source, s.sid), s]));
+  const parent = spawnParentOf(m, byKey);
+  if (!parent) return '';
+  return `<span class="meta-secondary"><button type="button" class="meta-spawner" data-uid="${esc(parent.uid)}"
+    title="由「${esc(parent.title)}」发起，点击打开">↰ ${esc(SOURCES[parent.source].name)} · ${esc(parent.title)}</button></span>`;
 }
 
 /* ---------- 回退父会话链 ---------- */
@@ -5580,6 +5752,24 @@ $('#view').onclick = e => {
 
 function renderView() {
   for (const b of $('#view').children) b.classList.toggle('on', b.dataset.v === S.view);
+  const nest = $('#nest-toggle');
+  nest.classList.toggle('on', S.nest);
+  nest.setAttribute('aria-pressed', String(S.nest));
+}
+$('#nest-toggle').onclick = () => {
+  S.nest = !S.nest;
+  store.set('nest', S.nest);
+  renderView();
+  renderSide();
+};
+
+/** 收起/展开一条发起者下面的整棵子树；列表重画但不跳滚动位置。 */
+function toggleNestFold(uid) {
+  S.nestClosed.has(uid) ? S.nestClosed.delete(uid) : S.nestClosed.add(uid);
+  store.set('nestClosed', [...S.nestClosed]);
+  const side = $('#side'), top = side?.scrollTop || 0;
+  renderSide();
+  if (side) side.scrollTop = top;
 }
 
 // ---------------------------------------------------------------- 栏宽拖动

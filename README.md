@@ -43,7 +43,9 @@ Codex 回退会生成继承历史的子会话，原会话（父会话）默认�
 
 ## 界面
 
-- **左栏**：两种视图 —— 📁 项目树（按 cwd 分组）/ 🕒 时间轴（按日期倒排，每条单独一行显示所在目录）。分组可折叠，折叠状态存 localStorage。家目录缩写成 `~`，过长的路径中间省略（`/a/b/…/y/z`）——不能用 `direction: rtl` 截左边，bidi 会把开头的 `/` 挪到末尾。
+- **左栏**：两种视图 —— 📁 项目树（按 cwd 分组）/ 🕒 时间轴（按日期倒排，每条单独一行显示所在目录）。分组可折叠，折叠状态存 localStorage。
+- **分层（⑂ 开关）**：打开后每条会话的子代理、以及由它发起的其他 CLI 会话缩进挂在它下面（可多层），跨目录的孩子离开自己的分组；整棵子树按最新活动排位，在跑的孩子排最前。发起者行左沿有三角，可收起整棵子树（收起状态存 localStorage）。发起者不在当前列表里（被筛掉、已删除）的会话仍作根显示。关掉开关即回到平铺，子代理仍只在详情标题下拉里切换。
+- **发起关系怎么来的**：一条会话由另一条会话派出去（Claude 的 Bash 里跑 `codex exec`、`grok -p`、`claude -p`，或经 `term.new_session` / ptyhost 起一条新会话）时，服务端趁两边进程都在，从进程树认出发起者：沿 CLI 主进程的祖先链找另一条会话的主进程，或链上某一级环境里带着别条会话的身份（`CLAUDE_CODE_SESSION_ID`、`CLAUDE_PID`、`CODEX_THREAD_ID`、`GROK_SESSION_ID`）。ptyhost 宿主会剥掉 CLI 子进程的会话变量并脱离发起者的进程树，但宿主自己仍带着发起者的环境，所以每一级都看；tmux server 由所有会话共享，走到它就停。一条链上同时看到祖父和父亲时取最晚创建的那条。关系一经看到就写进 `session-meta.json`（`spawned_by: {source, sid}`），之后进程退出、重启服务仍保留；`/api/sessions` 行和详情 meta 带出该字段，详情标题的元信息里给出发起者链接。服务启动时会清掉自己环境里的这几个变量，从某条 CLI 会话里手动起服务时网页新建的会话不会被误认成它的孩子。家目录缩写成 `~`，过长的路径中间省略（`/a/b/…/y/z`）——不能用 `direction: rtl` 截左边，bidi 会把开头的 `/` 挪到末尾。
 - **会话星标**：列表项与详情标题共用一个星标开关；星标会话在当前项目/日期分组内靠前。状态写入权限为 `0600` 的 `~/.local/share/agenthub/session-meta.json`，不修改 Claude/Codex/Grok 原始记录，换浏览器或重启服务后仍保留，并会同步到其他打开的页面。
 - **来源筛选**：顶栏三个 chip，各带图标与数量，点击开关。
 - **工具图标**：设置中可在原版图标与老板头像之间切换（Claude / Dario Amodei、Codex / Sam Altman、Grok / Elon Musk），立即应用到各处工具图标，选择保存在当前浏览器。头像本地内置，来源与许可可从设置查看。
@@ -94,6 +96,7 @@ T0 研究台账（`research_catalog` 的 `sessions` 表）和 labdesk 的“关�
 |---|---|
 | `width` | 侧栏宽度 |
 | `view` | 项目树 / 时间轴 |
+| `nest` | 分层开关；`nestClosed` 是分层里手动收起的发起者 uid |
 | `off` | 被关掉的来源 chip |
 | `closed` | 折叠的分组 |
 | `opts` | 大小写 / 全词 / 正则 三个搜索开关 |
@@ -343,7 +346,7 @@ agenthub/
 ### HTTP 接口
 
 - `GET /api/sessions[?force=1&sig=]` — 全部会话元数据；签名未变时返回轻量结果
-- `GET /api/live[?force=1]` — 活跃会话、tmux 子集及当前 CLI 进程启动时间
+- `GET /api/live[?force=1]` — 活跃会话、tmux 子集及当前 CLI 进程启动时间；顺带从进程树记录新出现的发起关系（`spawned_by`）
 - `GET /api/messages/<uid>?window=1&start=&head=&anchor=&agent=<id>` — 首尾窗口、整份或增量消息；`agent` 选择单个 Claude 子代理视图
 - `GET /api/watch?uid=&agent=&start=&head=&anchor=` — 当前主会话或所选子代理视图的 SSE 增量推送
 - `GET /api/media/<token>` — 会话中已登记图片的不透明只读地址

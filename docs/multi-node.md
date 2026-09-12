@@ -150,6 +150,7 @@ Hub 校验自己的前端 build；通过认证且协议兼容的节点请求不�
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 tests/hub_e2e.py
 python3 tests/fold_sweep_e2e.py
+python3 tests/nest_tree_e2e.py
 ```
 
 浏览器测试需要现有 Playwright/Chromium，使用隔离的三台模拟 HTTP 节点，覆盖渲染、筛选、

@@ -752,13 +752,41 @@ body.dragging { cursor: col-resize; user-select: none; }
 .group.closed .glist { display: none; }
 
 .item {
-  display: flex; gap: 8px; padding: 7px 11px 7px 13px;
+  --depth: 0;
+  position: relative;
+  display: flex; gap: 8px; padding: 7px 11px 7px calc(13px + var(--depth) * 18px);
   cursor: pointer; border-left: 3px solid transparent;
 }
 .item:hover { background: var(--hover); }
 .item.sel { background: var(--sel); border-left-color: var(--accent); }
 .item > .ico { flex: none; margin-top: 1px; }
 .item .body { min-width: 0; flex: 1; }
+/* 分层：缩进行左侧一根细线连回发起者，一眼看出挂在谁下面 */
+.item:not([data-depth="0"])::before {
+  content: ''; position: absolute; top: 0; bottom: 0;
+  left: calc(13px + (var(--depth) - 1) * 18px + 8px);
+  border-left: 1px solid var(--border);
+}
+/* 发起者行左沿的小三角：不占行内位置，收起时整棵子树从列表消失 */
+.nest-caret {
+  position: absolute; z-index: 1; top: 6px; left: calc(var(--depth) * 18px - 3px);
+  width: 20px; height: 22px; padding: 0; border: 0; background: none; cursor: pointer;
+  color: var(--muted); font-size: 10px; line-height: 1;
+}
+.nest-caret::before { content: '▼'; display: inline-block; transition: transform .12s; }
+.item.nest-closed > .nest-caret::before { transform: rotate(-90deg); }
+.nest-caret:hover { color: var(--text); }
+.nest-caret:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 4px; }
+.item.agent > .ico {
+  width: 24px; height: 24px; font-size: 15px; line-height: 1; color: var(--muted);
+}
+.item.agent .t { font-size: 12.5px; }
+.item.agent.live .t { font-weight: 600; }
+.meta-spawner {
+  border: 0; padding: 0; background: none; font: inherit; color: inherit; cursor: pointer;
+  text-decoration: underline dotted; text-underline-offset: 2px;
+}
+.meta-spawner:hover { color: var(--text); }
 .item-star {
   flex: none; align-self: flex-start; width: 25px; height: 25px; margin: -2px -5px 0 0; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;

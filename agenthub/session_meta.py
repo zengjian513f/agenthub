@@ -274,6 +274,47 @@ def set_fork_parent_visible(uid: str, visible: bool) -> dict:
     return {"fork_parent_visible": bool(visible)}
 
 
+def spawned_uids() -> set[str]:
+    """已记录发起者的会话。"""
+    with _lock:
+        return {uid for uid, meta in _read().items()
+                if isinstance(meta, dict) and isinstance(meta.get("spawned_by"), dict)}
+
+
+def record_spawn_parents(found: dict[str, dict]) -> int:
+    """记下会话由谁发起。一条会话只被发起一次, 首次观察到的关系永久保留。
+
+    进程只在双方都还在跑时能追溯, 所以看到就落盘; 之后 CLI 退出、机器重启,
+    左栏仍能把它挂在发起者下面。
+    """
+    if not found:
+        return 0
+    with _lock:
+        rows = _read()
+        written = 0
+        for uid, parent in found.items():
+            uid = str(uid or "").strip()
+            source = str((parent or {}).get("source") or "").strip()
+            sid = str((parent or {}).get("sid") or "").strip()
+            if not uid or not source or not sid:
+                continue
+            previous = rows.get(uid) if isinstance(rows.get(uid), dict) else {}
+            if isinstance(previous.get("spawned_by"), dict):
+                continue
+            rows[uid] = {**previous, "spawned_by": {"source": source, "sid": sid}}
+            written += 1
+        if written:
+            _write(rows)
+        return written
+
+
+def _spawned_by(meta) -> dict | None:
+    parent = meta.get("spawned_by") if isinstance(meta, dict) else None
+    if not isinstance(parent, dict) or not parent.get("source") or not parent.get("sid"):
+        return None
+    return {"source": str(parent["source"]), "sid": str(parent["sid"])}
+
+
 def fork_parent_uids(sessions: list[dict]) -> set[str]:
     """从同一来源的原生 sid 关系计算父会话，绝不把跨来源同名 sid 串起来。"""
     ancestors = {
@@ -329,6 +370,8 @@ def enrich_one(session: dict, topology: list[dict] | None = None) -> dict:
     if isinstance(meta, dict) and meta.get("starred"):
         row["starred"] = True
         row["starred_at"] = meta.get("starred_at")
+    if (spawned_by := _spawned_by(meta)):
+        row["spawned_by"] = spawned_by
     if topology is not None and str(session.get("uid") or "") in fork_parent_uids(topology):
         row["fork_parent"] = True
         row["fork_parent_visible"] = bool(
@@ -347,6 +390,8 @@ def enrich(sessions: list[dict], topology: list[dict] | None = None) -> list[dic
         if isinstance(meta, dict) and meta.get("starred"):
             row["starred"] = True
             row["starred_at"] = meta.get("starred_at")
+        if (spawned_by := _spawned_by(meta)):
+            row["spawned_by"] = spawned_by
         if str(session.get("uid") or "") in parents:
             row["fork_parent"] = True
             row["fork_parent_visible"] = bool(

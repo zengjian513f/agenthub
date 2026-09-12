@@ -43,11 +43,22 @@ _ENV_FAMILY = {
 }
 _ENV_SID = tuple(_ENV_FAMILY)
 _KEYWORDS = ("claude", "codex", "grok")
+# 一条会话由另一条 CLI 会话发起时, 子进程环境里留下的发起者身份。三家给工具子进程
+# 设的变量各不相同; CLAUDE_PID 直接指向父 Claude 进程, 裸 `claude` 没有 session id
+# 也能靠它认亲。
+SPAWN_ENV = {
+    "CLAUDE_CODE_SESSION_ID": "claude",
+    "CODEX_THREAD_ID": "codex",
+    "GROK_SESSION_ID": "grok",
+}
+SPAWN_ENV_KEYS = (*SPAWN_ENV, "CLAUDE_PID")
+_ANCESTRY_DEPTH = 16
 
 PROC_FS = Path("/proc")
 HAS_PROC = PROC_FS.is_dir()
 TTL = 3.0          # 扫描结果的缓存秒数, 前端可以放心高频轮询
 _cache = {"at": 0.0, "sids": set(), "paths": set(), "bare_claude": {}}
+_spawn_cache = {"at": -1.0, "found": {}}
 _scan_lock = threading.Lock()
 _UNSET = object()
 _psutil_module: object = _UNSET
@@ -527,3 +538,113 @@ def active_processes(sessions: list[dict], force: bool = False,
 def live_uids(sessions: list[dict], force: bool = False) -> list[str]:
     """在已知会话里挑出还活着的，并折叠共享进程的 Codex 回滚祖先。"""
     return active_processes(sessions, force=force)[0]
+
+
+# ----------------------------------------------------------------- 发起关系
+def _process_parent(pid: int) -> tuple[str, int] | None:
+    """(进程名, 父 pid)；读不到就返回 None。"""
+    if not HAS_PROC:
+        psutil = _psutil()
+        if psutil is None:
+            return None
+        try:
+            proc = psutil.Process(pid)
+            return _cli_name(proc.name() or ""), proc.ppid()
+        except Exception:
+            return None
+    try:
+        st = (PROC_FS / str(pid) / "stat").read_text()
+        name = st[st.index("(") + 1:st.rindex(")")]
+        return name, int(st[st.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError):
+        return None
+
+
+def _process_spawn_env(pid: int) -> dict[str, str]:
+    """进程环境里与发起关系有关的那几个变量。"""
+    found: dict[str, str] = {}
+    if not HAS_PROC:
+        psutil = _psutil()
+        if psutil is None:
+            return found
+        try:
+            env = psutil.Process(pid).environ()
+        except Exception:
+            return found
+        return {k: str(env[k]).strip() for k in SPAWN_ENV_KEYS if env.get(k)}
+    try:
+        raw = (PROC_FS / str(pid) / "environ").read_bytes().decode("utf8", "replace")
+    except OSError:
+        return found
+    for entry in raw.split("\0"):
+        key, sep, value = entry.partition("=")
+        if sep and key in SPAWN_ENV_KEYS and value.strip():
+            found[key] = value.strip()
+    return found
+
+
+def _spawn_candidates(pid: int, uid: str, by_key: dict[tuple[str, str], str],
+                      pid_owner: dict[int, str], memo: dict) -> set[str]:
+    """沿祖先链收集所有可能的发起者 uid。"""
+    found: set[str] = set()
+    cur = pid
+    for _ in range(_ANCESTRY_DEPTH):
+        if cur != pid and pid_owner.get(cur, uid) != uid:
+            found.add(pid_owner[cur])
+        if cur not in memo:
+            parent = _process_parent(cur)
+            memo[cur] = (parent, _process_spawn_env(cur) if parent else {})
+        parent, env = memo[cur]
+        if parent is None:
+            break
+        name, ppid = parent
+        # tmux server 由所有会话共享, 它的环境说明不了任何一条会话; 再往上也没有意义。
+        if name.startswith("tmux"):
+            break
+        for key, family in SPAWN_ENV.items():
+            owner = by_key.get((family, env.get(key, "").lower()))
+            if owner and owner != uid:
+                found.add(owner)
+        claude_pid = env.get("CLAUDE_PID", "")
+        if claude_pid.isdigit() and pid_owner.get(int(claude_pid), uid) != uid:
+            found.add(pid_owner[int(claude_pid)])
+        if ppid <= 1 or ppid == cur:
+            break
+        cur = ppid
+    return found
+
+
+def spawn_parents(sessions: list[dict], owned_pids: dict[str, list[int]],
+                  skip: set[str] | frozenset[str] = frozenset()) -> dict[str, dict]:
+    """运行中的会话各由哪条会话发起: {uid: {"source", "sid"}}。
+
+    顺着 CLI 主进程的祖先链找线索: 祖先本身是另一条会话的 CLI 主进程, 或链上某一级
+    的环境带着别条会话的身份。ptyhost 会把会话身份从 CLI 子进程的环境里剥掉, 宿主
+    进程又脱离启动者的进程树被 systemd 收养, 但宿主自己仍带着发起者的环境, 所以
+    每一级都要看。一条链上可能同时找到祖父和父亲 (Claude → Codex → Grok 时 Grok
+    的环境两家的身份都有), 取最晚创建的那条: 孩子总在父亲之后出生。
+    只看主进程, 结果按一次扫描缓存; 已记录过发起者的会话由调用方通过 skip 略过。
+    """
+    if _spawn_cache["at"] != _cache["at"]:
+        rows = {str(s["uid"]): s for s in sessions}
+        by_key = {(str(s.get("source") or ""), str(s.get("sid") or "").lower()): str(s["uid"])
+                  for s in sessions if s.get("sid")}
+        pid_owner = {pid: uid for uid, pids in owned_pids.items() for pid in pids if pid > 0}
+        memo: dict = {}
+        found: dict[str, dict] = {}
+        for uid, pids in owned_pids.items():
+            if uid not in rows:
+                continue
+            candidates: set[str] = set()
+            for pid in pids:
+                if pid > 0:
+                    candidates |= _spawn_candidates(pid, uid, by_key, pid_owner, memo)
+            candidates.discard(uid)
+            if not candidates:
+                continue
+            parent = rows[max(candidates, key=lambda u: str(rows[u].get("created") or ""))]
+            found[uid] = {"source": str(parent.get("source") or ""),
+                          "sid": str(parent.get("sid") or "")}
+        _spawn_cache.update(at=_cache["at"], found=found)
+    return {uid: dict(parent) for uid, parent in _spawn_cache["found"].items()
+            if uid not in skip}
