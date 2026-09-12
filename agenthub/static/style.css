@@ -809,8 +809,6 @@ body.dragging { cursor: col-resize; user-select: none; }
   font-size: 11.5px; color: var(--muted); margin-top: 1px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.item .m .meta-agents { display: inline-flex; align-items: center; gap: 2px; vertical-align: -1px; }
-.item .m .meta-agents .ui-icon { width: 11px; height: 11px; }
 .item .cwd {
   display: flex; align-items: baseline; gap: 4px;
   font-size: 11px; color: var(--muted); margin-top: 1px;

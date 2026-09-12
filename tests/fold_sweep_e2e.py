@@ -24,14 +24,13 @@ from hub_e2e import HEADER_ACTIONS, HEADER_FOLD_JS, MountedHub
 from hub_fixture import start_node, stop
 from session_menu_e2e import ACTION_ORDER, MenuNode, tier_of
 
-# 元信息的重要程度就是它的固定顺序；模拟会话补上模型和分支，九项齐全
-META_ORDER = ['mcount-total', 'size', 'time', 'meta-node', 'cwd', 'meta-source', 'model', 'session-id', 'branch']
+# 元信息的重要程度就是它的固定顺序；模拟会话补上模型，八项齐全（git 分支不再显示）
+META_ORDER = ['mcount-total', 'size', 'time', 'meta-node', 'cwd', 'meta-source', 'model', 'session-id']
 META_KEY = '''e => e.id === 'mcount-total' ? e.id
   : e.classList.contains('session-id') ? 'session-id'
   : e.classList.contains('meta-node') ? 'meta-node'
   : e.classList.contains('meta-source') ? 'meta-source'
   : e.querySelector('code') ? 'cwd' : e.textContent.includes('→') ? 'time'
-  : e.textContent.trim().startsWith('⑂') ? 'branch'
   : /^[0-9.]+[BKM]$/.test(e.textContent.trim()) ? 'size' : 'model' '''
 HEAD_STATE_JS = f'''() => {{
   const id = b => b.id || (b.hasAttribute('data-report-bug') ? 'report-bug' : '');
@@ -156,7 +155,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         node = start_node('a' * 32, 'Sweep')
         node.RequestHandlerClass = MenuNode
-        node.state['row'].update({'model': 'claude-opus-5', 'branch': 'feat/fold-sweep'})
+        node.state['row'].update({'model': 'claude-opus-5', 'branch': 'feat/fold-sweep'})   # branch 是 API 字段，标题栏不再显示
         registry = hub.Registry(Path(tmp) / 'nodes.json', ['127.0.0.0/8'])
         registry.register({'name': 'Sweep', 'url': f'http://127.0.0.1:{node.server_port}',
                            'token': node.state['token']})
