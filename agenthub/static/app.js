@@ -2715,9 +2715,11 @@ function groupBy(list) {
   });
 }
 
-const itemMeta = s => (s.stale ? '离线缓存 · ' : '') + (s.pending ? `${fmtTime(s.updated)} · 等待首条消息`
-  : [fmtTime(s.updated), fmtSize(s.size), s.model || '',
-                       s.agents ? `⑂${s.agents}` : '',
+/** 列表项的元信息行（HTML）：子代理数带层级树小图标，和分层开关、子代理角标同一个图形；
+ *  ⑂ 留给标题栏里的 git 分支和 Codex 回退父会话链，两种"分叉"不混用。 */
+const itemMeta = s => (s.stale ? '离线缓存 · ' : '') + (s.pending ? `${esc(fmtTime(s.updated))} · 等待首条消息`
+  : [esc(fmtTime(s.updated)), esc(fmtSize(s.size)), esc(s.model || ''),
+                       s.agents ? `<span class="meta-agents" title="${s.agents} 个子代理">${uiIcon('tree')}${s.agents}</span>` : '',
                        s.hits ? `命中 ${s.hits}${s.hits_capped ? '+' : ''}` : '']
                       .filter(Boolean).join(' · '));
 
@@ -2748,7 +2750,7 @@ function patchSide(list) {
       const s = r.s;
       const m = n.querySelector('.m');
       const t = itemMeta(s);
-      if (m && m.textContent !== t) m.textContent = t;
+      if (m && m.dataset.meta !== t) { m.dataset.meta = t; m.innerHTML = t; }
       const title = n.querySelector('.t');
       if (title && title.textContent !== s.title) {
         title.title = s.title;
@@ -2785,7 +2787,7 @@ function nestLeadMarkup(r) {
 function agentRow(s, a, depth) {
   const it = el('div', 'item agent tree',
     `${nestLeadMarkup({s, agent: a, depth, kids: 0, closed: false})}
-     <span class="ico">${icon(s.source)}<span class="item-status"></span><span class="agent-mark" title="子代理" aria-hidden="true">${uiIcon('fork')}</span></span>
+     <span class="ico">${icon(s.source)}<span class="item-status"></span><span class="agent-mark" title="子代理" aria-hidden="true">${uiIcon('tree')}</span></span>
      <div class="body">
        <div class="t" title="${esc(a.title)}">${hl(a.title)}</div>
        <div class="m">${esc(agentMeta(s.uid, a))}</div>
@@ -2881,7 +2883,7 @@ function renderSide() {
          <span class="ico">${icon(s.source)}<span class="item-status"></span></span>
          <div class="body">
            <div class="t" title="${esc(s.title)}">${hl(s.title)}</div>
-           <div class="m">${esc(meta)}</div>
+           <div class="m" data-meta="${esc(meta)}">${meta}</div>
            ${S.view === 'date'
              ? `<div class="cwd" title="${esc(s.cwd)}" data-node-name="${esc(s.node_name || '')}">${timelineDirectoryMarkup(s)}</div>` : ''}
            ${s.snippet ? `<div class="snip">${hl(s.snippet)}</div>` : ''}
@@ -3723,7 +3725,7 @@ function head(m, total) {
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
-      ${m.branch ? `<span class="meta-secondary">⑂ ${esc(m.branch)}</span>` : ''}
+      ${m.branch ? `<span class="meta-secondary" title="${m.source === 'grok' ? 'Grok agent' : 'Git 分支'}">⑂ ${esc(m.branch)}</span>` : ''}
     </div>`)}
       </div>
     </div>`;
