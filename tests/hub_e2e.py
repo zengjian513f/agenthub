@@ -20,6 +20,16 @@ class MountedHub(hub.HubHandler):
         return super().dispatch()
 
 
+def contrast(fg, bg):
+    """WCAG contrast ratio of two ``rgb()`` / ``rgba()`` strings."""
+    def luminance(css):
+        channels = [float(v) for v in css[css.index('(') + 1:css.index(')')].replace('/', ',').split(',')[:3]]
+        linear = [c / 255 / 12.92 if c / 255 <= .03928 else ((c / 255 + .055) / 1.055) ** 2.4 for c in channels]
+        return .2126 * linear[0] + .7152 * linear[1] + .0722 * linear[2]
+    a, b = luminance(fg), luminance(bg)
+    return (max(a, b) + .05) / (min(a, b) + .05)
+
+
 def main():
     with tempfile.TemporaryDirectory() as root:
         nodes = [start_node(char * 32, name) for char, name in [('a', 'NodeA'), ('b', 'NodeB'), ('c', 'Vega')]]
@@ -166,6 +176,22 @@ def main():
                 nodes[1].state['pause_stream'] = False
                 # New-session machine changes both capabilities and directory suggestions.
                 page.locator('#new-session').click()
+                # Chromium 的原生下拉弹层用 select 自身的 background-color 做底色，弹层文档的 body
+                # 固定为白色：机器下拉在两种主题下都必须是与外框同色的不透明面板、字色可读
+                # （BUG-20260912-091845：深色主题下透明背景成了白底浅字）。
+                for theme in ['dark', 'light']:
+                    page.evaluate('(theme) => applyTheme(theme, true)', theme)
+                    picker = page.evaluate('''() => {
+                      const select = document.querySelector('#new-node');
+                      const own = getComputedStyle(select), wrap = getComputedStyle(select.parentElement);
+                      return {bg: own.backgroundColor, fg: own.color, wrap: wrap.backgroundColor,
+                              scheme: own.colorScheme, theme: document.documentElement.dataset.theme};
+                    }''')
+                    assert picker['theme'] == theme and picker['scheme'] == theme, picker
+                    assert picker['bg'].startswith('rgb('), picker   # 不透明，不是 rgba(0, 0, 0, 0)
+                    assert picker['bg'] == picker['wrap'], picker
+                    assert contrast(picker['fg'], picker['bg']) >= 7, picker
+                page.evaluate('applyTheme("system", true)')
                 page.locator('#new-node').select_option('b' * 32)
                 page.locator('#new-cwd').fill('/home/')
                 page.wait_for_function('cwdCompletion.rows.includes("/home/NodeB/work/")')

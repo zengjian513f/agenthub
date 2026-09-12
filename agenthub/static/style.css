@@ -470,9 +470,11 @@ button.machine-swatch:hover { box-shadow: 0 0 0 3px color-mix(in srgb, var(--nod
   padding: 0 4px 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2);
 }
 #new-node-label > span { flex: none; color: var(--muted); font-size: 12px; font-weight: 600; }
+/* Chromium 把 select 自身的 background-color 当作原生下拉弹层的底色，弹层文档的 body 固定为白色，
+   所以这里必须是不透明的面板色：透明背景在深色主题下会变成白底浅字。 */
 #new-node {
   flex: 1; min-width: 0; height: 37px; padding: 0; border: 0;
-  background: transparent; color: var(--text); font: 13px/1 var(--sans);
+  background: var(--panel-2); color: var(--text); font: 13px/1 var(--sans);
 }
 #new-node:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
 .new-source label { min-width: 0; cursor: pointer; }
