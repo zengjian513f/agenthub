@@ -202,7 +202,6 @@ function browserStateSnapshot(reason = '') {
         anchor: entry.anchor, activity: entry.activity?.state || '',
         outbox: queuedMessages(S.sel).map(item => ({id: item.id, state: item.state}))} : null,
       dom_messages: nodes.length, terminal: termState,
-      header: consoleButtonState(),
     },
     content: {
       composer: $('#cinput')?.value || '',
@@ -228,125 +227,6 @@ function scheduleBrowserSnapshot(reason = 'render') {
       browserAuditEvent('dom.snapshot', snapshot.data, snapshot.content);
     } catch { /* page can be between detail teardown and rebuild */ }
   }, 100);
-}
-
-// ---- 会话标题栏 / 控制台按钮的存在性审计 ----
-// 控制台按钮"偶尔消失"一直没抓到现场：快照只看消息，不看标题栏。这里独立记录
-// 按钮的三层状态——在不在 DOM、几何上有没有被裁掉/盖住（elementFromPoint）、
-// #right 有没有被滚走——任何一层不成立就记一条 console.button.missing，附上
-// 标题栏 HTML 和布局数据；恢复时记 console.button.restored。
-// 常规状态变化（文案、接管态、灰态、位置）按签名去重记 console.button.state。
-function consoleButtonState() {
-  const button = $('#a-term');
-  const right = $('#right');
-  const detail = $('#detail');
-  const head = detail?.querySelector(':scope > .dhead');
-  const shown = !!right && right.offsetWidth > 0;   // 手机列表页 #right 整个 display:none
-  const state = {
-    present: !!button, head: !!head, shown,
-    detail_children: detail ? [...detail.children].map(
-      node => node.id || node.className.split(' ')[0] || node.tagName.toLowerCase()).slice(0, 8) : null,
-    right_scroll: right ? [right.scrollLeft, right.scrollTop] : null,
-    right_overflow: right ? [right.scrollWidth - right.clientWidth, right.scrollHeight - right.clientHeight] : null,
-    tier: layoutTier(), mobile_detail: document.body.classList.contains('mobile-detail'),
-  };
-  if (button) {
-    const style = getComputedStyle(button);
-    state.label = button.ariaLabel || '';
-    state.on = button.classList.contains('on');
-    state.unavailable = button.dataset.unavailable === 'true';
-    state.hidden = button.hidden || style.display === 'none' || style.visibility !== 'visible'
-      || parseFloat(style.opacity) === 0;
-  }
-  if (button && shown) {
-    const r = button.getBoundingClientRect(), rr = right.getBoundingClientRect();
-    const hit = r.width && r.height && document.visibilityState === 'visible'
-      ? document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) : undefined;
-    state.rect = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
-    state.in_right = r.width > 0 && r.right <= rr.right + .5 && r.left >= rr.left - .5
-      && r.top >= rr.top - .5 && r.bottom <= rr.bottom + .5;
-    // 页面不可见时 elementFromPoint 一律 null，不算被遮
-    state.hit = hit === undefined ? null : !!hit && button.contains(hit);
-    state.hit_target = hit ? (hit.id ? '#' + hit.id : hit.className ? '.' + String(hit.className).split(' ')[0]
-      : hit.tagName.toLowerCase()) : null;
-  }
-  // 不在 DOM 一定算丢；在 DOM 但页面可见时被隐藏/裁掉/盖住也算丢
-  state.ok = state.present && (!shown || (!state.hidden && state.in_right && state.hit !== false));
-  return state;
-}
-
-let consoleButtonMissingSince = 0;
-let consoleButtonSignature = '';
-let consoleButtonTimer = 0;
-function auditConsoleButton(reason = '') {
-  let state;
-  try { state = consoleButtonState(); } catch { return; }
-  const content = () => {
-    const head = $('#detail > .dhead');
-    return {dhead: head ? head.outerHTML.slice(0, 12000) : null,
-      detail: $('#detail')?.innerHTML.slice(0, 2000) || null};
-  };
-  const term = typeof T === 'undefined' ? null : {
-    name: T.name, uid: T.uid, mode: T.mode, views: [...T.views.keys()],
-    visible: !$('#termpane')?.classList.contains('hidden'),
-  };
-  if (!state.ok) {
-    // 丢失期间最多 5 秒记一次，免得 MutationObserver/定时器把库刷爆
-    const now = Date.now();
-    if (consoleButtonMissingSince && now - consoleButtonMissingSince < 5000) return;
-    consoleButtonMissingSince = consoleButtonMissingSince || now;
-    browserAuditEvent('console.button.missing', {reason, ...state, selected: S.sel, agent: S.agent,
-      terminal: term}, content(), {severity: 'error'});
-    return;
-  }
-  if (consoleButtonMissingSince) {
-    browserAuditEvent('console.button.restored', {reason, ...state,
-      missing_ms: Date.now() - consoleButtonMissingSince, terminal: term}, null, {severity: 'warning'});
-    consoleButtonMissingSince = 0;
-  }
-  const signature = JSON.stringify([state.label, state.on, state.unavailable, state.rect, state.tier,
-    state.hit_target, state.right_scroll]);
-  if (signature === consoleButtonSignature) return;
-  consoleButtonSignature = signature;
-  browserAuditEvent('console.button.state', {reason, ...state, terminal: term});
-}
-function scheduleConsoleButtonAudit(reason = '') {
-  clearTimeout(consoleButtonTimer);
-  consoleButtonTimer = setTimeout(() => auditConsoleButton(reason), 150);
-}
-{
-  // #detail 换内容（读取中/失败/正式渲染/新会话页）时重新盯住新的标题栏；标题栏
-  // 内部的增删和 class/hidden/style 变化也触发检查。#msgs 的海量变动不在观察范围内。
-  const headObserver = new MutationObserver(() => scheduleConsoleButtonAudit('head-mutation'));
-  let observedHead = null;
-  const watchHead = () => {
-    const head = $('#detail > .dhead');
-    if (head === observedHead) return;
-    headObserver.disconnect();
-    observedHead = head;
-    if (head) headObserver.observe(head, {childList: true, subtree: true, attributes: true,
-      attributeFilter: ['class', 'hidden', 'style', 'aria-label']});
-  };
-  new MutationObserver(() => { watchHead(); scheduleConsoleButtonAudit('detail-mutation'); })
-    .observe($('#detail'), {childList: true});
-  watchHead();
-  // 裁切/滚走这类不改 DOM 的情况靠 #right 的 scroll 和低频巡检兜底
-  $('#right')?.addEventListener('scroll', () => scheduleConsoleButtonAudit('right-scroll'), {passive: true});
-  setInterval(() => { if (!document.hidden) auditConsoleButton('periodic'); }, 5000);
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) scheduleConsoleButtonAudit('visible');
-  });
-}
-
-/** #detail 每次换内容都记一笔：谁换的、换完有没有标题栏和控制台按钮。 */
-function auditDetailRendered(source, extra = {}) {
-  const detail = $('#detail');
-  browserAuditEvent('detail.rendered', {
-    source, selected: S.sel, agent: S.agent, ...extra,
-    has_head: !!detail?.querySelector(':scope > .dhead'), has_console_button: !!$('#a-term'),
-    children: detail ? [...detail.children].map(
-      node => node.id || node.className.split(' ')[0] || node.tagName.toLowerCase()).slice(0, 8) : null,
-  });
 }
 
 queueMicrotask(() => browserAuditEvent('page.loaded', {
