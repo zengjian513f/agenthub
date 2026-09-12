@@ -1333,6 +1333,33 @@ class ClaudeSubagentMetaTests(unittest.TestCase):
                          adapters._norm_ts("2026-09-12T00:41:00.000Z"))
         self.assertEqual(items["fresh"]["title"], "任务 fresh")
 
+    def test_late_copies_of_a_notice_and_refusal_do_not_flip_a_running_agent(self):
+        """父会话会把同一条通知的文本在 dequeue/re-enqueue/吸收成 user 时再写几遍，
+        时间可晚十几分钟；refusal 后 CLI 自动重试。两者都不能把已被唤起的子代理翻成已停。"""
+        self.agent("worker", [self.user("2026-09-12T00:10:00.000Z"),
+                              self.assistant("2026-09-12T00:19:00.600Z", "end_turn"),
+                              self.user("2026-09-12T00:19:00.700Z", "追加一条任务"),
+                              self.assistant("2026-09-12T00:19:30.000Z", "refusal"),
+                              self.assistant("2026-09-12T00:20:59.000Z", "tool_use", "tool")])
+        notice = self.notice("2026-09-12T00:19:00.650Z", "worker", "completed")
+        text = notice["attachment"]["prompt"]
+        late_copy = {"type": "queue-operation", "operation": "remove",
+                     "timestamp": "2026-09-12T00:21:00.400Z", "content": text}
+        re_enqueue = {"type": "queue-operation", "operation": "enqueue",
+                      "timestamp": "2026-09-12T00:33:00.000Z", "content": text}
+        absorbed = self.notice("2026-09-12T00:35:00.000Z", "worker", "completed", shape="user")
+        self.parent.write_text(self.dump(self.parent_rows + [
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-09-12T00:19:00.650Z", "content": text},
+            late_copy, notice, re_enqueue, absorbed]))
+
+        self.assertTrue(self.items()["worker"]["active"])
+
+        # 换一段新文本的通知（第二次真正停止）才算停
+        with self.parent.open("a") as fh:
+            fh.write(json.dumps(self.notice("2026-09-12T00:40:00.000Z", "worker", "failed")) + "\n")
+        self.assertFalse(self.items()["worker"]["active"])
+
     def test_stop_notices_are_read_incrementally_and_only_from_complete_lines(self):
         self.agent("worker", [self.user("2026-09-12T01:00:00.000Z"),
                               self.assistant("2026-09-12T01:05:00.000Z", None)])

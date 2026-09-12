@@ -179,7 +179,11 @@ def _first_jsonl_timestamp(path: Path, *, strict: bool = False) -> str | None:
 
 # Claude 子代理 transcript 没有 turn_duration；回合是否收尾只能看最后一条
 # assistant 记录的 stop_reason。
-_CLAUDE_TURN_CLOSED = frozenset({"end_turn", "stop_sequence", "refusal"})
+# 只有 end_turn 算收尾。207 份真实子代理 transcript 回放：refusal（分类器拒答）
+# 和 stop_sequence 之后 Claude Code 都会不写 user 记录直接续写 assistant，
+# 父会话也不会为此发停止通知；把它们当收尾会让绿点闪一下。end_turn 之后
+# 只会再出现同一条消息拆出的 text 块，仍是 end_turn。
+_CLAUDE_TURN_CLOSED = frozenset({"end_turn"})
 
 
 def _claude_agent_tail(path: Path) -> tuple[str | None, bool]:
@@ -225,11 +229,22 @@ def _codex_agent_tail(path: Path) -> tuple[str | None, bool]:
 
 
 _AGENT_TASK_ID = re.compile(rb"<task-id>([A-Za-z0-9_-]{1,64})</task-id>")
+_AGENT_NOTICE = re.compile(rb"<task-notification>.*?</task-notification>", re.S)
 _agent_stops_lock = threading.Lock()
 _agent_stops: dict[str, dict] = {}
 
 
-def _collect_agent_stops(raw: bytes, stops: dict[str, str]) -> None:
+def _collect_agent_stops(raw: bytes, entry: dict) -> None:
+    """把一行主会话记录里的子代理停止点并入 entry["stops"]。
+
+    同一条 task-notification 会写很多份：enqueue 时的 queue-operation 和
+    queued_command 附件带事件时刻；之后的 dequeue/remove、父会话忙时反复
+    re-enqueue、最终作为 user 记录被吸收，都是同一段文本带着更晚的时间再出现
+    一遍，最晚可差十几分钟。子代理若在其间已被 SendMessage 唤起，拿最晚的
+    拷贝当停止点就会把正在跑的子代理判成已停。所以按通知文本去重，只认每段
+    文本第一次出现的时刻。后台 Bash 任务的 task-id 也会进来，只是永远匹配不到
+    子代理。
+    """
     has_notice = b"<task-id>" in raw
     has_result = b'"agentId"' in raw and b'"tool_result"' in raw
     if not (has_notice or has_result):
@@ -243,22 +258,34 @@ def _collect_agent_stops(raw: bytes, stops: dict[str, str]) -> None:
     ts = _norm_ts(rec.get("timestamp"))
     if not ts:
         return
-    agent_ids = set()
+    stops, notices = entry["stops"], entry["notices"]
     if has_notice:
-        # 同一条 task-notification 会以 queue-operation、queued_command 附件或
-        # user 记录各写一遍，时间一致；哪一份都算停止点。后台 Bash 任务的
-        # task-id 也会进来，只是永远匹配不到子代理。
-        agent_ids.update(m.group(1).decode() for m in _AGENT_TASK_ID.finditer(raw))
+        for block in _AGENT_NOTICE.finditer(raw):
+            match = _AGENT_TASK_ID.search(block.group(0))
+            if not match:
+                continue
+            agent_id = match.group(1).decode()
+            digest = hashlib.sha1(block.group(0)).hexdigest()[:20]
+            seen = notices.get(digest)
+            if seen is not None and seen[1] <= ts:
+                continue
+            notices[digest] = (agent_id, ts)
+            if seen is None:
+                if ts > stops.get(agent_id, ""):
+                    stops[agent_id] = ts
+            else:
+                # 更早的拷贝反而后写入（附件排在 dequeue 之后）：重算该子代理的最晚停止点
+                stops[agent_id] = max((t for a, t in notices.values() if a == agent_id),
+                                      default="")
     if has_result:
         # 前台 Agent 调用没有 task-notification，结束时 tool_result 直接带
         # 完整结果；后台调用的 tool_result 只是 async_launched，不算停止。
         result = rec.get("toolUseResult")
         if (isinstance(result, dict) and result.get("agentId")
                 and result.get("status") != "async_launched"):
-            agent_ids.add(str(result["agentId"]))
-    for agent_id in agent_ids:
-        if ts > stops.get(agent_id, ""):
-            stops[agent_id] = ts
+            agent_id = str(result["agentId"])
+            if ts > stops.get(agent_id, ""):
+                stops[agent_id] = ts
 
 
 def _claude_agent_stops(path: Path) -> dict[str, str]:
@@ -275,7 +302,7 @@ def _claude_agent_stops(path: Path) -> dict[str, str]:
     with _agent_stops_lock:
         entry = _agent_stops.get(key)
         if entry is None or size < entry["size"]:
-            entry = {"size": 0, "stops": {}}
+            entry = {"size": 0, "stops": {}, "notices": {}}
         if size > entry["size"]:
             with open(path, "rb") as fh:
                 fh.seek(entry["size"])
@@ -283,7 +310,7 @@ def _claude_agent_stops(path: Path) -> dict[str, str]:
             lines = blob.split(b"\n")
             # 最后一段可能是尚未写完的半行，留到下次再解析。
             for raw in lines[:-1]:
-                _collect_agent_stops(raw, entry["stops"])
+                _collect_agent_stops(raw, entry)
             entry["size"] += len(blob) - len(lines[-1])
         _agent_stops[key] = entry
         return dict(entry["stops"])
