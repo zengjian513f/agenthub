@@ -2615,6 +2615,9 @@ function nestTree(list) {
   for (const s of list) {
     const parent = spawnParentOf(s, byKey);
     if (!parent) continue;
+    // compact/continue 会另写一份 JSONL，新进程常继承旧会话的环境变量，
+    // spawned_by 会误把「同一条对话的续写」当成派出去的孩子。
+    if (parent.continued_in === s.uid) continue;
     // 数据出环（A 由 B 发起、B 又由 A 发起）时后处理的那条留作根，树不会吞掉它
     let cur = parent, looped = false;
     for (let i = 0; cur && i < list.length; i++) {
@@ -2708,6 +2711,8 @@ function groupBy(list) {
 
 const itemMeta = s => (s.stale ? '离线缓存 · ' : '') + (s.pending ? `${fmtTime(s.updated)} · 等待首条消息`
   : [fmtTime(s.updated), fmtSize(s.size), s.model || '',
+                       s.continued_in && S.sessions.some(x => x.uid === s.continued_in) ? '已续写' : '',
+                       S.sessions.some(x => x.continued_in === s.uid) ? '续写' : '',
                        s.agents ? `⑂${s.agents}` : '',
                        s.hits ? `命中 ${s.hits}${s.hits_capped ? '+' : ''}` : '']
                       .filter(Boolean).join(' · '));
@@ -2850,10 +2855,8 @@ function renderSide() {
       const s = r.s;
       const meta = itemMeta(s);
       const pickable = S.picking && sessionPickable(s);
-      // 分层时正在看的子代理有自己那一行，主会话行不再一起亮。
-      // 收起时续写会话藏在父行下，父行要跟着亮，否则点开后续写会话却看不到选中。
-      const selected = (S.sel === s.uid && !(S.nest && S.agent))
-        || (!S.agent && r.closed && followContinuedSession(s.uid) === S.sel);
+      // 分层时正在看的子代理有自己那一行，主会话行不再一起亮
+      const selected = S.sel === s.uid && !(S.nest && S.agent);
       const it = el('div', 'item' + (selected ? ' sel' : '') + (r.closed ? ' nest-closed' : '')
                               + (s.pending ? (s.stale ? ' pending' : ' pending live live-tmux') : '')
                               + (!s.pending && S.live.has(s.uid) ? ' live' : '')
@@ -3011,23 +3014,12 @@ function ensureConsolePlaceholder() {
   showConsoleToast('');
 }
 
-/** Claude compact/continue 会另起一份 JSONL。父会话点开时跟到当前续写会话，
- *  与点控制台时 followReplacement 同一条身份，避免气泡停在已封口的旧文件上。 */
-function followContinuedSession(uid) {
-  const seen = new Set();
-  let cur = uid;
-  while (cur && !seen.has(cur)) {
-    seen.add(cur);
-    const next = S.sessions.find(s => s.uid === cur)?.continued_in;
-    if (!next || next === cur || !S.sessions.some(s => s.uid === next)) return cur;
-    cur = next;
-  }
-  return cur;
+function continuedPredecessor(uid) {
+  return S.sessions.find(s => s.continued_in === uid) || null;
 }
 
 async function openSession(uid, agent = null) {
   const selectedAgent = agent || null;
-  if (!selectedAgent) uid = followContinuedSession(uid);
   browserAuditEvent('session.opened', {agent: selectedAgent || '', cached: cache.has(viewKey(uid, selectedAgent))},
     null, {uid});
   showMobileDetail();
@@ -3709,6 +3701,7 @@ function head(m, total) {
       ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
+      ${continueMarkup(m)}
       ${spawnerMarkup(m)}
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
@@ -3718,7 +3711,7 @@ function head(m, total) {
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
   h.addEventListener('click', event => {
-    const link = event.target.closest('.meta-spawner');
+    const link = event.target.closest('.meta-spawner, .meta-continue');
     if (link) openSession(link.dataset.uid);
   });
   h.querySelector('#a-star').onclick = () => toggleSessionStar(m.uid);
@@ -3770,12 +3763,27 @@ function head(m, total) {
   return h;
 }
 
+/** compact/continue 另起的 JSONL：两边标题栏互相给入口，左栏两行都可点。 */
+function continueMarkup(m) {
+  if (m.agent_id) return '';
+  if (m.continued_in && S.sessions.some(s => s.uid === m.continued_in)) {
+    return `<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(m.continued_in)}"
+      title="打开续写后的当前会话">已续写</button></span>`;
+  }
+  const prev = continuedPredecessor(m.uid);
+  if (prev) {
+    return `<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(prev.uid)}"
+      title="查看续写前的完整记录">续写前的记录</button></span>`;
+  }
+  return '';
+}
+
 /** 标题栏元信息里的发起者：由哪条会话把它派出来的，点击就跳过去。 */
 function spawnerMarkup(m) {
   if (m.agent_id || !m.spawned_by) return '';
   const byKey = new Map(S.sessions.map(s => [spawnKey(s.node_id, s.source, s.sid), s]));
   const parent = spawnParentOf(m, byKey);
-  if (!parent) return '';
+  if (!parent || parent.continued_in === m.uid) return '';
   return `<span class="meta-secondary"><button type="button" class="meta-spawner" data-uid="${esc(parent.uid)}"
     title="由「${esc(parent.title)}」发起，点击打开">↰ ${esc(SOURCES[parent.source].name)} · ${esc(parent.title)}</button></span>`;
 }
