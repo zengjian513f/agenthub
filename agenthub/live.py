@@ -45,10 +45,12 @@ _ENV_SID = tuple(_ENV_FAMILY)
 _KEYWORDS = ("claude", "codex", "grok")
 # 一条会话由另一条 CLI 会话发起时, 子进程环境里留下的发起者身份。三家给工具子进程
 # 设的变量各不相同; CLAUDE_PID 直接指向父 Claude 进程, 裸 `claude` 没有 session id
-# 也能靠它认亲。
+# 也能靠它认亲。Codex 子代理线程的 CODEX_THREAD_ID 是它自己的 (列表里没有这条),
+# CODEX_SESSION_ID 才是根线程; 两个都收, 子代理派出去的会话归到根会话名下。
 SPAWN_ENV = {
     "CLAUDE_CODE_SESSION_ID": "claude",
     "CODEX_THREAD_ID": "codex",
+    "CODEX_SESSION_ID": "codex",
     "GROK_SESSION_ID": "grok",
 }
 SPAWN_ENV_KEYS = (*SPAWN_ENV, "CLAUDE_PID")

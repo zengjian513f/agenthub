@@ -283,6 +283,7 @@ class SpawnParentTests(unittest.TestCase):
     SID_CHILD = "dddddddd-4444-4444-8444-dddddddddddd"
     SID_WEB = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
     SID_TMUX = "ffffffff-6666-4666-8666-ffffffffffff"
+    SID_SUBAGENT_CHILD = "77777777-7777-4777-8777-777777777777"
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -306,6 +307,11 @@ class SpawnParentTests(unittest.TestCase):
         # Claude 直接派的子 Claude：命令行是自己的 id，环境里是父亲的
         proc.add(300, "claude", 101, f"claude -p --session-id {self.SID_CHILD}",
                  {"CLAUDE_CODE_SESSION_ID": self.SID_CLAUDE, "CLAUDE_PID": "100"})
+        # Codex 子代理线程派的子 Claude：CODEX_THREAD_ID 是子代理自己的线程（不是会话），
+        # CODEX_SESSION_ID 才是根线程
+        proc.add(310, "claude", 102, f"claude -p --session-id {self.SID_SUBAGENT_CHILD}",
+                 {"CODEX_THREAD_ID": "99999999-9999-4999-8999-999999999999",
+                  "CODEX_SESSION_ID": self.SID_CODEX})
         # 网页新建的会话：宿主由服务启动，环境里没有任何会话身份
         proc.add(400, "ptyhost", 4856, "ptyhost run --name agenthub-claude-eeeeeeee -- claude")
         proc.add(401, "claude", 400, f"claude --session-id {self.SID_WEB}")
@@ -334,9 +340,11 @@ class SpawnParentTests(unittest.TestCase):
         child = self.session("claude", self.SID_CHILD, "2026-09-12T11:10:00+08:00")
         web = self.session("claude", self.SID_WEB, "2026-09-12T11:20:00+08:00")
         in_tmux = self.session("claude", self.SID_TMUX, "2026-09-12T11:30:00+08:00")
-        sessions = [claude, codex, grok, child, web, in_tmux]
+        by_subagent = self.session("claude", self.SID_SUBAGENT_CHILD, "2026-09-12T11:40:00+08:00")
+        sessions = [claude, codex, grok, child, web, in_tmux, by_subagent]
         owned = {claude["uid"]: [100], codex["uid"]: [102], grok["uid"]: [201],
-                 child["uid"]: [300], web["uid"]: [401], in_tmux["uid"]: [501]}
+                 child["uid"]: [300], web["uid"]: [401], in_tmux["uid"]: [501],
+                 by_subagent["uid"]: [310]}
         with patch.dict(live._cache, {"at": 1.0}), \
                 patch.dict(live._spawn_cache, {"at": -1.0, "found": {}}):
             found = live.spawn_parents(sessions, owned)
@@ -345,6 +353,8 @@ class SpawnParentTests(unittest.TestCase):
             # 宿主环境里同时有祖父 Claude 与父亲 Codex，父亲更晚出生
             grok["uid"]: {"source": "codex", "sid": self.SID_CODEX},
             child["uid"]: {"source": "claude", "sid": self.SID_CLAUDE},
+            # 祖先链上有 Codex 主进程 (102) 也有更早的 Claude (100)，Codex 更晚出生
+            by_subagent["uid"]: {"source": "codex", "sid": self.SID_CODEX},
         })
 
     def test_results_are_memoised_per_scan_and_skip_recorded(self):
