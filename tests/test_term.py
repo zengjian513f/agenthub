@@ -1,3 +1,5 @@
+import errno
+import os
 import unittest
 import shlex
 import struct
@@ -81,6 +83,73 @@ class NewSessionDirectoryTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "不是目录"):
                 term.new_cli_session("codex", str(target), create_cwd=True)
             self.assertTrue(target.is_file())
+
+
+class WindowsCliLookupTests(unittest.TestCase):
+    """Cetus 上 winget 装的 Codex/Grok 是 WinGet\\Links 下的符号链接。提权启动的
+    节点服务穿越不了它们（ERROR_UNTRUSTED_MOUNT_POINT），stat 直接报错，于是
+    /api/term/list 把两家都报成不可用，中央的新建会话按钮变灰。"""
+
+    UNTRUSTED = "无法遍历该路径，因为它包含不受信任的装入点。"
+
+    def _links(self, tmp, source, target_name, link_target=None):
+        pkg = term.Path(tmp) / "pkg"
+        pkg.mkdir(exist_ok=True)
+        exe = pkg / target_name
+        exe.write_bytes(b"MZ")
+        exe.chmod(0o755)
+        links = term.Path(tmp) / "Links"
+        links.mkdir(exist_ok=True)
+        link = links / f"{source}.exe"
+        # winget 的替换名带 \\?\ 前缀，os.readlink 原样返回。
+        os.symlink(link_target if link_target is not None else "\\\\?\\" + str(exe), link)
+        return links, link, exe
+
+    def _windows(self, links, blocked):
+        real_stat = os.stat
+
+        def elevated_stat(path, *args, **kwargs):
+            if kwargs.get("follow_symlinks", True) and os.fspath(path) in blocked:
+                raise OSError(errno.EINVAL, self.UNTRUSTED, os.fspath(path))
+            return real_stat(path, *args, **kwargs)
+
+        return (patch.object(term, "WINDOWS", True),
+                patch.dict(os.environ, {"PATH": str(links), "PATHEXT": ".COM;.EXE;.BAT;.CMD"}),
+                patch.object(os, "stat", elevated_stat))
+
+    def test_untraversable_winget_link_resolves_to_its_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            links, link, exe = self._links(tmp, "codex", "codex-x86_64-pc-windows-msvc.exe")
+            w, env, stat = self._windows(links, {str(link)})
+            with w, env, stat, patch.object(term.Path, "home", return_value=term.Path(tmp)):
+                self.assertFalse(os.path.exists(link))   # 服务进程看到的就是这样
+                self.assertEqual(term._which_cli("codex"), str(exe))
+                self.assertTrue(term.available_sources()["codex"])
+                self.assertFalse(term.available_sources()["grok"])
+
+    def test_relative_link_target_resolves_against_the_link_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            links, link, exe = self._links(tmp, "grok", "grok.exe",
+                                           link_target=os.path.join("..", "pkg", "grok.exe"))
+            w, env, stat = self._windows(links, {str(link)})
+            with w, env, stat, patch.object(term.Path, "home", return_value=term.Path(tmp)):
+                self.assertEqual(os.path.normpath(term._which_cli("grok")), str(exe))
+
+    def test_dangling_link_is_not_reported_as_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            links, link, exe = self._links(tmp, "codex", "codex.exe")
+            exe.unlink()
+            w, env, stat = self._windows(links, {str(link)})
+            with w, env, stat, patch.object(term.Path, "home", return_value=term.Path(tmp)):
+                self.assertIsNone(term._which_cli("codex"))
+
+    def test_extended_length_prefix_is_stripped(self):
+        self.assertEqual(term._strip_extended_prefix("\\\\?\\C:\\Users\\zj\\codex.exe"),
+                         "C:\\Users\\zj\\codex.exe")
+        self.assertEqual(term._strip_extended_prefix("\\\\?\\UNC\\srv\\share\\codex.exe"),
+                         "\\\\srv\\share\\codex.exe")
+        self.assertEqual(term._strip_extended_prefix("C:\\Users\\zj\\codex.exe"),
+                         "C:\\Users\\zj\\codex.exe")
 
 
 class TerminalSubmitTests(unittest.TestCase):

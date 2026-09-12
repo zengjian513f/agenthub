@@ -158,5 +158,14 @@ Rust 单测覆盖屏幕模型（滚动历史分页、软换行合并、宽字符
 Windows 上节点服务由用户自己启动，没有做自启。注意不要用计划任务：它把服务放进不允许
 breakaway 的 Job，ptyhost 接管会话时 `CREATE_BREAKAWAY_FROM_JOB` 会被拒（WinError 5）。
 
+**winget 装的 CLI 是符号链接，提权进程穿越不了。** `winget install` 的可移植包（Codex、Grok CLI）
+本体在 `%LOCALAPPDATA%\Microsoft\WinGet\Packages\…`，PATH 上只有
+`%LOCALAPPDATA%\Microsoft\WinGet\Links\codex.exe` 这样的符号链接。管理员从 OpenSSH 里起的
+服务拿的是提权令牌（High integrity），Windows 不让它穿越用户目录里的重解析点：`os.stat`、
+`os.path.exists`、直接按链接 `CreateProcess` 全部报 `ERROR_UNTRUSTED_MOUNT_POINT`（448），
+`shutil.which` 因此找不到，而交互桌面和 `where codex` 都正常。`term._which_cli` 在 `shutil.which`
+与 `~/.local/bin` 都落空后，按 PATH 与 PATHEXT 找到链接并自己 `os.readlink`，用目标 exe 检测和
+启动（`live.py` 已按 `codex-*` 前缀认主进程）。
+
 还差：`adapters.py` 识别 Windows 项目目录 slug 与盘符路径（Claude Code 会把 cwd 写进 JSONL，
 所以多数会话的分组是对的，回退解码才会出错）、文件管理器的根目录判断。

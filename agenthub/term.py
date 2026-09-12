@@ -232,8 +232,56 @@ def _which_cli(source: str) -> str | None:
         candidates += [home / ".local" / "bin" / f"{source}.exe",
                        home / ".local" / "bin" / f"{source}.cmd"]
     for p in candidates:
-        if p.is_file() and os.access(p, os.X_OK):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
             return str(p)
+    if WINDOWS:
+        return _which_untraversable_link(source)
+    return None
+
+
+def _strip_extended_prefix(path: str) -> str:
+    """把 os.readlink 在 Windows 上返回的 ``\\\\?\\`` 替换名还原成普通路径。"""
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
+def _which_untraversable_link(source: str) -> str | None:
+    """PATH 里只有一个提权进程无法穿越的符号链接时，直接返回链接目标。
+
+    winget 把可移植包（Codex、Grok CLI）装成 ``%LOCALAPPDATA%\\Microsoft\\WinGet\\Links``
+    下的符号链接。节点服务由管理员从 OpenSSH 里启动时拿的是提权令牌，Windows
+    不允许它穿越用户目录里的重解析点（ERROR_UNTRUSTED_MOUNT_POINT, 448）：
+    ``os.stat`` / ``os.path.exists`` 对链接本身就报错，shutil.which 和按链接
+    启动都失败，而 ``where codex`` 明明找得到。链接内容仍可读，目标文件也能直接
+    执行，所以按 PATH 与 PATHEXT 找到链接后自己解引用，用目标路径检测和启动。
+    """
+    exts = [ext for ext in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(";")
+            if ext]
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        try:
+            entries = {name.lower(): name for name in os.listdir(directory)}
+        except OSError:
+            continue
+        for ext in exts:
+            name = entries.get(f"{source}{ext}".lower())
+            if name is None:
+                continue
+            link = os.path.join(directory, name)
+            try:
+                if not os.path.islink(link):
+                    continue
+                target = _strip_extended_prefix(os.readlink(link))
+            except OSError:
+                continue
+            if not os.path.isabs(target):
+                target = os.path.join(directory, target)
+            if os.path.isfile(target) and os.access(target, os.X_OK):
+                return target
     return None
 
 
