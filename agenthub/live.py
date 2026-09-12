@@ -4,7 +4,10 @@
   - Codex  常驻持有会话文件的 fd     → /proc/<pid>/fd 直接给出文件路径
   - Claude 进程参数带 session id     → --session-id / --resume, 子进程还有 CLAUDE_CODE_SESSION_ID
     (子进程只在能沿进程树找到活着的 CLI 时才算数; CLI 退出后遗留的后台脚本不算)
-  - Grok   自己维护活跃会话清单       → ~/.grok/active_sessions.json
+  - Grok   TUI 维护活跃会话清单       → ~/.grok/active_sessions.json
+    headless / `grok -p` 不进那份清单, 也不带 --session-id, 但常驻打开会话目录里
+    的 events.jsonl (chat_history.jsonl 写完就关)。主进程只认本家的会话环境变量,
+    避免 Claude 拉起的 grok -p 把父会话的 CLAUDE_CODE_SESSION_ID 当成自己的身份。
 
 全部只读 /proc 与状态文件, 不触碰任何 CLI 进程。
 
@@ -33,7 +36,12 @@ from pathlib import Path
 GROK_ACTIVE = Path.home() / ".grok" / "active_sessions.json"
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _CMD_SID = re.compile(rf"--session-id[= ]({_UUID})|--resume[= ]({_UUID})")
-_ENV_SID = ("CLAUDE_CODE_SESSION_ID=", "CODEX_COMPANION_SESSION_ID=", "GROK_SESSION_ID=")
+_ENV_FAMILY = {
+    "CLAUDE_CODE_SESSION_ID=": "claude",
+    "CODEX_COMPANION_SESSION_ID=": "codex",
+    "GROK_SESSION_ID=": "grok",
+}
+_ENV_SID = tuple(_ENV_FAMILY)
 _KEYWORDS = ("claude", "codex", "grok")
 
 PROC_FS = Path("/proc")
@@ -59,6 +67,18 @@ def _cli_name(argv0: str) -> str:
     """命令名: 去掉目录和 Windows 的 .exe, 统一小写。两种路径分隔符都认。"""
     head = ntpath.basename(posixpath.basename(argv0.strip())).lower()
     return head[:-4] if head.endswith(".exe") else head
+
+
+def _cli_family(argv0: str) -> str | None:
+    """claude / codex / grok。用来拒绝跨家继承的会话环境变量。"""
+    head = _cli_name(argv0)
+    if head == "grok" or head.startswith("grok-"):
+        return "grok"
+    if head == "claude" or head.startswith("claude-"):
+        return "claude"
+    if head == "codex" or head.startswith("codex-"):
+        return "codex"
+    return None
 
 
 def _is_cli(cmd: str) -> bool:
@@ -162,6 +182,53 @@ def _cli_ancestor(pid: int) -> int | None:
     return None
 
 
+def _env_owner(pid: int, *, main: bool, argv0: str, cmd_sids: set[str],
+               env_key: str, env_sid: str) -> int | None:
+    """这个环境变量是不是当前 CLI 的身份。
+
+    主进程若已在命令行里表明身份，环境里继承来的旧 session id 不算。
+    Grok 只认 GROK_SESSION_ID：Claude 用 `grok -p` 拉起的进程会带上父会话的
+    CLAUDE_CODE_SESSION_ID，不能因此把 Grok 进程算到 Claude 头上。
+    Claude 底下的 Codex companion 仍可凭 CODEX_COMPANION_SESSION_ID 认领。
+    """
+    if main and cmd_sids and env_sid not in cmd_sids:
+        return None
+    owner = pid if main else _cli_ancestor(pid)
+    if owner is None:
+        return None
+    if main:
+        proc_family = _cli_family(argv0)
+    else:
+        owner_cmd = _process_cmdline(owner)
+        proc_family = _cli_family(
+            owner_cmd.strip().split(" ", 1)[0]) if owner_cmd else None
+    env_family = _ENV_FAMILY.get(env_key)
+    if proc_family == "grok" and env_family != "grok":
+        return None
+    if main and proc_family and env_family and proc_family != env_family:
+        return None
+    return owner
+
+
+def _session_path_pids(paths: dict[str, set[int]], session: dict) -> set[int]:
+    """会话 path 及其目录下被打开的 jsonl。
+
+    Grok 的 path 是会话目录。TUI 偶发打开 chat_history.jsonl；headless /
+    `grok -p` 常驻打开的是同目录的 events.jsonl。
+    """
+    found: set[int] = set()
+    path = str(session.get("path") or "")
+    if not path:
+        return found
+    found |= paths.get(path, set())
+    prefix = path.rstrip("/") + "/"
+    found |= paths.get(prefix + "chat_history.jsonl", set())
+    for held, pids in paths.items():
+        if held.startswith(prefix):
+            found |= pids
+    return found
+
+
 def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[str, float]]]:
     """返回 (会话id → pid集合, 会话文件路径 → pid集合)。"""
     sids: dict[str, set[int]] = {}
@@ -205,19 +272,22 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
             except (OSError, RuntimeError):
                 pass
 
+        argv0 = cmd.strip().split(" ", 1)[0]
         try:
             for e in (PROC_FS / spid / "environ").read_bytes().decode("utf8", "replace").split("\0"):
-                if e.startswith(_ENV_SID):
-                    env_sid = e.split("=", 1)[1].strip().lower()
-                    if main and cmd_sids and env_sid not in cmd_sids:
-                        continue
-                    owner = pid if main else _cli_ancestor(pid)
-                    if owner is None:
-                        # 环境变量只是继承来的。CLI 退出后被 setsid/nohup 留下的
-                        # 后台脚本仍带着 session id，但它们不是会话的运行实例：
-                        # 沿进程树找不到活着的 CLI，就不能把会话标成活跃。
-                        continue
-                    note(sids, env_sid, owner)
+                matched = next((prefix for prefix in _ENV_SID if e.startswith(prefix)), None)
+                if not matched:
+                    continue
+                env_sid = e.split("=", 1)[1].strip().lower()
+                owner = _env_owner(pid, main=main, argv0=argv0, cmd_sids=cmd_sids,
+                                   env_key=matched, env_sid=env_sid)
+                if owner is None:
+                    # 环境变量只是继承来的。CLI 退出后被 setsid/nohup 留下的
+                    # 后台脚本仍带着 session id，但它们不是会话的运行实例：
+                    # 沿进程树找不到活着的 CLI，就不能把会话标成活跃。
+                    # Grok -p 继承的父 Claude 会话 id 同样不算。
+                    continue
+                note(sids, env_sid, owner)
         except OSError:
             pass
 
@@ -302,6 +372,7 @@ def _scan_psutil() -> tuple[dict[str, set[int]], dict[str, set[int]],
             env = proc.environ()
         except Exception:
             env = {}
+        argv0 = argv[0] if argv else ""
         for prefix in _ENV_SID:
             value = env.get(prefix[:-1])
             if not value:
@@ -309,9 +380,9 @@ def _scan_psutil() -> tuple[dict[str, set[int]], dict[str, set[int]],
             env_sid = value.strip().lower()
             # 同 /proc 那条路：主进程若已在命令行里表明身份，环境里继承来的旧
             # session id 不算数，否则新旧两个会话会一起被标成活跃。
-            if main and cmd_sids and env_sid not in cmd_sids:
-                continue
-            owner = pid if main else _cli_ancestor(pid)
+            # Grok -p 继承的父 Claude 会话 id 同样不算。
+            owner = _env_owner(pid, main=main, argv0=argv0, cmd_sids=cmd_sids,
+                               env_key=prefix, env_sid=env_sid)
             if owner is None:                 # 同上：找不到活着的 CLI 就不算
                 continue
             note(sids, env_sid, owner)
@@ -368,8 +439,7 @@ def pids_of(session: dict, force: bool = False) -> list[int]:
     sid = str(session.get("sid", "")).lower()
     if sid:
         found |= sids.get(sid, set())
-    for p in (session["path"], f'{session["path"]}/chat_history.jsonl'):
-        found |= paths.get(p, set())
+    found |= _session_path_pids(paths, session)
     found |= _bare_claude_pids(session)
     return sorted(found)
 
@@ -377,8 +447,7 @@ def pids_of(session: dict, force: bool = False) -> list[int]:
 def is_live(session: dict, force: bool = False) -> bool:
     sids, paths = snapshot(force)
     sid = str(session.get("sid", "")).lower()
-    return bool((sid and sid in sids) or session["path"] in paths
-                or f'{session["path"]}/chat_history.jsonl' in paths
+    return bool((sid and sid in sids) or _session_path_pids(paths, session)
                 or _bare_claude_pids(session))
 
 

@@ -188,9 +188,9 @@ systemd 部署使用独立的 [`deploy/agenthub-tmux.service`](deploy/agenthub-t
 |---|---|
 | Codex | 常驻持有会话文件的 fd → `/proc/<pid>/fd` 直接给出文件路径 |
 | Claude | 进程参数 `--session-id` / `--resume <uuid>`，子进程还有 `CLAUDE_CODE_SESSION_ID` 环境变量（只在沿进程树能找到活着的 CLI 时才算；CLI 退出后遗留的 `setsid`/`nohup` 后台脚本不算） |
-| Grok | 自己维护 `~/.grok/active_sessions.json` |
+| Grok | TUI 维护 `~/.grok/active_sessions.json`。Claude 用 `grok -p` 拉起的 headless 会话不进那份清单、命令行也没有 `--session-id`，靠会话目录里常驻打开的 `events.jsonl`（`chat_history.jsonl` 写完就关）。Grok 主进程不认继承来的 `CLAUDE_CODE_SESSION_ID` |
 
-Claude 和 Grok 写完就关文件，所以**不能只靠 fd**；反过来 Codex 的会话 id 不出现在命令行里，所以也不能只认 session id。扫描约 40ms，服务端缓存 3s。
+Claude 写完就关文件，所以**不能只靠 fd**。Grok TUI 同样关 `chat_history.jsonl`，但 headless / `grok -p` 会常驻打开同目录的 `events.jsonl`。Codex 的会话 id 不出现在命令行里，所以也不能只认 session id。扫描约 40ms，服务端缓存 3s。
 
 被运行中的会话选中时，增量同步间隔自动从 10s 缩到 3s。
 

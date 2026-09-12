@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import time
@@ -100,13 +101,16 @@ class FakeProc:
     def __init__(self, root: Path):
         self.root = root
 
-    def add(self, pid: int, comm: str, ppid: int, cmdline: str, env: dict | None = None):
+    def add(self, pid: int, comm: str, ppid: int, cmdline: str,
+            env: dict | None = None, fds: dict[int, str] | None = None):
         d = self.root / str(pid)
         (d / "fd").mkdir(parents=True)
         (d / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
         (d / "stat").write_text(f"{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n")
         (d / "environ").write_bytes(b"".join(
             f"{k}={v}".encode() + b"\0" for k, v in (env or {}).items()))
+        for fd, target in (fds or {}).items():
+            os.symlink(target, d / "fd" / str(fd))
 
 
 class InheritedSessionEnvTests(unittest.TestCase):
@@ -200,6 +204,74 @@ class CodexForkOwnershipTests(unittest.TestCase):
         self.assertEqual(uids, [parent["uid"], child["uid"]])
         self.assertEqual(owned[parent["uid"]], [111])
         self.assertEqual(owned[child["uid"]], [222])
+
+
+class GrokHeadlessLiveTests(unittest.TestCase):
+    """Claude 用 grok -p 拉起的 headless 会话：不进 active_sessions.json。"""
+
+    SID_GROK = "01a09418-a82e-7370-9303-9c4fcf0b20c3"
+    SID_CLAUDE = "c357894e-ac88-4c9e-823e-3b5a9c19b9c0"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.grok_dir = (root / "home" / ".grok" / "sessions"
+                         / "%2Ftmp%2Fproject" / self.SID_GROK)
+        self.grok_dir.mkdir(parents=True)
+        self.events = self.grok_dir / "events.jsonl"
+        self.events.write_text("{}\n")
+        (self.grok_dir / "chat_history.jsonl").write_text("{}\n")
+        proc = FakeProc(root / "proc")
+        proc.add(1, "systemd", 0, "/sbin/init")
+        proc.add(100, "claude", 1, f"claude --resume {self.SID_CLAUDE}")
+        proc.add(200, "grok", 100,
+                 "/home/zj/.local/bin/grok -p do the task --cwd /tmp/project",
+                 env={"CLAUDE_CODE_SESSION_ID": self.SID_CLAUDE},
+                 fds={36: str(self.events)})
+        patches = [
+            patch.object(live, "PROC_FS", proc.root),
+            patch.object(live, "HAS_PROC", True),
+            patch.object(live, "GROK_ACTIVE", root / "missing-grok.json"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def grok_session(self):
+        return {
+            "uid": "grok:headless", "source": "grok", "sid": self.SID_GROK,
+            "cwd": "/tmp/project", "path": str(self.grok_dir),
+            "created": "2026-09-12T13:30:39+08:00",
+        }
+
+    def claude_session(self):
+        return {
+            "uid": "claude:parent", "source": "claude", "sid": self.SID_CLAUDE,
+            "cwd": "/tmp/project", "path": "/tmp/parent.jsonl",
+            "created": "2026-09-12T12:00:00+08:00",
+        }
+
+    def test_events_jsonl_fd_marks_headless_grok_live(self):
+        sids, paths, _bare = live._scan()
+        grok, claude = self.grok_session(), self.claude_session()
+
+        self.assertEqual(paths.get(str(self.events)), {200})
+        self.assertNotIn(self.SID_GROK, sids)
+        self.assertEqual(sids.get(self.SID_CLAUDE), {100})
+
+        cache = {"at": time.monotonic(), "sids": sids, "paths": paths, "bare_claude": {}}
+        with patch.dict(live._cache, cache, clear=True):
+            self.assertTrue(live.is_live(grok))
+            self.assertEqual(live.pids_of(grok), [200])
+            uids, owned = live.active_processes([grok, claude])
+            self.assertEqual(uids, [grok["uid"], claude["uid"]])
+            self.assertEqual(owned[grok["uid"]], [200])
+            self.assertEqual(owned[claude["uid"]], [100])
+
+    def test_inherited_claude_session_id_is_not_grok_identity(self):
+        sids, _paths, _bare = live._scan()
+        self.assertNotIn(200, sids.get(self.SID_CLAUDE, set()))
 
 
 if __name__ == "__main__":
