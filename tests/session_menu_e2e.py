@@ -64,9 +64,8 @@ def header_ids(page):
         'buttons => buttons.map(b => b.id || (b.hasAttribute("data-report-bug") ? "report-bug" : ""))')
 
 
-# 各级固定平铺在标题栏上的操作；其余操作在元信息全放下、还有空位时才按原顺序平铺出来
+# 标题栏一行的重要程度：先是操作（按菜单顺序），再是元信息；任何档位都按这个顺序平铺、从末尾折
 ACTION_ORDER = ['a-star', 'a-turns', 'report-bug', 'a-session-action']
-FIXED_INLINE = {'wide': ACTION_ORDER, 'medium': ['a-star'], 'narrow': []}
 
 
 def menu_action_ids(page):
@@ -75,25 +74,22 @@ def menu_action_ids(page):
 
 
 def assert_actions_fold(page, tier):
-    """标题栏不因折叠留白：固定平铺的一定在外面；菜单里剩的是 ACTION_ORDER 的一段后缀；
-    有操作在菜单里时元信息全放下了才会多平铺，且剩余空位放不下菜单里的第一项；菜单空了 ⋯ 不显示。"""
+    """标题栏不因折叠留白：平铺的操作是 ACTION_ORDER 的前缀、菜单里剩的是后缀；有操作在菜单里时
+    元信息一项也不平铺（次要的不能露在重要的前面），且剩余空位放不下菜单里的第一项；菜单空了 ⋯ 不显示。"""
     inline = header_ids(page)
     in_menu = menu_action_ids(page)
     brief, meta = meta_split(page)
     expected = ['a-term'] + [i for i in ACTION_ORDER if i not in in_menu] + (['a-more'] if in_menu or meta else [])
     assert inline == expected, (inline, expected)
-    assert all(i not in in_menu for i in FIXED_INLINE[tier]), (tier, in_menu)
     assert in_menu == ACTION_ORDER[len(ACTION_ORDER) - len(in_menu):], in_menu
-    extra = [i for i in ACTION_ORDER if i not in in_menu and i not in FIXED_INLINE[tier]]
-    if extra:
-        assert not meta, (extra, meta)
-    if in_menu and not meta:
+    if in_menu:
+        assert not brief, (in_menu, brief)
         layout = page.evaluate('''() => {
-          const brief = document.querySelector('.dbrief'), h2 = document.querySelector('.dhead h2');
+          const h2 = document.querySelector('.dhead h2');
           const actions = document.querySelector('.dhead-actions');
-          const last = brief && !brief.hidden ? brief : h2;
-          return {free: actions.getBoundingClientRect().left - last.getBoundingClientRect().right,
-                  gap: parseFloat(getComputedStyle(actions).columnGap)};
+          return {free: actions.getBoundingClientRect().left - h2.getBoundingClientRect().right,
+                  gap: parseFloat(getComputedStyle(actions).columnGap)
+                    + parseFloat(getComputedStyle(document.querySelector('.dtitle')).columnGap) * 2};
         }''')
         open_actions(page)
         width = page.locator('#session-actions-menu [role="menu"] > *').first.evaluate(
@@ -389,20 +385,20 @@ def main():
                         # report/stop actions before any native JSONL exists.
                         page.evaluate('''() => showNewSessionStage({name: 'pending-menu',
                           source: 'claude', title: 'New session', cwd: '/example/project', node_name: 'MenuNode'})''')
-                        # 临时会话的元信息很短，中窄屏也常常全放得下，这时报告/停止也平铺出来、⋯ 消失
+                        # 临时会话只有报告/停止两个操作和四项元信息：同样先操作后元信息，放得下的都平铺、⋯ 才消失
                         pending_actions = ['report-bug', 'a-session-action']
+                        pending_meta = ['mcount-total', 'meta-node', 'cwd', 'meta-source']   # 上面显式给了 node_name
                         in_menu = menu_action_ids(page)
                         brief, folded = meta_split(page)
                         assert in_menu == pending_actions[len(pending_actions) - len(in_menu):], in_menu
                         assert header_ids(page) == ['a-term'] + [i for i in pending_actions if i not in in_menu] + (
                             ['a-more'] if in_menu or folded else []), header_ids(page)
+                        placed = [i for i in pending_actions if i not in in_menu] + brief
+                        assert placed == (pending_actions + pending_meta)[:len(placed)], (placed, in_menu, folded)
                         if wide:
                             assert not in_menu and not folded, (in_menu, folded)
-                        elif in_menu != pending_actions:
-                            assert not folded, (in_menu, folded)
                         assert page.locator('.dhead').bounding_box()['height'] <= 46
                         assert page.locator('.dhead h2 > .ico > #dlive.visible.tmux').count() == 1
-                        pending_meta = ['mcount-total', 'meta-node', 'cwd', 'meta-source']   # 上面显式给了 node_name
                         assert brief + folded == pending_meta, (brief, folded)
                         open_actions(page)
                         assert page.locator('#a-session-action').get_attribute('aria-label') == '停止会话'

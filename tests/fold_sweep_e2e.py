@@ -5,9 +5,9 @@
   顶栏：折起的一定是优先级末尾连续几个（设置 → 报告 → 回收站 → 重新扫描 → 新建），
         菜单保持平铺顺序，筛选条不被挤压（除非五个都折了），折了就再放一个也放不下，
         全平铺时 ⋯ 不占位；同一档位内宽度越窄折得只多不少。
-  标题栏：平铺的一定是「本档固定平铺的操作 → 元信息（消息数、大小、时间、机器、目录、来源、模型、
-        会话号、分支）→ 其余操作」这条优先级的前缀，放不下的从末尾起进 ⋯；菜单空了 ⋯ 不显示；
-        窄屏标题不为元信息让位；同一档位内宽度越窄平铺得只少不多。
+  标题栏：平铺的一定是「操作（星标 → 折叠过程 → 报告 → 停止/删除）→ 元信息（消息数、大小、时间、
+        机器、目录、来源、模型、会话号、分支）」这条优先级的前缀，放不下的从末尾起进 ⋯（元信息先折、
+        按钮后折）；菜单空了 ⋯ 不显示；窄屏标题不让位；同一档位内宽度越窄平铺得只少不多。
 拖分割线只改详情区宽度，标题栏按同一顺序进出，宽屏与中屏各扫一遍。
 """
 import sys
@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 from agenthub import hub, server
 from hub_e2e import HEADER_ACTIONS, HEADER_FOLD_JS, MountedHub
 from hub_fixture import start_node, stop
-from session_menu_e2e import ACTION_ORDER, FIXED_INLINE, MenuNode, tier_of
+from session_menu_e2e import ACTION_ORDER, MenuNode, tier_of
 
 # 元信息的重要程度就是它的固定顺序；模拟会话补上模型和分支，九项齐全
 META_ORDER = ['mcount-total', 'size', 'time', 'meta-node', 'cwd', 'meta-source', 'model', 'session-id', 'branch']
@@ -58,8 +58,8 @@ HEAD_STATE_JS = f'''() => {{
 FIRST_MENU_WIDTH_JS = '''() => {
   const menu = document.querySelector('#session-actions-menu');
   const was = menu.hidden; menu.hidden = false;
-  const item = document.querySelector('#session-actions-menu .dmeta > *')
-    || document.querySelector('#session-actions-menu [role="menu"] > *');
+  const item = document.querySelector('#session-actions-menu [role="menu"] > *')
+    || document.querySelector('#session-actions-menu .dmeta > *');
   const width = item ? item.getBoundingClientRect().width : 0;
   menu.hidden = was;
   return width;
@@ -100,25 +100,20 @@ def check_header(page, width, tiers):
 
 
 def head_priority(tier, meta_order):
-    """标题栏一行上的重要程度：本档固定平铺的操作、元信息、其余操作。"""
-    fixed = FIXED_INLINE[tier]
-    return fixed + meta_order + [a for a in ACTION_ORDER if a not in fixed]
+    """标题栏一行上的重要程度：先操作（菜单顺序），后元信息；各档位相同。"""
+    return ACTION_ORDER + meta_order
 
 
 def check_head(page, width, tier, tiers, key, meta_order):
     """一个宽度（或分割线位置）上的标题栏不变量；tiers 按档位记录平铺项数用于单调性。"""
     state = page.evaluate(HEAD_STATE_JS)
     where = f'{key}@{width}'
-    fixed = FIXED_INLINE[tier]
-    rest = [a for a in ACTION_ORDER if a not in fixed]
     priority = head_priority(tier, meta_order)
     inline_actions = [i for i in state['inline'] if i not in ('a-term', 'a-more')]
-    extra = [i for i in inline_actions if i not in fixed]
-    placed = [i for i in inline_actions if i in fixed] + state['brief'] + extra
+    placed = inline_actions + state['brief']
     assert placed == priority[:len(placed)], (where, placed, priority, state)
     assert state['brief'] + state['menu_meta'] == meta_order, (where, state)
-    assert state['menu_actions'] == rest[len(rest) - len(state['menu_actions']):], (where, state)
-    assert set(extra) | set(state['menu_actions']) == set(rest), (where, state)
+    assert inline_actions + state['menu_actions'] == ACTION_ORDER, (where, state)
     remaining = bool(state['menu_meta'] or state['menu_actions'])
     assert state['more'] == remaining, (where, state)
     assert ('a-more' in state['inline']) == remaining, (where, state)
@@ -128,7 +123,7 @@ def check_head(page, width, tier, tiers, key, meta_order):
     if remaining:
         # 菜单里的第一项确实放不下：剩余空位小于它的宽度加上间距和给消息数变宽留的余量
         width_next = page.evaluate(FIRST_MENU_WIDTH_JS)
-        gap = state['brief_gap'] if state['menu_meta'] else state['action_gap']
+        gap = state['action_gap'] if state['menu_actions'] else state['brief_gap']
         assert state['free'] < width_next + gap + state['gap'] * 2 + SLACK, (where, state, width_next)
     n = len(placed)
     assert n <= tiers.get(key + tier, n), (where, 'unfolded while narrowing', state, tiers)

@@ -3239,12 +3239,12 @@ function bindSessionActions(heading) {
   layoutSessionHead(heading);
 }
 
-// 会话头任何宽度都只占一行，且不因折叠留白。三级排版只决定哪些操作固定平铺在标题右侧
-// （宽屏全部、中屏星标、窄屏没有）；元信息按固定顺序（消息数、大小、起止时间、机器、目录、
-// 来源、模型、会话号、分支）在任何宽度都尽量直接跟在标题后面（.dbrief），宽屏/中屏长标题让到
-// 标题行的 40%（不少于 8em）为止，窄屏标题不让位、元信息只填剩下的空白；从放不下的那一项起
-// 收进 ⋯ 菜单。元信息全放下了还有空位，菜单里剩下的操作也按顺序平铺出来；菜单空了 ⋯ 不显示。
-const HEAD_INLINE = {wide: null, medium: ['a-star'], narrow: []};
+// 会话头任何宽度都只占一行，且不因折叠留白。一行上的重要程度：标题 → 操作按钮（按菜单顺序：
+// 星标、折叠过程、报告、搜索、停止/删除）→ 元信息（消息数、大小、起止时间、机器、目录、来源、
+// 模型、会话号、分支）。宽屏/中屏长标题让到标题行的 40%（不少于 8em）为止，窄屏标题不让位；
+// 标题之后先按顺序平铺操作，全放下了再把元信息按顺序跟在标题后面（.dbrief）；从放不下的那一项起
+// 后面的全部收进 ⋯ 菜单（放不下某个按钮时元信息也不放，免得次要的露着、重要的反而折了）；
+// 菜单空了 ⋯ 不显示。
 // 消息数会随新消息变宽，留一点余量免得刚好放下的一项被裁掉
 const HEAD_BRIEF_SLACK = 24;
 function layoutSessionHead(heading = $('#detail .dhead')) {
@@ -3254,11 +3254,9 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
   if (!wrap || !menu || !list) return;
   const actions = wrap.parentElement;
   const tier = layoutTier();
-  const plan = HEAD_INLINE[tier];
   const menuButtons = node => node.matches('button') ? [node] : [...node.querySelectorAll('button')];
-  const inline = node => plan === null || menuButtons(node).some(item => plan.includes(item.id));
   closeSessionActions();
-  // 先把平铺出去的都收回菜单（保持原始顺序），再按本级挑出要平铺的
+  // 先把平铺出去的操作和元信息都收回菜单（保持原始顺序），量过宽度再按顺序往外放
   for (const node of actions.querySelectorAll(':scope > [data-from-menu]')) {
     delete node.dataset.fromMenu;
     for (const item of menuButtons(node)) {
@@ -3268,43 +3266,50 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
     list.appendChild(node);
   }
   list.replaceChildren(...[...list.children].sort((a, b) => a.dataset.order - b.dataset.order));
-  for (const node of [...list.children]) {
-    if (!inline(node)) continue;
-    node.dataset.fromMenu = '1';
-    for (const item of menuButtons(node)) item.removeAttribute('role');
-    actions.insertBefore(node, wrap);
-  }
-  heading.classList.toggle('head-flat', plan === null);
   const more = wrap.querySelector('#a-more');
   if (more) more.hidden = false;   // 量宽度时按 ⋯ 在场算，免得它的显隐反过来改变放得下的项数
-  // 元信息：全部先收回菜单，量出标题和操作区后按顺序往标题后放，放不下的留在菜单里
   const meta = menu.querySelector('.dmeta');
   let brief = heading.querySelector('.dbrief');
-  if (meta) {
-    if (!brief) {
-      brief = el('div', 'dbrief');
-      actions.before(brief);
+  if (meta && !brief) {
+    brief = el('div', 'dbrief');
+    actions.before(brief);
+  }
+  const items = meta ? [...meta.children, ...brief.children]
+    .sort((a, b) => a.dataset.order - b.dataset.order) : [];
+  for (const item of items) meta.appendChild(item);
+  if (brief) brief.hidden = true;
+  let keep = 0;
+  if (heading.isConnected) {
+    const title = heading.querySelector('.dtitle');
+    const h2 = title.querySelector('h2');
+    const gap = parseFloat(getComputedStyle(title).columnGap) || 0;
+    // 宽屏/中屏长标题最多占标题行的 40%（不少于 8em），其余让给操作和元信息；短标题只占自己的宽度。
+    // 窄屏标题优先，操作和元信息只填标题右边剩下的空白
+    const titleMax = tier === 'narrow' ? Infinity
+      : Math.max(8 * parseFloat(getComputedStyle(h2).fontSize), title.clientWidth * 0.4);
+    const titleWidth = Math.min(h2.getBoundingClientRect().width, titleMax);
+    const room = actions.getBoundingClientRect().left - h2.getBoundingClientRect().left
+      - titleWidth - gap * 2 - HEAD_BRIEF_SLACK;
+    let used = 0;
+    // 操作按钮先放：按菜单顺序逐个平铺，到放不下的那一个为止，它和后面的都留在菜单里
+    const actionsGap = parseFloat(getComputedStyle(actions).columnGap) || 0;
+    for (const node of [...list.children]) {
+      node.dataset.fromMenu = '1';
+      actions.insertBefore(node, wrap);
+      const width = node.getBoundingClientRect().width + actionsGap;
+      if (used + width > room) {
+        delete node.dataset.fromMenu;
+        list.prepend(node);
+        break;
+      }
+      used += width;
+      for (const item of menuButtons(node)) item.removeAttribute('role');
     }
-    const items = [...meta.children, ...brief.children]
-      .sort((a, b) => a.dataset.order - b.dataset.order);
-    for (const item of items) meta.appendChild(item);
-    brief.hidden = true;
-    let keep = 0;
-    if (heading.isConnected) {
-      const title = heading.querySelector('.dtitle');
-      const h2 = title.querySelector('h2');
-      const gap = parseFloat(getComputedStyle(title).columnGap) || 0;
-      // 宽屏/中屏长标题最多占标题行的 40%（不少于 8em），其余让给元信息；短标题只占自己的宽度。
-      // 窄屏标题优先，元信息只填标题右边剩下的空白
-      const titleMax = tier === 'narrow' ? Infinity
-        : Math.max(8 * parseFloat(getComputedStyle(h2).fontSize), title.clientWidth * 0.4);
-      const titleWidth = Math.min(h2.getBoundingClientRect().width, titleMax);
-      const room = actions.getBoundingClientRect().left - h2.getBoundingClientRect().left
-        - titleWidth - gap * 2 - HEAD_BRIEF_SLACK;
+    // 操作全放下了，元信息再按固定顺序往标题后放，放不下的留在菜单里
+    if (brief && !list.children.length) {
       brief.hidden = false;
       for (const item of items) brief.appendChild(item);
       const briefGap = parseFloat(getComputedStyle(brief).columnGap) || 0;
-      let used = 0;
       for (const item of items) {
         const width = item.getBoundingClientRect().width + (keep ? briefGap : 0);
         if (used + width > room) break;
@@ -3312,25 +3317,10 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
         keep++;
       }
       for (const item of items.slice(keep)) meta.appendChild(item);
-      // 元信息全放下了还有空位：菜单里剩下的操作按原顺序平铺出来，到放不下的那一项为止
-      if (keep === items.length) {
-        const actionsGap = parseFloat(getComputedStyle(actions).columnGap) || 0;
-        for (const node of [...list.children]) {
-          node.dataset.fromMenu = '1';
-          actions.insertBefore(node, wrap);
-          const width = node.getBoundingClientRect().width + actionsGap;
-          if (used + width > room) {
-            delete node.dataset.fromMenu;
-            list.prepend(node);
-            break;
-          }
-          used += width;
-          for (const item of menuButtons(node)) item.removeAttribute('role');
-        }
-      }
     }
-    brief.hidden = !keep;
   }
+  if (brief) brief.hidden = !keep;
+  heading.classList.toggle('head-flat', !list.children.length);
   if (more) {
     const menuEmpty = !list.children.length;
     more.title = more.ariaLabel = menuEmpty ? '会话信息' : '更多会话操作';
