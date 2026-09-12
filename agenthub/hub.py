@@ -440,6 +440,11 @@ class Registry:
 
 
 class HubHandler(server.Handler):
+    # page_id → 最近一次成功从 uid 解析出的节点；满了淘汰最老的条目。
+    _page_nodes = {}
+    _page_nodes_lock = threading.Lock()
+    _PAGE_NODES_MAX = 512
+
     @property
     def registry(self):
         return self.server.registry
@@ -838,13 +843,29 @@ class HubHandler(server.Handler):
                                       "to": {k: row[k] for k in ("name", "color")}})
         return self._json({"ok": True, "node": row})
 
+    def _remember_page_node(self, page_id, nid):
+        if not page_id:
+            return
+        with self._page_nodes_lock:
+            self._page_nodes.pop(page_id, None)
+            self._page_nodes[page_id] = nid
+            while len(self._page_nodes) > self._PAGE_NODES_MAX:
+                self._page_nodes.pop(next(iter(self._page_nodes)))
+
     def browser_audit(self, body):
         groups = {}
+        page_id = body.get("page_id") or ""
         for event in body.get("events", []):
             try:
                 nid, uid = fed.split(event.get("uid") or body.get("uid") or "", True)
             except ValueError:
-                continue
+                with self._page_nodes_lock:
+                    nid = self._page_nodes.get(page_id) if page_id else None
+                if not nid:
+                    continue
+                uid = ""
+            else:
+                self._remember_page_node(page_id, nid)
             groups.setdefault(nid, []).append({**event, "uid": uid})
         for nid, events in groups.items():
             node = self.registry.get(nid)

@@ -534,6 +534,28 @@ class HubHTTPTests(unittest.TestCase):
         self.assertEqual(self.b.state['writes'][-1][0],
                          '/api/sessions/fork-visibility')
 
+    def test_browser_audit_forwards_pending_uid_to_last_page_node(self):
+        page_id = 'page-audit-pending-uid'
+        uid = federation.qualify('a' * 32, 'claude:same-file-hash', True)
+        status, _ = self.call('/api/audit/browser', {
+            'page_id': page_id, 'uid': uid,
+            'events': [{'event': 'page.loaded', 'uid': uid}],
+        })
+        self.assertEqual(status, 200)
+        first = [w for w in self.a.state['writes'] if w[0] == '/api/audit/browser']
+        self.assertTrue(first)
+        n_before = len(first)
+        status, _ = self.call('/api/audit/browser', {
+            'page_id': page_id, 'uid': 'pending:xxx',
+            'events': [{'event': 'dom.snapshot', 'uid': 'pending:xxx'}],
+        })
+        self.assertEqual(status, 200)
+        writes = [w for w in self.a.state['writes'] if w[0] == '/api/audit/browser']
+        self.assertEqual(len(writes), n_before + 1)
+        forwarded = writes[-1][1]
+        self.assertEqual(forwarded['events'][0]['event'], 'dom.snapshot')
+        self.assertEqual(forwarded['events'][0]['uid'], '')
+
     def test_machine_colour_comes_from_the_registry(self):
         """配色按机器配在注册表里：加机器只改配置，不用改代码再部署三台。
 
