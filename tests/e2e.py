@@ -1103,9 +1103,9 @@ def run(pw):
         {uid:'newer-normal', cwd:'/tmp/sort', updated:'2026-08-08T09:00:00Z', starred:false},
       ];
       S.view = 'tree';
-      const tree = groupBy(rows)[0][1].map(s => s.uid);
+      const tree = groupBy(rows)[0][1].map(r => r.s.uid);   // 分组行是 {s, agent, depth}
       S.view = 'date';
-      const date = groupBy(rows)[0][1].map(s => s.uid);
+      const date = groupBy(rows)[0][1].map(r => r.s.uid);
       S.view = before;
       return {tree, date};
     }""")
