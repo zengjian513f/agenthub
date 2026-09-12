@@ -249,6 +249,22 @@ class GrokCli extends AgentHubCli {
   queueAction(message) {
     return super.queueAction(message);
   }
+
+  normalizeQueuedText(value) {
+    return String(value ?? '').trim();
+  }
+
+  queuedTextMatches(pending, native) {
+    const left = this.normalizeQueuedText(pending);
+    const right = this.normalizeQueuedText(native);
+    if (!left || !right) return false;
+    if (left === right) return true;
+    // Grok 走 /api/term/send 粘贴进 TUI。输入框里若有残留草稿，原生
+    // user 记录会变成「残留前缀 + 网页正文」。精确相等会留下第二条
+    // 排队气泡；只允许原生以网页正文为后缀，避免把中间碰巧相同的
+    // 短句当成回执。
+    return right.endsWith(left) && right.length > left.length;
+  }
 }
 
 const AGENTHUB_CLIS = Object.freeze({

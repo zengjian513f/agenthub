@@ -368,7 +368,14 @@ def run(pw):
       ]}, [1, 2]),
       codexApproval:AGENTHUB_CLIS.codex.questionAnswerKeys({kind:'approval', questions:[{
           options:[{label:'允许本次', key:'y'}, {label:'始终允许', key:'p'},
-            {label:'拒绝', key:'Escape'}]}]}, 1)
+            {label:'拒绝', key:'Escape'}]}]}, 1),
+      grokMatch:[
+        AGENTHUB_CLIS.grok.queuedTextMatches(
+          '明显没有修好，tmux里的内容多很多',
+          'mqxj 明显没有修好，tmux里的内容多很多'),
+        AGENTHUB_CLIS.grok.queuedTextMatches('hello', 'hello'),
+        AGENTHUB_CLIS.grok.queuedTextMatches('ok', 'this is okay but different'),
+        AGENTHUB_CLIS.grok.queuedTextMatches('foo', 'bar foo baz')]
     })""")
     check("三种 CLI 继承公共基类并拥有独立队列策略",
           all(cli_layers["classes"])
@@ -393,7 +400,30 @@ def run(pw):
           and cli_layers["claudeQuestionForm"] == (
               ["Left"] * 3 + ["Up"] * 5 + ["Down", "Enter"]
               + ["Up"] * 6 + ["Down", "Down", "Enter", "Enter"])
-          and cli_layers["codexApproval"] == ["p"], cli_layers)
+          and cli_layers["codexApproval"] == ["p"]
+          and cli_layers["grokMatch"] == [True, True, False, False], cli_layers)
+    grok_leftover = p.evaluate("""() => {
+      const u = 'grok:e2e-leftover-draft';
+      S.queued.set(u, [{id:'p1', text:'明显没有修好，tmux里的内容多很多',
+        state:'queued', created:Date.now(), media:[]}]);
+      reconcileQueuedMessages(u, [{role:'user',
+        text:'mqxj 明显没有修好，tmux里的内容多很多'}]);
+      const afterPrefix = queuedMessages(u).length;
+      S.queued.set(u, [{id:'p2', text:'hello',
+        state:'queued', created:Date.now(), media:[]}]);
+      reconcileQueuedMessages(u, [{role:'user', text:'hello'}]);
+      const afterExact = queuedMessages(u).length;
+      S.queued.set(u, [{id:'p3', text:'ok',
+        state:'queued', created:Date.now(), media:[]}]);
+      reconcileQueuedMessages(u, [{role:'user',
+        text:'this is okay but different'}]);
+      const afterUnrelated = queuedMessages(u).length;
+      S.queued.delete(u);
+      return {afterPrefix, afterExact, afterUnrelated};
+    }""")
+    check("Grok 终端残留草稿前缀仍能撤掉网页排队副本",
+          grok_leftover == {"afterPrefix": 0, "afterExact": 0, "afterUnrelated": 1},
+          grok_leftover)
     codex_branch_rebind = p.evaluate("""async () => {
       const fromUid = 'codex:e2e-old-branch', toUid = 'codex:e2e-current-branch';
       const rootSid = '01234567-89ab-cdef-0123-456789abcdef';
