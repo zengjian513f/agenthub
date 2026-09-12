@@ -2070,7 +2070,7 @@ function refreshSessionMeta() {
   if (currentEventAdded && current) {
     renderSession(current.meta, current.msgs, current.activity);
   } else if (current && oldHead && headerKey(current.meta) !== beforeKey) {
-    oldHead.replaceWith(head(current.meta, entryTotal(current)));
+    oldHead.replaceWith(head(current.meta, entryTotal(current), current.msgs));
     layoutSessionHead();
     auditDetailRendered('meta-refresh');
   }
@@ -2713,6 +2713,7 @@ const itemMeta = s => (s.stale ? '离线缓存 · ' : '') + (s.pending ? `${fmtT
   : [fmtTime(s.updated), fmtSize(s.size), s.model || '',
                        s.continued_in && S.sessions.some(x => x.uid === s.continued_in) ? '已续写' : '',
                        S.sessions.some(x => x.continued_in === s.uid) ? '续写' : '',
+                       s.compacts ? `已压缩 ×${s.compacts}` : '',
                        s.agents ? `⑂${s.agents}` : '',
                        s.hits ? `命中 ${s.hits}${s.hits_capped ? '+' : ''}` : '']
                       .filter(Boolean).join(' · '));
@@ -3281,7 +3282,7 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
   d.innerHTML = '';
   const entry = cache.get(viewKey(uid, agent));
   if (!agent) reconcileQueuedMessages(uid, msgs);
-  d.appendChild(head(meta, entryTotal(entry || {msgs})));
+  d.appendChild(head(meta, entryTotal(entry || {msgs}), entry?.msgs || msgs));
   layoutSessionHead();
   const box = el('div', 'msgs');
   box.id = 'msgs';
@@ -3661,7 +3662,7 @@ function sessionViewRows(m) {
       </button>`).join('')}`;
 }
 
-function head(m, total) {
+function head(m, total, msgs) {
   const h = el('div', 'dhead');
   const tmuxLive = S.liveTmux.has(m.uid);
   const hasAgents = (m.agent_items || []).length > 0;
@@ -3701,7 +3702,7 @@ function head(m, total) {
       ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
-      ${continueMarkup(m)}
+      ${continueMarkup(m, msgs)}
       ${spawnerMarkup(m)}
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
@@ -3763,19 +3764,26 @@ function head(m, total) {
   return h;
 }
 
-/** compact/continue 另起的 JSONL：两边标题栏互相给入口，左栏两行都可点。 */
-function continueMarkup(m) {
+/** compact/continue 另起的 JSONL：两边标题栏互相给入口，左栏两行都可点。
+ *  同一份文件里的 /compact 不是续写，只标次数。 */
+function continueMarkup(m, msgs) {
   if (m.agent_id) return '';
+  const bits = [];
   if (m.continued_in && S.sessions.some(s => s.uid === m.continued_in)) {
-    return `<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(m.continued_in)}"
-      title="打开续写后的当前会话">已续写</button></span>`;
+    bits.push(`<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(m.continued_in)}"
+      title="打开续写后的当前会话">已续写</button></span>`);
   }
   const prev = continuedPredecessor(m.uid);
   if (prev) {
-    return `<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(prev.uid)}"
-      title="查看续写前的完整记录">续写前的记录</button></span>`;
+    bits.push(`<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(prev.uid)}"
+      title="查看续写前的完整记录">续写前的记录</button></span>`);
   }
-  return '';
+  const n = Math.max(+m.compacts || 0,
+    (msgs || []).filter(x => x.role === 'event' && x.event_kind === 'compact').length);
+  if (n) {
+    bits.push(`<span class="meta-secondary" title="同一份记录里完成了 ${n} 次 /compact，没有另开会话">已压缩 ×${n}</span>`);
+  }
+  return bits.join('');
 }
 
 /** 标题栏元信息里的发起者：由哪条会话把它派出来的，点击就跳过去。 */

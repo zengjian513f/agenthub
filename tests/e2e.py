@@ -1688,6 +1688,8 @@ def run(pw):
           and "上下文" in compact_event.inner_text()
           and "已压缩" in compact_event.inner_text(),
           compact_event.all_inner_texts())
+    check("标题栏标出同文件 compact 次数",
+          "已压缩 ×1" in (p.locator(".dhead .dmeta").inner_text() or ""))
 
     # ---- 8. 默认折叠规则 ----
     def body_visible(role):

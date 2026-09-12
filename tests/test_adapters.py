@@ -730,6 +730,7 @@ class ClaudeProtocolTests(unittest.TestCase):
             full, _ = adapter.read(str(transcript))
             after_boundary = len("".join(lines[:3]).encode())
             incremental, _ = adapter.read(str(transcript), start=after_boundary)
+            compact_meta = adapter._meta(transcript, transcript.stat(), "proj")
 
         visible = [m for m in full if m["role"] != "status"]
         self.assertEqual([(m["role"], m["text"]) for m in visible], [
@@ -740,6 +741,7 @@ class ClaudeProtocolTests(unittest.TestCase):
         compact = visible[1]
         self.assertEqual(compact["event_kind"], "compact")
         self.assertFalse(compact["counted"])
+        self.assertEqual(compact_meta.get("compacts"), 1)
         self.assertEqual([m["state"] for m in full if m["role"] == "status"],
                          ["idle", "working"])
         self.assertEqual([(m["role"], m["text"]) for m in incremental
