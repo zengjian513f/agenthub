@@ -137,18 +137,20 @@ const AUDIT_BATCH_BYTES = 48 * 1024;
 const AUDIT_BATCH_COUNT = 20;
 const AUDIT_CONTENT_LIMIT = 32 * 1024;
 
+// 按 UTF-8 字节算：sendBeacon 的 64 KB 配额是字节数，中文一个字占 3 字节
+const auditEncoder = new TextEncoder();
 function auditEventBytes(event) {
-  try { return JSON.stringify(event).length; } catch { return AUDIT_BATCH_BYTES + 1; }
+  try { return auditEncoder.encode(JSON.stringify(event)).length; } catch { return AUDIT_BATCH_BYTES + 1; }
 }
 
-function spliceAuditBatch(queue) {
+function spliceAuditBatch(queue, limit = AUDIT_BATCH_BYTES, count = AUDIT_BATCH_COUNT) {
   if (!queue.length) return [];
-  if (auditEventBytes(queue[0]) > AUDIT_BATCH_BYTES) return queue.splice(0, 1);
+  if (auditEventBytes(queue[0]) > limit) return queue.splice(0, 1);
   const batch = [];
   let bytes = 0;
-  while (queue.length && batch.length < AUDIT_BATCH_COUNT) {
+  while (queue.length && batch.length < count) {
     const size = auditEventBytes(queue[0]);
-    if (bytes + size > AUDIT_BATCH_BYTES) break;
+    if (bytes + size > limit) break;
     batch.push(queue.shift());
     bytes += size;
   }
@@ -211,7 +213,8 @@ async function flushBrowserAudit() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     browserAuditFailCount = 0;
   } catch (error) {
-    browserAuditFailCount += 1;
+    // 断网期间只是攒着，不算失败次数；连续三次在线失败才认定这一批本身有问题
+    if (navigator.onLine) browserAuditFailCount += 1;
     if (browserAuditFailCount >= 3) {
       browserAuditFailCount = 0;
       const bytes = events.reduce((n, ev) => n + auditEventBytes(ev), 0);
@@ -235,20 +238,27 @@ async function flushBrowserAudit() {
   }
 }
 
+// 卸载时整个页面只有 64 KB 的 beacon 配额（和 keepalive 同一个池），超出的包
+// sendBeacon 直接返回 false。所以先把各事件的 content 丢掉保住事件本身，只给
+// page.hidden 那条快照留 content；分两包发，合计不超过 60 KB。发不出去的留在
+// 队列里，页面若只是进了 bfcache 还能补发。
 function flushBrowserAuditBeacon() {
   clearTimeout(browserAuditTimer);
   browserAuditTimer = 0;
   if (!navigator.sendBeacon || !browserAuditQueue.length) return;
-  const leftover = [];
-  while (browserAuditQueue.length) {
-    const events = spliceAuditBatch(browserAuditQueue);
+  const slim = browserAuditQueue.map(ev => ev.event === 'page.hidden' || ev.content == null ? ev
+    : {...ev, content: null, data: {...ev.data, content_dropped: true}});
+  browserAuditQueue = [];
+  for (const budget of [40 * 1024, 20 * 1024]) {
+    const events = spliceAuditBatch(slim, budget, 100);
+    if (!events.length) break;
     const ok = navigator.sendBeacon(appUrl('api/audit/browser'),
       new Blob([auditPayload(events)], {type: 'application/json'}));
-    if (!ok) leftover.push(...events);
+    if (!ok) { slim.unshift(...events); break; }
   }
-  if (leftover.length) {
-    browserAuditQueue.unshift(...leftover);
-    if (browserAuditQueue.length > 500) browserAuditQueue.length = 500;
+  if (slim.length) {
+    browserAuditQueue.unshift(...slim);
+    capAuditQueue();
   }
 }
 
@@ -289,6 +299,7 @@ function browserStateSnapshot(reason = '') {
         anchor: entry.anchor, activity: entry.activity?.state || '',
         outbox: queuedMessages(S.sel).map(item => ({id: item.id, state: item.state}))} : null,
       dom_messages: nodes.length, terminal: termState,
+      header: consoleButtonState(),
     },
     content: {
       composer: $('#cinput')?.value || '',
@@ -316,6 +327,125 @@ function scheduleBrowserSnapshot(reason = 'render') {
   }, 100);
 }
 
+// ---- 会话标题栏 / 控制台按钮的存在性审计 ----
+// 控制台按钮"偶尔消失"一直没抓到现场：快照只看消息，不看标题栏。这里独立记录
+// 按钮的三层状态——在不在 DOM、几何上有没有被裁掉/盖住（elementFromPoint）、
+// #right 有没有被滚走——任何一层不成立就记一条 console.button.missing，附上
+// 标题栏 HTML 和布局数据；恢复时记 console.button.restored。
+// 常规状态变化（文案、接管态、灰态、位置）按签名去重记 console.button.state。
+function consoleButtonState() {
+  const button = $('#a-term');
+  const right = $('#right');
+  const detail = $('#detail');
+  const head = detail?.querySelector(':scope > .dhead');
+  const shown = !!right && right.offsetWidth > 0;   // 手机列表页 #right 整个 display:none
+  const state = {
+    present: !!button, head: !!head, shown,
+    detail_children: detail ? [...detail.children].map(
+      node => node.id || node.className.split(' ')[0] || node.tagName.toLowerCase()).slice(0, 8) : null,
+    right_scroll: right ? [right.scrollLeft, right.scrollTop] : null,
+    right_overflow: right ? [right.scrollWidth - right.clientWidth, right.scrollHeight - right.clientHeight] : null,
+    tier: layoutTier(), mobile_detail: document.body.classList.contains('mobile-detail'),
+  };
+  if (button) {
+    const style = getComputedStyle(button);
+    state.label = button.ariaLabel || '';
+    state.on = button.classList.contains('on');
+    state.unavailable = button.dataset.unavailable === 'true';
+    state.hidden = button.hidden || style.display === 'none' || style.visibility !== 'visible'
+      || parseFloat(style.opacity) === 0;
+  }
+  if (button && shown) {
+    const r = button.getBoundingClientRect(), rr = right.getBoundingClientRect();
+    const hit = r.width && r.height && document.visibilityState === 'visible'
+      ? document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) : undefined;
+    state.rect = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+    state.in_right = r.width > 0 && r.right <= rr.right + .5 && r.left >= rr.left - .5
+      && r.top >= rr.top - .5 && r.bottom <= rr.bottom + .5;
+    // 页面不可见时 elementFromPoint 一律 null，不算被遮
+    state.hit = hit === undefined ? null : !!hit && button.contains(hit);
+    state.hit_target = hit ? (hit.id ? '#' + hit.id : hit.className ? '.' + String(hit.className).split(' ')[0]
+      : hit.tagName.toLowerCase()) : null;
+  }
+  // 不在 DOM 一定算丢；在 DOM 但页面可见时被隐藏/裁掉/盖住也算丢
+  state.ok = state.present && (!shown || (!state.hidden && state.in_right && state.hit !== false));
+  return state;
+}
+
+let consoleButtonMissingSince = 0;
+let consoleButtonSignature = '';
+let consoleButtonTimer = 0;
+function auditConsoleButton(reason = '') {
+  let state;
+  try { state = consoleButtonState(); } catch { return; }
+  const content = () => {
+    const head = $('#detail > .dhead');
+    return {dhead: head ? head.outerHTML.slice(0, 12000) : null,
+      detail: $('#detail')?.innerHTML.slice(0, 2000) || null};
+  };
+  const term = typeof T === 'undefined' ? null : {
+    name: T.name, uid: T.uid, mode: T.mode, views: [...T.views.keys()],
+    visible: !$('#termpane')?.classList.contains('hidden'),
+  };
+  if (!state.ok) {
+    // 丢失期间最多 5 秒记一次，免得 MutationObserver/定时器把库刷爆
+    const now = Date.now();
+    if (consoleButtonMissingSince && now - consoleButtonMissingSince < 5000) return;
+    consoleButtonMissingSince = consoleButtonMissingSince || now;
+    browserAuditEvent('console.button.missing', {reason, ...state, selected: S.sel, agent: S.agent,
+      terminal: term}, content(), {severity: 'error'});
+    return;
+  }
+  if (consoleButtonMissingSince) {
+    browserAuditEvent('console.button.restored', {reason, ...state,
+      missing_ms: Date.now() - consoleButtonMissingSince, terminal: term}, null, {severity: 'warning'});
+    consoleButtonMissingSince = 0;
+  }
+  const signature = JSON.stringify([state.label, state.on, state.unavailable, state.rect, state.tier,
+    state.hit_target, state.right_scroll]);
+  if (signature === consoleButtonSignature) return;
+  consoleButtonSignature = signature;
+  browserAuditEvent('console.button.state', {reason, ...state, terminal: term});
+}
+function scheduleConsoleButtonAudit(reason = '') {
+  clearTimeout(consoleButtonTimer);
+  consoleButtonTimer = setTimeout(() => auditConsoleButton(reason), 150);
+}
+{
+  // #detail 换内容（读取中/失败/正式渲染/新会话页）时重新盯住新的标题栏；标题栏
+  // 内部的增删和 class/hidden/style 变化也触发检查。#msgs 的海量变动不在观察范围内。
+  const headObserver = new MutationObserver(() => scheduleConsoleButtonAudit('head-mutation'));
+  let observedHead = null;
+  const watchHead = () => {
+    const head = $('#detail > .dhead');
+    if (head === observedHead) return;
+    headObserver.disconnect();
+    observedHead = head;
+    if (head) headObserver.observe(head, {childList: true, subtree: true, attributes: true,
+      attributeFilter: ['class', 'hidden', 'style', 'aria-label']});
+  };
+  new MutationObserver(() => { watchHead(); scheduleConsoleButtonAudit('detail-mutation'); })
+    .observe($('#detail'), {childList: true});
+  watchHead();
+  // 裁切/滚走这类不改 DOM 的情况靠 #right 的 scroll 和低频巡检兜底
+  $('#right')?.addEventListener('scroll', () => scheduleConsoleButtonAudit('right-scroll'), {passive: true});
+  setInterval(() => { if (!document.hidden) auditConsoleButton('periodic'); }, 5000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) scheduleConsoleButtonAudit('visible');
+  });
+}
+
+/** #detail 每次换内容都记一笔：谁换的、换完有没有标题栏和控制台按钮。 */
+function auditDetailRendered(source, extra = {}) {
+  const detail = $('#detail');
+  browserAuditEvent('detail.rendered', {
+    source, selected: S.sel, agent: S.agent, ...extra,
+    has_head: !!detail?.querySelector(':scope > .dhead'), has_console_button: !!$('#a-term'),
+    children: detail ? [...detail.children].map(
+      node => node.id || node.className.split(' ')[0] || node.tagName.toLowerCase()).slice(0, 8) : null,
+  });
+}
+
 queueMicrotask(() => browserAuditEvent('page.loaded', {
   url: location.pathname + location.search, referrer: document.referrer,
   user_agent: navigator.userAgent, language: navigator.language,
@@ -335,8 +465,10 @@ window.addEventListener('pagehide', () => {
   browserAuditEvent('page.hidden', snapshot.data, snapshot.content);
   flushBrowserAuditBeacon();
 });
-document.addEventListener('visibilitychange', () => browserAuditEvent(
-  'visibility.changed', {visibility: document.visibilityState}));
+document.addEventListener('visibilitychange', () => {
+  browserAuditEvent('visibility.changed', {visibility: document.visibilityState});
+  if (!document.hidden) scheduleBrowserSnapshot('visible');
+});
 document.addEventListener('click', event => {
   const target = event.target?.closest?.(
     'button, a, [role="button"], .item, .ghead, summary, label, input, select, textarea, [data-action], [data-term-key], [data-term-modifier], .fold-preview, .turn-toolbar');
@@ -352,11 +484,14 @@ document.addEventListener('click', event => {
 let auditResizeTimer = 0;
 window.addEventListener('resize', () => {
   clearTimeout(auditResizeTimer);
-  auditResizeTimer = setTimeout(() => browserAuditEvent('viewport.resized', {
-    width: innerWidth, height: innerHeight,
-    visual_width: window.visualViewport?.width,
-    visual_height: window.visualViewport?.height,
-  }), 200);
+  auditResizeTimer = setTimeout(() => {
+    browserAuditEvent('viewport.resized', {
+      width: innerWidth, height: innerHeight,
+      visual_width: window.visualViewport?.width,
+      visual_height: window.visualViewport?.height,
+    });
+    scheduleBrowserSnapshot('resized');
+  }, 200);
 });
 const el = (tag, cls, html) => {
   const n = document.createElement(tag);
@@ -1933,6 +2068,7 @@ function refreshSessionMeta() {
   } else if (current && oldHead && headerKey(current.meta) !== beforeKey) {
     oldHead.replaceWith(head(current.meta, entryTotal(current)));
     layoutSessionHead();
+    auditDetailRendered('meta-refresh');
   }
 }
 
@@ -2171,6 +2307,7 @@ async function deleteSessions(uids, button = null) {
         + '<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>';
       $('#detail-open-trash').onclick = openTrash;
       ensureConsolePlaceholder();
+      auditDetailRendered('trashed');
       showMobileList();
     }
   }
@@ -2748,6 +2885,7 @@ async function openSession(uid, agent = null) {
 
   $('#detail').innerHTML = '<div class="spin">正在读取会话…</div>';
   ensureConsolePlaceholder();
+  auditDetailRendered('loading');
   progress(0, 0, '下载');
   let res;
   try {
@@ -2761,6 +2899,7 @@ async function openSession(uid, agent = null) {
     progressDone();
     $('#detail').innerHTML = `<div class="empty">读取失败: ${esc(e.message)}</div>`;
     ensureConsolePlaceholder();
+    auditDetailRendered('load-failed', {error: String(e.message || e).slice(0, 300)});
     return;
   }
   if (S.sel !== uid || S.agent !== selectedAgent) return; // 期间切了别的视图
@@ -2980,6 +3119,7 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
   const box = el('div', 'msgs');
   box.id = 'msgs';
   d.appendChild(box);
+  auditDetailRendered('render', {messages: msgs.length, seq});
   S.cur = -1; S.autoOpen = 0; S.markCapped = false;
 
   // 关键: 建在游离的 fragment 里, 最后一次性挂上。
@@ -3020,6 +3160,7 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
     if (startWatch) watchSession(meta.uid, agent); // 之后的更新由服务端推过来
     if (typeof restoreTermPane === 'function') restoreTermPane(uid, agent);
     if (!agent) queueMicrotask(reconcileAllPendingMessages);
+    scheduleBrowserSnapshot('rendered');
   }
 }
 
@@ -3182,6 +3323,30 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
     brief.hidden = !keep;
   }
   if (more) more.hidden = menuEmpty && !meta?.children.length;
+  auditHeaderLayout(heading, tier, actions);
+}
+
+// 排版结果按签名去重记 header.layout：档位、平铺了哪些操作、标题后放了几项元信息、
+// 标题行有没有横向溢出（溢出就意味着右侧按钮会被 #right 裁掉）。
+let headerLayoutSignature = '';
+function auditHeaderLayout(heading, tier, actions) {
+  try {
+    const title = heading.querySelector('.dtitle');
+    const brief = heading.querySelector('.dbrief');
+    const data = {
+      tier, connected: heading.isConnected,
+      inline: [...actions.querySelectorAll('button')].filter(b => !b.hidden && b.offsetWidth)
+        .map(b => b.id || (b.dataset.reportBug !== undefined ? 'report-bug' : b.className.split(' ')[0])),
+      brief: brief && !brief.hidden ? brief.children.length : 0,
+      menu_meta: heading.querySelector('#session-actions-menu .dmeta')?.children.length ?? null,
+      title_overflow: title ? title.scrollWidth - title.clientWidth : null,
+      width: title?.clientWidth ?? null, head_height: heading.offsetHeight,
+    };
+    const signature = JSON.stringify(data);
+    if (signature === headerLayoutSignature) return;
+    headerLayoutSignature = signature;
+    browserAuditEvent('header.layout', data);
+  } catch { /* 审计不能影响排版 */ }
 }
 
 document.addEventListener('click', event => {
@@ -3558,6 +3723,7 @@ async function del(m) {
     + `<br><button type="button" class="btn" id="detail-open-trash">打开回收站</button></div>`;
   $('#detail-open-trash').onclick = openTrash;
   ensureConsolePlaceholder();
+  auditDetailRendered('trashed');
   showMobileList();
 }
 

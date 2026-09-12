@@ -1127,6 +1127,7 @@ function showNewSessionStage(info) {
   bindConsoleButton($('#a-term'), S.sel);
   $('#a-session-action').onclick = () => stopPendingSession(info, $('#a-session-action'));
   bindSessionActions($('#detail .dhead'));
+  if (typeof auditDetailRendered === 'function') auditDetailRendered('new-session', {name: info.name});
   showMobileDetail();
   T.uid = S.sel;
   if (!MOBILE.matches) T.mode = 'full';   // 手机本来就是终端覆盖层，不污染桌面保存的高度模式
@@ -1182,6 +1183,7 @@ function discardAbandonedNewSession(info) {
     $('#composer').classList.add('hidden');
     $('#detail').innerHTML = '<div class="empty">从左侧选择一个会话</div>';
     ensureConsolePlaceholder();
+    if (typeof auditDetailRendered === 'function') auditDetailRendered('discarded', {name: info.name});
     showMobileList();
   }
   T.pendingModes.delete(info.name);
