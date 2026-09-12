@@ -197,7 +197,7 @@ def check_page(page, node, scoped, width):
     node.state['rows'][2]['title'] = 'Grandchild C'
     node.state['rev'] += 1
 
-    # compact/continue 的新会话不是发起的子会话；旧会话仍可点开
+    # compact/continue 只保留链上最新会话；旧文件不进左栏，点旧 uid 跟到新会话
     extra = [
         row('claude:old', 'claude', 'sid-old', 'Old continued', '/proj/alpha', today(12, 0),
             continued_in='claude:new'),
@@ -210,12 +210,12 @@ def check_page(page, node, scoped, width):
     page.wait_for_function('S.sessions.some(s => s.sid === "sid-new")')
     continued = rows(page)
     new_uid, old_uid = q('claude:new'), q('claude:old')
-    depths = {r['uid']: r['depth'] for r in continued if r['uid'] in (new_uid, old_uid) and not r['agent']}
-    assert depths.get(new_uid) == 0 and depths.get(old_uid) == 0, depths
+    listed = [r['uid'] for r in continued if not r['agent']]
+    assert new_uid in listed and old_uid not in listed, listed
+    assert next(r['depth'] for r in continued if r['uid'] == new_uid) == 0
     to_list(page)
     page.evaluate('(uid) => openSession(uid)', old_uid)
-    page.wait_for_function(f'S.sel === {old_uid!r}')
-    assert page.evaluate('S.sel') == old_uid
+    page.wait_for_function(f'S.sel === {new_uid!r}')
     node.state['rows'] = [dict(r) for r in ROWS]
     node.state['rev'] += 1
     page.evaluate('pollSessions()')

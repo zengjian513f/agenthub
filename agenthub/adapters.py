@@ -706,12 +706,6 @@ def _claude_user_texts(rec: dict) -> list[str]:
     return texts
 
 
-def _claude_compact_record(rec: dict) -> bool:
-    return rec.get("type") == "system" and (
-        rec.get("subtype") == "compact_boundary"
-        or isinstance(rec.get("compactMetadata"), dict))
-
-
 def _is_claude_interrupt_record(rec: dict) -> bool:
     """JSONL 里一轮被 Esc 打断的原生标记，不是用户新输入。"""
     if rec.get("type") != "user":
@@ -1368,22 +1362,7 @@ class ClaudeAdapter:
     def _meta(self, f: Path, st, proj_name: str):
         generated_title = cwd = branch = created = sid = None
         first_user = None
-        compact_keys: set[str] = set()
-        compact_n = 0
-
-        def note_compact(rec: dict) -> None:
-            nonlocal compact_n
-            if not _claude_compact_record(rec):
-                return
-            key = str(rec.get("uuid") or rec.get("timestamp") or "")
-            if key:
-                if key in compact_keys:
-                    return
-                compact_keys.add(key)
-            compact_n += 1
-
         for rec in _head_lines(f, strict=True):
-            note_compact(rec)
             t = rec.get("type")
             if t == "ai-title" and not generated_title:
                 generated_title = rec.get("aiTitle")
@@ -1418,7 +1397,6 @@ class ClaudeAdapter:
                 latest_ai_title = rec["aiTitle"]
             elif rec.get("type") == "continued-in" and rec.get("continuedInSessionId"):
                 continued_in_sid = str(rec["continuedInSessionId"])
-            note_compact(rec)
         title = custom_title or latest_ai_title or generated_title
         if not title:
             title = _title_from_text(first_user) if first_user else f.stem[:8]
@@ -1480,8 +1458,6 @@ class ClaudeAdapter:
         }
         if continued_in_sid:
             row["continued_in_sid"] = continued_in_sid
-        if compact_n:
-            row["compacts"] = compact_n
         return row
 
     def finalize_sessions(self, rows: list[dict]) -> list[dict]:

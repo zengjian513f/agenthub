@@ -1916,7 +1916,10 @@ function pendingTmuxSessions() {
   });
 }
 
-const sessionHidden = session => !!session?.fork_parent && !session.fork_parent_visible;
+const sessionContinued = session =>
+  !!(session?.continued_in && S.sessions.some(s => s.uid === session.continued_in));
+const sessionHidden = session =>
+  (!!session?.fork_parent && !session.fork_parent_visible) || sessionContinued(session);
 // 沿 forked_from_id 往上追整条父会话链（近的在前）。只在同来源、同机器内按
 // 原生 sid 匹配；记录已不存在的一级保留占位并到此为止。
 function forkAncestors(session) {
@@ -2070,7 +2073,7 @@ function refreshSessionMeta() {
   if (currentEventAdded && current) {
     renderSession(current.meta, current.msgs, current.activity);
   } else if (current && oldHead && headerKey(current.meta) !== beforeKey) {
-    oldHead.replaceWith(head(current.meta, entryTotal(current), current.msgs));
+    oldHead.replaceWith(head(current.meta, entryTotal(current)));
     layoutSessionHead();
     auditDetailRendered('meta-refresh');
   }
@@ -2711,9 +2714,6 @@ function groupBy(list) {
 
 const itemMeta = s => (s.stale ? '离线缓存 · ' : '') + (s.pending ? `${fmtTime(s.updated)} · 等待首条消息`
   : [fmtTime(s.updated), fmtSize(s.size), s.model || '',
-                       s.continued_in && S.sessions.some(x => x.uid === s.continued_in) ? '已续写' : '',
-                       S.sessions.some(x => x.continued_in === s.uid) ? '续写' : '',
-                       s.compacts ? `已压缩 ×${s.compacts}` : '',
                        s.agents ? `⑂${s.agents}` : '',
                        s.hits ? `命中 ${s.hits}${s.hits_capped ? '+' : ''}` : '']
                       .filter(Boolean).join(' · '));
@@ -3015,12 +3015,21 @@ function ensureConsolePlaceholder() {
   showConsoleToast('');
 }
 
-function continuedPredecessor(uid) {
-  return S.sessions.find(s => s.continued_in === uid) || null;
+function followContinuedSession(uid) {
+  const seen = new Set();
+  let cur = uid;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const next = S.sessions.find(s => s.uid === cur)?.continued_in;
+    if (!next || next === cur || !S.sessions.some(s => s.uid === next)) return cur;
+    cur = next;
+  }
+  return cur;
 }
 
 async function openSession(uid, agent = null) {
   const selectedAgent = agent || null;
+  if (!selectedAgent) uid = followContinuedSession(uid);
   browserAuditEvent('session.opened', {agent: selectedAgent || '', cached: cache.has(viewKey(uid, selectedAgent))},
     null, {uid});
   showMobileDetail();
@@ -3282,7 +3291,7 @@ async function renderSession(meta, msgs, activity = null, { startWatch = true } 
   d.innerHTML = '';
   const entry = cache.get(viewKey(uid, agent));
   if (!agent) reconcileQueuedMessages(uid, msgs);
-  d.appendChild(head(meta, entryTotal(entry || {msgs}), entry?.msgs || msgs));
+  d.appendChild(head(meta, entryTotal(entry || {msgs})));
   layoutSessionHead();
   const box = el('div', 'msgs');
   box.id = 'msgs';
@@ -3662,7 +3671,7 @@ function sessionViewRows(m) {
       </button>`).join('')}`;
 }
 
-function head(m, total, msgs) {
+function head(m, total) {
   const h = el('div', 'dhead');
   const tmuxLive = S.liveTmux.has(m.uid);
   const hasAgents = (m.agent_items || []).length > 0;
@@ -3702,7 +3711,6 @@ function head(m, total, msgs) {
       ${m.node_name ? `<span class="meta-node node-badge" data-node-color="${nodeColor(m.node_name)}">${esc(m.node_name)}</span>` : ''}
       <span class="meta-secondary"><code>${esc(shortCwd(m.cwd || '(未知)', 999))}</code></span>
       <span class="meta-source">${esc(m.agent_type || SOURCES[m.source].name)}</span>
-      ${continueMarkup(m, msgs)}
       ${spawnerMarkup(m)}
       ${m.model ? `<span class="meta-secondary">${esc(m.model)}</span>` : ''}
       <span class="meta-secondary session-id"><code>${esc(m.sid)}</code></span>
@@ -3712,7 +3720,7 @@ function head(m, total, msgs) {
     </div>`;
   h.querySelector('.mobile-back').onclick = showMobileList;
   h.addEventListener('click', event => {
-    const link = event.target.closest('.meta-spawner, .meta-continue');
+    const link = event.target.closest('.meta-spawner');
     if (link) openSession(link.dataset.uid);
   });
   h.querySelector('#a-star').onclick = () => toggleSessionStar(m.uid);
@@ -3762,28 +3770,6 @@ function head(m, total, msgs) {
   renderSessionAction(m, h.querySelector('#a-session-action'));
   bindSessionActions(h);
   return h;
-}
-
-/** compact/continue 另起的 JSONL：两边标题栏互相给入口，左栏两行都可点。
- *  同一份文件里的 /compact 不是续写，只标次数。 */
-function continueMarkup(m, msgs) {
-  if (m.agent_id) return '';
-  const bits = [];
-  if (m.continued_in && S.sessions.some(s => s.uid === m.continued_in)) {
-    bits.push(`<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(m.continued_in)}"
-      title="打开续写后的当前会话">已续写</button></span>`);
-  }
-  const prev = continuedPredecessor(m.uid);
-  if (prev) {
-    bits.push(`<span class="meta-secondary"><button type="button" class="meta-continue" data-uid="${esc(prev.uid)}"
-      title="查看续写前的完整记录">续写前的记录</button></span>`);
-  }
-  const n = Math.max(+m.compacts || 0,
-    (msgs || []).filter(x => x.role === 'event' && x.event_kind === 'compact').length);
-  if (n) {
-    bits.push(`<span class="meta-secondary" title="同一份记录里完成了 ${n} 次 /compact，没有另开会话">已压缩 ×${n}</span>`);
-  }
-  return bits.join('');
 }
 
 /** 标题栏元信息里的发起者：由哪条会话把它派出来的，点击就跳过去。 */

@@ -782,11 +782,11 @@ body.dragging { cursor: col-resize; user-select: none; }
 }
 .item.agent .t { font-size: 12.5px; }
 .item.agent.live .t { font-weight: 600; }
-.meta-spawner, .meta-continue {
+.meta-spawner {
   border: 0; padding: 0; background: none; font: inherit; color: inherit; cursor: pointer;
   text-decoration: underline dotted; text-underline-offset: 2px;
 }
-.meta-spawner:hover, .meta-continue:hover { color: var(--text); }
+.meta-spawner:hover { color: var(--text); }
 .item-star {
   flex: none; align-self: flex-start; width: 25px; height: 25px; margin: -2px -5px 0 0; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;
