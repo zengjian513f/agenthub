@@ -142,8 +142,12 @@ Hub 校验自己的前端 build；通过认证且协议兼容的节点请求不�
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 tests/hub_e2e.py
+python3 tests/fold_sweep_e2e.py
 ```
 
 浏览器测试需要现有 Playwright/Chromium，使用隔离的三台模拟 HTTP 节点，覆盖渲染、筛选、
 搜索、SSE、媒体、新建路由、双向 WebSocket、二进制上传、离线、手机和独立本地页面。
 不启动 tmux、Claude、Codex，不调用真实模型，不连接正在运行的 AgentHub 服务。
+`fold_sweep_e2e.py` 把视口从 1698px 逐 10px 降到 320px（再拖分割线收窄详情区），在每个宽度上核对
+顶栏和会话标题栏都只在放不下时折叠、折起的先后就是重要程度的倒序、折了之后没有留白，
+中央与独立节点各扫一遍。
