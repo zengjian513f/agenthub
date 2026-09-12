@@ -803,7 +803,9 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 /* 菜单可越过详情底边；消息由 .msgs 滚动裁切，外层 #right 限制页面边界。 */
 #detail { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: visible; }
 .dhead {
-  flex: none; z-index: 3; background: var(--panel);
+  /* 高于 .turn-toolbar（z-index 3）：展开中的回合工具条 sticky 在消息区顶部，
+     否则会盖住标题栏下拉（子代理菜单、回退链、⋯）的前几行。 */
+  flex: none; z-index: 4; background: var(--panel);
   width: 100%;
   border-bottom: 1px solid var(--border); padding: 6px 12px;
 }

@@ -64,24 +64,43 @@ def open_menu(page):
     return rows(page)
 
 
+STICKY_TOOLBAR = '''() => {
+  // 展开中的回合工具条 sticky 在消息区顶部；真实会话滚到一个回合中间时就是这样。
+  const turn = document.createElement('div');
+  turn.className = 'msg turn-process';
+  turn.innerHTML = '<div class="turn-toolbar"><button class="turn-preview" type="button">🔧 5 · 1 分 21 秒</button></div>'
+    + '<div style="height:1200px"></div>';
+  const msgs = document.querySelector('#msgs');
+  msgs.prepend(turn);
+  msgs.scrollTop = 40;
+}'''
+
+
 def assert_geometry(page):
-    """起止时间和绿点都要落在自己那一行按钮里，窄屏也不能被裁掉或挤出去。"""
-    boxes = page.locator('#session-view-menu button[data-agent]:not([data-agent=""])').evaluate_all('''items =>
+    """起止时间和绿点都要落在自己那一行按钮里，窄屏也不能被裁掉或挤出去；
+    每一行的种类、时间和正中都要真的点得到，不能被消息区里 sticky 的回合工具条盖住。"""
+    boxes = page.locator('#session-view-menu button[data-agent]').evaluate_all('''items =>
       items.map(b => {
         const r = b.getBoundingClientRect(), menu = document.querySelector('#session-view-menu').getBoundingClientRect();
         const inside = el => { if (!el) return true; const e = el.getBoundingClientRect();
           return e.left >= r.left - .5 && e.right <= r.right + .5 && e.top >= r.top - .5 && e.bottom <= r.bottom + .5; };
+        const hitAt = (el, left) => { if (!el) return true; const e = el.getBoundingClientRect();
+          return b.contains(document.elementFromPoint(left ? e.x + 6 : e.x + e.width / 2, e.y + e.height / 2)); };
         const span = b.querySelector('.view-span'), dot = b.querySelector('.view-live');
-        return {span: inside(span), dot: inside(dot), fits: r.right <= menu.right + .5 && r.left >= menu.left - .5,
-                hit: b.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)),
+        return {agent: b.dataset.agent, span: inside(span), dot: inside(dot),
+                fits: r.right <= menu.right + .5 && r.left >= menu.left - .5,
+                hit: hitAt(b), kindHit: hitAt(b.querySelector('.view-kind'), true),
+                titleHit: hitAt(b.querySelector('b'), true), spanHit: hitAt(span),
                 dotVisible: !dot || (dot.offsetWidth > 0 && dot.offsetHeight > 0)};
       })''')
-    assert all(all(b.values()) for b in boxes), boxes
+    assert all(all(v for k, v in b.items() if k != 'agent') for b in boxes), boxes
 
 
 def check_page(page, node, uid):
     page.evaluate('(uid) => openSession(uid)', uid)
     page.locator('#a-view-switch').wait_for()
+    page.wait_for_function('document.querySelector("#msgs .msg")')
+    page.evaluate(STICKY_TOOLBAR)
 
     # 父进程没在跑：没有绿点，纯按结束时间倒序
     node.state['live'] = None
