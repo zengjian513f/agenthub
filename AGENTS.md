@@ -80,8 +80,7 @@
 - `tests/claude_monkey.py` and the non-`--simulate` mode of
   `tests/dual_cli_monkey.py` start real CLI sessions and cost money. They are
   explicit standalone runs: never wire them into unittest/e2e discovery or the
-  normal test suite. Running them when the task calls for it needs no separate
-  authorization; the only hard rule is the model.
+  normal test suite.
 - Paid runs must use the cheapest model at low effort: Claude Code
   `claude-haiku-4-5-20251001` with `--effort low`, Codex `gpt-5.6-luna` with
   `model_reasoning_effort="low"`, Grok `grok-4.6` at low effort. Use the full
@@ -89,3 +88,5 @@
   assertion enabled, and never fall back to a more expensive model.
 - `tests/dual_cli_monkey.py --simulate` is a free scheduler/model check: it must
   not start tmux, a browser, Claude, Codex, or contact the agenthub service.
+- This section covers the CLI under test only; grok delegation recipe:
+  `~/.claude/grok-cli.md`.
