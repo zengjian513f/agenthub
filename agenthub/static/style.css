@@ -415,6 +415,15 @@ header .header-actions .header-menu .btn:focus-visible { outline: 2px solid var(
 .machine-row:last-child { border-bottom: 0; }
 .machine-row .machine-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .machine-row .machine-enabled { flex: none; width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.machine-grip {
+  flex: none; width: 18px; height: 24px; padding: 0; border: 0; border-radius: 5px;
+  background: transparent; color: var(--muted); font-size: 13px; letter-spacing: -3px;
+  cursor: grab; touch-action: none; user-select: none;
+}
+.machine-grip:hover { background: var(--hover); color: var(--text); }
+.machine-grip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.machine-row.dragging { background: var(--hover); box-shadow: 0 6px 20px rgba(0, 0, 0, .18); position: relative; z-index: 1; }
+.machine-row.dragging .machine-grip { cursor: grabbing; }
 /* 停用的机器只剩勾选框是实的，其余压暗：它此刻对页面其它部分不存在 */
 .machine-row.machine-off .machine-head > :not(.machine-enabled),
 .machine-row.machine-off .machine-fields, .machine-row.machine-off .machine-state { opacity: .5; }

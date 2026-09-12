@@ -314,13 +314,16 @@ def main():
                 assert page.locator('#machine-rows .machine-enabled:checked').count() == 3
                 probes = lambda: len([p for p, _ in nodes[2].state['gets'] if p.startswith('/api/')])
                 vega_row.locator('.machine-enabled').uncheck()
-                page.wait_for_function('!Nodes.list.some(n => n.name === "Vega") && Nodes.disabled.some(n => n.name === "Vega")')
+                page.wait_for_function('!Nodes.list.some(n => n.name === "Vega") && Nodes.machines.some(n => n.name === "Vega" && !n.enabled)')
                 page.wait_for_function('!S.sessions.some(s => s.node_name === "Vega")')
                 assert page.locator('#node-chips button', has_text='Vega').count() == 0
                 assert not page.locator('#node-chips button.node-offline').is_visible()
                 assert not page.locator('#node-notice').is_visible()
                 off_row = page.locator('#machine-rows .machine-row.machine-off')
                 assert off_row.count() == 1 and '已停用' in off_row.locator('.machine-state').inner_text()
+                # 停用不改顺序：Vega 还在第三行
+                machine_names = lambda: page.locator('#machine-rows .machine-row input[type="text"]').evaluate_all('e => e.map(i => i.value)')
+                assert machine_names() == ['NodeA', 'NodeB', 'Vega'], machine_names()
                 assert off_row.locator('.machine-backend option').first.inner_text() == '已停用'
                 assert not off_row.locator('.machine-enabled').is_checked()
                 page.evaluate('prepareNewNode()')
@@ -332,11 +335,35 @@ def main():
                 # Ticking it back brings it back online and into the list.
                 nodes[2].state['offline'] = False
                 off_row.locator('.machine-enabled').check()
-                page.wait_for_function('Nodes.list.some(n => n.name === "Vega") && !Nodes.disabled.length')
+                page.wait_for_function('Nodes.list.some(n => n.name === "Vega") && Nodes.machines.every(n => n.enabled)')
                 page.wait_for_function('Nodes.list.find(n => n.name === "Vega")?.online === true', timeout=20000)
                 page.wait_for_function('S.sessions.some(s => s.node_name === "Vega" && !s.stale)', timeout=20000)
                 assert page.locator('#machine-rows .machine-enabled:checked').count() == 3
                 assert page.locator('#node-chips button', has_text='Vega').count() == 1
+                assert machine_names() == ['NodeA', 'NodeB', 'Vega'], machine_names()
+                # The order is the user's: drag Vega's grip to the top, everything follows.
+                chip_names = lambda: page.locator('#node-chips button').evaluate_all('e => e.map(b => b.firstChild.textContent.trim())')
+                grip = page.locator('[data-machine-grip="' + 'c' * 32 + '"]')
+                top = page.locator('#machine-rows .machine-row').first.bounding_box()
+                box = grip.bounding_box()
+                page.mouse.move(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                page.mouse.down()
+                page.mouse.move(box['x'] + box['width'] / 2, top['y'] + 4, steps=8)
+                assert machine_names() == ['Vega', 'NodeA', 'NodeB'], machine_names()   # 拖动中实时换位
+                page.mouse.up()
+                page.wait_for_function('Nodes.machines[0]?.name === "Vega" && Nodes.list[0]?.name === "Vega"')
+                assert chip_names() == ['Vega', 'NodeA', 'NodeB'], chip_names()
+                assert [n['id'] for n in registry.machines()] == ['c' * 32, 'a' * 32, 'b' * 32]
+                page.evaluate('prepareNewNode()')
+                assert page.locator('#new-node option').all_inner_texts() == ['Vega', 'NodeA', 'NodeB']
+                # Keyboard: ArrowDown twice moves it back to the bottom, focus stays on the grip.
+                grip = page.locator('[data-machine-grip="' + 'c' * 32 + '"]')
+                grip.focus(); grip.press('ArrowDown'); grip.press('ArrowDown')
+                assert machine_names() == ['NodeA', 'NodeB', 'Vega'], machine_names()
+                page.wait_for_function('Nodes.list[2]?.name === "Vega"')
+                assert page.evaluate('document.activeElement?.dataset.machineGrip') == 'c' * 32
+                assert chip_names() == ['NodeA', 'NodeB', 'Vega'], chip_names()
+                assert [n['id'] for n in registry.machines()] == ['a' * 32, 'b' * 32, 'c' * 32]
                 page.locator('#settings-dialog .modal-actions button').click()
                 page.locator('#q').fill('needle'); page.locator('#q').press('Enter')
                 page.wait_for_function('S.results?.length === 3')

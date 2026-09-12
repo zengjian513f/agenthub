@@ -5984,17 +5984,15 @@ function machineTargets() {
       ? [{id: '', name: '本机', color: '', online: true, local: true,
           backends: T.backends, backend: T.backend}] : [];
   }
-  const live = Nodes.list.map(node => {
-    const cap = Nodes.capabilities[node.id] || {};
+  // 按注册表顺序列全部机器，停用的原位留着（只剩勾选框能把它接回来），不往后挪
+  const machines = Nodes.machines.length ? Nodes.machines : Nodes.list;
+  return machines.map(node => {
+    const on = node.enabled !== false;
+    const cap = on ? Nodes.capabilities[node.id] || {} : {};
     return {id: node.id, name: node.name, color: node.color || '',
-            online: node.online, local: false, enabled: true,
+            online: on ? node.online : null, local: false, enabled: on,
             backends: cap.backends || [], backend: cap.backend || ''};
   });
-  // 停用的机器排在后面：不显示、不检查、视同不存在，只留一个勾选框能把它接回来
-  const off = Nodes.disabled.map(node => ({
-    id: node.id, name: node.name, color: node.color || '', online: null,
-    local: false, enabled: false, backends: [], backend: ''}));
-  return [...live, ...off];
 }
 
 function setMachineNote(text, isError = false) {
@@ -6008,9 +6006,11 @@ function renderMachineSettings() {
   const rows = $('#machine-rows');
   const targets = machineTargets();
   const active = document.activeElement;
-  // 正在输入机器名时不要重绘，否则光标和未提交的文字都会没
+  // 正在输入机器名时不要重绘，否则光标和未提交的文字都会没；拖动中也不能换 DOM
   if (active && rows.contains(active) && active.tagName === 'INPUT' && active.type === 'text') return;
+  if (machineDrag) return;
   closeMachinePalette();
+  const focusedGrip = active?.dataset?.machineGrip;
   rows.textContent = '';
   if (!targets.length) {
     const empty = document.createElement('p');
@@ -6022,6 +6022,7 @@ function renderMachineSettings() {
   for (const target of targets) {
     rows.append(machineRow(target));
   }
+  if (focusedGrip) $(`[data-machine-grip="${focusedGrip}"]`)?.focus();   // 方向键挪完焦点留在原行
 }
 
 // 机器的配色就是名字左边那个色块：点开直接挑，右边不再重复一栏下拉。
@@ -6106,10 +6107,27 @@ $('#settings-dialog').addEventListener('keydown', event => {
 function machineRow(target) {
   const row = document.createElement('div');
   row.className = 'machine-row' + (target.enabled === false ? ' machine-off' : '');
+  row.dataset.machine = target.id;
 
   const head = document.createElement('div');
   head.className = 'machine-head';
   if (!target.local) {
+    // 顺序由用户拖出来（键盘用方向键），机器筛选和新建会话下拉都按这个顺序
+    const grip = document.createElement('button');
+    grip.type = 'button';
+    grip.className = 'machine-grip';
+    grip.dataset.machineGrip = target.id;
+    grip.title = '拖动调整顺序；也可按 ↑ ↓';
+    grip.setAttribute('aria-label', `调整 ${target.name} 的顺序：拖动，或按上下方向键`);
+    grip.innerHTML = '<span aria-hidden="true">⋮⋮</span>';
+    grip.onpointerdown = event => startMachineDrag(event, row, grip);
+    grip.onkeydown = event => {
+      const step = {ArrowUp: -1, ArrowDown: 1}[event.key];
+      if (!step) return;
+      event.preventDefault();
+      moveMachineRow(row, step);
+    };
+    head.append(grip);
     // 双系统的两台机器一台开着另一台必然关着：没勾选的不显示、不检查，就当不存在
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
@@ -6192,6 +6210,82 @@ async function machinePost(url, body, control) {
     return data;
   } finally {
     control.disabled = false;
+  }
+}
+
+// ---- 机器顺序：指针拖动 + 方向键 ----
+let machineDrag = null;
+let machineOrderTimer = 0;
+
+function startMachineDrag(event, row, grip) {
+  if (event.button !== 0 || machineDrag) return;
+  event.preventDefault();
+  const rows = $('#machine-rows');
+  const before = [...rows.children].map(r => r.dataset.machine);
+  machineDrag = {row, grip, before};
+  row.classList.add('dragging');
+  // 监听放在 document 上：行一被 insertBefore 挪动，浏览器就会释放指针捕获，
+  // 捕获在把手上的话第一次换位之后就收不到 pointermove 了
+  const move = e => {
+    if (e.pointerId !== event.pointerId) return;
+    // 拿指针所在的那一行当目标：在它上半就插到它前面，下半就插到它后面
+    const y = e.clientY;
+    for (const other of rows.children) {
+      if (other === row) continue;
+      const r = other.getBoundingClientRect();
+      if (y < r.top || y > r.bottom) continue;
+      const after = y > r.top + r.height / 2;
+      const want = after ? other.nextSibling : other;
+      if (want !== row && want !== row.nextSibling) rows.insertBefore(row, want);
+      break;
+    }
+  };
+  const finish = e => {
+    if (e.pointerId !== event.pointerId) return;
+    document.removeEventListener('pointermove', move);
+    document.removeEventListener('pointerup', finish);
+    document.removeEventListener('pointercancel', finish);
+    row.classList.remove('dragging');
+    const dragged = machineDrag;
+    machineDrag = null;
+    const after = [...rows.children].map(r => r.dataset.machine);
+    if (after.join() !== dragged.before.join()) void saveMachineOrder(after);
+  };
+  document.addEventListener('pointermove', move);
+  document.addEventListener('pointerup', finish);
+  document.addEventListener('pointercancel', finish);
+}
+
+function moveMachineRow(row, step) {
+  const rows = $('#machine-rows');
+  const target = step < 0 ? row.previousElementSibling : row.nextElementSibling?.nextElementSibling;
+  if (step < 0 && !row.previousElementSibling) return;
+  if (step > 0 && !row.nextElementSibling) return;
+  rows.insertBefore(row, target || null);
+  row.querySelector('.machine-grip')?.focus();
+  clearTimeout(machineOrderTimer);   // 连按几下只提交最后的顺序
+  machineOrderTimer = setTimeout(() => {
+    void saveMachineOrder([...rows.children].map(r => r.dataset.machine));
+  }, 400);
+}
+
+async function saveMachineOrder(ids) {
+  const rows = $('#machine-rows');
+  try {
+    const response = await fetch(appUrl('api/nodes/order'), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ids}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.error) throw new Error(data.error || `请求失败（HTTP ${response.status}）`);
+    Nodes.machines = data.machines;
+    setMachineNote('顺序已保存。');
+    await loadNodes();                  // 机器筛选和新建会话下拉跟着换顺序
+    renderMachineSettings();
+  } catch (error) {
+    setMachineNote(`顺序保存失败：${error.message || error}`, true);
+    await loadNodes().catch(() => {});
+    renderMachineSettings();            // 回到服务端仍然认的顺序
   }
 }
 

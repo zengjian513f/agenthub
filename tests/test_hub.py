@@ -641,10 +641,12 @@ class HubHTTPTests(unittest.TestCase):
             self.assertEqual(status, 200, body)
             self.assertEqual(body['node']['enabled'], False)
 
-            # 公开列表里没有它，只在停用名单里留个名字供重新勾选；健康状态一并清掉
+            # 公开列表里没有它；设置页的完整名单里它还在原来的位置（顺序不随启用状态变），
+            # 只是标为停用、没有健康状态
             _, listing = self.call('/api/nodes')
             self.assertEqual([n['id'] for n in listing['nodes']], ['a' * 32])
-            self.assertEqual([(n['id'], n['name']) for n in listing['disabled']], [(node_b, 'NodeB')])
+            self.assertEqual([(n['id'], n['enabled'], n['online']) for n in listing['machines']],
+                             [('a' * 32, True, True), (node_b, False, None)])
             self.assertEqual(self.registry.state(node_b), {})
             self.assertEqual([n['id'] for n in self.registry.all()], ['a' * 32])
 
@@ -664,7 +666,8 @@ class HubHTTPTests(unittest.TestCase):
             # 停用状态随注册表落盘，重启后仍然停用
             fresh = hub.Registry(self.registry.path, ['127.0.0.0/8'], monitor=False)
             self.assertEqual([n['id'] for n in fresh.all()], ['a' * 32])
-            self.assertEqual([n['id'] for n in fresh.disabled()], [node_b])
+            self.assertEqual([(n['id'], n['enabled']) for n in fresh.machines()],
+                             [('a' * 32, True), (node_b, False)])
 
             self.assertEqual(self.call(f'/api/nodes/{node_b}/display', {'enabled': 'yes'})[0], 400)
         finally:
@@ -672,11 +675,45 @@ class HubHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(body['node']['enabled'], True)
         self.assertEqual({n['id'] for n in self.registry.all()}, {'a' * 32, node_b})
-        self.assertEqual(self.call('/api/nodes')[1]['disabled'], [])
+        self.assertTrue(all(n['enabled'] for n in self.call('/api/nodes')[1]['machines']))
         self.registry.check_all()
         self.assertTrue(self.registry.state(node_b).get('online'))
         self.assertEqual({r['node_id'] for r in self.call('/api/sessions?force=1')[1]['sessions']},
                          {'a' * 32, node_b})
+
+    def test_machine_order_is_the_users_and_survives_toggling(self):
+        """机器顺序只由用户在设置页拖动决定：机器筛选、新建下拉、设置页都按它排，
+        停用/启用不改顺序，重启后不变；顺序必须是全部机器的一个排列。"""
+        node_a, node_b = 'a' * 32, 'b' * 32
+        original = [n['id'] for n in self.registry.machines()]
+        self.assertEqual(original, [node_a, node_b])
+        try:
+            status, body = self.call('/api/nodes/order', {'ids': [node_b, node_a]})
+            self.assertEqual(status, 200, body)
+            self.assertEqual([n['id'] for n in body['machines']], [node_b, node_a])
+            _, listing = self.call('/api/nodes')
+            self.assertEqual([n['id'] for n in listing['nodes']], [node_b, node_a])
+            self.assertEqual([n['id'] for n in listing['machines']], [node_b, node_a])
+            self.assertEqual([n['id'] for n in self.call('/api/sessions?force=1')[1]['nodes']], [node_b, node_a])
+
+            # 停用再启用，位置不动
+            self.call(f'/api/nodes/{node_b}/display', {'enabled': False})
+            self.assertEqual([(n['id'], n['enabled']) for n in self.call('/api/nodes')[1]['machines']],
+                             [(node_b, False), (node_a, True)])
+            self.call(f'/api/nodes/{node_b}/display', {'enabled': True})
+            self.assertEqual([n['id'] for n in self.call('/api/nodes')[1]['machines']], [node_b, node_a])
+
+            fresh = hub.Registry(self.registry.path, ['127.0.0.0/8'], monitor=False)
+            self.assertEqual([n['id'] for n in fresh.machines()], [node_b, node_a])
+
+            for bad in ([node_a], [node_a, node_b, node_a], [node_a, 'c' * 32], 'ab', None):
+                with self.subTest(bad=bad):
+                    status, body = self.call('/api/nodes/order', {'ids': bad})
+                    self.assertEqual(status, 400, body)
+            self.assertEqual([n['id'] for n in self.registry.machines()], [node_b, node_a])
+        finally:
+            self.registry.reorder(original)
+        self.assertEqual([n['id'] for n in self.registry.machines()], original)
 
     def test_terminal_backend_is_reported_and_switched_per_machine(self):
         """终端后端是每台机器各自的设置，网页按机器读取和切换。"""

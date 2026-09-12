@@ -467,11 +467,28 @@ class Registry:
                      **self.health.get(n["id"], {"online": None})}
                     for n in self.nodes if enabled(n)]
 
-    def disabled(self):
-        """停用的机器只在设置页露面，供重新勾选；没有健康状态。"""
+    def machines(self):
+        """设置页用的完整名单：按注册表顺序，含停用的机器；顺序不随启用状态变，
+        只由用户在设置页拖动决定。"""
         with self.lock:
-            return [{"id": n["id"], "name": n["name"], "color": n.get("color", "")}
-                    for n in self.nodes if not enabled(n)]
+            return [{"id": n["id"], "name": n["name"], "color": n.get("color", ""),
+                     "enabled": enabled(n),
+                     **(self.health.get(n["id"], {"online": None}) if enabled(n) else {"online": None})}
+                    for n in self.nodes]
+
+    def reorder(self, ids):
+        """按设置页拖出来的顺序重排注册表；必须是全部机器（含停用的）的一个排列。"""
+        if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+            raise ValueError("ids 必须是机器 id 列表")
+        with self.lock:
+            known = [n["id"] for n in self.nodes]
+            if sorted(ids) != sorted(known) or len(set(ids)) != len(ids):
+                raise ValueError("顺序必须包含每台机器各一次")
+            if ids != known:
+                by_id = {n["id"]: n for n in self.nodes}
+                self.nodes = [by_id[x] for x in ids]
+                self.save()
+            return [n["id"] for n in self.nodes]
 
 
 class HubHandler(server.Handler):
@@ -517,7 +534,9 @@ class HubHandler(server.Handler):
                                    "build": server.ASSET_VERSION, "hostname": "AgentHub"})
             if path == "/api/nodes" and self.command == "GET":
                 return self._json({"mode": "hub", "nodes": self.registry.public(),
-                                   "disabled": self.registry.disabled()})
+                                   "machines": self.registry.machines()})
+            if path == "/api/nodes/order" and self.command == "POST":
+                return self.set_order(self.read_body())
             display = re.fullmatch(r"/api/nodes/([a-f0-9]{32})/display", path)
             if display and self.command == "POST":
                 return self.set_display(display[1], self.read_body())
@@ -881,6 +900,19 @@ class HubHandler(server.Handler):
                                 data={"node_id": nid, "from": before,
                                       "to": {k: row[k] for k in ("name", "color", "enabled")}})
         return self._json({"ok": True, "node": row})
+
+    def set_order(self, body):
+        """设置页拖动后的机器顺序：机器筛选、新建会话下拉和设置页都按它排。"""
+        body = body if isinstance(body, dict) else {}
+        before = [n["id"] for n in self.registry.machines()]
+        try:
+            after = self.registry.reorder(body.get("ids"))
+        except ValueError as error:
+            return self._json({"error": str(error)}, 400)
+        if after != before:
+            server.audit.record("hub.node.order.changed", category="terminal",
+                                data={"from": before, "to": after})
+        return self._json({"ok": True, "machines": self.registry.machines()})
 
     def _remember_page_node(self, page_id, nid):
         if not page_id:
