@@ -858,6 +858,73 @@ class ClaudeProtocolTests(unittest.TestCase):
             self.assertEqual(adapter._sid_paths, {parent_id: parent})
 
 
+    def test_codex_subagent_items_carry_turn_state_and_last_record_time(self):
+        """子代理 rollout 自己的 task_started / task_complete / turn_aborted 就是回合边界。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            day = root / "2026" / "09" / "12"
+            day.mkdir(parents=True)
+            parent_id = "00000000-0000-0000-0000-000000000030"
+
+            def event(ts, kind, **payload):
+                return {"type": "event_msg", "timestamp": ts,
+                        "payload": {"type": kind, "turn_id": "t", **payload}}
+
+            def write(name, agent_id, rows):
+                meta = {"type": "session_meta", "timestamp": "2026-09-12T01:00:00Z",
+                        "payload": {"id": agent_id, "session_id": parent_id,
+                                    "parent_thread_id": parent_id,
+                                    "thread_source": "subagent",
+                                    "source": {"subagent": {"thread_spawn": {
+                                        "parent_thread_id": parent_id, "depth": 1,
+                                        "agent_path": f"/root/{name}"}}},
+                                    "timestamp": "2026-09-12T01:00:00Z",
+                                    "cwd": "/tmp/project"}}
+                (day / f"rollout-{name}-{agent_id}.jsonl").write_text(
+                    "\n".join(json.dumps(r) for r in [meta, *rows]) + "\n")
+
+            write("parent", parent_id, [])
+            (day / f"rollout-parent-{parent_id}.jsonl").write_text(json.dumps({
+                "type": "session_meta", "timestamp": "2026-09-12T00:59:00Z",
+                "payload": {"id": parent_id, "session_id": parent_id, "thread_source": "user",
+                            "timestamp": "2026-09-12T00:59:00Z", "cwd": "/tmp/project"}}) + "\n")
+            ids = {kind: f"00000000-0000-0000-0000-00000000003{n}"
+                   for n, kind in enumerate(["running", "done", "aborted", "resumed"], start=1)}
+            write("running", ids["running"], [
+                event("2026-09-12T01:01:00Z", "task_started"),
+                {"type": "response_item", "timestamp": "2026-09-12T01:02:00Z",
+                 "payload": {"type": "reasoning"}},
+                {"type": "event_msg", "timestamp": "2026-09-12T01:03:00Z",
+                 "payload": {"type": "token_count"}}])
+            write("done", ids["done"], [
+                event("2026-09-12T01:01:00Z", "task_started"),
+                event("2026-09-12T01:10:00Z", "task_complete", completed_at=1789166200)])
+            write("aborted", ids["aborted"], [
+                event("2026-09-12T01:01:00Z", "task_started"),
+                event("2026-09-12T01:05:00Z", "turn_aborted", reason="interrupted")])
+            write("resumed", ids["resumed"], [
+                event("2026-09-12T01:01:00Z", "task_started"),
+                event("2026-09-12T01:05:00Z", "task_complete"),
+                event("2026-09-12T01:20:00Z", "task_started"),
+                {"type": "response_item", "timestamp": "2026-09-12T01:21:00Z",
+                 "payload": {"type": "message"}}])
+
+            with patch.object(adapters, "CODEX_ROOT", root), \
+                    patch.object(adapters, "CODEX_INDEX", Path(tmp) / "missing-index"):
+                adapter = adapters.CodexAdapter()
+                public = adapter.finalize_sessions(adapter.scan_sessions())
+
+            parent = next(row for row in public if row["sid"] == parent_id)
+            items = {item["title"].removeprefix("/root/"): item for item in parent["agent_items"]}
+            self.assertEqual({k: v["active"] for k, v in items.items()}, {
+                "running": True, "done": False, "aborted": False, "resumed": True})
+            self.assertEqual(items["done"]["updated"], adapters._norm_ts("2026-09-12T01:10:00Z"))
+            self.assertEqual(items["running"]["updated"], adapters._norm_ts("2026-09-12T01:03:00Z"))
+            self.assertEqual(items["done"]["created"], adapters._norm_ts("2026-09-12T01:00:00Z"))
+            self.assertNotIn("_agent_active", parent)
+            self.assertFalse(any("active" in row for row in public))
+
+
 class IncrementalCursorTests(unittest.TestCase):
     def test_confirmed_in_memory_claude_rewind_pins_history_until_new_branch_appends(self):
         with tempfile.TemporaryDirectory() as tmp, \

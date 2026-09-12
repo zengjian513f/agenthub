@@ -203,6 +203,27 @@ def _claude_agent_tail(path: Path) -> tuple[str | None, bool]:
     return updated, closed is False
 
 
+# Codex 子代理与用户线程共用一套 Session 事件环：task_started / task_complete /
+# turn_aborted 恒落盘（codex-rs/rollout/src/policy.rs），ShutdownComplete 不落盘，
+# followup 再唤起会写新的 task_started。子代理在父进程内运行，没有自己的进程。
+_CODEX_TURN_OPEN = {"task_started": True, "turn_started": True,
+                    "task_complete": False, "turn_complete": False,
+                    "turn_aborted": False}
+
+
+def _codex_agent_tail(path: Path) -> tuple[str | None, bool]:
+    """Codex 子代理 rollout 的 (最后一条记录时间, 最后一个回合是否仍未收尾)。I/O 错误直接抛出。"""
+    updated, open_turn = None, None
+    for rec in _iter_records_reversed(path):
+        if updated is None:
+            updated = _norm_ts(rec.get("timestamp"))
+        if open_turn is None and rec.get("type") == "event_msg":
+            open_turn = _CODEX_TURN_OPEN.get((rec.get("payload") or {}).get("type"))
+        if updated is not None and open_turn is not None:
+            break
+    return updated, bool(open_turn)
+
+
 _AGENT_TASK_ID = re.compile(rb"<task-id>([A-Za-z0-9_-]{1,64})</task-id>")
 _agent_stops_lock = threading.Lock()
 _agent_stops: dict[str, dict] = {}
@@ -1665,11 +1686,13 @@ class CodexAdapter:
                   or meta.get("id") or f.stem)
         base_title = (_title_from_text(first_user) if first_user
                       else "(无标题) " + f.stem.replace("rollout-", "")[:16])
+        # 只有子代理才读尾部：列表要显示它的结束时间和是否还在跑。
+        agent_updated, agent_active = _codex_agent_tail(f) if is_subagent else (None, False)
         return {
             "uid": _uid("codex", str(f)), "source": "codex", "sid": sid,
             "title": _clip(base_title, 110), "cwd": meta.get("cwd") or "(未知)",
             "created": _norm_ts(meta.get("timestamp")) or _iso(st.st_mtime),
-            "updated": _iso(st.st_mtime), "size": st.st_size, "path": str(f),
+            "updated": agent_updated or _iso(st.st_mtime), "size": st.st_size, "path": str(f),
             "model": model, "branch": None,
             "forked_from_id": str(meta.get("forked_from_id") or ""),
             "history_base": meta.get("history_base")
@@ -1685,6 +1708,7 @@ class CodexAdapter:
                                 or spawn.get("agent_nickname") or sid),
             "_agent_type": str(meta.get("agent_role") or spawn.get("agent_role")
                                or "subagent"),
+            "_agent_active": agent_active,
         }
 
     def session_meta(self, path: str | Path) -> dict | None:
@@ -1740,7 +1764,7 @@ class CodexAdapter:
             items = by_sid[owner].setdefault("agent_items", [])
             items.append({
                 "id": agent["sid"], "title": agent["_agent_title"],
-                "type": agent["_agent_type"],
+                "type": agent["_agent_type"], "active": bool(agent.get("_agent_active")),
                 **{k: agent[k] for k in ("path", "cwd", "model", "created", "updated", "size")},
             })
             by_sid[owner]["agents"] = len(items)
@@ -1784,6 +1808,7 @@ class CodexAdapter:
             s.pop("_agent_parent_sid", None)
             s.pop("_agent_title", None)
             s.pop("_agent_type", None)
+            s.pop("_agent_active", None)
         return out
 
     def list_sessions(self):
