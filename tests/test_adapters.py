@@ -355,6 +355,49 @@ class GrokAdapterTests(unittest.TestCase):
         ])
         self.assertEqual(end, expected_end)
 
+    def test_in_flight_user_query_envelope_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            history = session / "chat_history.jsonl"
+            rows = [
+                {"type": "user", "content": [{
+                    "type": "text",
+                    "text": (
+                        "The user sent a message while you were working:\n"
+                        "<user_query>\n"
+                        "不要显示任何续写状况。显示最新那个会话就行。\n"
+                        "</user_query>\n"
+                        "Make sure to complete any unfinished tasks from previous turns."
+                    ),
+                }], "prompt_index": 7},
+                {"type": "user", "content": [{
+                    "type": "text",
+                    "text": (
+                        "The user interrupted the previous turn:\n"
+                        "<user_query>\n"
+                        "如果有多个提交，amend合并。\n"
+                        "</user_query>\n"
+                        "Make sure to complete any unfinished tasks from previous turns."
+                    ),
+                }], "prompt_index": 8},
+                {"type": "user", "content": [{
+                    "type": "text",
+                    "text": (
+                        "请看这段 <user_query>示例</user_query> 标签怎么渲染"
+                    ),
+                }], "prompt_index": 9},
+            ]
+            history.write_text("\n".join(
+                json.dumps(item, ensure_ascii=False) for item in rows) + "\n")
+
+            messages, _ = adapters.GrokAdapter().read(str(session))
+
+        self.assertEqual([(m["role"], m["text"]) for m in messages], [
+            ("user", "不要显示任何续写状况。显示最新那个会话就行。"),
+            ("user", "如果有多个提交，amend合并。"),
+            ("user", "请看这段 <user_query>示例</user_query> 标签怎么渲染"),
+        ])
+
     def test_image_metadata_envelope_is_removed_but_media_is_kept(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Path(tmp)

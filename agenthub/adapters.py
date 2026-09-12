@@ -668,7 +668,12 @@ _CODEX_ABORT_PREFIX = re.compile(
     r"^\s*<turn_aborted>.*?</turn_aborted>\s*", re.I | re.S)
 _GROK_USER_QUERY = re.compile(
     r"^\s*(?:<image_files>.*?</image_files>\s*)*"
-    r"<user_query>(.*?)</user_query>\s*$", re.I | re.S)
+    r"(?:The user (?:sent a message while you were working|"
+    r"interrupted the previous turn):\s*)?"
+    r"(?:<image_files>.*?</image_files>\s*)*"
+    r"<user_query>(.*?)</user_query>\s*"
+    r"(?:Make sure to complete any unfinished tasks from previous turns\.)?\s*$",
+    re.I | re.S)
 _CLAUDE_BASH_INPUT = re.compile(
     r"^\s*<bash-input>(.*?)</bash-input>\s*$", re.I | re.S)
 _CLAUDE_BASH_STREAM = re.compile(
@@ -723,7 +728,11 @@ def _strip_codex_abort_prefix(text: str) -> str:
 
 
 def _strip_grok_user_query(text: str) -> str:
-    """剥 Grok 的 user_query/image_files 信封，图片本身由结构化 part 显示。"""
+    """剥 Grok 的 user_query/image_files 信封，图片本身由结构化 part 显示。
+
+    工作中途插入或打断上一轮时，Grok 还会在标签外加协议前后缀；那不是
+    用户正文。信封以外还有别的字则原样保留。
+    """
     match = _GROK_USER_QUERY.fullmatch(str(text or ""))
     if not match:
         return text
