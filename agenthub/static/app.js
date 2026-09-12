@@ -3239,17 +3239,12 @@ function bindSessionActions(heading) {
   layoutSessionHead(heading);
 }
 
-// 会话头任何宽度都只占一行。三级排版决定哪些操作平铺在标题右侧；元信息按固定顺序
-// （消息数、大小、起止时间、机器、目录、来源、模型、会话号、分支）尽量直接跟在标题
-// 后面（.dbrief），长标题让到标题行的 40%（不少于 8em）为止，从放不下的那一项起全部收进 ⋯ 菜单：
-//   宽屏：操作全部平铺；元信息全放得下时 ⋯ 没有内容，不显示
-//   中屏：只平铺星标，元信息同样按剩余宽度平铺
-//   窄屏：全部收进菜单
-const HEAD_INLINE = {
-  wide: {actions: null, brief: true},
-  medium: {actions: ['a-star'], brief: true},
-  narrow: {actions: [], brief: false},
-};
+// 会话头任何宽度都只占一行，且不因折叠留白。三级排版只决定哪些操作固定平铺在标题右侧
+// （宽屏全部、中屏星标、窄屏没有）；元信息按固定顺序（消息数、大小、起止时间、机器、目录、
+// 来源、模型、会话号、分支）在任何宽度都尽量直接跟在标题后面（.dbrief），宽屏/中屏长标题让到
+// 标题行的 40%（不少于 8em）为止，窄屏标题不让位、元信息只填剩下的空白；从放不下的那一项起
+// 收进 ⋯ 菜单。元信息全放下了还有空位，菜单里剩下的操作也按顺序平铺出来；菜单空了 ⋯ 不显示。
+const HEAD_INLINE = {wide: null, medium: ['a-star'], narrow: []};
 // 消息数会随新消息变宽，留一点余量免得刚好放下的一项被裁掉
 const HEAD_BRIEF_SLACK = 24;
 function layoutSessionHead(heading = $('#detail .dhead')) {
@@ -3261,8 +3256,7 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
   const tier = layoutTier();
   const plan = HEAD_INLINE[tier];
   const menuButtons = node => node.matches('button') ? [node] : [...node.querySelectorAll('button')];
-  const inline = node => plan.actions === null
-    || menuButtons(node).some(item => plan.actions.includes(item.id));
+  const inline = node => plan === null || menuButtons(node).some(item => plan.includes(item.id));
   closeSessionActions();
   // 先把平铺出去的都收回菜单（保持原始顺序），再按本级挑出要平铺的
   for (const node of actions.querySelectorAll(':scope > [data-from-menu]')) {
@@ -3280,13 +3274,9 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
     for (const item of menuButtons(node)) item.removeAttribute('role');
     actions.insertBefore(node, wrap);
   }
-  heading.classList.toggle('head-flat', plan.actions === null);
-  const menuEmpty = !list.children.length;
+  heading.classList.toggle('head-flat', plan === null);
   const more = wrap.querySelector('#a-more');
-  if (more) {
-    more.title = more.ariaLabel = menuEmpty ? '会话信息' : '更多会话操作';
-    more.hidden = false;   // 量宽度时按 ⋯ 在场算，免得它的显隐反过来改变放得下的项数
-  }
+  if (more) more.hidden = false;   // 量宽度时按 ⋯ 在场算，免得它的显隐反过来改变放得下的项数
   // 元信息：全部先收回菜单，量出标题和操作区后按顺序往标题后放，放不下的留在菜单里
   const meta = menu.querySelector('.dmeta');
   let brief = heading.querySelector('.dbrief');
@@ -3300,12 +3290,14 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
     for (const item of items) meta.appendChild(item);
     brief.hidden = true;
     let keep = 0;
-    if (plan.brief && heading.isConnected) {
+    if (heading.isConnected) {
       const title = heading.querySelector('.dtitle');
       const h2 = title.querySelector('h2');
       const gap = parseFloat(getComputedStyle(title).columnGap) || 0;
-      // 长标题最多占标题行的 40%（不少于 8em），其余让给元信息；短标题只占自己的宽度
-      const titleMax = Math.max(8 * parseFloat(getComputedStyle(h2).fontSize), title.clientWidth * 0.4);
+      // 宽屏/中屏长标题最多占标题行的 40%（不少于 8em），其余让给元信息；短标题只占自己的宽度。
+      // 窄屏标题优先，元信息只填标题右边剩下的空白
+      const titleMax = tier === 'narrow' ? Infinity
+        : Math.max(8 * parseFloat(getComputedStyle(h2).fontSize), title.clientWidth * 0.4);
       const titleWidth = Math.min(h2.getBoundingClientRect().width, titleMax);
       const room = actions.getBoundingClientRect().left - h2.getBoundingClientRect().left
         - titleWidth - gap * 2 - HEAD_BRIEF_SLACK;
@@ -3320,10 +3312,30 @@ function layoutSessionHead(heading = $('#detail .dhead')) {
         keep++;
       }
       for (const item of items.slice(keep)) meta.appendChild(item);
+      // 元信息全放下了还有空位：菜单里剩下的操作按原顺序平铺出来，到放不下的那一项为止
+      if (keep === items.length) {
+        const actionsGap = parseFloat(getComputedStyle(actions).columnGap) || 0;
+        for (const node of [...list.children]) {
+          node.dataset.fromMenu = '1';
+          actions.insertBefore(node, wrap);
+          const width = node.getBoundingClientRect().width + actionsGap;
+          if (used + width > room) {
+            delete node.dataset.fromMenu;
+            list.prepend(node);
+            break;
+          }
+          used += width;
+          for (const item of menuButtons(node)) item.removeAttribute('role');
+        }
+      }
     }
     brief.hidden = !keep;
   }
-  if (more) more.hidden = menuEmpty && !meta?.children.length;
+  if (more) {
+    const menuEmpty = !list.children.length;
+    more.title = more.ariaLabel = menuEmpty ? '会话信息' : '更多会话操作';
+    more.hidden = menuEmpty && !meta?.children.length;
+  }
   auditHeaderLayout(heading, tier, actions);
 }
 
@@ -3375,12 +3387,10 @@ for (const media of [MOBILE, MEDIUM]) media.addEventListener('change', () => lay
   document.fonts?.ready.then(() => layoutSessionHead());   // 字体换过之后文字宽度会变
 }
 
-// 顶栏右侧按钮按三级宽度折进 ⋯ 菜单：宽屏全露出，中屏折起回收站/报告/设置，窄屏全折起。
-const HEADER_FOLD = {
-  wide: [],
-  medium: ['trash', 'report-bug', 'settings'],
-  narrow: ['new-session', 'reload', 'trash', 'report-bug', 'settings'],
-};
+// 顶栏右侧按钮只在放不下时才折进 ⋯ 菜单，任何宽度都不因折叠留白：先全部平铺量一次，
+// 筛选条被挤压（内容比可见宽度宽）或整条顶栏横向溢出，才从最不常用的一头逐个折起，
+// 直到不再挤压。平铺顺序即重要程度：新建、重新扫描、回收站、报告问题、设置。
+const HEADER_ACTIONS = ['new-session', 'reload', 'trash', 'report-bug', 'settings'];
 function closeHeaderMenu(restoreFocus = false) {
   const menu = $('#header-menu');
   if (!menu || menu.hidden) return;
@@ -3390,26 +3400,40 @@ function closeHeaderMenu(restoreFocus = false) {
   if (restoreFocus) button?.focus();
 }
 function layoutHeader() {
+  const header = $('header'), filters = header?.querySelector('.header-filters');
   const more = $('#header-more'), menu = $('#header-menu');
-  if (!more || !menu) return;
-  const fold = HEADER_FOLD[layoutTier()];
-  closeHeaderMenu();
-  for (const id of ['new-session', 'reload', 'trash', 'report-bug', 'settings']) {
-    const button = document.getElementById(id);
-    if (!button) continue;
-    if (fold.includes(id)) {
-      let label = button.querySelector(':scope > span.menu-label');
-      if (!label) button.appendChild(label = el('span', 'menu-label'));
-      label.textContent = button.ariaLabel || button.title;
-      button.setAttribute('role', 'menuitem');
-      menu.appendChild(button);
-    } else {
-      button.querySelector(':scope > span.menu-label')?.remove();
-      button.removeAttribute('role');
-      more.before(button);
-    }
+  if (!filters || !more || !menu) return;
+  const squeezed = () => filters.scrollWidth > filters.clientWidth
+    || header.scrollWidth > header.clientWidth;
+  // 现状仍成立（没被挤压，且折起的第一个按钮拿出来也放不下）就不动 DOM：
+  // 计数变宽之类的重排大多如此，别把用户正开着的菜单或键盘焦点弄丢
+  const actions = more.parentElement;
+  if (!squeezed()) {
+    const free = actions.getBoundingClientRect().left - filters.getBoundingClientRect().right
+      - (parseFloat(getComputedStyle(header).columnGap) || 0);
+    const unit = more.getBoundingClientRect().width + (parseFloat(getComputedStyle(actions).columnGap) || 0);
+    if (!menu.children.length || free < unit) return;
   }
-  more.hidden = !fold.length;
+  closeHeaderMenu();
+  const buttons = HEADER_ACTIONS.map(id => document.getElementById(id)).filter(Boolean);
+  for (const button of buttons) {
+    button.querySelector(':scope > span.menu-label')?.remove();
+    button.removeAttribute('role');
+    more.before(button);
+  }
+  more.hidden = true;
+  // 折起第一个按钮只是把它换成 ⋯，宽度没省出来；所以真要折就至少折两个，循环自然做到
+  let folded = 0;
+  while (folded < buttons.length && squeezed()) {
+    more.hidden = false;
+    const button = buttons[buttons.length - 1 - folded++];
+    let label = button.querySelector(':scope > span.menu-label');
+    if (!label) button.appendChild(label = el('span', 'menu-label'));
+    label.textContent = button.ariaLabel || button.title;
+    button.setAttribute('role', 'menuitem');
+    menu.prepend(button);   // 从末尾往前折，菜单里仍是平铺时的顺序
+  }
+  more.hidden = !folded;
 }
 {
   const button = $('#header-more-btn'), menu = $('#header-menu');
@@ -3449,6 +3473,11 @@ function layoutHeader() {
   }, true);
   addEventListener('resize', () => closeHeaderMenu());
   for (const media of [MOBILE, MEDIUM]) media.addEventListener('change', layoutHeader);
+  // 视口、断点换挡、机器/来源筛选增减、会话计数变宽都会改变筛选条的内容宽度；
+  // 观察的都是 flex: none 的组，重排只搬右侧按钮，不会改它们的尺寸而形成回环。
+  // 新建按钮随终端能力出现/消失时由 term.js 直接调 layoutHeader()。
+  const observer = new ResizeObserver(() => layoutHeader());
+  for (const node of [$('header'), $('.brand'), ...$('.header-filters').children]) observer.observe(node);
   layoutHeader();
 }
 

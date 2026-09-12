@@ -66,7 +66,7 @@ def main():
                         page.evaluate('window.oldSearch = searchAbort')
                         assert page.evaluate('''() => document.querySelector('#search-progress')
                           .getBoundingClientRect().bottom <= document.querySelector('#side').getBoundingClientRect().top''')
-                        if mobile:   # 窄屏顶栏按钮全部折进 ⋯
+                        if not page.locator('#new-session').is_visible():   # 顶栏放不下时新建按钮折在 ⋯ 里
                             page.locator('#header-more-btn').click()
                         page.locator('#new-session').click()
                         page.locator('#new-session-form label:has(input[value="codex"])').click()

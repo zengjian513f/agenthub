@@ -874,28 +874,51 @@ def run(pw):
     check("新建刷新设置使用相同按钮尺寸",
           action_styles[1:] == [action_styles[0], action_styles[0]], action_styles)
 
-    # 顶栏按三级宽度排版：中屏折起回收站/报告/设置，窄屏全部折进 ⋯；每级都只有一行
+    # 顶栏右侧按钮只在筛选条放不下时才折进 ⋯，任何宽度都不因折叠留白：折起的只能是优先级
+    # 末尾的连续几个，菜单里保持平铺顺序；折了就一定是再放一个也会挤压筛选条；每级都只有一行
+    HEADER_ACTIONS = ["new-session", "reload", "trash", "report-bug", "settings"]
+    def header_fold():
+        return p.evaluate("""() => {
+          const header = document.querySelector('header'), filters = header.querySelector('.header-filters');
+          const actions = header.querySelector('.header-actions'), more = document.querySelector('#header-more');
+          const ids = nodes => [...nodes].map(b => b.id).filter(id => id && id !== 'header-more-btn');
+          const unit = document.querySelector('#header-more-btn').getBoundingClientRect().width
+            || document.querySelector('#settings').getBoundingClientRect().width;
+          return {inline: ids(actions.querySelectorAll(':scope > .btn')),
+            menu: ids(document.querySelectorAll('#header-menu > .btn')), more: !more.hidden,
+            squeezed: filters.scrollWidth > filters.clientWidth || header.scrollWidth > header.clientWidth,
+            free: actions.getBoundingClientRect().left - filters.getBoundingClientRect().right
+              - parseFloat(getComputedStyle(header).columnGap),
+            unit: unit + parseFloat(getComputedStyle(actions).columnGap),
+            height: header.getBoundingClientRect().height};
+        }""")
+    def check_header_fold(where):
+        fold = header_fold()
+        check(f"{where}：折起的只能是末尾几个按钮，⋯ 只在折了东西时出现",
+              fold["inline"] + fold["menu"] == HEADER_ACTIONS and fold["more"] == bool(fold["menu"]), fold)
+        check(f"{where}：筛选条没有被挤压", not fold["squeezed"], fold)
+        if fold["menu"]:
+            check(f"{where}：折起后剩下的空位放不下下一个按钮", fold["free"] < fold["unit"], fold)
+        else:
+            check(f"{where}：全部平铺时 ⋯ 不占位", not p.locator("#header-more-btn").is_visible())
+        check(f"{where}：顶栏只有一行", fold["height"] <= 52, fold)
+        return fold
     def resize(width, height):
         p.set_viewport_size({"width": width, "height": height})
         p.evaluate("dispatchEvent(new Event('resize'))")
-        # headless 只有渲染一帧后才派发媒体查询 change，折叠布局靠它驱动
+        # headless 只有渲染一帧后才派发媒体查询 change 和 ResizeObserver，折叠布局靠它们驱动
         p.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
         p.wait_for_timeout(300)
     resize(900, 780)
-    check("中屏顶栏露出新建和刷新，其余折进 ⋯",
-          p.locator("#new-session").is_visible() and p.locator("#reload").is_visible()
-          and not p.locator("#settings").is_visible() and not p.locator(".brand-name").is_visible()
-          and p.locator("#header-more-btn").is_visible()
-          and p.locator("header").bounding_box()["height"] <= 52)
-    p.locator("#header-more-btn").click()
-    check("中屏 ⋯ 菜单里是回收站、报告问题和设置",
-          p.locator("#header-menu button:visible").evaluate_all(
-              "b => b.map(x => x.id)") == ["trash", "report-bug", "settings"]
-          and p.locator("#header-menu #settings").inner_text().strip() == "设置")
-    p.keyboard.press("Escape")
-    check("Esc 关闭 ⋯ 菜单并把焦点还给按钮",
-          not p.locator("#header-menu").is_visible()
-          and p.evaluate("document.activeElement?.id") == "header-more-btn")
+    check("中屏顶栏放得下就全部平铺，机器名收起",
+          header_fold()["menu"] == [] and p.locator("#settings").is_visible()
+          and not p.locator(".brand-name").is_visible())
+    check_header_fold("中屏")
+    resize(608, 780)
+    check("608px 宽的顶栏放得下五个按钮，不折叠、不留白",
+          header_fold()["menu"] == [] and p.locator("#new-session").is_visible()
+          and p.locator("#settings").is_visible())
+    check_header_fold("608px")
     resize(390, 780)
     mobile_header = p.evaluate("""() => {
       const box = id => { const r = document.querySelector(id).getBoundingClientRect();
@@ -910,25 +933,42 @@ def run(pw):
           and abs(mobile_header["actions"]["top"] - mobile_header["view"]["top"]) < 4
           and mobile_header["header"]["height"] <= 46 and not mobile_header["overflow"],
           mobile_header)
-    check("手机顶栏保留会话数量和视图按钮，其余按钮全部折进 ⋯",
+    check("手机顶栏保留会话数量和视图按钮",
           not p.locator(".brand-name").is_visible()
           and p.locator("#session-total").is_visible()
           and p.locator('#view button[aria-label="项目树"]').is_visible()
           and p.locator('#view button[aria-label="时间轴"]').is_visible()
-          and p.locator("#session-scope [role=radio]").count() == 2
-          and not p.locator("#reload").is_visible()
-          and p.locator("#header-more-btn").is_visible())
+          and p.locator("#session-scope [role=radio]").count() == 2)
+    phone_fold = check_header_fold("手机")
+    check("手机顶栏放不下的按钮从设置、报告问题起折进 ⋯",
+          phone_fold["menu"][-2:] == ["report-bug", "settings"]
+          and not p.locator("#settings").is_visible()
+          and p.locator("#header-more-btn").is_visible(), phone_fold)
     p.locator("#header-more-btn").click()
-    check("手机 ⋯ 菜单包含全部五个顶栏操作",
+    check("手机 ⋯ 菜单按平铺顺序列出折起的按钮并带文字",
           p.locator("#header-menu button:visible").evaluate_all("b => b.map(x => x.id)")
-          == ["new-session", "reload", "trash", "report-bug", "settings"])
+          == phone_fold["menu"]
+          and p.locator("#header-menu #settings").inner_text().strip() == "设置")
     p.keyboard.press("Escape")
+    check("Esc 关闭 ⋯ 菜单并把焦点还给按钮",
+          not p.locator("#header-menu").is_visible()
+          and p.evaluate("document.activeElement?.id") == "header-more-btn")
+    # 新建按钮随终端能力出现/消失时也要重新量，不能靠换挡才更新
+    p.evaluate("""() => { document.querySelector('#new-session').classList.add('hidden'); layoutHeader(); }""")
+    hidden_fold = header_fold()
+    p.evaluate("""() => { document.querySelector('#new-session').classList.remove('hidden'); layoutHeader(); }""")
+    check("新建按钮不可用时它的位置让给别的按钮",
+          hidden_fold["inline"] + hidden_fold["menu"] == HEADER_ACTIONS
+          and not hidden_fold["squeezed"]
+          and len(hidden_fold["menu"]) <= len(phone_fold["menu"])
+          and header_fold() == phone_fold, (hidden_fold, phone_fold))
     resize(1280, 720)
     check("宽屏顶栏全部按钮平铺，⋯ 不出现",
           p.locator("#settings").is_visible() and p.locator("#trash").is_visible()
           and not p.locator("#header-more-btn").is_visible()
           and p.locator(".brand-name").is_visible()
           and p.locator(".brand-name").inner_text().strip() not in {"", "__AGENTHUB_HOSTNAME__"})
+    check_header_fold("宽屏")
     brand_style = p.locator(".brand-name").evaluate("""n => {
       const s = getComputedStyle(n);
       return {background:s.backgroundImage, family:s.fontFamily,

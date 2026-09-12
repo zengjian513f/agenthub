@@ -64,11 +64,43 @@ def header_ids(page):
         'buttons => buttons.map(b => b.id || (b.hasAttribute("data-report-bug") ? "report-bug" : ""))')
 
 
-INLINE_IDS = {
-    'wide': ['a-term', 'a-star', 'a-turns', 'report-bug', 'a-session-action'],
-    'medium': ['a-term', 'a-star', 'a-more'],
-    'narrow': ['a-term', 'a-more'],
-}
+# 各级固定平铺在标题栏上的操作；其余操作在元信息全放下、还有空位时才按原顺序平铺出来
+ACTION_ORDER = ['a-star', 'a-turns', 'report-bug', 'a-session-action']
+FIXED_INLINE = {'wide': ACTION_ORDER, 'medium': ['a-star'], 'narrow': []}
+
+
+def menu_action_ids(page):
+    return page.locator('#session-actions-menu [role="menu"] > *').evaluate_all(
+        'items => items.map(b => b.id || (b.hasAttribute("data-report-bug") ? "report-bug" : ""))')
+
+
+def assert_actions_fold(page, tier):
+    """标题栏不因折叠留白：固定平铺的一定在外面；菜单里剩的是 ACTION_ORDER 的一段后缀；
+    有操作在菜单里时元信息全放下了才会多平铺，且剩余空位放不下菜单里的第一项；菜单空了 ⋯ 不显示。"""
+    inline = header_ids(page)
+    in_menu = menu_action_ids(page)
+    brief, meta = meta_split(page)
+    expected = ['a-term'] + [i for i in ACTION_ORDER if i not in in_menu] + (['a-more'] if in_menu or meta else [])
+    assert inline == expected, (inline, expected)
+    assert all(i not in in_menu for i in FIXED_INLINE[tier]), (tier, in_menu)
+    assert in_menu == ACTION_ORDER[len(ACTION_ORDER) - len(in_menu):], in_menu
+    extra = [i for i in ACTION_ORDER if i not in in_menu and i not in FIXED_INLINE[tier]]
+    if extra:
+        assert not meta, (extra, meta)
+    if in_menu and not meta:
+        layout = page.evaluate('''() => {
+          const brief = document.querySelector('.dbrief'), h2 = document.querySelector('.dhead h2');
+          const actions = document.querySelector('.dhead-actions');
+          const last = brief && !brief.hidden ? brief : h2;
+          return {free: actions.getBoundingClientRect().left - last.getBoundingClientRect().right,
+                  gap: parseFloat(getComputedStyle(actions).columnGap)};
+        }''')
+        open_actions(page)
+        width = page.locator('#session-actions-menu [role="menu"] > *').first.evaluate(
+            'e => e.getBoundingClientRect().width')
+        page.keyboard.press('Escape')
+        assert layout['free'] < width + layout['gap'] + 24, (layout, width, in_menu)
+    return in_menu
 # 元信息的固定顺序：消息数、大小、起止时间、机器、目录、来源、[模型]、会话号、[分支]（机器徽章只有中央站的会话才有；
 # 模拟节点的会话没有模型和分支）
 META_ORDER = ['mcount-total', 'size', 'time', 'meta-node', 'cwd', 'meta-source', 'session-id']
@@ -87,21 +119,17 @@ def meta_split(page):
 
 
 def assert_meta_fit(page, tier, scoped):
-    """标题后放得下的元信息都要放出来，只有放不下的才进 ⋯；顺序固定，标题行不换行。"""
+    """任何宽度下标题后放得下的元信息都要放出来，只有放不下的才进 ⋯；顺序固定，标题行不换行。"""
     brief, menu = meta_split(page)
     expected = [k for k in META_ORDER if scoped or k != 'meta-node']
     assert brief + menu == expected, (brief, menu)
     assert page.locator('.dbrief').is_visible() == bool(brief)
-    if tier == 'narrow':
-        assert not brief, brief
     more = page.locator('#a-more')
-    if tier == 'wide':
-        # 操作全平铺后 ⋯ 只剩元信息；元信息也都放下了就不显示
-        assert more.is_visible() == bool(menu), (menu, more.is_visible())
-        if menu:
-            assert more.get_attribute('aria-label') == '会话信息'
-    else:
-        assert more.is_visible() and more.get_attribute('aria-label') == '更多会话操作'
+    in_menu = menu_action_ids(page)
+    # ⋯ 只在菜单里还有操作或元信息时显示；只剩元信息时叫 会话信息
+    assert more.is_visible() == bool(menu or in_menu), (menu, in_menu, more.is_visible())
+    if more.is_visible():
+        assert more.get_attribute('aria-label') == ('更多会话操作' if in_menu else '会话信息')
     layout = page.evaluate('''() => {
       const h2 = document.querySelector('.dhead h2'), brief = document.querySelector('.dbrief');
       const actions = document.querySelector('.dhead-actions');
@@ -111,7 +139,7 @@ def assert_meta_fit(page, tier, scoped):
               gap: parseFloat(getComputedStyle(document.querySelector('.dtitle')).columnGap)};
     }''')
     assert not layout['overlap'], layout
-    if menu and tier != 'narrow':
+    if menu:
         # 菜单里第一项确实放不下：剩余空间小于它的宽度（加上间距和留给消息数变宽的余量）
         open_actions(page)
         width = page.locator('#session-actions-menu .dmeta > *').first.evaluate('e => e.getBoundingClientRect().width')
@@ -169,9 +197,9 @@ def assert_menu_text_selectable(page):
 def assert_actions_menu(page, tier, scoped):
     menu = page.locator('#session-actions-menu')
     max_height = 46   # 会话头任何宽度都只有一行
-    wide = tier == 'wide'
-    assert header_ids(page) == INLINE_IDS[tier] + (['a-more'] if wide and meta_split(page)[1] else []), header_ids(page)
+    in_menu = assert_actions_fold(page, tier)
     assert_meta_fit(page, tier, scoped)
+    has_more = page.locator('#a-more').is_visible()
     assert page.locator('.dhead').bounding_box()['height'] <= max_height
     assert not page.evaluate('document.documentElement.scrollWidth > innerWidth')
     assert page.evaluate('''limit => {
@@ -185,8 +213,8 @@ def assert_actions_menu(page, tier, scoped):
       return fits;
     }''', max_height)
     open_actions(page)
-    scope = page.locator('.dhead-actions') if wide else menu
-    assert menu.is_visible() == (not wide or bool(meta_split(page)[1]))
+    scope = menu if in_menu else page.locator('.dhead-actions')
+    assert menu.is_visible() == has_more
     assert page.locator('#mcount-total').is_visible()
     assert page.locator('.session-id').is_visible()
     hits = scope.locator('button:visible').evaluate_all('''items => items.map(e => {
@@ -200,25 +228,24 @@ def assert_actions_menu(page, tier, scoped):
     before = page.evaluate('S.compactTurns')
     page.locator('#a-turns').click()
     assert menu.is_hidden() and page.evaluate('S.compactTurns') != before
-    if not wide or meta_split(page)[1]:
+    if has_more:
         assert_menu_text_selectable(page)
     more = page.locator('#a-more')
-    if not wide:
-        first, second = ('a-star', 'a-turns') if tier == 'narrow' else ('a-turns', 'report-bug')
+    if len(in_menu) >= 2:
+        item = lambda i: page.locator('.dhead').locator(f'#{i}' if i != 'report-bug' else '[data-report-bug]').first
         more.press('ArrowDown')
-        assert page.locator('#' + first).evaluate('e => e === document.activeElement')
+        assert item(in_menu[0]).evaluate('e => e === document.activeElement')
         page.keyboard.press('End')
-        assert page.locator('#a-session-action').evaluate('e => e === document.activeElement')
+        assert item(in_menu[-1]).evaluate('e => e === document.activeElement')
         page.keyboard.press('Home')
         page.keyboard.press('ArrowDown')
-        assert page.locator('.dhead').locator(f'#{second}, [data-report-bug]').first.evaluate(
-            'e => e === document.activeElement')
+        assert item(in_menu[1]).evaluate('e => e === document.activeElement')
         page.keyboard.press('Escape')
         assert menu.is_hidden() and more.evaluate('e => e === document.activeElement')
         more.press('ArrowUp')
         page.keyboard.press('Tab')
         assert menu.is_hidden()
-    else:
+    if 'a-star' not in in_menu and 'a-turns' not in in_menu:
         # 平铺后每个操作自己就是 Tab 序列里的一站，不再需要菜单的方向键导航。
         page.locator('#a-star').focus()
         page.keyboard.press('Tab')
@@ -229,7 +256,7 @@ def assert_actions_menu(page, tier, scoped):
     open_actions(page)   # 打开 ⋯ 会收起视图菜单；没有 ⋯ 可开时视图开关自己收起
     if not page.locator('#a-more').is_visible():
         page.locator('#a-view-switch').click()
-    assert menu.is_visible() == (not wide or bool(meta_split(page)[1]))
+    assert menu.is_visible() == has_more
     assert page.locator('#session-view-menu').is_hidden()
     page.locator('.dhead h2 > .ico').click()
     assert menu.is_hidden()
@@ -362,15 +389,21 @@ def main():
                         # report/stop actions before any native JSONL exists.
                         page.evaluate('''() => showNewSessionStage({name: 'pending-menu',
                           source: 'claude', title: 'New session', cwd: '/example/project', node_name: 'MenuNode'})''')
-                        assert header_ids(page) == (
-                            ['a-term', 'report-bug', 'a-session-action'] if wide
-                            else ['a-term', 'a-more']), header_ids(page)
+                        # 临时会话的元信息很短，中窄屏也常常全放得下，这时报告/停止也平铺出来、⋯ 消失
+                        pending_actions = ['report-bug', 'a-session-action']
+                        in_menu = menu_action_ids(page)
+                        brief, folded = meta_split(page)
+                        assert in_menu == pending_actions[len(pending_actions) - len(in_menu):], in_menu
+                        assert header_ids(page) == ['a-term'] + [i for i in pending_actions if i not in in_menu] + (
+                            ['a-more'] if in_menu or folded else []), header_ids(page)
+                        if wide:
+                            assert not in_menu and not folded, (in_menu, folded)
+                        elif in_menu != pending_actions:
+                            assert not folded, (in_menu, folded)
                         assert page.locator('.dhead').bounding_box()['height'] <= 46
                         assert page.locator('.dhead h2 > .ico > #dlive.visible.tmux').count() == 1
                         pending_meta = ['mcount-total', 'meta-node', 'cwd', 'meta-source']   # 上面显式给了 node_name
-                        brief, folded = meta_split(page)
                         assert brief + folded == pending_meta, (brief, folded)
-                        assert (not folded) if wide else (not brief) if tier == 'narrow' else True, (brief, folded)
                         open_actions(page)
                         assert page.locator('#a-session-action').get_attribute('aria-label') == '停止会话'
                         assert page.locator('.dhead [data-report-bug]').is_visible()

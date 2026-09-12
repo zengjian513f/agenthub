@@ -132,9 +132,10 @@ html, body {
 #node-notice { padding: 6px 12px; color: var(--muted); font-size: 12px; flex: none; }
 /* ---------- 顶栏 ---------- */
 /* 顶栏按三级宽度排版，任何一级都只占一行：
-   宽屏（≥1200px）机器和 Agent 筛选平铺、按钮全部露出；
-   中屏（721–1199px）机器改为下拉、筛选只留图标、次要按钮折进 ⋯；
-   窄屏（≤720px）机器仍是下拉、所有按钮折进 ⋯。 */
+   宽屏（≥1200px）机器和 Agent 筛选平铺；
+   中屏（721–1199px）机器改为下拉、筛选只留图标；
+   窄屏（≤720px）机器仍是下拉、按钮更紧凑。
+   右侧按钮不按档位折叠：app.js 量过筛选条放不下才从末尾折进 ⋯，任何宽度都不因折叠留白。 */
 header {
   position: relative; display: flex; flex-wrap: nowrap; align-items: center; gap: 14px;
   width: 100%;
@@ -1759,7 +1760,7 @@ body.dragging-v { cursor: row-resize; user-select: none; }
     height: var(--visual-viewport-height, 100dvh);
   }
 
-  /* 窄屏顶栏只有一行：会话范围、机器下拉、Agent 图标、视图、⋯ */
+  /* 窄屏顶栏只有一行：会话范围、机器下拉、Agent 图标、视图、放得下的按钮和 ⋯ */
   header {
     gap: 4px;
     padding: 6px max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left));

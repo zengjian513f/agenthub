@@ -30,6 +30,23 @@ def contrast(fg, bg):
     return (max(a, b) + .05) / (min(a, b) + .05)
 
 
+HEADER_ACTIONS = ['new-session', 'reload', 'trash', 'report-bug', 'settings']
+# 顶栏右侧按钮的折叠状态：平铺的、折进 ⋯ 的、筛选条是否被挤压、筛选条和按钮之间的空位、再放一个按钮要多宽
+HEADER_FOLD_JS = """() => {
+  const header = document.querySelector('header'), filters = header.querySelector('.header-filters');
+  const actions = header.querySelector('.header-actions');
+  const ids = nodes => [...nodes].map(b => b.id).filter(id => id && id !== 'header-more-btn');
+  return {inline: ids(actions.querySelectorAll(':scope > .btn')),
+    menu: ids(document.querySelectorAll('#header-menu > .btn')),
+    more: !document.querySelector('#header-more').hidden,
+    squeezed: filters.scrollWidth > filters.clientWidth || header.scrollWidth > header.clientWidth,
+    free: actions.getBoundingClientRect().left - filters.getBoundingClientRect().right
+      - parseFloat(getComputedStyle(header).columnGap),
+    unit: document.querySelector('#header-more-btn').getBoundingClientRect().width
+      + parseFloat(getComputedStyle(actions).columnGap)};
+}"""
+
+
 def main():
     with tempfile.TemporaryDirectory() as root:
         nodes = [start_node(char * 32, name) for char, name in [('a', 'NodeA'), ('b', 'NodeB'), ('c', 'Vega')]]
@@ -86,10 +103,17 @@ def main():
                     assert page.locator('.brand-name + #side-toggle + #session-scope').count() == 1
                     assert page.locator('header').bounding_box()['height'] <= 52
                     assert page.locator('#session-scope [role=radio]').count() == 2
+                    fold = page.evaluate(HEADER_FOLD_JS)
+                    # 右侧按钮只折放不下的：折起的是末尾几个且菜单保持平铺顺序，筛选条不被挤压，
+                    # 折了就说明再放一个也放不下；放得下时 ⋯ 不出现
+                    assert fold['inline'] + fold['menu'] == HEADER_ACTIONS and not fold['squeezed'], fold
+                    assert fold['more'] == bool(fold['menu']), fold
                     if wide:
+                        assert not fold['menu'] and page.locator('#settings').is_visible(), fold
                         assert page.locator('#session-scope').bounding_box()['width'] == 98
                         assert all(b.bounding_box()['width'] == 48 for b in page.locator('#session-scope button').all())
                         return
+                    assert fold['menu'] and fold['free'] < fold['unit'], fold
                     page.locator('#node-pick').click()
                     assert page.locator('#node-chips').is_visible()
                     assert page.locator('#node-chips button').count() == 3
@@ -102,11 +126,11 @@ def main():
                     assert page.locator('#node-pick .node-pick-label').inner_text() == '全部'
                     page.keyboard.press('Escape')
                     assert not page.locator('#node-chips').is_visible()
-                    # 右侧按钮全部折进 ⋯
+                    # 设置最先折进 ⋯，菜单里能点到
                     assert not page.locator('#settings').is_visible()
                     page.locator('#header-more-btn').click()
                     assert page.locator('#header-menu #settings').is_visible()
-                    assert page.locator('#header-menu #reload').is_visible()
+                    assert page.locator('#header-menu button:visible').evaluate_all('b => b.map(x => x.id)') == fold['menu']
                     page.keyboard.press('Escape')
                     assert not page.locator('#header-menu').is_visible()
                 check_toolbar()

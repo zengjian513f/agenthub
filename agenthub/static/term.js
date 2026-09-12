@@ -375,7 +375,12 @@ async function loadTermList() {
     // 必须连同草稿和终端归属一起跟进，不能继续向已消失的 uid 请求接管。
     await rebindSelectedTermSession();
   }
-  $('#new-session')?.classList.toggle('hidden', !T.enabled);
+  const create = $('#new-session');
+  if (create && create.classList.contains('hidden') === T.enabled) {
+    create.classList.toggle('hidden', !T.enabled);
+    // 新建按钮出现/消失改变顶栏右侧占宽，放不放得下要重新量
+    if (typeof layoutHeader === 'function') layoutHeader();
+  }
   renderTakeoverBtn();
   const after = fingerprint();
   if (after !== before && S.sig && typeof renderSide === 'function') {
