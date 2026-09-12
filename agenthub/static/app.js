@@ -252,6 +252,22 @@ function flushBrowserAuditBeacon() {
   }
 }
 
+const nativeAlert = window.alert.bind(window);
+const nativeConfirm = window.confirm.bind(window);
+window.alert = message => {
+  const text = String(message ?? '').slice(0, 500);
+  browserAuditEvent('dialog.shown', {kind: 'alert', text});
+  try { return nativeAlert(message); }
+  finally { browserAuditEvent('dialog.closed', {kind: 'alert', result: null}); }
+};
+window.confirm = message => {
+  const text = String(message ?? '').slice(0, 500);
+  browserAuditEvent('dialog.shown', {kind: 'confirm', text});
+  let result = null;
+  try { return (result = nativeConfirm(message)); }
+  finally { browserAuditEvent('dialog.closed', {kind: 'confirm', result}); }
+};
+
 function browserStateSnapshot(reason = '') {
   const box = $('#msgs');
   const nodes = box ? [...box.querySelectorAll('.msg, #activity, .client-outbox')].slice(-40) : [];
