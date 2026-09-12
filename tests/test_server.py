@@ -40,6 +40,61 @@ class AccessAllowlistTests(unittest.TestCase):
         self.assertEqual(str(server.ALLOWED_NETWORKS[0]), "10.0.0.0/24")
 
 
+class SpawnWatchTests(unittest.TestCase):
+    """发起关系的记录不能依赖浏览器：没人开网页时服务自己也要按节奏看进程。"""
+
+    def test_loop_records_parents_without_any_http_request(self):
+        import tempfile
+        import threading
+        from pathlib import Path
+        from agenthub import index, live, session_meta
+        child = {"uid": "grok:child", "source": "grok", "sid": "child-sid",
+                 "created": "2026-09-12T20:46:40+08:00"}
+        parent = {"uid": "claude:root", "source": "claude", "sid": "root-sid",
+                  "created": "2026-09-12T18:00:00+08:00"}
+        stop = threading.Event()
+        calls = []
+
+        def spawn_parents(sessions, owned, skip=frozenset()):
+            calls.append(set(skip))
+            stop.set()                      # 一轮之后停下，别让测试真的睡 10 秒
+            return {} if "grok:child" in skip else {"grok:child": {"source": "claude", "sid": "root-sid"}}
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(session_meta, "DATA_DIR", Path(tmp)), \
+                patch.object(session_meta, "META_FILE", Path(tmp) / "session-meta.json"), \
+                patch.object(index, "load", return_value=[parent, child]), \
+                patch.object(live, "active_processes",
+                             return_value=(["grok:child", "claude:root"],
+                                           {"grok:child": [201], "claude:root": [100]})), \
+                patch.object(live, "spawn_parents", side_effect=spawn_parents):
+            server._spawn_watch_loop(stop)
+            self.assertEqual(calls, [set()])
+            self.assertEqual(session_meta.enrich([child])[0]["spawned_by"],
+                             {"source": "claude", "sid": "root-sid"})
+            # 已记录的会话下一轮由 skip 略过，不会重写
+            stop.clear()
+            server._spawn_watch_loop(stop)
+            self.assertEqual(calls[-1], {"grok:child"})
+
+    def test_a_failing_tick_does_not_kill_the_loop(self):
+        import threading
+        from agenthub import index
+        stop = threading.Event()
+        attempts = []
+
+        def load():
+            attempts.append(1)
+            if len(attempts) >= 2:
+                stop.set()
+            raise OSError("inventory unavailable")
+
+        with patch.object(index, "load", side_effect=load), \
+                patch.object(server, "SPAWN_WATCH_INTERVAL", 0.01):
+            server._spawn_watch_loop(stop)
+        self.assertEqual(len(attempts), 2)
+
+
 class BulkSessionDeleteTests(unittest.TestCase):
     """左栏多选删除: 一条失败不能把其余会话一起拖住。"""
 

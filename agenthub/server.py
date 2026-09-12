@@ -314,6 +314,39 @@ def _outbox_loop() -> None:
             _deliver_claude_item(item, panes)
 
 
+SPAWN_WATCH_INTERVAL = 10.0
+
+
+def _record_spawn_parents(sessions: list[dict], owned_pids: dict[str, list[int]]) -> int:
+    """发起关系只在双方进程都在时能从进程树看出来，看到就写进 session-meta。"""
+    spawned = live.spawn_parents(sessions, owned_pids, skip=session_meta.spawned_uids())
+    return session_meta.record_spawn_parents(spawned) if spawned else 0
+
+
+def _spawn_watch_tick() -> int:
+    """扫一遍 inventory 与进程，记下新出现的发起关系；返回新记录数。"""
+    sessions = index.load()
+    _uids, owned_pids = live.active_processes(sessions)
+    return _record_spawn_parents(sessions, owned_pids)
+
+
+def _spawn_watch_loop(stop: threading.Event | None = None) -> None:
+    """不能只靠浏览器轮询 /api/live 顺手记录：agent 批量派出的 headless 会话往往
+    在没人开着网页的几分钟里生灭（实测 10 条 grok -p 跑了 5–7 分钟，期间没有
+    可见页面，只有收尾时还活着的 3 条被记下）。服务自己按固定节奏看一眼，
+    进程扫描与 /api/live 共用同一份 3 秒缓存，网页开着时几乎不额外花钱。
+    """
+    while not (stop and stop.is_set()):
+        try:
+            _spawn_watch_tick()
+        except Exception:
+            pass                                  # 诊断性的记录，绝不能拖垮服务
+        if stop:
+            stop.wait(SPAWN_WATCH_INTERVAL)
+        else:
+            time.sleep(SPAWN_WATCH_INTERVAL)
+
+
 def _sessions_signature(index_sig: str | None = None) -> str:
     """原生会话与 agenthub 自有元数据共同决定列表版本。"""
     return f"{index.signature() if index_sig is None else index_sig}:{session_meta.signature()}"
@@ -1208,11 +1241,7 @@ class Handler(BaseHTTPRequestHandler):
             force = q.get("force", ["0"])[0] == "1"
             sessions = debug_runs.filter_rows(index.cached(), _debug_run(q))
             uids, owned_pids = live.active_processes(sessions, force=force)
-            # 发起关系只在双方进程都在时能从进程树看出来; 趁每次判活顺手记下。
-            spawned = live.spawn_parents(sessions, owned_pids,
-                                         skip=session_meta.spawned_uids())
-            if spawned:
-                session_meta.record_spawn_parents(spawned)
+            _record_spawn_parents(sessions, owned_pids)   # 趁每次判活顺手记下
             live_set = set(uids)
             tmux_uids = [s["uid"] for s in sessions
                          if s["uid"] in live_set
@@ -2552,6 +2581,7 @@ def main():
         ap.error(f"--allow 包含无效的 IP/CIDR: {exc}")
 
     threading.Thread(target=index.load, daemon=True).start()  # 后台预热索引
+    threading.Thread(target=_spawn_watch_loop, daemon=True, name="agenthub-spawn-watch").start()
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
