@@ -392,6 +392,8 @@ WAL，文件权限 `0600`），顺序由数据库自增序号确定；较大的�
 消息批和 DOM 快照以 SHA-256 寻址、zlib 压缩并去重。默认保留 14 天。诊断写入在后台执行，
 队列、磁盘或数据库失败不会改变消息发送结果。
 
+浏览器端除 HTTP/SSE/终端回执和点击外，还记录会话标题栏本身：`detail.rendered`（详情区每次换内容，来源与换完是否还有标题栏和控制台按钮）、`header.layout`（三级排版结果、标题行是否溢出）、`console.button.state/missing/restored`（控制台按钮在不在 DOM、有没有被裁掉或盖住、`#right` 是否被滚走，丢失时附标题栏 HTML，最多 5 秒一条）、`terminal.pane`（终端面板开合与模式变化及原因）、`dialog.shown/closed`（`alert`/`confirm` 文案与结果）。回传按 UTF-8 字节分批（≤48 KB、≤20 条），单条正文超过 32 KB 先截断，页面卸载时用 `sendBeacon` 分两包且只保留最后一张快照的正文——Chrome 对 keepalive/beacon 的请求体只有 64 KB 配额，超限会让整批永远发不出去。中央按 `page_id` 记住每页最近一次解析出的机器，选中会话为空或处于临时会话阶段的事件也能转发到该机器。
+
 审计会保存诊断所需的对话正文、终端输入输出和页面可见文字，因此该数据库本身属于敏感
 本机数据，不应上传或随仓库发布。结构化字段会递归移除 Cookie、Authorization、密码、
 API key 与 access/refresh token；附件只记录既有引用和元数据，不另复制正文附件。
