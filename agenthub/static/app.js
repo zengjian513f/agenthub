@@ -202,6 +202,7 @@ function browserStateSnapshot(reason = '') {
         anchor: entry.anchor, activity: entry.activity?.state || '',
         outbox: queuedMessages(S.sel).map(item => ({id: item.id, state: item.state}))} : null,
       dom_messages: nodes.length, terminal: termState,
+      header: consoleButtonState(),
     },
     content: {
       composer: $('#cinput')?.value || '',
@@ -227,6 +228,125 @@ function scheduleBrowserSnapshot(reason = 'render') {
       browserAuditEvent('dom.snapshot', snapshot.data, snapshot.content);
     } catch { /* page can be between detail teardown and rebuild */ }
   }, 100);
+}
+
+// ---- 会话标题栏 / 控制台按钮的存在性审计 ----
+// 控制台按钮"偶尔消失"一直没抓到现场：快照只看消息，不看标题栏。这里独立记录
+// 按钮的三层状态——在不在 DOM、几何上有没有被裁掉/盖住（elementFromPoint）、
+// #right 有没有被滚走——任何一层不成立就记一条 console.button.missing，附上
+// 标题栏 HTML 和布局数据；恢复时记 console.button.restored。
+// 常规状态变化（文案、接管态、灰态、位置）按签名去重记 console.button.state。
+function consoleButtonState() {
+  const button = $('#a-term');
+  const right = $('#right');
+  const detail = $('#detail');
+  const head = detail?.querySelector(':scope > .dhead');
+  const shown = !!right && right.offsetWidth > 0;   // 手机列表页 #right 整个 display:none
+  const state = {
+    present: !!button, head: !!head, shown,
+    detail_children: detail ? [...detail.children].map(
+      node => node.id || node.className.split(' ')[0] || node.tagName.toLowerCase()).slice(0, 8) : null,
+    right_scroll: right ? [right.scrollLeft, right.scrollTop] : null,
+    right_overflow: right ? [right.scrollWidth - right.clientWidth, right.scrollHeight - right.clientHeight] : null,
+    tier: layoutTier(), mobile_detail: document.body.classList.contains('mobile-detail'),
+  };
+  if (button) {
+    const style = getComputedStyle(button);
+    state.label = button.ariaLabel || '';
+    state.on = button.classList.contains('on');
+    state.unavailable = button.dataset.unavailable === 'true';
+    state.hidden = button.hidden || style.display === 'none' || style.visibility !== 'visible'
+      || parseFloat(style.opacity) === 0;
+  }
+  if (button && shown) {
+    const r = button.getBoundingClientRect(), rr = right.getBoundingClientRect();
+    const hit = r.width && r.height && document.visibilityState === 'visible'
+      ? document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) : undefined;
+    state.rect = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+    state.in_right = r.width > 0 && r.right <= rr.right + .5 && r.left >= rr.left - .5
+      && r.top >= rr.top - .5 && r.bottom <= rr.bottom + .5;
+    // 页面不可见时 elementFromPoint 一律 null，不算被遮
+    state.hit = hit === undefined ? null : !!hit && button.contains(hit);
+    state.hit_target = hit ? (hit.id ? '#' + hit.id : hit.className ? '.' + String(hit.className).split(' ')[0]
+      : hit.tagName.toLowerCase()) : null;
+  }
+  // 不在 DOM 一定算丢；在 DOM 但页面可见时被隐藏/裁掉/盖住也算丢
+  state.ok = state.present && (!shown || (!state.hidden && state.in_right && state.hit !== false));
+  return state;
+}
+
+let consoleButtonMissingSince = 0;
+let consoleButtonSignature = '';
+let consoleButtonTimer = 0;
+function auditConsoleButton(reason = '') {
+  let state;
+  try { state = consoleButtonState(); } catch { return; }
+  const content = () => {
+    const head = $('#detail > .dhead');
+    return {dhead: head ? head.outerHTML.slice(0, 12000) : null,
+      detail: $('#detail')?.innerHTML.slice(0, 2000) || null};
+  };
+  const term = typeof T === 'undefined' ? null : {
+    name: T.name, uid: T.uid, mode: T.mode, views: [...T.views.keys()],
+    visible: !$('#termpane')?.classList.contains('hidden'),
+  };
+  if (!state.ok) {
+    // 丢失期间最多 5 秒记一次，免得 MutationObserver/定时器把库刷爆
+    const now = Date.now();
+    if (consoleButtonMissingSince && now - consoleButtonMissingSince < 5000) return;
+    consoleButtonMissingSince = consoleButtonMissingSince || now;
+    browserAuditEvent('console.button.missing', {reason, ...state, selected: S.sel, agent: S.agent,
+      terminal: term}, content(), {severity: 'error'});
+    return;
+  }
+  if (consoleButtonMissingSince) {
+    browserAuditEvent('console.button.restored', {reason, ...state,
+      missing_ms: Date.now() - consoleButtonMissingSince, terminal: term}, null, {severity: 'warning'});
+    consoleButtonMissingSince = 0;
+  }
+  const signature = JSON.stringify([state.label, state.on, state.unavailable, state.rect, state.tier,
+    state.hit_target, state.right_scroll]);
+  if (signature === consoleButtonSignature) return;
+  consoleButtonSignature = signature;
+  browserAuditEvent('console.button.state', {reason, ...state, terminal: term});
+}
+function scheduleConsoleButtonAudit(reason = '') {
+  clearTimeout(consoleButtonTimer);
+  consoleButtonTimer = setTimeout(() => auditConsoleButton(reason), 150);
+}
+{
+  // #detail 换内容（读取中/失败/正式渲染/新会话页）时重新盯住新的标题栏；标题栏
+  // 内部的增删和 class/hidden/style 变化也触发检查。#msgs 的海量变动不在观察范围内。
+  const headObserver = new MutationObserver(() => scheduleConsoleButtonAudit('head-mutation'));
+  let observedHead = null;
+  const watchHead = () => {
+    const head = $('#detail > .dhead');
+    if (head === observedHead) return;
+    headObserver.disconnect();
+    observedHead = head;
+    if (head) headObserver.observe(head, {childList: true, subtree: true, attributes: true,
+      attributeFilter: ['class', 'hidden', 'style', 'aria-label']});
+  };
+  new MutationObserver(() => { watchHead(); scheduleConsoleButtonAudit('detail-mutation'); })
+    .observe($('#detail'), {childList: true});
+  watchHead();
+  // 裁切/滚走这类不改 DOM 的情况靠 #right 的 scroll 和低频巡检兜底
+  $('#right')?.addEventListener('scroll', () => scheduleConsoleButtonAudit('right-scroll'), {passive: true});
+  setInterval(() => { if (!document.hidden) auditConsoleButton('periodic'); }, 5000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) scheduleConsoleButtonAudit('visible');
+  });
+}
+
+/** #detail 每次换内容都记一笔：谁换的、换完有没有标题栏和控制台按钮。 */
+function auditDetailRendered(source, extra = {}) {
+  const detail = $('#detail');
+  browserAuditEvent('detail.rendered', {
+    source, selected: S.sel, agent: S.agent, ...extra,
+    has_head: !!detail?.querySelector(':scope > .dhead'), has_console_button: !!$('#a-term'),
+    children: detail ? [...detail.children].map(
+      node => node.id || node.className.split(' ')[0] || node.tagName.toLowerCase()).slice(0, 8) : null,
+  });
 }
 
 queueMicrotask(() => browserAuditEvent('page.loaded', {
@@ -369,6 +489,16 @@ function fmtTime(iso) {
   if (d.toDateString() === y.toDateString()) return '昨天 ' + hm;
   if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}-${p(d.getDate())} ${hm}`;
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+/** 起止时间：同一天只写一次日期前缀；没有结束时间就是还在跑。 */
+function fmtSpan(start, end) {
+  const from = fmtTime(start);
+  if (!end) return from ? `${from} → 运行中` : '运行中';
+  const to = fmtTime(end);
+  if (!from) return to;   // 旧节点的列表项还没有开始时间
+  const split = s => { const i = s.lastIndexOf(' '); return i < 0 ? [s, ''] : [s.slice(0, i), s.slice(i + 1)]; };
+  const [fromDay, fromClock] = split(from), [toDay, toClock] = split(to);
+  return fromClock && toClock && fromDay === toDay ? `${from} → ${toClock}` : `${from} → ${to}`;
 }
 /** 家目录缩成 ~; 过长的路径中间省略, 首尾都是有信息量的部分。
  *  不能用 CSS direction:rtl 来截左边 —— bidi 会把开头的 "/" 挪到末尾。 */
@@ -3185,27 +3315,41 @@ function layoutHeader() {
   layoutHeader();
 }
 
+/** 子代理是否仍在跑：服务端按 transcript 与父会话的停止通知判断，父进程不在则一律不算。 */
+const agentRunning = (uid, item) => !!item.active && S.live.has(uid);
+
+/** 主会话/子代理下拉的行：主会话固定在前，子代理按结束时间倒序，还在跑的没有结束时间、排最前并带绿点。 */
+function sessionViewRows(m) {
+  const row = S.sessions.find(s => s.uid === m.uid);
+  const items = [...((row || m).agent_items || [])];
+  const running = a => agentRunning(m.uid, a);
+  const when = value => Date.parse(value || '') || 0;
+  items.sort((a, b) => (running(b) - running(a)) || (when(b.updated) - when(a.updated)));
+  const mainTitle = m.parent_title || m.title;
+  return `
+      <button type="button" data-agent="" class="${m.agent_id ? '' : 'on'}" role="menuitem">
+        <small><span class="view-kind">主会话</span></small><b>${esc(mainTitle)}</b>
+      </button>
+      ${items.map(a => `<button type="button" data-agent="${esc(a.id)}"
+        class="${m.agent_id === a.id ? 'on' : ''}${running(a) ? ' running' : ''}" role="menuitem">
+        <small><span class="view-kind">${running(a)
+          ? '<i class="view-live" title="运行中" aria-label="运行中"></i>' : ''}子代理 · ${esc(a.type)}</span>
+          <span class="view-span">${esc(fmtSpan(a.created, running(a) ? null : a.updated))}</span></small>
+        <b>${esc(a.title)}</b>
+      </button>`).join('')}`;
+}
+
 function head(m, total) {
   const h = el('div', 'dhead');
   const tmuxLive = S.liveTmux.has(m.uid);
-  const agentItems = m.agent_items || [];
-  const hasAgents = agentItems.length > 0;
-  const mainTitle = m.parent_title || m.title;
+  const hasAgents = (m.agent_items || []).length > 0;
   const titleView = hasAgents ? `
     <button class="session-view-switch" id="a-view-switch" type="button"
       title="切换主会话/子代理" aria-label="切换主会话/子代理" aria-expanded="false">
       <span>${esc(m.title)}</span><i>⌄</i>
     </button>` : `<span>${esc(m.title)}</span>`;
   const menuView = hasAgents ? `
-    <div class="session-view-menu" id="session-view-menu" hidden role="menu">
-      <button type="button" data-agent="" class="${m.agent_id ? '' : 'on'}" role="menuitem">
-        <small>主会话</small><b>${esc(mainTitle)}</b>
-      </button>
-      ${agentItems.map(a => `<button type="button" data-agent="${esc(a.id)}"
-        class="${m.agent_id === a.id ? 'on' : ''}" role="menuitem">
-        <small>子代理 · ${esc(a.type)}</small><b>${esc(a.title)}</b>
-      </button>`).join('')}
-    </div>` : '';
+    <div class="session-view-menu" id="session-view-menu" hidden role="menu">${sessionViewRows(m)}</div>` : '';
   h.innerHTML = `
     <div class="dtitle">
       <button class="mobile-back" title="返回会话列表" aria-label="返回会话列表">←</button>
@@ -3266,6 +3410,9 @@ function head(m, total) {
     };
     viewSwitch.onclick = e => {
       e.stopPropagation();
+      // 起止时间和运行点按打开时的列表数据重画；列表刷新不重建标题栏，
+      // 否则正在看的菜单会被换掉。
+      if (viewMenu.hidden) viewMenu.innerHTML = sessionViewRows(m);
       viewMenu.hidden = !viewMenu.hidden;
       viewSwitch.setAttribute('aria-expanded', String(!viewMenu.hidden));
       if (!viewMenu.hidden) setTimeout(() => document.addEventListener('click', close, { once: true }), 0);

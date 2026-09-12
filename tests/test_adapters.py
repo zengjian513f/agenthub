@@ -1140,6 +1140,161 @@ class IncrementalCursorTests(unittest.TestCase):
                                  ["父项新文", "子项正文"])
 
 
+class ClaudeSubagentMetaTests(unittest.TestCase):
+    """子代理列表项要带起止时间和"仍在运行"判定。
+
+    transcript 自己分不清收尾：同一版本 CLI 里收尾 text 记录既有 end_turn 也有
+    stop_reason=None。父会话在子代理停止后写的 task-notification / 前台
+    tool_result 才是停止点，之后只有再追加 user 记录才算被唤起。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.project = Path(self.tmp.name) / "-tmp-project"
+        self.parent = self.project / "parent-session.jsonl"
+        self.subagents = self.project / "parent-session" / "subagents"
+        self.subagents.mkdir(parents=True)
+        self.parent_rows = [{
+            "type": "user", "uuid": "u0", "parentUuid": None, "isSidechain": False,
+            "sessionId": "parent-session", "cwd": "/tmp/project",
+            "timestamp": "2026-09-12T00:00:00.000Z",
+            "message": {"role": "user", "content": "主任务"},
+        }]
+        patcher = patch.object(adapters, "_agent_stops", {})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def dump(rows):
+        return "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+
+    def agent(self, agent_id, rows, tool_use_id="toolu_" + "x" * 20):
+        path = self.subagents / f"agent-{agent_id}.jsonl"
+        path.write_text(self.dump([{"isSidechain": True, "agentId": agent_id, **row}
+                                   for row in rows]))
+        path.with_suffix(".meta.json").write_text(json.dumps({
+            "agentType": "general-purpose", "description": f"任务 {agent_id}",
+            "toolUseId": tool_use_id,
+        }))
+        return path
+
+    @staticmethod
+    def user(ts, text="继续"):
+        return {"type": "user", "timestamp": ts,
+                "message": {"role": "user", "content": text}}
+
+    @staticmethod
+    def assistant(ts, stop_reason, kind="text"):
+        block = ({"type": "text", "text": "结论"} if kind == "text"
+                 else {"type": "tool_use", "id": "toolu_call", "name": "Bash", "input": {}})
+        return {"type": "assistant", "timestamp": ts,
+                "message": {"role": "assistant", "stop_reason": stop_reason,
+                            "content": [block]}}
+
+    @staticmethod
+    def tool_result(ts):
+        return {"type": "user", "timestamp": ts,
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_call", "content": "ok"}]}}
+
+    @staticmethod
+    def notice(ts, agent_id, status, shape="attachment"):
+        text = (f"<task-notification>\n<task-id>{agent_id}</task-id>\n"
+                f"<status>{status}</status>\n<summary>Agent finished</summary>\n"
+                "</task-notification>")
+        if shape == "user":
+            return {"type": "user", "timestamp": ts,
+                    "message": {"role": "user", "content": text}}
+        return {"type": "attachment", "timestamp": ts,
+                "attachment": {"type": "queued_command", "commandMode": "task-notification",
+                               "prompt": text, "timestamp": ts}}
+
+    @staticmethod
+    def agent_result(ts, agent_id, status, tool_use_id):
+        return {"type": "user", "timestamp": ts,
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": tool_use_id,
+                     "content": [{"type": "text", "text": "Async agent launched successfully"
+                                  if status == "async_launched" else "报告"}]}]},
+                "toolUseResult": {"status": status, "agentId": agent_id}}
+
+    def items(self):
+        meta = adapters.ClaudeAdapter().session_meta(self.parent)
+        return {item["id"]: item for item in meta["agent_items"]}
+
+    def test_agent_items_carry_start_end_and_running_state(self):
+        self.agent("done", [self.user("2026-09-12T00:10:00.000Z"),
+                            self.assistant("2026-09-12T00:10:05.000Z", "tool_use", "tool"),
+                            self.tool_result("2026-09-12T00:10:06.000Z"),
+                            self.assistant("2026-09-12T00:12:00.000Z", "end_turn")])
+        self.agent("streamed", [self.user("2026-09-12T00:20:00.000Z"),
+                                self.assistant("2026-09-12T00:22:00.000Z", None)])
+        self.agent("resumed", [self.user("2026-09-12T00:30:00.000Z"),
+                               self.assistant("2026-09-12T00:31:00.000Z", None),
+                               self.user("2026-09-12T00:40:00.000Z", "再来一次"),
+                               self.assistant("2026-09-12T00:41:00.000Z", "tool_use", "tool")])
+        self.agent("killed", [self.user("2026-09-12T00:50:00.000Z"),
+                              self.assistant("2026-09-12T00:51:00.000Z", "tool_use", "tool")])
+        self.agent("fresh", [self.user("2026-09-12T01:00:00.000Z")],
+                   tool_use_id="toolu_fresh")
+        self.agent("foreground", [self.user("2026-09-12T01:10:00.000Z"),
+                                  self.assistant("2026-09-12T01:12:00.000Z", None)],
+                   tool_use_id="toolu_fg")
+        self.parent.write_text(self.dump(self.parent_rows + [
+            self.notice("2026-09-12T00:12:00.100Z", "done", "completed"),
+            self.notice("2026-09-12T00:22:00.100Z", "streamed", "completed", shape="user"),
+            self.notice("2026-09-12T00:31:00.100Z", "resumed", "failed"),
+            self.notice("2026-09-12T00:52:00.000Z", "killed", "killed"),
+            self.agent_result("2026-09-12T01:00:00.100Z", "fresh", "async_launched", "toolu_fresh"),
+            self.agent_result("2026-09-12T01:12:00.200Z", "foreground", "completed", "toolu_fg"),
+        ]))
+
+        items = self.items()
+
+        self.assertEqual({k: v["active"] for k, v in items.items()}, {
+            "done": False, "streamed": False, "resumed": True,
+            "killed": False, "fresh": True, "foreground": False,
+        })
+        self.assertEqual(items["done"]["created"],
+                         adapters._norm_ts("2026-09-12T00:10:00.000Z"))
+        self.assertEqual(items["done"]["updated"],
+                         adapters._norm_ts("2026-09-12T00:12:00.000Z"))
+        self.assertEqual(items["resumed"]["created"],
+                         adapters._norm_ts("2026-09-12T00:30:00.000Z"))
+        self.assertEqual(items["resumed"]["updated"],
+                         adapters._norm_ts("2026-09-12T00:41:00.000Z"))
+        self.assertEqual(items["fresh"]["title"], "任务 fresh")
+
+    def test_stop_notices_are_read_incrementally_and_only_from_complete_lines(self):
+        self.agent("worker", [self.user("2026-09-12T01:00:00.000Z"),
+                              self.assistant("2026-09-12T01:05:00.000Z", None)])
+        self.parent.write_text(self.dump(self.parent_rows))
+        self.assertTrue(self.items()["worker"]["active"])
+
+        line = json.dumps(self.notice("2026-09-12T01:05:00.100Z", "worker", "completed"))
+        with self.parent.open("a") as fh:
+            fh.write(line[:len(line) // 2])
+        # 半行还没写完：既不能算停止，也不能把它当作已扫过
+        self.assertTrue(self.items()["worker"]["active"])
+        with self.parent.open("a") as fh:
+            fh.write(line[len(line) // 2:] + "\n")
+        self.assertFalse(self.items()["worker"]["active"])
+
+        # 通知之后再追加 user 记录就是被 SendMessage 唤起
+        with (self.subagents / "agent-worker.jsonl").open("a") as fh:
+            fh.write(json.dumps({"isSidechain": True, "agentId": "worker",
+                                 **self.user("2026-09-12T01:20:00.000Z", "继续")}) + "\n")
+        self.assertTrue(self.items()["worker"]["active"])
+
+        # 文件被重写变短时从头再扫，不沿用旧偏移
+        self.parent.write_text(self.dump(self.parent_rows))
+        self.assertTrue(self.items()["worker"]["active"])
+        self.parent.write_text(self.dump(self.parent_rows + [
+            self.notice("2026-09-12T01:21:00.000Z", "worker", "killed")]))
+        self.assertFalse(self.items()["worker"]["active"])
+
+
 class FileChangeTests(unittest.TestCase):
     def test_apply_patch_wrapper_recovers_per_file_diffs(self):
         patch_text = """*** Begin Patch

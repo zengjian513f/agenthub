@@ -21,7 +21,7 @@ from . import audit, media, session_meta, trash
 
 CACHE_DIR = Path.home() / ".cache" / "agenthub"
 CACHE_FILE = CACHE_DIR / "index.json"
-CACHE_VERSION = 6
+CACHE_VERSION = 7  # 子代理项新增 created/active
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
 WINDOW_CACHE_VERSION = 8
 MESSAGE_CURSOR_VERSION = 8

@@ -37,6 +37,14 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _ts_after(later: str | None, earlier: str | None) -> bool:
+    """两个 ``_norm_ts``/``_iso`` 串按真实时刻比较；解析不了的一律不算更晚。"""
+    try:
+        return datetime.fromisoformat(str(later)) > datetime.fromisoformat(str(earlier))
+    except (TypeError, ValueError):
+        return False
+
+
 def _norm_ts(v) -> str | None:
     """把各家时间戳统一成本地时区 ISO 串。"""
     if not v:
@@ -123,36 +131,141 @@ def _latest_jsonl_timestamp(path: Path, parsed_tail: list[dict] | None = None,
             return normalized
 
     try:
-        with open(path, "rb") as fh:
-            fh.seek(0, 2)
-            cursor = fh.tell()
-            suffix = b""
-            while cursor > 0:
-                lo = max(0, cursor - 64 * 1024)
-                fh.seek(lo)
-                data = fh.read(cursor - lo) + suffix
-                lines = data.split(b"\n")
-                if lo:
-                    suffix = lines[0]
-                    lines = lines[1:]
-                else:
-                    suffix = b""
-                for raw in reversed(lines):
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        rec = json.loads(raw)
-                    except Exception:
-                        continue
-                    normalized = _norm_ts(rec.get("timestamp"))
-                    if normalized:
-                        return normalized
-                cursor = lo
+        for rec in _iter_records_reversed(path):
+            normalized = _norm_ts(rec.get("timestamp"))
+            if normalized:
+                return normalized
     except OSError:
         if strict:
             raise
     return None
+
+
+def _iter_records_reversed(path: Path):
+    """从 EOF 反向逐条解析 JSONL；跨块残行拼接，坏行跳过，I/O 错误直接抛出。"""
+    with open(path, "rb") as fh:
+        fh.seek(0, 2)
+        cursor = fh.tell()
+        suffix = b""
+        while cursor > 0:
+            lo = max(0, cursor - 64 * 1024)
+            fh.seek(lo)
+            data = fh.read(cursor - lo) + suffix
+            lines = data.split(b"\n")
+            if lo:
+                suffix = lines[0]
+                lines = lines[1:]
+            else:
+                suffix = b""
+            for raw in reversed(lines):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    yield json.loads(raw)
+                except Exception:
+                    continue
+            cursor = lo
+
+
+def _first_jsonl_timestamp(path: Path, *, strict: bool = False) -> str | None:
+    """文件头第一条带合法时间戳的记录时间。"""
+    for rec in _head_lines(path, 8, strict=strict):
+        normalized = _norm_ts(rec.get("timestamp"))
+        if normalized:
+            return normalized
+    return None
+
+
+# Claude 子代理 transcript 没有 turn_duration；回合是否收尾只能看最后一条
+# assistant 记录的 stop_reason。
+_CLAUDE_TURN_CLOSED = frozenset({"end_turn", "stop_sequence", "refusal"})
+
+
+def _claude_agent_tail(path: Path) -> tuple[str | None, bool]:
+    """子代理 transcript 的 (最后一条记录时间, 最后一个回合是否仍未收尾)。
+
+    同一版本 CLI 里，收尾的 text 记录有时带 end_turn，有时 stop_reason 还是
+    None（message_delta 晚于 content_block_stop 落盘）。所以这里的"未收尾"
+    只能排除确定已收尾的情况，最终是否仍在运行还要对照父会话的停止通知，
+    见 ``_claude_agent_stops``。I/O 错误直接抛出。
+    """
+    updated, closed = None, None
+    for rec in _iter_records_reversed(path):
+        if updated is None:
+            updated = _norm_ts(rec.get("timestamp"))
+        if closed is None and rec.get("type") in ("user", "assistant"):
+            closed = (rec.get("type") == "assistant"
+                      and (rec.get("message") or {}).get("stop_reason")
+                      in _CLAUDE_TURN_CLOSED)
+        if updated is not None and closed is not None:
+            break
+    return updated, closed is False
+
+
+_AGENT_TASK_ID = re.compile(rb"<task-id>([A-Za-z0-9_-]{1,64})</task-id>")
+_agent_stops_lock = threading.Lock()
+_agent_stops: dict[str, dict] = {}
+
+
+def _collect_agent_stops(raw: bytes, stops: dict[str, str]) -> None:
+    has_notice = b"<task-id>" in raw
+    has_result = b'"agentId"' in raw and b'"tool_result"' in raw
+    if not (has_notice or has_result):
+        return
+    try:
+        rec = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(rec, dict):
+        return
+    ts = _norm_ts(rec.get("timestamp"))
+    if not ts:
+        return
+    agent_ids = set()
+    if has_notice:
+        # 同一条 task-notification 会以 queue-operation、queued_command 附件或
+        # user 记录各写一遍，时间一致；哪一份都算停止点。后台 Bash 任务的
+        # task-id 也会进来，只是永远匹配不到子代理。
+        agent_ids.update(m.group(1).decode() for m in _AGENT_TASK_ID.finditer(raw))
+    if has_result:
+        # 前台 Agent 调用没有 task-notification，结束时 tool_result 直接带
+        # 完整结果；后台调用的 tool_result 只是 async_launched，不算停止。
+        result = rec.get("toolUseResult")
+        if (isinstance(result, dict) and result.get("agentId")
+                and result.get("status") != "async_launched"):
+            agent_ids.add(str(result["agentId"]))
+    for agent_id in agent_ids:
+        if ts > stops.get(agent_id, ""):
+            stops[agent_id] = ts
+
+
+def _claude_agent_stops(path: Path) -> dict[str, str]:
+    """主会话 transcript 里每个子代理最近一次停止的时间，按文件增量扫描。
+
+    子代理停止（完成、失败、被杀、随旧进程消失）后 30–150 ms 内父会话必写
+    task-notification 或 Agent 的 tool_result；之后只有 SendMessage 能把它
+    唤起，而唤起一定会往子代理 transcript 追加新的 user 记录。因此"子代理
+    最后一条记录晚于父会话最近一次停止通知"就是它仍在运行的判据。通知可能
+    离文件尾很远，尾读兜不住，所以按路径记住已扫到的字节数，只读新增部分。
+    """
+    key = str(path)
+    size = path.stat().st_size
+    with _agent_stops_lock:
+        entry = _agent_stops.get(key)
+        if entry is None or size < entry["size"]:
+            entry = {"size": 0, "stops": {}}
+        if size > entry["size"]:
+            with open(path, "rb") as fh:
+                fh.seek(entry["size"])
+                blob = fh.read(size - entry["size"])
+            lines = blob.split(b"\n")
+            # 最后一段可能是尚未写完的半行，留到下次再解析。
+            for raw in lines[:-1]:
+                _collect_agent_stops(raw, entry["stops"])
+            entry["size"] += len(blob) - len(lines[-1])
+        _agent_stops[key] = entry
+        return dict(entry["stops"])
 
 
 def _iter_records(path, start: int = 0):
@@ -1170,29 +1283,44 @@ class ClaudeAdapter:
         if not cwd:
             cwd = "/" + proj_name.lstrip("-").replace("-", "/")
         agent_items = []
-        for af in sorted((f.parent / f.stem / "subagents").glob("agent-*.jsonl")):
+        agent_files = sorted((f.parent / f.stem / "subagents").glob("agent-*.jsonl"))
+        stops = _claude_agent_stops(f) if agent_files else {}
+        for af in agent_files:
             agent_id = af.stem.removeprefix("agent-")
+            meta_file = af.with_suffix(".meta.json")
             try:
-                info = json.loads(af.with_suffix(".meta.json").read_text(errors="replace"))
+                info = json.loads(meta_file.read_text(errors="replace"))
+                meta_mtime = meta_file.stat().st_mtime
             except FileNotFoundError:
-                info = {}
+                info, meta_mtime = {}, None
             except OSError:
                 raise
             except ValueError:
-                info = {}
+                info, meta_mtime = {}, None
             try:
                 ast = af.stat()
             except FileNotFoundError:
                 continue
             except OSError:
                 raise
-            agent_updated = _latest_jsonl_timestamp(af, strict=True) \
-                or _iso(ast.st_mtime)
+            try:
+                agent_updated, open_turn = _claude_agent_tail(af)
+                agent_created = _first_jsonl_timestamp(af, strict=True)
+            except FileNotFoundError:
+                continue
+            agent_updated = agent_updated or _iso(ast.st_mtime)
+            # meta.json 在派生时写入，是第一条记录读不到时最接近的开始时间。
+            agent_created = agent_created \
+                or (_iso(meta_mtime) if meta_mtime else None) or agent_updated
+            stopped_at = stops.get(agent_id)
             agent_items.append({
                 "id": agent_id,
                 "title": str(info.get("description") or f"子代理 {agent_id[:8]}"),
                 "type": str(info.get("agentType") or "subagent"),
-                "updated": agent_updated, "size": ast.st_size,
+                "created": agent_created, "updated": agent_updated,
+                "size": ast.st_size,
+                "active": open_turn and (stopped_at is None
+                                         or _ts_after(agent_updated, stopped_at)),
             })
         updated = _latest_jsonl_timestamp(f, tail_records, strict=True) \
             or created or _iso(st.st_mtime)

@@ -857,7 +857,17 @@ mark.cur { background: #ff9f43; box-shadow: 0 0 0 2px rgba(255, 159, 67, .45); }
 }
 .session-view-menu button:hover { background: var(--hover); }
 .session-view-menu button.on { background: var(--sel); }
-.session-view-menu small { color: var(--muted); font-size: 10.5px; font-weight: 500; }
+.session-view-menu small {
+  display: flex; flex-wrap: wrap; justify-content: space-between; column-gap: 10px;
+  color: var(--muted); font-size: 10.5px; font-weight: 500;
+}
+.session-view-menu .view-kind { display: inline-flex; align-items: center; gap: 5px; }
+.session-view-menu .view-span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* 还在跑的子代理：种类前挂一个和左栏一样的绿点 */
+.session-view-menu .view-live {
+  flex: none; width: 7px; height: 7px; border-radius: 999px; background: var(--live-direct);
+}
+.session-view-menu button.running .view-span { color: var(--live-direct); }
 .session-view-menu b { overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.35; }
 /* 回退父会话链：挂在标题栏右侧操作区下方，每级一行，右侧是显示/隐藏 */
 .fork-chain-menu { left: auto; right: 0; width: min(440px, calc(100vw - 40px)); }
