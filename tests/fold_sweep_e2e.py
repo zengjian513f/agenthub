@@ -5,7 +5,7 @@
   顶栏：折起的一定是优先级末尾连续几个（设置 → 报告 → 回收站 → 重新扫描 → 新建），
         菜单保持平铺顺序，筛选条不被挤压（除非五个都折了），折了就再放一个也放不下，
         全平铺时 ⋯ 不占位；同一档位内宽度越窄折得只多不少；
-        中屏与窄屏顶栏同高且是三档里最矮的，跨过 720px 不跳高。
+        三档顶栏同高，跨过 1200px、720px 都不跳高。
   标题栏：平铺的一定是「操作（星标 → 折叠过程 → 报告 → 停止/删除）→ 元信息（消息数、大小、时间、
         机器、目录、来源、模型、会话号、分支）」这条优先级的前缀，放不下的从末尾起进 ⋯（元信息先折、
         按钮后折）；菜单空了 ⋯ 不显示；窄屏标题不让位；同一档位内宽度越窄平铺得只少不多。
@@ -217,9 +217,8 @@ def main():
                     head_events = fold_events(head_rows, priority_of)
                     # 608px（报告里的平板宽度）五个顶栏按钮必须全平铺
                     assert next(f for w, f, t in header_rows if w == 608) == [], header_rows
-                    # 中屏与窄屏顶栏同高，且不比宽屏高：713px 与 765px 两张截图不能差 4px
-                    compact = {h for w, h, t in header_heights if t != 'wide'}
-                    assert compact == {min(h for w, h, t in header_heights)}, header_heights
+                    # 三档顶栏同高：713px 与 765px、1698px 与 713px 的截图都不能差出一截
+                    assert len({h for w, h, t in header_heights}) == 1, header_heights
                     # 扫描要真的经过折叠与全平铺两种状态：窄屏一定折；中央站四台机器的 chips 让宽屏也折
                     # （中屏机器收成下拉、来源只剩图标，五个按钮放得下是对的）；每个档位都要有全平铺的宽度
                     for tier in ['narrow'] + (['wide'] if scoped else []):

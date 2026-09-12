@@ -135,13 +135,13 @@ html, body {
    宽屏（≥1200px）机器和 Agent 筛选平铺；
    中屏（721–1199px）机器改为下拉、筛选只留图标；
    窄屏（≤720px）机器仍是下拉、间距更紧。
-   中屏与窄屏顶栏同高（6px 内边距 + 30px 控件）：竖向尺寸只在共用块里定一次，
-   两档只差横向间距与标签，跨过 720px 时顶栏不跳高。
+   三档顶栏同高（6px 内边距 + 30px 控件，seg 内按钮 28px）：竖向尺寸只在基础规则里定一次，
+   各档位块只改横向间距与标签，改窗口宽度时顶栏不跳高。
    右侧按钮不按档位折叠：app.js 量过筛选条放不下才从末尾折进 ⋯，任何宽度都不因折叠留白。 */
 header {
   position: relative; display: flex; flex-wrap: nowrap; align-items: center; gap: 14px;
   width: 100%;
-  padding: 9px 18px 9px 14px; background: var(--panel);
+  padding: 6px 18px 6px 14px; background: var(--panel);
   border-bottom: 1px solid var(--border); flex: none;
 }
 .brand { display: flex; align-items: center; gap: 8px; margin-right: 4px; flex: none; white-space: nowrap; }
@@ -178,8 +178,8 @@ header {
 .seg[hidden] { display: none; }
 .seg button {
   display: inline-flex; align-items: center; justify-content: center; gap: 5px; flex: none;
-  height: 30px; border: 0; border-radius: 0; background: transparent; color: var(--muted);
-  padding: 5px 9px; cursor: pointer; font: inherit; font-size: 13px; white-space: nowrap;
+  height: 28px; border: 0; border-radius: 0; background: transparent; color: var(--muted);
+  padding: 4px 9px; cursor: pointer; font: inherit; font-size: 13px; white-space: nowrap;
   transition: background-color .12s, color .12s;
 }
 .seg button + button { border-left: 1px solid var(--border); }
@@ -270,11 +270,11 @@ header {
   display: flex; align-items: center; gap: 8px; margin-left: auto; flex: none;
 }
 header .header-actions .btn {
-  width: 32px; height: 32px; padding: 0; flex: none;
+  width: 30px; height: 30px; padding: 0; flex: none;
   display: inline-flex; align-items: center; justify-content: center;
 }
 #side-toggle {
-  width: 32px; height: 32px; padding: 0; flex: none;
+  width: 30px; height: 30px; padding: 0; flex: none;
   display: inline-flex; align-items: center; justify-content: center;
 }
 body.side-collapsed #side-toggle { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
@@ -324,10 +324,6 @@ header .header-actions .header-menu .btn:focus-visible { outline: 2px solid var(
   #node-chips button { justify-content: space-between; gap: 14px; height: 36px; padding: 6px 12px; }
   #node-chips button + button { border-left: 0; border-top: 1px solid var(--border); }
   header .header-more { display: block; }
-  /* 中窄屏同高：内边距与各控件高度只在这里定，各档位块不再各写一套 */
-  header { padding-block: 6px; }
-  header .seg button { height: 28px; }
-  header .header-actions .btn, #side-toggle { min-width: 30px; width: 30px; height: 30px; }
 }
 
 /* 中屏：横屏手机和平板沿用紧凑顶栏，避免 720px 以上突然恢复长标签。 */
@@ -337,7 +333,7 @@ header .header-actions .header-menu .btn:focus-visible { outline: 2px solid var(
   header .brand { margin-right: 0; }
   header .brand-name { display: none; }
   header .chip > span, header .mobile-label { display: none; }
-  header .seg button { min-width: 32px; padding: 5px 7px; }
+  header .seg button { min-width: 32px; padding: 4px 7px; }
 }
 
 /* ---------- 新建会话 ---------- */

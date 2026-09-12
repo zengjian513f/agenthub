@@ -970,7 +970,9 @@ def run(pw):
           and not p.locator("#header-more-btn").is_visible()
           and p.locator(".brand-name").is_visible()
           and p.locator(".brand-name").inner_text().strip() not in {"", "__AGENTHUB_HOSTNAME__"})
-    check_header_fold("宽屏")
+    wide_fold = check_header_fold("宽屏")
+    check("宽屏顶栏与中窄屏同高，跨过 1200px 不跳高",
+          wide_fold["height"] == narrow_fold["height"], (wide_fold["height"], narrow_fold["height"]))
     brand_style = p.locator(".brand-name").evaluate("""n => {
       const s = getComputedStyle(n);
       return {background:s.backgroundImage, family:s.fontFamily,
