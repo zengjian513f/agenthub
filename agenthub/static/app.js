@@ -6178,20 +6178,16 @@ function machineRow(target) {
     backend.value = target.backend || '';
     backend.onchange = () => void chooseBackend(target, backend);
   }
-  fields.append(backend);
-  row.append(fields);
-
+  // 一行就是全部：说明都进悬停提示，不占高度
   const blocked = target.backends.filter(b => !b.available);
-  const state = document.createElement('p');
-  state.className = 'machine-state';
-  state.textContent = target.enabled === false
+  backend.title = target.enabled === false
     ? '已停用：不显示、不检查，视同不存在；勾选后重新接入'
     : target.online === false
     ? (typeof nodeOfflineReason === 'function'
         ? nodeOfflineReason(Nodes.list.find(n => n.id === target.id) || {}) : '离线')
-    : blocked.map(b => `${b.label}不可用：${b.unavailable_reason}`).join('；')
-      || '新建会话将由所选后端托管';
-  row.append(state);
+    : ['新建会话用的控制台后端', ...blocked.map(b => `${b.label}不可用：${b.unavailable_reason}`)].join('；');
+  fields.append(backend);
+  row.append(fields);
   return row;
 }
 

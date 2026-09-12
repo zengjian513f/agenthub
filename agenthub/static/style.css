@@ -409,14 +409,14 @@ header .header-actions .header-menu .btn:focus-visible { outline: 2px solid var(
 .settings-pane { display: flex; flex-direction: column; gap: 8px; }
 .settings-pane[hidden] { display: none; }
 .machine-row {
-  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px;
-  align-items: center; padding: 11px 0; border-bottom: 1px solid var(--border);
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px;
+  align-items: center; padding: 4px 0; border-bottom: 1px solid var(--border);
 }
 .machine-row:last-child { border-bottom: 0; }
 .machine-row .machine-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .machine-row .machine-enabled { flex: none; width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .machine-grip {
-  flex: none; width: 18px; height: 24px; padding: 0; border: 0; border-radius: 5px;
+  flex: none; width: 18px; height: 22px; padding: 0; border: 0; border-radius: 5px;
   background: transparent; color: var(--muted); font-size: 13px; letter-spacing: -3px;
   cursor: grab; touch-action: none; user-select: none;
 }
@@ -426,16 +426,16 @@ header .header-actions .header-menu .btn:focus-visible { outline: 2px solid var(
 .machine-row.dragging .machine-grip { cursor: grabbing; }
 /* 停用的机器只剩勾选框是实的，其余压暗：它此刻对页面其它部分不存在 */
 .machine-row.machine-off .machine-head > :not(.machine-enabled),
-.machine-row.machine-off .machine-fields, .machine-row.machine-off .machine-state { opacity: .5; }
+.machine-row.machine-off .machine-fields { opacity: .5; }
 .machine-row input[type="text"] {
-  min-width: 0; flex: 1; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px;
+  min-width: 0; flex: 1; padding: 3px 8px; border: 1px solid var(--border); border-radius: 7px;
   background: var(--panel-2); color: var(--text); font: inherit; font-weight: 600;
 }
 .machine-row input[type="text"]:focus { outline: none; border-color: var(--accent); }
 .machine-row .machine-fields { display: flex; gap: 8px; align-items: center; }
 .machine-row .machine-backend { width: 118px; }
 .machine-row select {
-  padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px;
+  padding: 3px 8px; border: 1px solid var(--border); border-radius: 7px;
   background: var(--panel-2); color: var(--text); font: inherit;
 }
 .machine-row select:focus { outline: none; border-color: var(--accent); }
@@ -456,7 +456,6 @@ button.machine-swatch:hover { box-shadow: 0 0 0 3px color-mix(in srgb, var(--nod
 .machine-palette .machine-swatch { width: 18px; height: 18px; border-radius: 5px; }
 .machine-swatch[data-node-color=""] { border: 1px dashed var(--border); background: var(--panel-2); }
 .machine-palette .machine-swatch[aria-selected="true"] { outline: 2px solid var(--accent); outline-offset: 2px; }
-.machine-row .machine-state { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 11.5px; }
 .setting-group { padding: 11px 0; border-bottom: 1px solid var(--border); }
 .setting-group-title { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
 .setting-group-title small {

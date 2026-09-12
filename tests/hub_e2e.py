@@ -320,7 +320,8 @@ def main():
                 assert not page.locator('#node-chips button.node-offline').is_visible()
                 assert not page.locator('#node-notice').is_visible()
                 off_row = page.locator('#machine-rows .machine-row.machine-off')
-                assert off_row.count() == 1 and '已停用' in off_row.locator('.machine-state').inner_text()
+                assert off_row.count() == 1 and off_row.locator('.machine-state').count() == 0   # 一行到底，没有说明行
+                assert '已停用' in off_row.locator('.machine-backend').get_attribute('title')
                 # 停用不改顺序：Vega 还在第三行
                 machine_names = lambda: page.locator('#machine-rows .machine-row input[type="text"]').evaluate_all('e => e.map(i => i.value)')
                 assert machine_names() == ['NodeA', 'NodeB', 'Vega'], machine_names()
