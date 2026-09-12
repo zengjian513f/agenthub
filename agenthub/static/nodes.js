@@ -243,8 +243,9 @@ function renderNodes() {
   const notice = document.querySelector('#node-notice');
   const labels = {search: '全文搜索', sessions: '会话列表', live: '运行状态', term: '终端列表'};
   const failures = [...Nodes.errors].flatMap(([context, errors]) => {
+    // 已不在列表里的机器（刚停用的）留下的旧错误不算
     const names = [...new Set(errors.filter(e => !Nodes.off.has(e.node_id)
-      && Nodes.list.find(n => n.id === e.node_id)?.online !== false).map(e => e.name))];
+      && Nodes.list.some(n => n.id === e.node_id && n.online !== false)).map(e => e.name))];
     return names.length ? [`${names.join('、')} ${labels[context] || '请求'}失败或超时`] : [];
   });
   notice.hidden = !failures.length && !!Nodes.list.length;
