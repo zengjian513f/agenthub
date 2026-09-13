@@ -99,9 +99,6 @@ cp host-rs/target/x86_64-unknown-linux-musl/release/ptyhost bin/ptyhost
   的 `native_binding`。`guarded_v1` / `launch_guard_v1` 是按身份核对的请求信封，本项目的
   客户端仍用普通请求（`{"op": ..., "token": ...}`），两者在同一个宿主上并行有效。
 - 没有 `--meta` 起的旧实例在 SessionDock 里只能看不能操作；`bind_native` 对它返回 False。
-- `rehome` 让一个活着的宿主把自己的 `.json` / `.sock` / `.log` 搬到另一个会话目录，pty、
-  CLI 子进程和已 attach 的客户端都不受影响（SessionDock 的 `--adopt-host-dir` 用它把
-  别的目录里的实例收进自己的目录）。
 - 两个后端共用一个会话目录时，把 `AGENTHUB_HOST_DIR` 指到 SessionDock 的宿主目录
   （部署上是 `/srv/sessiondock/host`），两边看到、接管的是同一批实例。本项目按名称
   `agenthub-<source>-<sid 前 8 位>` 或按进程树找到会话所在的宿主，SessionDock 起的

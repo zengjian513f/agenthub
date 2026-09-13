@@ -182,7 +182,7 @@ pub struct Session {
     cwd: Option<String>,
     meta: Value,
     native_binding: guard::binding::State,
-    directory: Mutex<PathBuf>,
+    directory: PathBuf,
     created: u64,
     token: String,
     history: usize,
@@ -301,7 +301,7 @@ impl Session {
             cwd: cwd.filter(|c| !c.is_empty()),
             meta,
             native_binding: guard::binding::State::default(),
-            directory: Mutex::new(directory),
+            directory,
             created: now_secs(),
             token,
             history,
@@ -361,16 +361,12 @@ impl Session {
         lock(&self.name).clone()
     }
 
-    fn directory_now(&self) -> PathBuf {
-        lock(&self.directory).clone()
-    }
-
     fn sock_path(&self) -> PathBuf {
-        self.directory_now().join(format!("{}.sock", self.name_now()))
+        self.directory.join(format!("{}.sock", self.name_now()))
     }
 
     fn info_path(&self) -> PathBuf {
-        self.directory_now().join(format!("{}.json", self.name_now()))
+        self.directory.join(format!("{}.json", self.name_now()))
     }
 
     fn cmd_label(&self) -> String {
@@ -434,7 +430,7 @@ impl Session {
     pub fn cleanup(&self) {
         let _ = std::fs::remove_file(self.info_path());
         let _ = std::fs::remove_file(self.sock_path());
-        let log = self.directory_now().join(format!("{}.log", self.name_now()));
+        let log = self.directory.join(format!("{}.log", self.name_now()));
         if let Ok(meta) = std::fs::metadata(&log) {
             if meta.is_file() && meta.len() == 0 {
                 let _ = std::fs::remove_file(&log);
@@ -803,7 +799,6 @@ impl Session {
                 }))
             }
             "rename" => self.rename(req.get("to").and_then(|v| v.as_str()).unwrap_or("")),
-            "rehome" => self.rehome(req.get("dir").and_then(|v| v.as_str()).unwrap_or("")),
             "kill" => {
                 self.stop(req.get("force").and_then(|v| v.as_bool()).unwrap_or(false));
                 Ok(json!({"ok": true}))
@@ -869,14 +864,14 @@ impl Session {
         if new == old {
             return Ok(json!({"ok": true, "name": new}));
         }
-        if self.directory_now().join(format!("{new}.json")).exists() {
+        if self.directory.join(format!("{new}.json")).exists() {
             return Err(format!("会话已存在: {new}"));
         }
         let old_info = self.info_path();
         let old_sock = self.sock_path();
         #[cfg(unix)]
         {
-            let path = self.directory_now().join(format!("{new}.sock"));
+            let path = self.directory.join(format!("{new}.sock"));
             let fresh = Listener::bind_unix(&path).map_err(|e| format!("重建 socket 失败: {e}"))?;
             *lock(&self.listener) = Some(Arc::new(fresh));
         }
@@ -890,56 +885,6 @@ impl Session {
         let _ = std::fs::remove_file(old_info);
         let _ = std::fs::remove_file(old_sock);
         Ok(json!({"ok": true, "name": new}))
-    }
-
-    /// Move this live session's endpoint files into another host directory
-    /// (`rehome`): the same three steps as `rename` — bind the socket at the
-    /// new path, publish the record there, drop the old files — plus the
-    /// directory itself, so a later `resize`/`rename`/exit writes there too.
-    /// The PTY, the child and every attached client are untouched; the log
-    /// file is renamed along (an open handle follows the inode). Used to
-    /// adopt instances started by a previous service into the current one.
-    fn rehome(&self, dir: &str) -> Result<Value, String> {
-        let target = PathBuf::from(dir);
-        if dir.is_empty() || !target.is_absolute() {
-            return Err("目标目录必须是绝对路径".into());
-        }
-        let meta = std::fs::symlink_metadata(&target).map_err(|e| format!("目标目录不可用: {e}"))?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            return Err("目标目录必须是普通目录".into());
-        }
-        let target = target.canonicalize().map_err(|e| format!("目标目录不可用: {e}"))?;
-        let name = self.name_now();
-        let old_dir = self.directory_now();
-        if old_dir == target {
-            return Ok(json!({"ok": true, "dir": target.to_string_lossy(), "name": name}));
-        }
-        if target.join(format!("{name}.json")).exists() || target.join(format!("{name}.sock")).exists() {
-            return Err(format!("目标目录已有同名会话: {name}"));
-        }
-        let old_info = self.info_path();
-        let old_sock = self.sock_path();
-        let old_log = old_dir.join(format!("{name}.log"));
-        #[cfg(unix)]
-        {
-            let path = target.join(format!("{name}.sock"));
-            let fresh = Listener::bind_unix(&path).map_err(|e| format!("重建 socket 失败: {e}"))?;
-            *lock(&self.listener) = Some(Arc::new(fresh));
-        }
-        *lock(&self.directory) = target.clone();
-        self.write_info();
-        #[cfg(unix)]
-        {
-            // 唤醒仍阻塞在旧 socket 上的 accept：它会看到 listener 已更换并继续。
-            let _ = Stream::connect_unix(&old_sock);
-        }
-        let _ = std::fs::remove_file(old_info);
-        let _ = std::fs::remove_file(old_sock);
-        if old_log.is_file() {
-            let _ = std::fs::rename(&old_log, target.join(format!("{name}.log")));
-        }
-        Ok(json!({"ok": true, "dir": target.to_string_lossy(), "name": name,
-                  "sock": self.sock_path().to_string_lossy()}))
     }
 
     fn attach(
