@@ -6,7 +6,7 @@ import struct
 import tempfile
 from unittest.mock import call, patch
 
-from agenthub import term, term_tmux
+from agenthub import term, term_host, term_tmux
 
 
 class DirectoryCompletionTests(unittest.TestCase):
@@ -249,12 +249,14 @@ class TerminalSubmitTests(unittest.TestCase):
         pane = {"name": "agenthub-test", "server": term_tmux.MANAGED_SERVER}
         with patch.object(term_tmux, "session_info", return_value=pane), \
                 patch.object(term_tmux.uuid, "uuid4") as uuid4, \
-                patch.object(term_tmux.time, "sleep") as sleep, \
+                patch.object(term_tmux, "capture_screen_state",
+                             return_value=("idle", (0, 0))), \
+                patch.object(term_tmux.term_submit, "wait_paste_consumed") as wait, \
                 patch.object(term_tmux, "_tmux") as tmux:
             uuid4.return_value.hex = "fixed"
             term_tmux.submit_text("agenthub-test", "两行\n内容")
 
-        sleep.assert_called_once_with(0.04)
+        wait.assert_called_once()
         self.assertEqual(tmux.call_args_list, [
             call("set-buffer", "-b", "agenthub-submit-fixed", "--", "两行\n内容",
                  server=term_tmux.MANAGED_SERVER, no_start=True),
@@ -290,6 +292,21 @@ class TerminalSubmitTests(unittest.TestCase):
         ])
         kill_pids.assert_called_once_with([123])
         kill_session.assert_called_once_with("agenthub-test")
+
+
+class TermHostSubmitTests(unittest.TestCase):
+    def test_submit_pastes_then_waits_before_enter(self):
+        with patch.object(term_host, "capture_screen_state",
+                          return_value=("idle", (0, 0))), \
+                patch.object(term_host.term_submit, "wait_paste_consumed") as wait, \
+                patch.object(term_host.client, "request") as request:
+            term_host.submit_text("agenthub-test", "hello")
+
+        wait.assert_called_once()
+        self.assertEqual([item.args[1] for item in request.call_args_list],
+                         ["paste", "keys"])
+        self.assertEqual(request.call_args_list[0].kwargs["text"], "hello")
+        self.assertEqual(request.call_args_list[1].kwargs["keys"], ["Enter"])
 
 
 class TermCaptureTests(unittest.TestCase):

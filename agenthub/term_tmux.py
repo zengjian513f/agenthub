@@ -36,7 +36,7 @@ try:
 except ImportError:                     # pragma: no cover - 只在 Windows 命中
     fcntl = pty = termios = None        # type: ignore[assignment]
 
-from . import audit, live
+from . import audit, live, term_submit
 
 PREFIX = "agenthub-"          # agenthub 起的会话用这个前缀, 便于识别
 MANAGED_SERVER = "agenthub"   # 独立 socket，不继承用户默认 tmux server 的交互配置
@@ -211,6 +211,8 @@ def submit_text(name: str, text: str) -> None:
     `send-keys -l` 会以机器速度逐字注入。Codex 等 TUI 有粘贴突发检测，紧随其后的
     Enter 偶尔会被识别成多行粘贴的一部分。tmux `paste-buffer -p` 会显式包上
     bracketed-paste 起止序列，让应用先得到一个完整 Paste 事件，再收到提交键。
+    粘贴后等到 TUI 结束 ``Pasting…`` 并稳定，才发 Enter（Windows ConPTY 上
+    40ms 间隔不够）。不根据可见行数或草稿指纹补发：手机终端经常只剩一两行。
     """
     with _submit_locks_guard:
         lock = _submit_locks.setdefault(name, threading.Lock())
@@ -220,6 +222,10 @@ def submit_text(name: str, text: str) -> None:
         row = session_info(name)
         if not row:
             raise RuntimeError(f"tmux 会话不存在: {name}")
+        try:
+            before, _ = capture_screen_state(name)
+        except Exception:
+            before = ""
         buffer_name = f"agenthub-submit-{uuid.uuid4().hex}"
         _tmux("set-buffer", "-b", buffer_name, "--", text,
               server=row["server"], no_start=True)
@@ -233,9 +239,8 @@ def submit_text(name: str, text: str) -> None:
             except Exception:
                 pass
             raise
-        # 给全屏 TUI 一个事件循环间隔来消费 bracketed-paste 的结束序列；
-        # 否则紧随其后的 Enter 偶尔会被并入粘贴，文字留到下一次提交。
-        time.sleep(0.04)
+        term_submit.wait_paste_consumed(
+            lambda: capture_screen_state(name), before, text)
         _tmux("send-keys", "-t", name, "--", "Enter",
               server=row["server"], no_start=True)
         audit.record("tmux.submit.completed", category="terminal",

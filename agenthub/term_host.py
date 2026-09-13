@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import audit, live
+from . import audit, live, term_submit
 from .host import client, procs
 
 PREFIX = "agenthub-"
@@ -230,8 +230,13 @@ def submit_text(name: str, text: str) -> None:
     with lock:
         audit.record("host.submit.started", category="terminal",
                      data={"tmux": name, "chars": len(text)}, content=text)
+        try:
+            before, _ = capture_screen_state(name)
+        except Exception:
+            before = ""
         client.request(name, "paste", text=text)
-        time.sleep(0.04)
+        term_submit.wait_paste_consumed(
+            lambda: capture_screen_state(name), before, text)
         client.request(name, "keys", keys=["Enter"])
         audit.record("host.submit.completed", category="terminal",
                      data={"tmux": name, "chars": len(text)}, content=text)
