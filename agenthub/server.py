@@ -2206,7 +2206,8 @@ class Handler(BaseHTTPRequestHandler):
             term.kill_pids(pids)
 
         cols, rows = int(body.get("cols", 120)), int(body.get("rows", 32))
-        term.new_session(name, term.resume_command(s["source"], s["sid"]), s["cwd"], cols, rows)
+        term.new_session(name, term.resume_command(s["source"], s["sid"]), s["cwd"], cols, rows,
+                         meta=term.launch_meta(s["source"], str(s["sid"]), s["uid"]))
         time.sleep(0.1)
         if not term.has_session(name):
             return self._json({"error": f"{s['source']} 启动后立即退出，请检查 CLI 环境"}, 500)
@@ -2376,6 +2377,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"tmux 会话名冲突: {canonical}"}, 409)
             canonical = term.rename_session(name, canonical)
         running = name in names or canonical in names
+        if running:
+            # 新建时宿主还没有原生记录; 现在把它绑到落盘的会话, 之后 SessionDock
+            # 也能按身份接管这个实例。绑不上只记审计, 不影响本地控制台。
+            try:
+                term.bind_native(canonical if canonical in names else name,
+                                 str(s["sid"]), s["uid"])
+            except Exception as e:
+                audit.record("host.native.bind_failed", category="terminal",
+                             severity="warning",
+                             data={"tmux": canonical, "uid": s["uid"], "error": str(e)[:200]})
         result = {"waiting": False, "running": running,
                   "name": canonical, "uid": s["uid"], "session": s}
         pending_store.resolve(name, result)

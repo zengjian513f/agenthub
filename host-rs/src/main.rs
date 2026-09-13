@@ -12,6 +12,8 @@
 
 mod client;
 mod dsr;
+mod guard;
+mod output;
 mod protocol;
 mod screen;
 mod session;
@@ -21,7 +23,7 @@ mod transport;
 use std::io::Write;
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct Args {
     dir: Option<String>,
@@ -74,12 +76,10 @@ fn parse() -> Args {
         let item = raw[i].clone();
         let mut value = |key: &str| -> String {
             i += 1;
-            raw.get(i)
-                .cloned()
-                .unwrap_or_else(|| {
-                    eprintln!("{key} 缺少取值");
-                    std::process::exit(2)
-                })
+            raw.get(i).cloned().unwrap_or_else(|| {
+                eprintln!("{key} 缺少取值");
+                std::process::exit(2)
+            })
         };
         match item.as_str() {
             "--dir" => args.dir = Some(value("--dir")),
@@ -262,7 +262,11 @@ fn cmd_capture(dir: &PathBuf, args: &Args) -> i32 {
         Some(name) => name,
         None => return 2,
     };
-    let kind = if args.lines > 0 { "scrollback" } else { "screen" };
+    let kind = if args.lines > 0 {
+        "scrollback"
+    } else {
+        "screen"
+    };
     let reply = client::request(
         dir,
         name,
@@ -274,7 +278,10 @@ fn cmd_capture(dir: &PathBuf, args: &Args) -> i32 {
     );
     match reply {
         Ok(reply) => {
-            println!("{}", reply.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+            println!(
+                "{}",
+                reply.get("text").and_then(|v| v.as_str()).unwrap_or("")
+            );
             let cursor = reply.get("cursor").and_then(|v| v.as_array()).cloned();
             if let Some(cursor) = cursor {
                 let at = |i: usize| cursor.get(i).and_then(|v| v.as_u64()).unwrap_or(0);

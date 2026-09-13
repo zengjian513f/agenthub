@@ -80,6 +80,14 @@ impl Stream {
             Self::Tcp(s) => s.shutdown(std::net::Shutdown::Both),
         };
     }
+
+    pub fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_write_timeout(timeout),
+            Self::Tcp(s) => s.set_write_timeout(timeout),
+        }
+    }
 }
 
 impl Read for Stream {

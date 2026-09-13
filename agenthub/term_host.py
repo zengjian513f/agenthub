@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -138,8 +140,24 @@ def _log_tail(name: str) -> str:
     return text.strip()[-600:]
 
 
+def launch_meta(source: str, sid: str | None = None, uid: str | None = None) -> dict:
+    """宿主实例的身份元数据, 随 ``--meta`` 写进宿主, 之后不可改。
+
+    ``instance_id`` / ``launch_id`` 标识这一个宿主进程; 续接已有会话时同时声明
+    ``sid`` / ``uid``, 新建会话时留空, 等 CLI 落盘后由 :func:`bind_native` 补上。
+    SessionDock 只接管带这份身份的宿主 (它的每次控制请求都核对 instance_id), 没有
+    这份元数据的实例在那边只能看、不能操作。
+    """
+    meta = {"source": source, "instance_id": secrets.token_hex(16),
+            "launch_id": secrets.token_hex(16)}
+    if sid and uid:
+        meta["sid"] = sid
+        meta["uid"] = uid
+    return meta
+
+
 def new_session(name: str, cmd: str | list[str], cwd: str | None = None,
-                cols: int = 120, rows: int = 32) -> str:
+                cols: int = 120, rows: int = 32, meta: dict | None = None) -> str:
     full = name if name.startswith(PREFIX) else PREFIX + name
     if has_session(full):
         raise RuntimeError(f"会话已存在: {full}")
@@ -158,6 +176,8 @@ def new_session(name: str, cmd: str | list[str], cwd: str | None = None,
               "--name", full, "--cols", str(cols), "--rows", str(rows)]
     if cwd and os.path.isdir(cwd):
         launch += ["--cwd", cwd]
+    if meta:
+        launch += ["--meta", json.dumps(meta, separators=(",", ":"))]
     launch += ["--", *argv]
 
     attempts = [True, False] if _use_scope() else [False]
@@ -206,6 +226,30 @@ def kill_session(name: str, timeout: float = 4.0) -> bool:
             pass
     audit.record("host.session.killed", category="terminal", data={"tmux": name})
     return True
+
+
+def bind_native(name: str, sid: str, uid: str) -> bool:
+    """把新建时还没有原生记录的宿主绑定到 CLI 落盘后的会话 (``launch_bind_v1``)。
+
+    一个宿主只能绑一次; 启动时已经声明了 sid/uid 的宿主 (续接) 不需要也不能再绑,
+    元数据一致就当作已绑定。旧版宿主 (没有 instance_id) 直接返回 False。
+    """
+    info = client.session_info(name)
+    if not info:
+        raise RuntimeError(f"会话不存在: {name}")
+    meta = info.get("meta") or {}
+    instance, launch, source = meta.get("instance_id"), meta.get("launch_id"), meta.get("source")
+    if not (instance and launch and source):
+        return False
+    if meta.get("sid") or meta.get("uid"):
+        return meta.get("sid") == sid and meta.get("uid") == uid
+    reply = client.request(name, "launch_bind_v1", expected_instance_id=instance,
+                           expected_source=source, expected_launch_id=launch,
+                           native={"sid": sid, "uid": uid})
+    bound = reply.get("native_binding") or {}
+    audit.record("host.native.bound", category="terminal",
+                 data={"tmux": name, "sid": sid, "uid": uid, "instance_id": instance})
+    return bound.get("sid") == sid and bound.get("uid") == uid
 
 
 def rename_session(old: str, new: str) -> str:

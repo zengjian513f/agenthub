@@ -85,6 +85,31 @@ cp host-rs/target/x86_64-unknown-linux-musl/release/ptyhost bin/ptyhost
 - ptyhost 没有 copy-mode，`scroll`/`leave_copy_mode` 是空操作；`submit_text` 只在应用请求了
   bracketed paste 时才包起止序列，和 tmux `paste-buffer -p` 的行为一致。
 
+## 实例身份与 SessionDock 共用
+
+`host-rs/` 与 SessionDock（同一批会话的 Rust 后端）的 `crates/ptyhost` 是**同一份源码**，
+两边用同一个宿主协议。SessionDock 的每次控制请求都核对宿主的**实例身份**，因此本项目起的
+宿主也要带上这份身份，两个后端才能互相接管对方起的实例：
+
+- 宿主启动时经 `--meta` 写入不可更改的元数据：`source`、`instance_id`、`launch_id`
+  （`term_host.launch_meta`）。续接已有会话时同时声明 `sid` / `uid`；新建会话时 CLI 还没
+  落盘，先留空，`new-status` 关联到真正的会话后由 `term.bind_native` 发 `launch_bind_v1`
+  一次性绑上（一个宿主只能绑一次，冲突即拒绝）。
+- 宿主的 `info` 应答带 `capabilities: {instance_guard, launch_guard, launch_bind}` 和当前
+  的 `native_binding`。`guarded_v1` / `launch_guard_v1` 是按身份核对的请求信封，本项目的
+  客户端仍用普通请求（`{"op": ..., "token": ...}`），两者在同一个宿主上并行有效。
+- 没有 `--meta` 起的旧实例在 SessionDock 里只能看不能操作；`bind_native` 对它返回 False。
+- `rehome` 让一个活着的宿主把自己的 `.json` / `.sock` / `.log` 搬到另一个会话目录，pty、
+  CLI 子进程和已 attach 的客户端都不受影响（SessionDock 的 `--adopt-host-dir` 用它把
+  别的目录里的实例收进自己的目录）。
+- 两个后端共用一个会话目录时，把 `AGENTHUB_HOST_DIR` 指到 SessionDock 的宿主目录
+  （部署上是 `/srv/sessiondock/host`），两边看到、接管的是同一批实例。本项目按名称
+  `agenthub-<source>-<sid 前 8 位>` 或按进程树找到会话所在的宿主，SessionDock 起的
+  `agenthub-<随机>` 实例走进程树这条路。
+
+改 `host-rs/` 就等于改 SessionDock 的宿主：两边的源码要一起同步，合并前在两边都跑
+`cargo test`。
+
 ## 命令行
 
 ```bash

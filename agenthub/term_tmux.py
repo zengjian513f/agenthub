@@ -142,8 +142,8 @@ def _session_tmux(name: str, *args: str, timeout: int = 10) -> str:
 
 
 def new_session(name: str, cmd: str | list[str], cwd: str | None = None,
-                cols: int = 120, rows: int = 32) -> str:
-    """在 agenthub 专用 tmux server 中新建 detached 会话。"""
+                cols: int = 120, rows: int = 32, meta: dict | None = None) -> str:
+    """在 agenthub 专用 tmux server 中新建 detached 会话。tmux 没有实例身份, meta 不用。"""
     global _managed_configured
     if not isinstance(cmd, str):
         cmd = shlex.join(cmd)

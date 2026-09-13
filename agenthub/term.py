@@ -407,7 +407,8 @@ def new_cli_session(source: str, cwd: str, cols: int = 120, rows: int = 32,
     command = _clean_cli_command(args[0], *args[1:])
     token = sid or str(uuid.uuid4())
     suffix = sid[:8] if sid else f"new-{token[:8]}"
-    name = new_session(f"{source}-{suffix}", command, str(path), cols, rows)
+    name = new_session(f"{source}-{suffix}", command, str(path), cols, rows,
+                       meta=launch_meta(source))
     return {"name": name, "source": source, "sid": sid, "cwd": str(path), "token": token}
 
 
@@ -437,11 +438,21 @@ def has_session(name: str) -> bool:
 
 
 def new_session(name: str, cmd: str | list[str], cwd: str | None = None,
-                cols: int = 120, rows: int = 32) -> str:
+                cols: int = 120, rows: int = 32, meta: dict | None = None) -> str:
     full = name if name.startswith(PREFIX) else PREFIX + name
     if has_session(full):
         raise RuntimeError(f"tmux 会话已存在: {full}")
-    return primary().new_session(full, cmd, cwd, cols, rows)
+    return primary().new_session(full, cmd, cwd, cols, rows, meta=meta)
+
+
+launch_meta = term_host.launch_meta
+
+
+def bind_native(name: str, sid: str, uid: str) -> bool:
+    """CLI 落盘后把宿主绑到它的原生会话; tmux 后端没有实例身份, 返回 False。"""
+    module = _require(name)
+    bind = getattr(module, "bind_native", None)
+    return bool(bind(name, sid, uid)) if bind else False
 
 
 def kill_session(name: str) -> bool:

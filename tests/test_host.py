@@ -349,6 +349,10 @@ class TermHostBackendTests(unittest.TestCase):
         with patch.object(term, "_which_cli", return_value=str(fake)):
             info = term.new_cli_session("codex", self.tmp.name, 60, 10)
         self.assertTrue(info["name"].startswith("agenthub-codex-new-"))
+        meta = client.session_info(info["name"])["meta"]
+        self.assertEqual(meta["source"], "codex")
+        self.assertEqual((len(meta["instance_id"]), len(meta["launch_id"])), (32, 32))
+        self.assertNotIn("sid", meta)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline \
                 and "fake-codex" not in term.capture_screen_plain(info["name"]):
@@ -362,6 +366,50 @@ class TermHostBackendTests(unittest.TestCase):
         while time.monotonic() < deadline and term.has_session(info["name"]):
             time.sleep(0.05)
         self.assertFalse(term.has_session(info["name"]))
+
+    def test_a_new_session_carries_a_pending_identity_and_binds_once(self):
+        # 新建: 宿主先只有实例身份, CLI 落盘后再绑原生会话 (SessionDock 的 launch_bind_v1)。
+        meta = term.launch_meta("codex")
+        self.assertEqual(sorted(meta), ["instance_id", "launch_id", "source"])
+        name = term.new_session("id-a", ["sh", "-i"], self.tmp.name, meta=meta)
+        info = client.session_info(name)
+        self.assertEqual(info["meta"], meta)
+        reply = client.request(name, "info")
+        self.assertEqual(reply["capabilities"],
+                         {"instance_guard": 1, "launch_guard": 1, "launch_bind": 1})
+        self.assertIsNone(reply["native_binding"])
+        uid = "codex:0123456789abcdef"
+        self.assertTrue(term.bind_native(name, "thread-1", uid))
+        self.assertTrue(term.bind_native(name, "thread-1", uid))       # 幂等
+        with self.assertRaisesRegex(RuntimeError, "conflict"):
+            term.bind_native(name, "thread-2", uid)
+        bound = client.request(name, "info")["native_binding"]
+        self.assertEqual((bound["sid"], bound["uid"], bound["instance_id"], bound["method"]),
+                         ("thread-1", uid, meta["instance_id"], "operator"))
+        # 绑定后, 按身份核对的 guarded_v1 信封才被接受: 这正是 SessionDock 接管的前提。
+        guarded = client.request(name, "guarded_v1", expected_instance_id=meta["instance_id"],
+                                 expected_source="codex", expected_sid="thread-1",
+                                 expected_uid=uid, request={"op": "cursor"})
+        self.assertEqual(guarded["instance_guard"], {"version": 1, "instance_id": meta["instance_id"]})
+        with self.assertRaisesRegex(RuntimeError, "instance guard rejected"):
+            client.request(name, "guarded_v1", expected_instance_id="another-instance-0002",
+                           expected_source="codex", expected_sid="thread-1",
+                           request={"op": "cursor"})
+        self.assertTrue(term.kill_session(name))
+
+    def test_a_resume_declares_sid_and_uid_up_front(self):
+        meta = term.launch_meta("claude", "0000-sid", "claude:fedcba9876543210")
+        name = term.new_session("id-b", ["sh", "-i"], self.tmp.name, meta=meta)
+        self.assertEqual(client.session_info(name)["meta"]["sid"], "0000-sid")
+        # 启动时已声明的身份不可再绑: 一致即视为已绑定, 不一致就不是这个会话。
+        self.assertTrue(term.bind_native(name, "0000-sid", "claude:fedcba9876543210"))
+        self.assertFalse(term.bind_native(name, "other-sid", "claude:fedcba9876543210"))
+        # 没有实例身份的宿主 (旧版启动) 绑不了, 也不报错。
+        legacy = term.new_session("id-c", ["sh", "-i"], self.tmp.name)
+        self.assertEqual(client.session_info(legacy)["meta"], {})
+        self.assertFalse(term.bind_native(legacy, "x-sid", "claude:0000000000000000"))
+        self.assertTrue(term.kill_session(name))
+        self.assertTrue(term.kill_session(legacy))
 
     def test_launch_failure_is_reported_and_dead_command_vanishes_like_tmux(self):
         with patch.object(term_host, "host_binary", return_value="/nonexistent/agenthub-host"):
