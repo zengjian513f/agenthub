@@ -13,7 +13,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from agenthub import create_requests, federation, hub, server
-from hub_fixture import start_node, stop
+from hub_fixture import NodeHandler, start_node, stop
 
 
 class FederationTests(unittest.TestCase):
@@ -102,6 +102,75 @@ class FederationTests(unittest.TestCase):
 
 
 class HubHTTPTests(unittest.TestCase):
+    def test_sessiondock_registration_and_requests_use_native_headers(self):
+        class NativeNode(NodeHandler):
+            def authenticated(self):
+                captured.append(dict(self.headers))
+                return (self.headers.get('X-SessionDock-Protocol') == '1'
+                        and self.headers.get('X-SessionDock-Node-Token') == self.state['token'])
+
+            def do_GET(self):
+                if not self.authenticated():
+                    return self._json({'error': 'node authentication required'}, 403)
+                return super().do_GET()
+
+            def do_POST(self):
+                if not self.authenticated():
+                    return self._json({'error': 'node authentication required'}, 403)
+                return super().do_POST()
+
+        captured = []
+        node = start_node('c' * 32, 'Native')
+        node.RequestHandlerClass = NativeNode
+        http = None
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                registry = hub.Registry(Path(root) / 'nodes.json', ['127.0.0.0/8'], monitor=False)
+                body = {'name': 'NativeNode', 'url': f'http://127.0.0.1:{node.server_port}',
+                        'token': node.state['token']}
+                with self.assertRaises(ValueError):
+                    registry.register(body)
+                with self.assertRaises(ValueError):
+                    registry.register({**body, 'transport': 'unknown'})
+                with self.assertRaises(ValueError):
+                    registry.register({**body, 'transport': 'sessiondock', 'token': 'wrong-' * 8})
+                registry.register({**body, 'transport': 'sessiondock'})
+                registry = hub.Registry(registry.path, ['127.0.0.0/8'], monitor=False)
+                self.assertEqual(registry.all()[0]['transport'], 'sessiondock')
+                http = ThreadingHTTPServer(('127.0.0.1', 0), hub.HubHandler)
+                http.daemon_threads = True
+                http.registry = registry
+                http.hub_mode = True
+                threading.Thread(target=http.serve_forever, daemon=True).start()
+                base = f'http://127.0.0.1:{http.server_port}'
+                with urlopen(base + '/api/sessions', timeout=5) as response:
+                    rows = json.loads(response.read())['sessions']
+                self.assertEqual(rows[0]['node_id'], 'c' * 32)
+                status, result = registry.search_request(registry.all()[0], {'q': ['needle']})
+                self.assertEqual(status, 200)
+                self.assertEqual(len(result['results']), 1)
+                request = Request(base + '/api/session/star', method='POST',
+                                  data=json.dumps({'uid': rows[0]['uid'], 'starred': True}).encode(),
+                                  headers={'Content-Type': 'application/json',
+                                           'X-AgentHub-Page': 'native-page',
+                                           'X-AgentHub-Trace': 'native-trace',
+                                           'X-AgentHub-Build': server.ASSET_VERSION})
+                with urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(node.state['writes'][-1][1]['uid'], node.state['row']['uid'])
+                for suffix, value in [('Page', 'native-page'), ('Trace', 'native-trace'),
+                                      ('Build', server.ASSET_VERSION)]:
+                    self.assertEqual(captured[-1]['X-SessionDock-' + suffix], value)
+                    self.assertNotIn('X-AgentHub-' + suffix, captured[-1])
+                with urlopen(base + '/api/nodes', timeout=5) as response:
+                    public = response.read().decode()
+                self.assertNotIn(node.state['token'], public)
+                self.assertNotIn(body['url'], public)
+        finally:
+            if http is not None:
+                stop(http)
+            stop(node)
+
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()

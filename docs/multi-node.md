@@ -85,6 +85,13 @@ Hub 默认只监听 `127.0.0.1:8720`，放在 hub-host **已有登录鉴权**的
    完成后执行 `systemctl --user restart agenthub-hub`，让运行中的 Hub 重新读取配置。
    节点服务与运行中的 CLI 不受影响。
 
+   连接已运行的 SessionDock 协议 1 节点时，在注册参数中增加
+   `"transport": "sessiondock"`，使用它的私网节点监听地址和对应凭据。
+   Hub 使用 `X-SessionDock-Node-Token`、`X-SessionDock-Protocol` 认证，
+   并转换转发的 Page、Trace、Build 请求头；浏览器仍使用 AgentHub 的接口。
+   未指定 `transport` 的节点继续使用 AgentHub 请求头。同步注册表时保留节点 ID、
+   已有机器顺序、配色和启用状态；离线机器保留已验证的注册信息，恢复后自动检测。
+
 ## 操作和数据边界
 
 - 顶部机器、Agent Type 和视图共用同一排分段按钮；机器按钮支持多选，双击仅选一台，与 Agent Type 筛选取交集；不提供“全部”或管理机器按钮。视口窄于 1200px 时机器筛选收成一个下拉按钮，按钮文字概括当前选择（全部机器 / 单台机器名并着色 / N 台机器），展开后是同一组机器按钮，点选不收起。

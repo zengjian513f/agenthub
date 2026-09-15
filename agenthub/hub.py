@@ -84,6 +84,7 @@ class Registry:
         self.nodes = json.loads(path.read_text()) if path.exists() else []
         for node in self.nodes:
             self.validate_url(node["url"])
+            self.header_prefix(node)
             if enabled(node):
                 self.load_snapshot(node)
         if monitor:
@@ -230,6 +231,9 @@ class Registry:
             raise ValueError("请输入机器名称、地址和至少 32 字符的节点凭据")
         self.validate_url(url)
         candidate = {"url": url, "token": token}
+        if body.get("transport") is not None:
+            candidate["transport"] = body["transport"]
+        self.header_prefix(candidate)
         status, meta = self.request(candidate, "/api/meta")
         if (status != 200 or meta.get("mode") != "local"
                 or meta.get("protocol") != fed.PROTOCOL
@@ -305,9 +309,17 @@ class Registry:
         return cls(u.hostname, u.port, timeout=timeout)
 
     @staticmethod
+    def header_prefix(node):
+        transport = node.get("transport", "agenthub")
+        if transport not in {"agenthub", "sessiondock"}:
+            raise ValueError("节点 transport 只能取 agenthub 或 sessiondock")
+        return "X-SessionDock-" if transport == "sessiondock" else "X-AgentHub-"
+
+    @staticmethod
     def headers(node):
-        return {"X-AgentHub-Node-Token": node["token"],
-                "X-AgentHub-Protocol": str(fed.PROTOCOL), "Accept-Encoding": "identity"}
+        prefix = Registry.header_prefix(node)
+        return {prefix + "Node-Token": node["token"],
+                prefix + "Protocol": str(fed.PROTOCOL), "Accept-Encoding": "identity"}
 
     def request(self, node, path, method="GET", body=None, timeout=5):
         conn = self.connection(node, timeout)
@@ -952,7 +964,9 @@ class HubHandler(server.Handler):
         headers = self.registry.headers(node)
         for key in ("Content-Type", "X-AgentHub-Page", "X-AgentHub-Trace", "X-AgentHub-Build", "Range"):
             if self.headers.get(key):
-                headers[key] = self.headers[key]
+                target_key = (self.registry.header_prefix(node) + key[len("X-AgentHub-"):]
+                              if key.startswith("X-AgentHub-") else key)
+                headers[target_key] = self.headers[key]
         headers["X-Real-IP"] = self._display_ip()
         websocket = path == "/api/term/attach"
         if websocket:
