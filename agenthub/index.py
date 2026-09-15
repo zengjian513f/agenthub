@@ -29,6 +29,10 @@ WINDOW_CACHE_MIN_BYTES = 8 * 1024 * 1024
 WINDOW_CACHE_MEMORY_ITEMS = 16
 TRASH_DIR = Path.home() / ".local" / "share" / "agenthub" / "trash"
 CHECK_TTL = 0.5       # 高频热路径复用已发布快照；列表轮询仍会及时发现磁盘变化
+# 浏览器列表轮询接受的最大快照年龄。server 的预热线程按更短的节奏主动扫
+# inventory，轮询请求自己几乎不再扫盘；预热线程不在时（测试、脚本）轮询
+# 至多晚 POLL_TTL 秒看到磁盘变化，仍远小于 8 秒的轮询间隔。
+POLL_TTL = 2.0
 
 _lock = threading.Lock()
 
@@ -61,40 +65,76 @@ _KIND_SOURCE = {
 }
 
 
+def _scandir(path: str) -> list[os.DirEntry]:
+    try:
+        with os.scandir(path) as it:
+            return list(it)
+    except OSError:
+        return []
+
+
+def _entry_is_dir(entry: os.DirEntry) -> bool:
+    try:
+        return entry.is_dir()
+    except OSError:
+        return False
+
+
 def _inventory() -> dict[str, tuple[str, str, int, int, int]]:
-    """枚举索引依赖，但不解析会话正文。子文件同时记录其主会话 owner。"""
+    """枚举索引依赖，但不解析会话正文。子文件同时记录其主会话 owner。
+
+    这是列表轮询的地板：每秒一次的预热扫描要把 ~1600 个文件各 stat 一遍。
+    用 os.scandir 单趟走目录树，比 Path.glob 分三趟匹配快一倍多；输出与
+    glob 版本逐项相同（同样的路径键、同样的 owner 规则）。
+    """
     from .adapters import CLAUDE_ROOT, CODEX_ROOT, CODEX_INDEX, GROK_ROOT
 
     files = {}
 
-    def add(path: Path, kind: str, owner: Path | str):
+    def add(path: str, kind: str, owner: str):
         try:
-            st = path.stat()
+            st = os.stat(path)
         except OSError:
             return
-        files[str(path)] = (kind, str(owner), st.st_size, st.st_mtime_ns,
-                            int(getattr(st, "st_ino", 0)))
+        files[path] = (kind, owner, st.st_size, st.st_mtime_ns,
+                       int(getattr(st, "st_ino", 0)))
 
     if CLAUDE_ROOT.is_dir():
-        for f in CLAUDE_ROOT.glob("*/*.jsonl"):
-            add(f, "claude-main", f)
-        for f in CLAUDE_ROOT.glob("*/*/subagents/*.jsonl"):
-            session_dir = f.parent.parent
-            add(f, "claude-agent", session_dir.parent / f"{session_dir.name}.jsonl")
-        for f in CLAUDE_ROOT.glob("*/*/subagents/*.meta.json"):
-            session_dir = f.parent.parent
-            add(f, "claude-agent-meta",
-                session_dir.parent / f"{session_dir.name}.jsonl")
+        for project in _scandir(str(CLAUDE_ROOT)):
+            if not _entry_is_dir(project):
+                continue
+            for item in _scandir(project.path):
+                if item.name.endswith(".jsonl"):
+                    add(item.path, "claude-main", item.path)
+                if not _entry_is_dir(item):
+                    continue
+                owner = os.path.join(project.path, f"{item.name}.jsonl")
+                for sub in _scandir(os.path.join(item.path, "subagents")):
+                    if sub.name.endswith(".jsonl"):
+                        add(sub.path, "claude-agent", owner)
+                    elif sub.name.endswith(".meta.json"):
+                        add(sub.path, "claude-agent-meta", owner)
     if CODEX_ROOT.is_dir():
-        for f in CODEX_ROOT.glob("**/*.jsonl"):
-            add(f, "codex-main", f)
+        stack = [str(CODEX_ROOT)]
+        while stack:
+            for entry in _scandir(stack.pop()):
+                if _entry_is_dir(entry):
+                    stack.append(entry.path)
+                elif entry.name.endswith(".jsonl"):
+                    add(entry.path, "codex-main", entry.path)
     if GROK_ROOT.is_dir():
-        for f in GROK_ROOT.glob("*/*/summary.json"):
-            add(f, "grok-summary", f.parent)
-        for f in GROK_ROOT.glob("*/*/chat_history.jsonl"):
-            add(f, "grok-chat", f.parent)
+        for top in _scandir(str(GROK_ROOT)):
+            if not _entry_is_dir(top):
+                continue
+            for session in _scandir(top.path):
+                if not _entry_is_dir(session):
+                    continue
+                add(os.path.join(session.path, "summary.json"),
+                    "grok-summary", session.path)
+                add(os.path.join(session.path, "chat_history.jsonl"),
+                    "grok-chat", session.path)
     if CODEX_INDEX.exists():
-        add(CODEX_INDEX, "codex-index", "")
+        add(str(CODEX_INDEX), "codex-index", "")
     return files
 
 
@@ -316,13 +356,18 @@ def signature() -> str:
     return str(_state["sig"] or "")
 
 
-def load(force: bool = False) -> list[dict]:
-    """扫描 inventory 并增量协调；同一时刻只允许一个刷新者。"""
+def load(force: bool = False, ttl: float | None = None) -> list[dict]:
+    """扫描 inventory 并增量协调；同一时刻只允许一个刷新者。
+
+    ttl 是调用方接受的快照年龄（默认 CHECK_TTL）；列表轮询传 POLL_TTL，
+    由预热线程负责把快照保持在这个年龄以内。
+    """
+    ttl = CHECK_TTL if ttl is None else ttl
     with _lock:
         now = time.monotonic()
         if (not force and _state["initialized"]
                 and _state["checked_at"] > 0
-                and now - _state["checked_at"] <= CHECK_TTL):
+                and now - _state["checked_at"] <= ttl):
             return _state["sessions"]
 
         files = _inventory()
@@ -391,10 +436,11 @@ def load(force: bool = False) -> list[dict]:
         return _state["sessions"]
 
 
-def load_snapshot(force: bool = False) -> tuple[list[dict], str, float]:
+def load_snapshot(force: bool = False,
+                  ttl: float | None = None) -> tuple[list[dict], str, float]:
     """原子取得同一发布版本的列表、签名和构建时间。"""
     while True:
-        sessions = load(force=force)
+        sessions = load(force=force, ttl=ttl)
         force = False
         with _lock:
             if sessions is _state["sessions"]:
@@ -696,22 +742,37 @@ _cursor_cache: dict[tuple[str, str, str], tuple[tuple, dict]] = {}
 _cursor_cache_lock = threading.Lock()
 
 
-def _cursor_stamp(s: dict) -> tuple:
+def _data_path(s: dict) -> str:
+    """data_file() 的字符串版；列表路径每次要算几百个，绕开 pathlib 的开销。"""
+    path = str(s["path"])
+    return os.path.join(path, "chat_history.jsonl") if s["source"] == "grok" else path
+
+
+def _path_stamp(path: str, uid: str) -> tuple:
     """游标缓存版本；ctime/inode 补上同尺寸重写和路径复用的边界。"""
-    f = data_file(s)
     try:
-        st = f.stat()
+        st = os.stat(path)
     except OSError:
-        return (str(f), 0, 0, 0, 0,
-                session_meta.timeline_revision(s.get("uid", "")))
-    return (str(f), st.st_size, st.st_mtime_ns, st.st_ctime_ns,
-            int(getattr(st, "st_ino", 0)),
-            session_meta.timeline_revision(s.get("uid", "")))
+        return (path, 0, 0, 0, 0, session_meta.timeline_revision(uid))
+    return (path, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            int(getattr(st, "st_ino", 0)), session_meta.timeline_revision(uid))
+
+
+def _cursor_stamp(s: dict) -> tuple:
+    return _path_stamp(_data_path(s), str(s.get("uid") or ""))
+
+
+def _cursor_hit(cache_id: tuple, stamp: tuple) -> dict | None:
+    """缓存里有这个版本的游标就复制一份；没有或文件不在返回 None。"""
+    cached_value = _cursor_cache.get(cache_id)
+    if cached_value and cached_value[0] == stamp and stamp[2]:
+        return dict(cached_value[1])
+    return None
 
 
 def _cached_cursor(s: dict) -> dict:
     """按文件版本复用游标；同一新版本并发到达时只允许一次重读。"""
-    cache_id = (str(s.get("source") or ""), str(data_file(s)),
+    cache_id = (str(s.get("source") or ""), _data_path(s),
                 str(s.get("agent_id") or ""))
     stamp = _cursor_stamp(s)
     cached_value = _cursor_cache.get(cache_id)
@@ -739,23 +800,43 @@ def _cached_cursor(s: dict) -> dict:
         return dict(value)
 
 
+def _agent_data_path(s: dict, item: dict, agent: str) -> str:
+    """session_view() 会给子代理视图算出的 path，纯字符串版。"""
+    if s["source"] == "codex":
+        return str(item["path"])
+    parent = str(s["path"])
+    stem = os.path.splitext(os.path.basename(parent))[0]
+    return os.path.join(os.path.dirname(parent), stem, "subagents", f"agent-{agent}.jsonl")
+
+
 def with_cursors(sessions: list[dict]) -> list[dict]:
     """给列表元数据附加主会话及子代理的 EOF 游标。
 
     这里只读取每个文件头 4 KiB、尾部锚点和 Claude 最后一条树记录；浏览器
     随后只拉变化文件的新增区间，不需要为了左栏未读数下载整份历史。
+    子代理的游标先按 (来源, 文件, agent) 直接查缓存，命中就不必构造整份视图；
+    只有版本变了才走 session_view() 重算。
     """
     out = []
     for session in sessions:
         row = {**session, "cursor": _cached_cursor(session)}
         items = []
+        source = str(session.get("source") or "")
+        uid = str(session.get("uid") or "")
         for item in session.get("agent_items") or []:
             copy = dict(item)
-            try:
-                copy["cursor"] = _cached_cursor(
-                    session_view(session, str(item.get("id") or "")))
-            except KeyError:
-                pass
+            agent = str(item.get("id") or "")
+            hit = None
+            if source in {"claude", "codex"} and agent:
+                path = _agent_data_path(session, item, agent)
+                hit = _cursor_hit((source, path, agent), _path_stamp(path, uid))
+            if hit is not None:
+                copy["cursor"] = hit
+            else:
+                try:
+                    copy["cursor"] = _cached_cursor(session_view(session, agent))
+                except KeyError:
+                    pass
             items.append(copy)
         if items:
             row["agent_items"] = items

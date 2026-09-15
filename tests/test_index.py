@@ -487,6 +487,45 @@ class IsolatedIndexTests(unittest.TestCase):
             self.assertIsNone(index.get("missing"))
             self.assertIs(index.cached()[0], session)
 
+    def test_poll_ttl_reuses_the_snapshot_without_scanning(self):
+        """列表轮询接受 POLL_TTL 内的快照；默认 CHECK_TTL 的调用仍会扫盘。"""
+        self.claude_session("one", "第一个")
+        first = index.load(force=True)
+        with patch.object(index, "_inventory",
+                          side_effect=AssertionError("poll must not scan")):
+            self.assertIs(index.load(ttl=index.POLL_TTL), first)
+            self.assertIs(index.load_snapshot(ttl=index.POLL_TTL)[0], first)
+        self.claude_session("two", "第二个")
+        self.assertEqual(len(index.load()), 2)      # CHECK_TTL 已打成 -1：立即扫描
+        with patch.object(index, "_inventory", wraps=index._inventory) as scan:
+            index.load(force=True, ttl=index.POLL_TTL)
+            self.assertTrue(scan.called)             # force 无视 ttl
+
+    def test_agent_cursor_fast_path_matches_the_full_view(self):
+        """子代理游标先按文件版本直接查缓存；结果必须与 session_view 路径完全一致。"""
+        parent = self.claude_session("parent", "父会话")
+        agent = parent.parent / "parent" / "subagents" / "agent-a1.jsonl"
+        self.write_rows(agent, [{
+            "type": "user", "uuid": "a1-user", "parentUuid": None,
+            "sessionId": "parent", "cwd": "/tmp/project", "isSidechain": True,
+            "timestamp": "2026-08-11T08:00:01Z", "agentId": "a1",
+            "message": {"content": [{"type": "text", "text": "子代理"}]},
+        }])
+        session = index.load(force=True)[0]
+        self.assertTrue(session.get("agent_items"))
+        first = index.with_cursors([session])[0]
+        with patch.object(index, "session_view",
+                          side_effect=AssertionError("cached agent cursor must not rebuild the view")):
+            second = index.with_cursors([session])[0]
+        self.assertEqual(first, second)
+        self.assertEqual(first["agent_items"][0]["cursor"],
+                         index.cursor(index.session_view(session, "a1")))
+        agent.unlink()                                # 文件没了：不能再给旧游标背书
+        with patch.object(index, "session_view", wraps=index.session_view) as view:
+            third = index.with_cursors([session])[0]
+            view.assert_called_once()
+        self.assertNotIn("cursor", third["agent_items"][0])
+
     def test_signature_changes_when_index_schema_changes(self):
         files = {"/session": ("claude-main", "/session", 123, 456, 789)}
         current = index._signature(files)
