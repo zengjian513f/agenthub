@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -25,10 +26,14 @@ CACHE_DIR = Path.home() / ".cache" / "agenthub"
 CACHE_FILE = CACHE_DIR / "index.json"
 CACHE_VERSION = 10  # hide superseded Claude continued-in parents in the list
 WINDOW_CACHE_DIR = CACHE_DIR / "message-windows"
-WINDOW_CACHE_VERSION = 10  # strip Grok in-flight user_query envelopes
+WINDOW_CACHE_VERSION = 11  # windows now hold media-enriched messages + tokens
 MESSAGE_CURSOR_VERSION = 10
 WINDOW_CACHE_MIN_BYTES = 8 * 1024 * 1024
 WINDOW_CACHE_MEMORY_ITEMS = 16
+VIEW_CACHE_MAX_ITEMS = 32
+# 按已序列化 JSON 正文 (+ 已压缩流) 计量；实测消息对象本身约再占 1.8 倍
+# 正文大小 (56 MB 正文 ≈ 100 MB 对象)，即上限对应约 3 倍的常驻内存。
+VIEW_CACHE_MAX_BYTES = 192 * 1024 * 1024
 TRASH_DIR = Path.home() / ".local" / "share" / "agenthub" / "trash"
 CHECK_TTL = 0.5       # 高频热路径复用已发布快照；列表轮询仍会及时发现磁盘变化
 # 浏览器列表轮询接受的最大快照年龄。server 的预热线程按更短的节奏主动扫
@@ -631,7 +636,11 @@ def _window_memory_get(key: str, stamp: dict) -> dict | None:
         if not cached or cached[0] != stamp:
             return None
         _window_cache_memory.move_to_end(key)
-        return copy.deepcopy(cached[1])
+        value = cached[1]
+    # 窗口里的消息已带媒体 token；仓库淘汰后必须重新解析以重新登记。
+    if not media.retain(value.get("media_tokens") or ()):
+        return None
+    return copy.deepcopy(value)
 
 
 def _window_memory_put(key: str, stamp: dict, value: dict) -> None:
@@ -664,7 +673,11 @@ def _window_disk_read(key: str, stamp: dict) -> dict | None:
     if not isinstance(row, dict) or row.get("schema") != WINDOW_CACHE_VERSION \
             or row.get("stamp") != stamp or not isinstance(row.get("value"), dict):
         return None
-    return row["value"]
+    value = row["value"]
+    # 服务重启后媒体仓库是空的：引用了本地图片的窗口需要重新解析登记。
+    if not media.retain(value.get("media_tokens") or ()):
+        return None
+    return value
 
 
 def _window_disk_write(key: str, stamp: dict, value: dict) -> None:
@@ -737,6 +750,342 @@ def _cached_initial_window(s: dict, ad, build) -> dict:
             _window_memory_put(key, before, value)
             _window_disk_write(key, before, value)
         return copy.deepcopy(value)
+
+
+# ---- 解析视图缓存 ----------------------------------------------------------
+#
+# 整份读取的结果按会话视图缓存在进程内：消息对象、序列化后的 JSON 正文以及
+# adapter 的续读状态。指纹与窗口缓存相同 (路径/大小/mtime/ctime/inode、Codex
+# 继承段、Claude 时间线、Codex 改名)。文件只增长时从上次 EOF 起只解析尾部并
+# 拼接；截断、改写、指纹以外的变化都退回整份解析。同一视图同一时刻只有一个
+# 解析者，其余请求等待后共用结果。
+
+
+class CachedMessages(list):
+    """整份读取返回的消息列表；附带已序列化的 JSON 正文供响应直接拼接。"""
+
+    __slots__ = ("view",)
+
+    def __init__(self, items, view):
+        super().__init__(items)
+        self.view = view
+
+    def __reduce__(self):
+        # deepcopy / pickle 得到普通列表；缓存视图及其锁不随之复制。
+        return (list, (list(self),))
+
+    @property
+    def json_bytes(self) -> bytes:
+        """与 json.dumps(list, ensure_ascii=False).encode() 逐字节相同。"""
+        return self.view.body
+
+    def deflate(self, level: int) -> tuple[bytes, int, int]:
+        """正文去掉末尾 ']' 后的 raw deflate 流 (已 sync flush)、其 crc32 和长度。"""
+        return self.view.deflate(level)
+
+
+class _View:
+    __slots__ = ("stamp", "end", "head", "anchor", "tip", "messages",
+                 "message_total", "activity", "activity_changed", "state",
+                 "tokens", "body", "floor", "complete", "_deflate", "_deflate_lock")
+
+    def __init__(self):
+        self.stamp = None
+        self.end = 0
+        self.head = ""
+        self.anchor = ""
+        self.tip = None
+        self.messages: list[dict] = []
+        self.message_total = 0
+        self.activity = None
+        self.activity_changed = False
+        self.state = None
+        self.tokens: list[str] = []
+        self.body = b"[]"
+        self.floor = 0
+        self.complete = True
+        self._deflate = None
+        self._deflate_lock = threading.Lock()
+
+    @property
+    def cost(self) -> int:
+        return len(self.body) + (len(self._deflate[1]) if self._deflate else 0)
+
+    def deflate(self, level: int) -> tuple[bytes, int, int]:
+        with self._deflate_lock:
+            if self._deflate is None or self._deflate[0] != level:
+                opened = self.body[:-1]
+                packer = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
+                data = packer.compress(opened) + packer.flush(zlib.Z_SYNC_FLUSH)
+                self._deflate = (level, data, zlib.crc32(opened), len(opened))
+                _view_cache_account()
+            _, data, crc, length = self._deflate
+            return data, crc, length
+
+    def extend_deflate(self, previous: "_View", tail: bytes) -> None:
+        """追加时沿用旧视图已压缩的前缀，只压缩新增正文。"""
+        with previous._deflate_lock:
+            cached = previous._deflate
+        if cached is None:
+            return
+        level, data, crc, length = cached
+        packer = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = data + packer.compress(tail) + packer.flush(zlib.Z_SYNC_FLUSH)
+        self._deflate = (level, data, zlib.crc32(tail, crc), length + len(tail))
+
+
+_view_cache: OrderedDict[str, _View] = OrderedDict()
+_view_cache_guard = threading.Lock()
+_view_locks: dict[str, threading.Lock] = {}
+
+
+def _view_lock(key: str) -> threading.Lock:
+    with _view_cache_guard:
+        return _view_locks.setdefault(key, threading.Lock())
+
+
+def _view_cache_account() -> None:
+    with _view_cache_guard:
+        _view_cache_trim()
+
+
+def _view_cache_trim() -> None:
+    total = sum(view.cost for view in _view_cache.values())
+    while _view_cache and (len(_view_cache) > VIEW_CACHE_MAX_ITEMS
+                           or total > VIEW_CACHE_MAX_BYTES):
+        _, gone = _view_cache.popitem(last=False)
+        total -= gone.cost
+
+
+def _view_put(key: str, view: _View) -> None:
+    with _view_cache_guard:
+        _view_cache[key] = view
+        _view_cache.move_to_end(key)
+        _view_cache_trim()
+
+
+def _view_peek(key: str) -> _View | None:
+    with _view_cache_guard:
+        return _view_cache.get(key)
+
+
+def _view_get(key: str, stamp: dict) -> _View | None:
+    with _view_cache_guard:
+        view = _view_cache.get(key)
+        if view is None or view.stamp != stamp:
+            return None
+        _view_cache.move_to_end(key)
+    if not media.retain(view.tokens):
+        return None
+    return view
+
+
+def _clear_view_cache() -> None:
+    """测试及维护入口。"""
+    with _view_cache_guard:
+        _view_cache.clear()
+        _view_locks.clear()
+
+
+def view_cache_stats() -> dict:
+    with _view_cache_guard:
+        return {"items": len(_view_cache),
+                "bytes": sum(view.cost for view in _view_cache.values())}
+
+
+def _media_tokens(messages) -> list[str]:
+    """消息引用的本地媒体 token；外链媒体不经过仓库。"""
+    tokens = []
+    for message in messages:
+        for item in message.get("media") or ():
+            src = str(item.get("src") or "")
+            if src.startswith("/api/media/"):
+                tokens.append(src[len("/api/media/"):])
+    return tokens
+
+
+def _split_status(msgs: list[dict]) -> tuple[list[dict], list[dict]]:
+    events = [m for m in msgs if m.get("role") == "status"]
+    return [m for m in msgs if m.get("role") != "status"], events
+
+
+def _line_complete(f: Path, end: int) -> bool:
+    """EOF 落在完整一行之后才能缓存；半行会被 _iter_records 跳过，整读可补回。"""
+    if end <= 0:
+        return True
+    try:
+        with open(f, "rb") as fh:
+            fh.seek(end - 1)
+            return fh.read(1) == b"\n"
+    except OSError:
+        return False
+
+
+def _claude_read_options(s: dict, ver: dict) -> dict:
+    timeline = (session_meta.timeline(str(s.get("uid") or ""))
+                if not s.get("agent_id") else None)
+    return {"agent": s.get("agent_id"),
+            "declared_tip": _claude_effective_tip(s, pos=ver["size"]),
+            "abandoned_after": int((timeline or {}).get("stale_end") or 0)}
+
+
+def _finish_view(s: dict, ad, view: _View, stamp: dict) -> _View:
+    f = data_file(s)
+    view.stamp = stamp
+    view.head = _cursor_head(f, min(4096, view.end))
+    view.anchor = _anchor_hash(f, view.end)
+    view.tip = (_claude_effective_tip(s, pos=view.end)
+                if isinstance(ad, ClaudeAdapter) else None)
+    view.complete = _line_complete(f, view.end)
+    view.message_total = sum(m.get("counted") is not False for m in view.messages)
+    return view
+
+
+def _view_parse(s: dict, ad, ver: dict, stamp: dict) -> _View:
+    """整份解析并生成缓存视图。"""
+    if isinstance(ad, ClaudeAdapter):
+        msgs, end, state = ad.read_state(s["path"], **_claude_read_options(s, ver))
+    else:
+        msgs, end, state = ad.read_state(s["path"])
+    view = _View()
+    view.end = end
+    view.state = state
+    view.messages, events = _split_status(msgs)
+    for msg in view.messages:
+        media.enrich_message(msg, s.get("cwd"))
+    view.activity_changed = bool(events)
+    view.activity = events[-1] if events else None
+    if s.get("source") == "codex":
+        own_start = int((state or {}).get("own_start") or 0)
+        view.floor = sum(1 for m in msgs[:own_start] if m.get("role") != "status")
+    view.tokens = _media_tokens(view.messages)
+    view.body = json.dumps(view.messages, ensure_ascii=False).encode()
+    return _finish_view(s, ad, view, stamp)
+
+
+def _view_grew(s: dict, ad, old: _View, stamp: dict) -> bool:
+    """旧视图之后文件是否只在末尾追加：与浏览器续读游标同一套校验。"""
+    previous = old.stamp
+    if not previous or not old.complete or old.state is None:
+        return False
+    for field in ("schema", "source", "agent", "semantic"):
+        if previous.get(field) != stamp.get(field):
+            return False
+    before, after = previous["dependencies"], stamp["dependencies"]
+    if len(before) != len(after) or before[:-1] != after[:-1]:
+        return False
+    was, now = before[-1], after[-1]
+    if was.get("missing") or now.get("missing"):
+        return False
+    if (was["path"] != now["path"] or was["inode"] != now["inode"]
+            or now["size"] <= old.end or now["mtime_ns"] < was["mtime_ns"]):
+        return False
+    f = data_file(s)
+    if _cursor_head(f, min(4096, old.end)) != old.head:
+        return False
+    if _anchor_hash(f, old.end) != old.anchor:
+        return False
+    if isinstance(ad, ClaudeAdapter):
+        prefix_tip = _claude_effective_tip(s, pos=old.end)
+        if prefix_tip:
+            if prefix_tip != old.tip or not ad.append_extends(
+                    str(f), old.end, prefix_tip, agent=s.get("agent_id")):
+                return False
+        elif old.tip:
+            return False
+    return True
+
+
+def _view_extend(s: dict, ad, old: _View, ver: dict, stamp: dict) -> _View | None:
+    """只解析旧 EOF 之后的记录并接到旧视图之后；无法保证等价时返回 None。"""
+    if isinstance(ad, ClaudeAdapter):
+        msgs, end, state = ad.read_state(
+            s["path"], **_claude_read_options(s, ver), state=old.state)
+    elif s.get("source") == "codex":
+        msgs, end, state = ad.read_state(
+            s["path"], state=old.state, prefix=old.messages, prefix_floor=old.floor)
+    else:
+        msgs, end, state = ad.read_state(s["path"], state=old.state)
+    if state is None:
+        return None
+    tail, events = _split_status(msgs)
+    for msg in tail:
+        media.enrich_message(msg, s.get("cwd"))
+    patches = list((state or {}).get("patches") or ())
+    view = _View()
+    view.end = end
+    view.state = state
+    combined = list(old.messages)
+    for index, replacement in patches:
+        combined[index] = replacement
+    combined.extend(tail)
+    view.messages = combined
+    view.activity_changed = old.activity_changed or bool(events)
+    view.activity = events[-1] if events else old.activity
+    view.floor = old.floor
+    view.tokens = old.tokens + _media_tokens(tail) if not patches else _media_tokens(combined)
+    if patches:
+        view.body = json.dumps(combined, ensure_ascii=False).encode()
+    elif not tail:
+        view.body = old.body
+        view._deflate = old._deflate
+    else:
+        tail_json = json.dumps(tail, ensure_ascii=False).encode()
+        if old.messages:
+            joint = b", " + tail_json[1:-1]
+            view.body = old.body[:-1] + joint + b"]"
+            view.extend_deflate(old, joint)
+        else:
+            view.body = tail_json
+    return _finish_view(s, ad, view, stamp)
+
+
+def _view_for(s: dict, ad, ver: dict) -> _View:
+    """取得会话视图：命中缓存、增量拼接或整份解析，同一视图单飞。"""
+    key = _window_cache_identity(s)
+    before = _window_cache_stamp(s, ad)
+    view = _view_get(key, before)
+    if view is not None:
+        return view
+    with _view_lock(key):
+        before = _window_cache_stamp(s, ad)
+        view = _view_get(key, before)
+        if view is not None:
+            return view
+        old = _view_peek(key)
+        view = None
+        if old is not None and _view_grew(s, ad, old, before):
+            view = _view_extend(s, ad, old, ver, before)
+        if view is None:
+            view = _view_parse(s, ad, ver, before)
+        after = _window_cache_stamp(s, ad)
+        if after == before and view.complete:
+            _view_put(key, view)
+        return view
+
+
+def _batch_from_view(view: _View, initial_window: bool) -> dict:
+    msgs = view.messages
+    partial = None
+    window_size = INITIAL_HEAD_MESSAGES + INITIAL_TAIL_MESSAGES
+    if initial_window:
+        if len(msgs) > window_size:
+            omitted = len(msgs) - window_size
+            msgs = msgs[:INITIAL_HEAD_MESSAGES] + msgs[-INITIAL_TAIL_MESSAGES:]
+            partial = {"head": INITIAL_HEAD_MESSAGES, "tail": INITIAL_TAIL_MESSAGES,
+                       "omitted": omitted}
+        msgs = [dict(m) for m in msgs]
+    else:
+        # 消费者只读消息，但仍给每条一个浅副本，避免响应处理误改缓存对象。
+        msgs = CachedMessages((dict(m) for m in msgs), view)
+    return {"end": view.end, "messages": msgs, "message_total": view.message_total,
+            "partial": partial, "activity_changed": view.activity_changed,
+            "activity": view.activity, "enriched": True,
+            "media_tokens": _media_tokens(msgs) if initial_window else None}
+
+
+def _view_batch(s: dict, ad, ver: dict, initial_window: bool) -> dict:
+    return _batch_from_view(_view_for(s, ad, ver), initial_window)
 
 
 def _anchor_hash(f: Path, pos: int) -> str:
@@ -946,6 +1295,7 @@ def _read_message_batch(s: dict, ad, start: int, ver: dict,
 
 _audit_parse_seen: OrderedDict[tuple, None] = OrderedDict()
 _audit_parse_lock = threading.Lock()
+AUDIT_INLINE_MESSAGES = 256
 
 
 def _audit_message_batch(s: dict, result: dict, requested: dict) -> None:
@@ -969,24 +1319,33 @@ def _audit_message_batch(s: dict, result: dict, requested: dict) -> None:
         _audit_parse_seen[fingerprint] = None
         while len(_audit_parse_seen) > 4096:
             _audit_parse_seen.popitem(last=False)
-    roles: dict[str, int] = {}
-    for message in messages:
-        role = str(message.get("role") or "unknown")
-        roles[role] = roles.get(role, 0) + 1
-    audit.record(
-        "jsonl.batch.parsed", category="parser",
-        uid=str(s.get("uid") or ""), source=str(s.get("source") or ""),
-        data={
-            "path": str(data_file(s)), "agent": str(s.get("agent_id") or ""),
-            "requested": requested, "reset": bool(result.get("reset")),
-            "start": result.get("start"), "end": result.get("end"),
-            "version": result.get("version"), "anchor": result.get("anchor"),
-            "message_count": len(messages), "message_total": result.get("message_total"),
-            "roles": roles, "partial": result.get("partial"),
-            "activity_changed": bool(result.get("activity_changed")),
-        },
-        content={"messages": messages, "activity": result.get("activity")},
-    )
+    data = {
+        "path": str(data_file(s)), "agent": str(s.get("agent_id") or ""),
+        "requested": requested, "reset": bool(result.get("reset")),
+        "start": result.get("start"), "end": result.get("end"),
+        "version": result.get("version"), "anchor": result.get("anchor"),
+        "message_count": len(messages), "message_total": result.get("message_total"),
+        "partial": result.get("partial"),
+        "activity_changed": bool(result.get("activity_changed")),
+    }
+    activity = result.get("activity")
+    uid, source = str(s.get("uid") or ""), str(s.get("source") or "")
+
+    def record() -> None:
+        roles: dict[str, int] = {}
+        for message in messages:
+            role = str(message.get("role") or "unknown")
+            roles[role] = roles.get(role, 0) + 1
+        audit.record("jsonl.batch.parsed", category="parser", uid=uid, source=source,
+                     data={**data, "roles": roles},
+                     content={"messages": messages, "activity": activity})
+
+    if len(messages) <= AUDIT_INLINE_MESSAGES:
+        record()
+        return
+    # 整份读取的证据 blob 要对几万条消息做脱敏、序列化和压缩 (百毫秒级)。
+    # 去重已经同步完成，序列化放到后台线程，不让首次打开多等这一段。
+    threading.Thread(target=record, name="audit-batch", daemon=True).start()
 
 
 def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
@@ -1039,12 +1398,15 @@ def messages_for(s: dict, start: int = 0, head: str = "", anchor: str = "",
 
     if reset and windowed and _window_cache_eligible(s):
         batch = _cached_initial_window(
-            s, ad, lambda: _read_message_batch(s, ad, 0, ver, True))
+            s, ad, lambda: _view_batch(s, ad, ver, True))
+    elif reset:
+        batch = _view_batch(s, ad, ver, windowed)
     else:
-        batch = _read_message_batch(s, ad, start, ver, windowed and reset)
+        batch = _read_message_batch(s, ad, start, ver, False)
     msgs = batch["messages"]
-    for msg in msgs:
-        media.enrich_message(msg, s.get("cwd"))
+    if not batch.get("enriched"):
+        for msg in msgs:
+            media.enrich_message(msg, s.get("cwd"))
     result = {"meta": s, "version": ver, "reset": reset, "start": start,
               "end": batch["end"],
               "anchor": _cursor_anchor(s, batch["end"]), "messages": msgs,

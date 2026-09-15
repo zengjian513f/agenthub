@@ -1221,8 +1221,9 @@ class IncrementalCursorTests(unittest.TestCase):
 
             # 模拟服务重启后的空内存；第二次必须直接读持久化窗口，不能再解析。
             session_index._clear_window_cache_memory()
+            session_index._clear_view_cache()
             adapter = session_index.ADAPTERS["claude"]
-            with patch.object(adapter, "read",
+            with patch.object(adapter, "read_state",
                               side_effect=AssertionError("unexpected reparse")):
                 second = session_index.messages_for(session, windowed=True)
             self.assertEqual(second["messages"], first["messages"])

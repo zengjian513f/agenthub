@@ -1036,22 +1036,32 @@ class ClaudeAdapter:
             return str(rec["leafUuid"])
         return cls._graph_uuid(rec, agent)
 
+    @staticmethod
+    def _new_graph() -> dict:
+        return {"parents": {}, "user_parents": {}, "user_offsets": {},
+                "response_nodes": [], "interrupt_nodes": [], "scan_tip": None}
+
+    @staticmethod
+    def _copy_graph(graph: dict) -> dict:
+        """续读要在旧图的副本上累加：旧图属于已缓存视图，失败时不能被污染。"""
+        return {"parents": dict(graph["parents"]),
+                "user_parents": dict(graph["user_parents"]),
+                "user_offsets": dict(graph["user_offsets"]),
+                "response_nodes": list(graph["response_nodes"]),
+                "interrupt_nodes": list(graph["interrupt_nodes"]),
+                "scan_tip": graph["scan_tip"]}
+
     @classmethod
-    def _active_lineage(cls, path: str, start: int = 0,
-                        agent: str | None = None,
-                        declared_tip: str | None = None,
-                        abandoned_after: int = 0,
-                        ) -> tuple[set[str] | None, set[str], int]:
-        """扫描读取区间，求活动祖先链、无回答的废弃输入及实际 EOF。"""
-        parents: dict[str, str | None] = {}
-        user_parents: dict[str, str | None] = {}
-        user_offsets: dict[str, int] = {}
-        response_nodes: list[str] = []
-        interrupt_nodes: list[str] = []
-        tip = str(declared_tip) if declared_tip else None
-        scan_tip = None
-        end = start
-        for rec, off in _iter_records(path, start):
+    def _accumulate_graph(cls, graph: dict, records, agent: str | None,
+                          end: int) -> int:
+        """把一段记录累加进父指针图，返回实际读到的 EOF。"""
+        parents = graph["parents"]
+        user_parents = graph["user_parents"]
+        user_offsets = graph["user_offsets"]
+        response_nodes = graph["response_nodes"]
+        interrupt_nodes = graph["interrupt_nodes"]
+        scan_tip = graph["scan_tip"]
+        for rec, off in records:
             end = off
             uid = cls._graph_uuid(rec, agent)
             if uid:
@@ -1078,10 +1088,33 @@ class ClaudeAdapter:
             signal = cls._lineage_signal(rec, agent)
             if signal:
                 scan_tip = signal
-                if not declared_tip:
-                    tip = signal
+        graph["scan_tip"] = scan_tip
+        return end
+
+    @classmethod
+    def _active_lineage(cls, path: str, start: int = 0,
+                        agent: str | None = None,
+                        declared_tip: str | None = None,
+                        abandoned_after: int = 0,
+                        ) -> tuple[set[str] | None, set[str], set[str], set[str], int]:
+        """扫描读取区间，求活动祖先链、无回答的废弃输入及实际 EOF。"""
+        graph = cls._new_graph()
+        end = cls._accumulate_graph(graph, _iter_records(path, start), agent, start)
+        return (*cls._classify_lineage(graph, declared_tip, abandoned_after), end)
+
+    @classmethod
+    def _classify_lineage(cls, graph: dict, declared_tip: str | None,
+                          abandoned_after: int = 0,
+                          ) -> tuple[set[str] | None, set[str], set[str], set[str]]:
+        """由完整父指针图求当前分支；只依赖图，不再回读文件。"""
+        parents = graph["parents"]
+        user_parents = graph["user_parents"]
+        user_offsets = graph["user_offsets"]
+        response_nodes = graph["response_nodes"]
+        interrupt_nodes = graph["interrupt_nodes"]
+        tip = str(declared_tip) if declared_tip else graph["scan_tip"]
         if not tip:
-            return None, set(), set(), set(), end
+            return None, set(), set(), set()
         active: set[str] = set()
         node = tip
         while node and node not in active:
@@ -1119,10 +1152,12 @@ class ClaudeAdapter:
         for interrupt_uid in interrupt_nodes:
             node = interrupt_uid
             seen: set[str] = set()
-            while node and node not in seen:
+            while node and node not in seen and node not in active:
+                # 活动链对祖先封闭：一旦走到活动节点，更上层的祖先都不可能再
+                # 满足“不在活动链上”，不必一路走到根。
                 seen.add(node)
                 parent = parents.get(node)
-                if (node in user_parents and node not in active
+                if (node in user_parents
                         and parent in active and parent in active_user_parents
                         and user_offsets.get(node, 0) > stale_after):
                     abandoned.add(node)
@@ -1145,6 +1180,8 @@ class ClaudeAdapter:
             if uid in user_parents and uid not in responded:
                 abandoned.add(uid)
         deferred_abort: set[str] = set()
+        interrupt_set = set(interrupt_nodes)
+        response_set = set(response_nodes)
         for uid in abandoned:
             stack = list(children.get(uid, ()))
             seen: set[str] = set()
@@ -1153,24 +1190,58 @@ class ClaudeAdapter:
                 if node in seen:
                     continue
                 seen.add(node)
-                if node in interrupt_nodes or node in response_nodes:
+                if node in interrupt_set or node in response_set:
                     deferred_abort.add(uid)
                     break
                 stack.extend(children.get(node, ()))
-        return active, abandoned, offshoot, deferred_abort, end
+        return active, abandoned, offshoot, deferred_abort
 
     @classmethod
     def latest_tip_after(cls, path: str, start: int, end: int | None = None,
                          agent: str | None = None) -> str | None:
-        """返回一个追加区间自己声明的最后叶子，不回看区间以前的旧分支。"""
-        tip = None
-        for rec, off in _iter_records(path, start):
-            if end is not None and off > end:
-                break
-            signal = cls._lineage_signal(rec, agent)
-            if signal:
-                tip = signal
-        return tip
+        """返回一个追加区间自己声明的最后叶子，不回看区间以前的旧分支。
+
+        从区间末尾反向扫描：回退点之后的区间可能有几十 MB，而所求的只是
+        其中最后一条信号，通常就在末尾几行；结果与正向全扫相同。
+        """
+        floor = max(0, int(start))
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                cursor = size if end is None else min(max(0, end), size)
+                suffix = b""
+                first = True
+                while cursor > floor:
+                    lo = max(floor, cursor - 64 * 1024)
+                    fh.seek(lo)
+                    data = fh.read(cursor - lo) + suffix
+                    lines = data.split(b"\n")
+                    if first and cursor < size and not data.endswith(b"\n"):
+                        # end 落在行中间：这一行结束于 end 之后，正向扫描不会计入。
+                        lines = lines[:-1]
+                    first = False
+                    if lo > floor:
+                        # 第一段可能是跨块的半行，留到下一块拼完再看。
+                        suffix = lines[0]
+                        lines = lines[1:]
+                    else:
+                        suffix = b""
+                    for raw in reversed(lines):
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            rec = json.loads(raw)
+                        except Exception:
+                            continue
+                        signal = cls._lineage_signal(rec, agent)
+                        if signal:
+                            return signal
+                    cursor = lo
+        except OSError:
+            pass
+        return None
 
     @staticmethod
     def _screen_key(value) -> str:
@@ -1486,24 +1557,82 @@ class ClaudeAdapter:
     def read(self, path: str, start: int = 0, agent: str | None = None,
              declared_tip: str | None = None, abandoned_after: int = 0,
              search_only: bool = False):
+        msgs, end, _state = self.read_state(
+            path, start=start, agent=agent, declared_tip=declared_tip,
+            abandoned_after=abandoned_after, search_only=search_only)
+        return msgs, end
+
+    def read_state(self, path: str, start: int = 0, agent: str | None = None,
+                   declared_tip: str | None = None, abandoned_after: int = 0,
+                   search_only: bool = False, state: dict | None = None):
+        """解析并返回 (消息, EOF, 可续读状态)。
+
+        `state` 是上一次 read_state 返回的状态：从它记录的 EOF 起只解析新
+        追加的记录，父指针图、工具名表和回合等簿记都接着上次继续，结果与
+        整份重读逐条相同。若追加区间让**已有**记录的分支归类发生变化（新
+        分支使旧输入变成废弃/隐藏），返回 None 状态，调用方必须整份重读。
+        """
         return self._read_one(path, start=start, agent=agent[:8] if agent else None,
                               declared_tip=declared_tip,
-                              abandoned_after=abandoned_after, search_only=search_only)
+                              abandoned_after=abandoned_after,
+                              search_only=search_only, state=state)
+
+    # 单遍缓冲解析记录的文件大小上限；更大的文件退回两遍扫描，避免瞬时占用
+    # 数倍于文件的内存。
+    SINGLE_PASS_MAX_BYTES = 200 * 1024 * 1024
 
     def _read_one(self, path: str, agent: str | None = None, start: int = 0,
                   declared_tip: str | None = None,
-                  abandoned_after: int = 0, search_only: bool = False):
+                  abandoned_after: int = 0, search_only: bool = False,
+                  state: dict | None = None):
         # 先用轻量父指针表确定当前分支，再做原有消息解析。这样双 Esc 后留在
         # append-only 文件里的旧输入/回答不会继续混入当前时间线。
-        active, abandoned, offshoot, deferred_abort, end = self._active_lineage(
-            path, start=start, agent=agent, declared_tip=declared_tip,
-            abandoned_after=abandoned_after)
+        resumed = state is not None
+        if resumed:
+            start = int(state["end"])
+            graph = self._copy_graph(state["graph"])
+            records = list(_iter_records(path, start))
+            end = self._accumulate_graph(graph, records, agent, start)
+            tail_nodes = set(graph["parents"]) - set(state["graph"]["parents"])
+            classes = self._classify_lineage(graph, declared_tip, abandoned_after)
+            active, abandoned, offshoot, deferred_abort = classes
+            # 旧记录的归类必须与整份重读一致；任一集合在旧节点上有出入就
+            # 放弃续读。集合运算只涉及节点 ID，不重读正文。
+            for previous, current in zip(state["classes"], classes):
+                if (previous is None) != (current is None):
+                    return [], end, None
+                if current is not None and previous != (current - tail_nodes):
+                    return [], end, None
+            calls = dict(state["calls"])
+            current_turn = state["current_turn"]
+            previous_custom_title = state["previous_custom_title"]
+            custom_title_seeded = True
+        else:
+            graph = self._new_graph()
+            try:
+                buffer = (start == 0 and Path(path).stat().st_size
+                          <= self.SINGLE_PASS_MAX_BYTES)
+            except OSError:
+                buffer = False
+            if buffer:
+                # 整份读取时把记录缓冲一遍，第二趟不再重新 json.loads 整个文件。
+                records = list(_iter_records(path, start))
+            else:
+                records = None
+            end = self._accumulate_graph(
+                graph, records if records is not None else _iter_records(path, start),
+                agent, start)
+            if records is None:
+                records = _iter_records(path, start)
+            classes = self._classify_lineage(graph, declared_tip, abandoned_after)
+            active, abandoned, offshoot, deferred_abort = classes
+            calls = {}
+            current_turn = None
+            previous_custom_title = None
+            custom_title_seeded = start == 0
         visible_extra = abandoned | offshoot
-        msgs, calls = [], {}
-        current_turn = None
-        previous_custom_title = None
-        custom_title_seeded = start == 0
-        for rec, off in _iter_records(path, start):
+        msgs = []
+        for rec, off in records:
             end = off
             uid = self._graph_uuid(rec, agent)
             interrupted_branch = bool(uid and uid in abandoned)
@@ -1734,7 +1863,13 @@ class ClaudeAdapter:
                 msgs.append(_msg("command", f"/rename {title}", ts,
                                  counted=False, inferred=True,
                                  event_id=f"rename:{rec.get('sessionId') or ''}:{off}"))
-        return msgs, end
+        next_state = {
+            "end": end, "graph": graph, "calls": calls,
+            "current_turn": current_turn,
+            "previous_custom_title": previous_custom_title,
+            "classes": tuple(None if c is None else set(c) for c in classes),
+        }
+        return msgs, end, next_state
 
 
 # --------------------------------------------------------------------------
@@ -1987,8 +2122,20 @@ class CodexAdapter:
         return [*self._history_segments(parent, seen), (parent, limit)]
 
     def _read_file(self, path: str | Path, start: int = 0,
-                   stop: int | None = None, search_only: bool = False):
-        msgs, calls, end = [], {}, start
+                   stop: int | None = None, search_only: bool = False,
+                   calls: dict | None = None, prefix: list[dict] | None = None,
+                   prefix_floor: int = 0):
+        """解析一个 rollout 区间。
+
+        `calls` 是续读时沿用的 call_id → 工具名表（在副本上更新）；`prefix`
+        是本区间之前已解析出的消息，只读，供 turn_aborted 回填上一条进展，
+        只回看下标 >= prefix_floor 的部分（本文件自己的消息，不含继承段）。
+        回填以 (下标, 新消息) 记入 patches 返回，绝不原地修改旧消息。
+        """
+        msgs, end = [], start
+        calls = dict(calls) if calls else {}
+        prefix = prefix or []
+        patches: list[tuple[int, dict]] = []
         session_meta = {}
         for rec, off in _iter_records(path, start):
             if stop is not None and off > stop:
@@ -2021,13 +2168,21 @@ class CodexAdapter:
                     # “已中断”。增量读取若没覆盖这条消息，浏览器会用同一个
                     # activity.turn_id 在缓存中补标。
                     if aborted_turn:
-                        for message in reversed(msgs):
+                        for index in range(len(msgs) + len(prefix) - 1,
+                                           max(0, prefix_floor) - 1, -1):
+                            own = index >= len(prefix)
+                            message = msgs[index - len(prefix)] if own else prefix[index]
                             if (message.get("turn_id") == aborted_turn
                                     and message.get("role") == "assistant"):
                                 if message.get("phase") != "final":
-                                    message["interrupted"] = True
-                                    message["interrupt_reason"] = (
-                                        p.get("reason") or "本轮在最终答复前被中断")
+                                    patched = {**message, "interrupted": True,
+                                               "interrupt_reason": (
+                                                   p.get("reason")
+                                                   or "本轮在最终答复前被中断")}
+                                    if own:
+                                        msgs[index - len(prefix)] = patched
+                                    else:
+                                        patches.append((index, patched))
                                 break
                     msgs.append(_status("aborted", ts, turn_id=p.get("turn_id"),
                                         reason=p.get("reason"), duration_ms=p.get("duration_ms")))
@@ -2105,19 +2260,43 @@ class CodexAdapter:
                 msgs.append(_msg("tool", _pretty_json(p.get("arguments") or {}), ts,
                                  name=k, **turn_meta))
 
-        return msgs, end, session_meta
+        return msgs, end, session_meta, calls, patches
 
     def read(self, path: str, start: int = 0, search_only: bool = False):
+        msgs, end, _state = self.read_state(path, start=start, search_only=search_only)
+        return msgs, end
+
+    def read_state(self, path: str, start: int = 0, search_only: bool = False,
+                   state: dict | None = None, prefix: list[dict] | None = None,
+                   prefix_floor: int = 0):
+        """解析并返回 (消息, EOF, 可续读状态)。
+
+        带 `state` 时从其 EOF 续读当前叶子文件，工具名表接着上次；`prefix`
+        为已缓存的旧消息（只读），turn_aborted 需要回填时以 state["patches"]
+        返回 (下标, 替换消息)，且只回看 prefix[prefix_floor:]。整读返回的
+        state["own_start"] 是当前文件消息在结果中的起始下标（之前是继承段）。
+        """
+        if state is not None:
+            msgs, end, _, calls, patches = self._read_file(
+                path, start=int(state["end"]), search_only=search_only,
+                calls=state["calls"], prefix=prefix, prefix_floor=prefix_floor)
+            return msgs, end, {"end": end, "calls": calls, "patches": patches,
+                               "own_start": 0}
         # 增量偏移始终属于当前叶子文件；父历史是不可变前缀，只在首次整读时补。
         if start:
-            msgs, end, _ = self._read_file(path, start=start, search_only=search_only)
-            return msgs, end
+            msgs, end, _, calls, _ = self._read_file(
+                path, start=start, search_only=search_only)
+            return msgs, end, {"end": end, "calls": calls, "patches": [],
+                               "own_start": 0}
 
         msgs = []
         for parent, limit in self._history_segments(path):
-            inherited, _, _ = self._read_file(parent, stop=limit, search_only=search_only)
+            inherited, _, _, _, _ = self._read_file(parent, stop=limit,
+                                                    search_only=search_only)
             msgs.extend(inherited)
-        current, end, session_meta = self._read_file(path, search_only=search_only)
+        own_start = len(msgs)
+        current, end, session_meta, calls, _ = self._read_file(
+            path, search_only=search_only)
         msgs.extend(current)
 
         # /rename 是 TUI 本地命令，不进入 rollout。session_index 只证明名称在此时
@@ -2133,7 +2312,10 @@ class CodexAdapter:
                 at = next((i for i, msg in enumerate(msgs)
                            if msg.get("ts") and msg["ts"] > name_event["updated"]), len(msgs))
                 msgs.insert(at, event)
-        return msgs, end
+                if at <= own_start:
+                    own_start += 1
+        return msgs, end, {"end": end, "calls": calls, "patches": [],
+                           "own_start": own_start}
 
 
 def _pretty_json(v) -> str:
@@ -2201,11 +2383,21 @@ class GrokAdapter:
         }
 
     def read(self, path: str, start: int = 0):
+        msgs, end, _state = self.read_state(path, start=start)
+        return msgs, end
+
+    def read_state(self, path: str, start: int = 0, state: dict | None = None):
+        """解析并返回 (消息, EOF, 可续读状态)；带 state 时从其 EOF 接着解析。"""
         chat = Path(path) / "chat_history.jsonl"
-        msgs, calls, end = [], {}, start
-        current_turn = None
+        if state is not None:
+            start = int(state["end"])
+            calls = dict(state["calls"])
+            current_turn = state["current_turn"]
+        else:
+            calls, current_turn = {}, None
+        msgs, end = [], start
         if not chat.is_file():
-            return msgs, end
+            return msgs, end, {"end": end, "calls": calls, "current_turn": current_turn}
         for rec, off in _iter_records(chat, start):
             end = off
             t = rec.get("type")
@@ -2258,7 +2450,7 @@ class GrokAdapter:
                                          summary=_tool_summary(name, args),
                                          changes=_tool_file_changes(name, args) or None,
                                          **_turn_fields(current_turn)))
-        return msgs, end
+        return msgs, end, {"end": end, "calls": calls, "current_turn": current_turn}
 
 
 def _unquote_cwd(name: str) -> str:

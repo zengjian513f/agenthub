@@ -195,6 +195,20 @@ def enrich_message(msg: dict, cwd: str | None) -> None:
     media.extend(x for x in found if x.get("src") not in have)
 
 
+def retain(tokens) -> bool:
+    """把这些条目移到 LRU 尾部；任一条目已被淘汰则返回 False。
+
+    解析结果缓存里的消息只引用 token，不保存图片本身；命中前必须确认
+    每个 token 仍可解析，否则调用方应当重新解析以重新登记图片。
+    """
+    with _lock:
+        for token in tokens:
+            if token not in _items:
+                return False
+            _items.move_to_end(token)
+    return True
+
+
 def get(token: str) -> tuple[bytes, str, str] | None:
     if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
         return None
