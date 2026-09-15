@@ -241,6 +241,14 @@ Claude 写完就关文件，所以**不能只靠 fd**。Grok TUI 同样关 `chat
 压缩后为 1.20 MiB（减少 73%，服务端约增加 75 ms CPU）；增量响应通常很小，不会压缩。
 反向代理配置也对 JSON、JS、CSS 和 SVG 提供相同级别的 gzip 兜底，WebSocket 与 SSE 不压缩。
 
+静态文件按 `(mtime_ns, size)` 缓存在内存里，带内容哈希的强 `ETag` 和 `Last-Modified`，
+`If-None-Match` / `If-Modified-Since` 命中回 `304`；文本类（JS、CSS、JSON、SVG、TTF）≥ 1 KiB
+按 gzip level 6 压一次随条目缓存。页面里 `?v=` 戳跟着磁盘文件走（改了 JS 不重启也会换戳），
+带当前戳的 URL 回 `public, max-age=31536000, immutable`，其余静态资源 `no-cache`（回源校验），
+HTML 页面始终 `no-store`。`<meta name="agenthub-build">` 仍是进程启动时的 build 号，
+写请求的版本校验不受运行中改文件影响。连接开启 `TCP_NODELAY`，头和正文一次写出：
+keep-alive 上的小响应否则每个都要等浏览器 40 ms 的延迟 ACK。
+
 有个坑值得记：渲染必须**先在游离的 `DocumentFragment` 里建好整棵子树再一次性挂上**。若逐批插入已在文档中的容器，每批都会触发一次全量 layout，节点上万时是 O(n²) —— 同一个会话实测 243ms 变成 14.5s。批间让出主线程也要用 `setTimeout` 而非 `requestAnimationFrame`，后者会等一次绘制，又把 layout 成本引回来。
 
 ## 索引缓存与列表自动刷新

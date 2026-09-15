@@ -30,16 +30,16 @@ TOP_LEVEL_BY_ID = re.compile(
 
 
 def asset_version_names() -> list[str]:
-    """从 server.py 里把 ASSET_VERSION 的文件清单抠出来。"""
+    """从 server.py 里把 ASSET_VERSION 的文件清单（ASSET_VERSION_FILES）抠出来。"""
     tree = ast.parse(SERVER.read_text())
     for node in tree.body:
         targets = getattr(node, "targets", [])
         if not (targets and isinstance(targets[0], ast.Name)
-                and targets[0].id == "ASSET_VERSION"):
+                and targets[0].id == "ASSET_VERSION_FILES"):
             continue
         return [n.value for n in ast.walk(node)
                 if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    raise AssertionError("server.py 里找不到 ASSET_VERSION")
+    raise AssertionError("server.py 里找不到 ASSET_VERSION_FILES")
 
 
 class BuildHashTests(unittest.TestCase):
