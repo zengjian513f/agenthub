@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import email.utils
 import gzip
 import hashlib
 import html
@@ -28,14 +29,29 @@ from . import (audit, bug_report, claude_bridge, claude_queue, codex_bridge,
 from . import federation, create_requests, files, file_manager
 
 STATIC = Path(__file__).parent / "static"
-ASSET_VERSION = hashlib.sha256(b"".join(
-    (STATIC / name).read_bytes()
-    for name in ("style.css", "cli.js", "nodes.js", "app.js", "term.js",
-                 "files.html", "files.js", "files.css", "typography.css", "typography.js",
-                 "file.html", "file.js", "file-preview.css", "file-preview.js",
-                 "pwa-install.js", "syntax.js",
-                 "vendor/markdown-it/markdown-it.min.js")
-)).hexdigest()[:12]
+# 页面里带 ?v= 戳的文件。ASSET_VERSION 是进程启动时算出的 build 号（页面以 _build
+# 回传，服务端据此拒绝过期页面的写请求）；_ASSET_STAMP 则跟着磁盘上的文件走，
+# 改了 JS/CSS 不重启也会换一个 ?v=，浏览器才不会拿着 immutable 的旧缓存不放。
+ASSET_VERSION_FILES = ("style.css", "cli.js", "nodes.js", "app.js", "term.js",
+                       "files.html", "files.js", "files.css", "typography.css", "typography.js",
+                       "file.html", "file.js", "file-preview.css", "file-preview.js",
+                       "pwa-install.js", "syntax.js",
+                       "vendor/markdown-it/markdown-it.min.js")
+
+
+def _asset_digest(names=ASSET_VERSION_FILES) -> str:
+    return hashlib.sha256(b"".join(
+        (STATIC / name).read_bytes() for name in names)).hexdigest()[:12]
+
+
+ASSET_VERSION = _asset_digest()
+HTML_PAGES = frozenset({"index.html", "files.html", "file.html"})
+# 静态文件 gzip：只压文本类（字体里 ttf 没预压缩，也值得压；woff2/png/webp 压不动）。
+# 压缩结果按文件版本缓存在内存里，级别高一点也只付一次。
+STATIC_GZIP_TYPES = ("text/", "application/javascript", "application/json",
+                     "application/manifest+json", "image/svg+xml", "font/ttf")
+STATIC_GZIP_LEVEL = 6
+STATIC_IMMUTABLE = "public, max-age=31536000, immutable"
 HOSTNAME = socket.gethostname().strip() or "localhost"
 HUB_MODE = False
 NODE_TOKEN = ""
@@ -778,9 +794,125 @@ def _accepts_gzip(value: str) -> bool:
     return exact if exact is not None else bool(wildcard)
 
 
+class _StaticEntry:
+    """一个静态文件在内存里的一个版本：正文、强 ETag、Last-Modified 和按需的 gzip。"""
+    __slots__ = ("key", "data", "etag", "last_modified", "mtime", "gzip")
+
+    def __init__(self, key: tuple[int, int], data: bytes, mtime: float):
+        self.key = key
+        self.data = data
+        self.etag = '"' + hashlib.sha256(data).hexdigest()[:20] + '"'
+        self.mtime = mtime
+        self.last_modified = email.utils.formatdate(mtime, usegmt=True)
+        self.gzip: bytes | None = None
+
+
+class _StaticCache:
+    """按 (mtime_ns, size) 识别文件版本；每次请求一次 stat，文件一改自动换版本。"""
+
+    def __init__(self):
+        self._entries: dict[Path, _StaticEntry] = {}
+        self._lock = threading.Lock()
+
+    def get(self, path: Path) -> _StaticEntry:
+        st = path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        with self._lock:
+            entry = self._entries.get(path)
+        if entry is not None and entry.key == key:
+            return entry
+        entry = _StaticEntry(key, path.read_bytes(), st.st_mtime)
+        with self._lock:
+            self._entries[path] = entry
+        return entry
+
+    @staticmethod
+    def packed(entry: _StaticEntry) -> bytes | None:
+        """gzip 结果随条目缓存；压不小的文件记为空串，下次直接跳过。"""
+        if entry.gzip is None:
+            packed = gzip.compress(entry.data, compresslevel=STATIC_GZIP_LEVEL, mtime=0)
+            entry.gzip = packed if len(packed) < len(entry.data) else b""
+        return entry.gzip or None
+
+
+class _AssetStamp:
+    """页面 ?v= 用的内容戳：ASSET_VERSION_FILES 任一文件在磁盘上变了就重新算。"""
+
+    def __init__(self, names=ASSET_VERSION_FILES):
+        self._names = names
+        self._lock = threading.Lock()
+        self._keys: dict[str, tuple[int, int] | None] | None = None
+        self._value = ASSET_VERSION
+
+    def current(self) -> tuple[str, dict[str, tuple[int, int] | None]]:
+        keys = {}
+        for name in self._names:
+            try:
+                st = (STATIC / name).stat()
+                keys[name] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                keys[name] = None
+        with self._lock:
+            if keys != self._keys:
+                present = [name for name in self._names if keys[name] is not None]
+                self._value = _asset_digest(present)
+                self._keys = keys
+            return self._value, keys
+
+
+_STATIC_CACHE = _StaticCache()
+_ASSET_STAMP = _AssetStamp()
+
+
+def _static_type(name: str) -> str:
+    ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    if ctype.startswith(("text/", "application/javascript")):
+        ctype += "; charset=utf-8"
+    return ctype
+
+
+def _static_compressible(ctype: str) -> bool:
+    return ctype.startswith(STATIC_GZIP_TYPES)
+
+
+def _not_modified(headers, etag: str, mtime: float) -> bool:
+    """RFC 9110 §13.1：有 If-None-Match 就只看它（弱比较），否则看 If-Modified-Since。"""
+    if headers is None:
+        return False
+    match = headers.get("If-None-Match", "")
+    if match:
+        tags = [tag.strip() for tag in match.split(",")]
+        return "*" in tags or any(tag.removeprefix("W/") == etag for tag in tags)
+    since = headers.get("If-Modified-Since", "")
+    if since:
+        try:
+            limit = email.utils.parsedate_to_datetime(since).timestamp()
+        except (TypeError, ValueError):
+            return False
+        return int(mtime) <= limit
+    return False
+
+
+def _warm_static_cache() -> None:
+    """启动时把页面首屏会用到的文件读进缓存并压好，首个请求不必现压。"""
+    for path in sorted(STATIC.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            entry = _STATIC_CACHE.get(path)
+            if _static_compressible(_static_type(path.name)) and len(entry.data) >= JSON_GZIP_MIN:
+                _StaticCache.packed(entry)
+        except OSError:
+            continue
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "agenthub"
     protocol_version = "HTTP/1.1"
+    # 头和正文分两次 write 就是两个 TCP 段；keep-alive 连接上 Nagle 会把小的第二段
+    # 扣住等对端 ACK，而浏览器的延迟 ACK 要 40 ms。实测首屏十几个小文件每个都卡
+    # 40 ms，/api/live 这类几百字节的响应也一样。TCP_NODELAY 是 HTTP 服务的常规配置。
+    disable_nagle_algorithm = True
 
     # ---- 基础设施 ----------------------------------------------------
     # 这些是秒级轮询, 打出来只会淹没真正有用的日志
@@ -891,14 +1023,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+        if code == 304:
+            # 304 没有正文；HTTP/1.1 客户端按状态码就知道到空行为止，不需要
+            # Content-Length，写个 0 反而是在描述一个不存在的表示。
+            body = b""
+        else:
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
         for k, v in (extra or {}).items():
             self.send_header(k, v)
-        self.end_headers()
+        # 头和正文合成一次 write：一次系统调用、一个 TCP 段，小响应不再拆成两包。
+        # end_headers() 只是往 _headers_buffer 追加空行再 flush，这里手工做同样的事。
+        self._headers_buffer.append(b"\r\n")
+        payload = b"".join(self._headers_buffer) + body
+        self._headers_buffer = []
         delivered = True
         try:
-            self.wfile.write(body)
+            self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
             delivered = False
         if (hasattr(self, "_audit_started")
@@ -2874,19 +3015,45 @@ class Handler(BaseHTTPRequestHandler):
         f = (STATIC / rel).resolve()
         if not str(f).startswith(str(STATIC.resolve())) or not f.is_file():
             return self._send(404, b"not found", "text/plain")
-        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        if ctype.startswith(("text/", "application/javascript")):
-            ctype += "; charset=utf-8"
-        data = f.read_bytes()
-        if f.name in {"index.html", "files.html", "file.html"}:
+        ctype = _static_type(f.name)
+        headers = getattr(self, "headers", None)
+        query = parse_qs(urlparse(getattr(self, "path", "")).query)
+        entry = _STATIC_CACHE.get(f)
+        if f.name in HTML_PAGES:
+            # 页面每次都按当前进程状态和磁盘上的资源戳现做，绝不缓存。
             hub_mode = getattr(getattr(self, "server", None), "hub_mode", HUB_MODE)
+            stamp, _keys = _ASSET_STAMP.current()
+            data = entry.data
             data = data.replace(b"__AGENTHUB_MODE__", b"hub" if hub_mode else b"local")
             data = data.replace(b"__AGENTHUB_HOSTNAME__",
                                 html.escape("AgentHub" if hub_mode else HOSTNAME).encode("utf-8"))
-            data = data.replace(b"__AGENTHUB_ASSET_VERSION__",
-                                ASSET_VERSION.encode("ascii"))
-        cache = "no-store" if f.name in {"index.html", "files.html", "file.html"} else "no-cache"
-        self._send(200, data, ctype, {"Cache-Control": cache})
+            data = data.replace(b"?v=__AGENTHUB_ASSET_VERSION__", b"?v=" + stamp.encode("ascii"))
+            data = data.replace(b"__AGENTHUB_ASSET_VERSION__", ASSET_VERSION.encode("ascii"))
+            entry = _StaticEntry(entry.key, data, entry.mtime)
+            cache = "no-store"
+        else:
+            # 带当前内容戳的 URL 内容就是不变的，可以长期缓存；其它的都要回源校验。
+            # 戳和文件版本必须是同一份 stat 看到的，中间文件被改了就退回 no-cache。
+            cache = "no-cache"
+            stamped = query.get("v", [""])[0]
+            if stamped and rel in ASSET_VERSION_FILES:
+                stamp, keys = _ASSET_STAMP.current()
+                if stamped == stamp and keys.get(rel) == entry.key:
+                    cache = STATIC_IMMUTABLE
+        extra = {"Cache-Control": cache, "ETag": entry.etag, "Last-Modified": entry.last_modified}
+        compressible = _static_compressible(ctype)
+        if compressible:
+            extra["Vary"] = "Accept-Encoding"
+        if _not_modified(headers, entry.etag, entry.mtime):
+            return self._send(304, b"", ctype, extra)
+        body = entry.data
+        if compressible and len(body) >= JSON_GZIP_MIN and headers is not None \
+                and _accepts_gzip(headers.get("Accept-Encoding", "")):
+            packed = _StaticCache.packed(entry)
+            if packed:
+                body = packed
+                extra["Content-Encoding"] = "gzip"
+        self._send(200, body, ctype, extra)
 
 
 def main():
@@ -2935,6 +3102,7 @@ def main():
         ap.error(f"--allow 包含无效的 IP/CIDR: {exc}")
 
     threading.Thread(target=index.load, daemon=True).start()  # 后台预热索引
+    threading.Thread(target=_warm_static_cache, daemon=True, name="agenthub-static-warm").start()
     threading.Thread(target=_spawn_watch_loop, daemon=True, name="agenthub-spawn-watch").start()
     threading.Thread(target=_poll_warm_loop, daemon=True, name="agenthub-poll-warm").start()
 

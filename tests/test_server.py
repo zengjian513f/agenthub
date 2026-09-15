@@ -1,6 +1,9 @@
+import gzip
 import json
 import re
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from agenthub import server, term_host, term_tmux
@@ -289,6 +292,190 @@ class StaticIdentityTests(unittest.TestCase):
         self.assertIn('.msg[data-role="thinking"]::before', stylesheet)
         self.assertIn('.msg[data-role="thinking"] > .mb { min-width: 0; padding: 0; }',
                       stylesheet)
+
+
+class StaticCachingTests(unittest.TestCase):
+    """静态文件的缓存契约：强 ETag 走 304，带戳的长期缓存，页面永不缓存，gzip 只压文本。"""
+
+    @staticmethod
+    def _handler(path, headers=None):
+        handler = object.__new__(server.Handler)
+        handler.path = path
+        handler.headers = dict(headers or {})
+        replies = []
+        handler._send = lambda status, data, ctype, extra=None: replies.append(
+            (status, data, ctype, extra or {}))
+        return handler, replies
+
+    def _get(self, path, headers=None):
+        handler, replies = self._handler(path, headers)
+        handler._static(path.split("?")[0])
+        return replies[0]
+
+    def test_etag_round_trip_answers_304_without_a_body(self):
+        status, data, _ctype, headers = self._get("/app.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(data, (server.STATIC / "app.js").read_bytes())
+        self.assertRegex(headers["ETag"], r'^"[0-9a-f]{20}"$')
+        self.assertRegex(headers["Last-Modified"], r"GMT$")
+
+        for name, value in [("If-None-Match", headers["ETag"]),
+                            ("If-None-Match", "W/" + headers["ETag"]),
+                            ("If-None-Match", '"other", ' + headers["ETag"]),
+                            ("If-None-Match", "*"),
+                            ("If-Modified-Since", headers["Last-Modified"])]:
+            with self.subTest(header=f"{name}: {value}"):
+                status, data, _ctype, again = self._get("/app.js", {name: value})
+                self.assertEqual(status, 304)
+                self.assertEqual(data, b"")
+                # 304 要带着 200 会带的校验和缓存头，浏览器靠它们续期缓存条目。
+                self.assertEqual(again["ETag"], headers["ETag"])
+                self.assertEqual(again["Cache-Control"], headers["Cache-Control"])
+
+        for name, value in [("If-None-Match", '"stale"'),
+                            ("If-Modified-Since", "Sat, 01 Jan 2000 00:00:00 GMT"),
+                            ("If-Modified-Since", "not a date")]:
+            with self.subTest(header=f"{name}: {value}"):
+                status, data, _ctype, _headers = self._get("/app.js", {name: value})
+                self.assertEqual(status, 200)
+                self.assertTrue(data)
+
+    def test_if_none_match_takes_precedence_over_if_modified_since(self):
+        _status, _data, _ctype, headers = self._get("/style.css")
+        status, _data, _ctype, _headers = self._get("/style.css", {
+            "If-None-Match": '"stale"', "If-Modified-Since": headers["Last-Modified"]})
+        self.assertEqual(status, 200)
+
+    def test_only_urls_stamped_with_the_current_version_are_immutable(self):
+        stamp, _keys = server._ASSET_STAMP.current()
+        self.assertEqual(stamp, server.ASSET_VERSION)
+        cases = {
+            f"/app.js?v={stamp}": server.STATIC_IMMUTABLE,
+            f"/style.css?v={stamp}": server.STATIC_IMMUTABLE,
+            "/app.js": "no-cache",
+            "/app.js?v=000000000000": "no-cache",
+            f"/vendor/xterm.js?v={stamp}": "no-cache",    # 不在 ASSET_VERSION_FILES 里
+            f"/fonts/CascadiaMono.woff2?v={stamp}": "no-cache",
+            "/vendor/xterm.js": "no-cache",
+            "/manifest.webmanifest": "no-cache",
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                status, _data, _ctype, headers = self._get(url)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Cache-Control"], expected)
+                self.assertIn("ETag", headers)
+
+    def test_html_pages_are_never_cached(self):
+        stamp, _keys = server._ASSET_STAMP.current()
+        for url in ("/", "/index.html", f"/index.html?v={stamp}", "/files.html", "/file.html"):
+            with self.subTest(url=url):
+                status, data, ctype, headers = self._get(url, {"Accept-Encoding": "gzip"})
+                self.assertEqual(status, 200)
+                self.assertIn("text/html", ctype)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertNotIn(b"__AGENTHUB_ASSET_VERSION__", gzip.decompress(data))
+
+    def test_gzip_only_when_accepted_and_only_for_text_types(self):
+        plain = self._get("/app.js")
+        packed = self._get("/app.js", {"Accept-Encoding": "gzip, deflate, br"})
+        self.assertNotIn("Content-Encoding", plain[3])
+        self.assertEqual(packed[3]["Content-Encoding"], "gzip")
+        self.assertLess(len(packed[1]), len(plain[1]) // 2)
+        # 两种表示都声明 Vary，中间缓存才不会把压缩版发给不接受 gzip 的客户端。
+        self.assertEqual(plain[3]["Vary"], "Accept-Encoding")
+        self.assertEqual(packed[3]["Vary"], "Accept-Encoding")
+        self.assertEqual(packed[3]["ETag"], plain[3]["ETag"])
+
+        refused = self._get("/app.js", {"Accept-Encoding": "gzip;q=0, identity"})
+        self.assertNotIn("Content-Encoding", refused[3])
+
+        for url in ("/fonts/CascadiaMono.woff2", "/icons/icon-192.png", "/avatars/sam-imdb.webp"):
+            with self.subTest(url=url):
+                status, data, _ctype, headers = self._get(url, {"Accept-Encoding": "gzip"})
+                self.assertEqual(status, 200)
+                self.assertNotIn("Content-Encoding", headers)
+                self.assertNotIn("Vary", headers)
+                self.assertEqual(data, (server.STATIC / url.lstrip("/")).read_bytes())
+
+        # 不到 1 KB 的文本压了也省不下什么。
+        small = self._get("/manifest.webmanifest", {"Accept-Encoding": "gzip"})
+        self.assertLess(len(small[1]), server.JSON_GZIP_MIN)
+        self.assertNotIn("Content-Encoding", small[3])
+
+    def test_gzip_body_decodes_to_the_identical_bytes(self):
+        for url in ("/app.js", "/style.css", "/vendor/xterm.js", "/fonts/UbuntuSansMono.ttf"):
+            with self.subTest(url=url):
+                plain = self._get(url)
+                packed = self._get(url, {"Accept-Encoding": "gzip"})
+                self.assertEqual(packed[3]["Content-Encoding"], "gzip")
+                self.assertEqual(gzip.decompress(packed[1]), plain[1])
+                self.assertEqual(plain[1], (server.STATIC / url.lstrip("/")).read_bytes())
+
+    def test_stamp_follows_the_file_on_disk_while_build_stays_put(self):
+        """改了 JS 不重启：页面换新戳、旧戳退回 no-cache、build 号不变。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            static = Path(tmp)
+            (static / "index.html").write_text(
+                '<meta name="agenthub-build" content="__AGENTHUB_ASSET_VERSION__">\n'
+                '<script src="app.js?v=__AGENTHUB_ASSET_VERSION__"></script>\n')
+            (static / "app.js").write_text("console.log(1);\n")
+            with patch.object(server, "STATIC", static), \
+                    patch.object(server, "ASSET_VERSION_FILES", ("app.js",)), \
+                    patch.object(server, "_STATIC_CACHE", server._StaticCache()), \
+                    patch.object(server, "_ASSET_STAMP", server._AssetStamp(("app.js",))):
+                page = self._get("/")[1].decode()
+                first = re.search(r'app\.js\?v=([0-9a-f]{12})', page).group(1)
+                self.assertIn(f'content="{server.ASSET_VERSION}"', page)
+                self.assertEqual(self._get(f"/app.js?v={first}")[3]["Cache-Control"],
+                                 server.STATIC_IMMUTABLE)
+                before = self._get("/app.js")
+
+                (static / "app.js").write_text("console.log(2);\n")
+                page = self._get("/")[1].decode()
+                second = re.search(r'app\.js\?v=([0-9a-f]{12})', page).group(1)
+                self.assertNotEqual(first, second)
+                self.assertIn(f'content="{server.ASSET_VERSION}"', page)
+                after = self._get(f"/app.js?v={second}")
+                self.assertEqual(after[3]["Cache-Control"], server.STATIC_IMMUTABLE)
+                self.assertEqual(after[1], b"console.log(2);\n")
+                self.assertNotEqual(after[3]["ETag"], before[3]["ETag"])
+                self.assertEqual(self._get(f"/app.js?v={first}")[3]["Cache-Control"], "no-cache")
+                self.assertEqual(
+                    self._get("/app.js", {"If-None-Match": before[3]["ETag"]})[0], 200)
+
+    def test_send_frames_responses_for_keep_alive(self):
+        """200 总带 Content-Length；304 没有正文也不带 Content-Length；头和正文一次写出。"""
+        def send(code, body, ctype, extra=None):
+            handler = object.__new__(server.Handler)
+            handler.request_version = "HTTP/1.1"
+            handler.requestline = "GET /x HTTP/1.1"
+            handler.client_address = ("127.0.0.1", 1)
+            writes = []
+            handler.wfile = type("Sink", (), {"write": staticmethod(writes.append)})()
+            handler._send(code, body, ctype, extra)
+            return writes
+
+        writes = send(200, b"hello", "text/plain", {"ETag": '"x"'})
+        self.assertEqual(len(writes), 1)
+        head, _, body = writes[0].partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.1 200 OK\r\n"))
+        self.assertIn(b"\r\nContent-Length: 5\r\n", head)
+        self.assertIn(b"\r\nContent-Type: text/plain\r\n", head)
+        self.assertNotIn(b"Connection: close", head)
+        self.assertEqual(body, b"hello")
+
+        writes = send(304, b"", "text/plain", {"ETag": '"x"', "Cache-Control": "no-cache"})
+        self.assertEqual(len(writes), 1)
+        head, _, body = writes[0].partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.1 304 Not Modified\r\n"))
+        self.assertNotIn(b"Content-Length", head)
+        self.assertNotIn(b"Content-Type", head)
+        self.assertIn(b'\r\nETag: "x"\r\n', head)
+        self.assertEqual(body, b"")
+
+    def test_handler_disables_nagle(self):
+        self.assertTrue(server.Handler.disable_nagle_algorithm)
 
 
 class DirectoryCompletionRouteTests(unittest.TestCase):

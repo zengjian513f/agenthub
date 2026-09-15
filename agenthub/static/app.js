@@ -6670,7 +6670,6 @@ renderOpts();
 renderPickBar();
 renderView();
 ensureConsolePlaceholder();
-pollLive();   // 终端面板由 term.js 自己初始化 (它在本文件之后加载)
 function uidOfDeepLink(spec) {
   if (!spec) return null;
   const cut = spec.indexOf(':');
@@ -6681,7 +6680,10 @@ function uidOfDeepLink(spec) {
     || S.sessions.find(s => s.uid === spec);
   return hit ? hit.uid : null;
 }
-loadSessions(false).then(ok => {
+// 首屏只等会话列表。活跃探测不在首屏依赖里，却和列表请求同时到达服务端互相
+// 拖慢；等列表落地再发第一轮，之后仍由 setInterval 按 LIVE_MS 轮询。
+// 终端面板由 term.js 自己初始化 (它在本文件之后加载)。
+loadSessions(false).finally(() => { pollLive(); }).then(ok => {
   if (!ok) return;
   const deep = uidOfDeepLink(DEEP_SID);
   if (deep) { openSession(deep); return; }   // 深链优先于上次浏览位置
