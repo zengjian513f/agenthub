@@ -33,6 +33,10 @@ CHECK_TTL = 0.5       # 高频热路径复用已发布快照；列表轮询仍�
 # inventory，轮询请求自己几乎不再扫盘；预热线程不在时（测试、脚本）轮询
 # 至多晚 POLL_TTL 秒看到磁盘变化，仍远小于 8 秒的轮询间隔。
 POLL_TTL = 2.0
+# 活跃会话每秒都在追加，快照随之每秒换新；磁盘缓存只服务冷启动，不必每次
+# 都把 2 MB JSON 重写一遍。两次落盘之间至少隔这么久，期间的版本先记着，
+# 下一次 load()（哪怕 inventory 没变）满足间隔就补写。
+CACHE_WRITE_INTERVAL = 10.0
 
 _lock = threading.Lock()
 
@@ -48,6 +52,8 @@ def _empty_state() -> dict:
         "checked_at": 0.0,
         "dirty": False,
         "sig": None,
+        "cache_written_at": 0.0,
+        "cache_pending": None,
     }
 
 
@@ -333,6 +339,27 @@ def _write_cache(raw: dict, sessions: list[dict], files: dict,
         pass
 
 
+def _schedule_cache_write(raw: dict, sessions: list[dict], files: dict,
+                          sig: str, built_at: float) -> None:
+    """按 CACHE_WRITE_INTERVAL 限频落盘；来不及写的版本先挂起。调用方持有 _lock。"""
+    now = time.monotonic()
+    if now - _state["cache_written_at"] >= CACHE_WRITE_INTERVAL:
+        _write_cache(raw, sessions, files, sig, built_at)
+        _state["cache_written_at"] = now
+        _state["cache_pending"] = None
+    else:
+        _state["cache_pending"] = (raw, sessions, files, sig, built_at)
+
+
+def _flush_cache_write() -> None:
+    """inventory 没变的一轮：把上次挂起的版本补写到磁盘。调用方持有 _lock。"""
+    pending = _state["cache_pending"]
+    if pending and time.monotonic() - _state["cache_written_at"] >= CACHE_WRITE_INTERVAL:
+        _write_cache(*pending)
+        _state["cache_written_at"] = time.monotonic()
+        _state["cache_pending"] = None
+
+
 def _publish(raw: dict, sessions: list[dict], files: dict, sig: str,
              built_at: float, checked_at: float, dirty: bool):
     """一次替换完整快照，HTTP 读者不会看到半新半旧的组合。"""
@@ -347,6 +374,8 @@ def _publish(raw: dict, sessions: list[dict], files: dict, sig: str,
         "checked_at": checked_at,
         "dirty": dirty,
         "sig": sig,
+        "cache_written_at": _state["cache_written_at"],
+        "cache_pending": _state["cache_pending"],
     }
 
 
@@ -378,6 +407,7 @@ def load(force: bool = False, ttl: float | None = None) -> list[dict]:
                 and _state["sig"] == sig):
             _publish(_state["raw"], _state["sessions"], files, sig,
                      _state["built_at"], time.monotonic(), False)
+            _flush_cache_write()
             return _state["sessions"]
 
         if not force and not _state["initialized"]:
@@ -398,7 +428,7 @@ def load(force: bool = False, ttl: float | None = None) -> list[dict]:
                     _publish(raw, sessions, files, sig, built_at,
                              time.monotonic(), dirty)
                     if not dirty and cached_sig != sig:
-                        _write_cache(raw, sessions, files, sig, built_at)
+                        _schedule_cache_write(raw, sessions, files, sig, built_at)
                     return sessions
 
         t0 = time.time()
@@ -430,7 +460,7 @@ def load(force: bool = False, ttl: float | None = None) -> list[dict]:
         dirty = _inventory() != files
         _publish(raw, sessions, files, sig, built_at, time.monotonic(), dirty)
         if not dirty:
-            _write_cache(raw, sessions, files, sig, built_at)
+            _schedule_cache_write(raw, sessions, files, sig, built_at)
         if full:
             print(f"[agenthub] 索引重建: {len(sessions)} 个会话, {time.time() - t0:.1f}s")
         return _state["sessions"]

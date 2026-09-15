@@ -501,6 +501,32 @@ class IsolatedIndexTests(unittest.TestCase):
             index.load(force=True, ttl=index.POLL_TTL)
             self.assertTrue(scan.called)             # force 无视 ttl
 
+    def test_cache_writes_are_rate_limited_and_flushed_on_a_quiet_load(self):
+        """活跃会话每秒换快照时磁盘缓存不必每次重写；安静下来后补写最新版本。"""
+        clock = [1000.0]
+        with patch.object(index.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(index, "_write_cache", wraps=index._write_cache) as write:
+            path = self.claude_session("busy", "第一版")
+            index.load(force=True)
+            self.assertEqual(write.call_count, 1)             # 首次落盘不等
+            clock[0] += 1.0
+            with path.open("a") as fh:
+                fh.write(json.dumps({"type": "user", "uuid": "u2", "parentUuid": "busy-user",
+                                     "sessionId": "busy", "timestamp": "2026-08-11T08:00:01Z",
+                                     "message": {"content": [{"type": "text", "text": "追加"}]}}) + "\n")
+            index.load()
+            self.assertEqual(write.call_count, 1)             # 间隔内：挂起
+            self.assertIsNotNone(index._state["cache_pending"])
+            clock[0] += 0.5
+            index.load()                                       # 没变化、间隔未到：仍挂起
+            self.assertEqual(write.call_count, 1)
+            clock[0] += index.CACHE_WRITE_INTERVAL
+            index.load()                                       # 安静一轮：补写
+            self.assertEqual(write.call_count, 2)
+            self.assertIsNone(index._state["cache_pending"])
+        payload = json.loads(self.cache_file.read_text())
+        self.assertEqual(payload["sig"], index._state["sig"])
+
     def test_agent_cursor_fast_path_matches_the_full_view(self):
         """子代理游标先按文件版本直接查缓存；结果必须与 session_view 路径完全一致。"""
         parent = self.claude_session("parent", "父会话")
