@@ -363,39 +363,335 @@ def _view_signature(rows: list[dict], run_id: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
+class _PaneLinker:
+    """一次请求内 pane ↔ 会话的匹配器：pane 名索引、祖先链记忆、续写原会话表。
+
+    /api/term/list 要把几百条会话逐一对上几十个 pane；逐条从头读 /proc 祖先链、
+    逐条线性扫列表找续写原会话是 O(会话 × pane × 深度)。这里把不变的部分算一次。
+    只在一次请求 (或一次预热) 内使用，不跨请求保存。
+    """
+
+    def __init__(self, panes: list[dict], topology: list[dict] | None = None):
+        self.panes = panes
+        self.by_name: dict[str, dict] = {}
+        for pane in panes:
+            self.by_name.setdefault(pane["name"], pane)
+        self.owned = [pane for pane in panes if pane.get("owned")]
+        self.ancestry = term.ancestry()
+        self._topology = topology
+        self._origins: dict[str, dict] | None = None
+
+    def origin_of(self, session: dict) -> dict | None:
+        """列表里 continued_in 指向这条会话的那条原会话（没有就是 None）。"""
+        if session.get("source") != "claude":
+            return None
+        if self._origins is None:
+            rows = index.cached() if self._topology is None else self._topology
+            origins: dict[str, dict] = {}
+            for row in rows:
+                target = row.get("continued_in")
+                if target is None or row.get("uid") == target:
+                    continue
+                origins.setdefault(target, row)
+            self._origins = origins
+        return self._origins.get(str(session.get("uid") or ""))
+
+    def pane_for(self, session: dict, pids: list[int] | None = None,
+                 _hops: int = 0) -> dict | None:
+        name = term.session_name_for(session["source"], session["sid"])
+        exact = self.by_name.get(name)
+        if exact and (pids is None or any(
+                pid != 0 and term.process_belongs_to(pid, exact["pid"], self.ancestry)
+                for pid in pids)):
+            return exact
+        pids = live.pids_of(session) if pids is None else pids
+        pane = next((pane for pane in self.owned if any(
+            pid > 0 and term.process_belongs_to(pid, pane["pid"], self.ancestry)
+            for pid in pids
+        )), None)
+        if pane:
+            return pane
+        # Claude 续写 (continued-in)：新 JSONL 的进程跑在原会话 TUI 的守护子进程下，
+        # 按进程树它不是这个 pane 的 CLI，但列表只显示续写后的会话，控制台随之过继。
+        # 反过来，pane 里的 CLI 自己派出的 grok -p / codex exec 不在此列，它们没有控制台。
+        origin = self.origin_of(session) if _hops < 8 else None
+        return self.pane_for(origin, _hops=_hops + 1) if origin else None
+
+
 def _pane_for_session(session: dict, panes: list[dict],
-                      pids: list[int] | None = None, _hops: int = 0) -> dict | None:
+                      pids: list[int] | None = None) -> dict | None:
     """按规范名或真实进程树找会话所在的 agenthub tmux pane。
 
     Codex 双 Esc 会换新 UUID，但进程仍留在旧 UUID 命名的 tmux session 中；
     这时名称不再可靠，pane 祖先进程才是权威关联。
     """
-    name = term.session_name_for(session["source"], session["sid"])
-    exact = next((pane for pane in panes if pane["name"] == name), None)
-    if exact and (pids is None or any(
-            pid != 0 and term.process_belongs_to(pid, exact["pid"])
-            for pid in pids)):
-        return exact
-    pids = live.pids_of(session) if pids is None else pids
-    pane = next((pane for pane in panes if pane.get("owned") and any(
-        pid > 0 and term.process_belongs_to(pid, pane["pid"]) for pid in pids
-    )), None)
-    if pane:
-        return pane
-    # Claude 续写 (continued-in)：新 JSONL 的进程跑在原会话 TUI 的守护子进程下，
-    # 按进程树它不是这个 pane 的 CLI，但列表只显示续写后的会话，控制台随之过继。
-    # 反过来，pane 里的 CLI 自己派出的 grok -p / codex exec 不在此列，它们没有控制台。
-    origin = _continued_origin(session) if _hops < 8 else None
-    return _pane_for_session(origin, panes, _hops=_hops + 1) if origin else None
+    return _PaneLinker(panes).pane_for(session, pids)
 
 
 def _continued_origin(session: dict) -> dict | None:
     """列表里 continued_in 指向这条会话的那条原会话（没有就是 None）。"""
-    if session.get("source") != "claude":
-        return None
-    uid = str(session.get("uid") or "")
-    return next((row for row in index.cached()
-                 if row.get("continued_in") == uid and row.get("uid") != uid), None)
+    return _PaneLinker([]).origin_of(session)
+
+
+# ---- 轮询路径缓存 ---------------------------------------------------
+# 每个打开的标签页都在连续轮询 /api/sessions?sig（8 s）、/api/live 与
+# /api/term/list（3 s）。三者的响应都是若干"来源快照"的纯函数，来源没变就
+# 直接复用上次的结果：
+#   - 会话列表：inventory 快照（同一 list 对象）+ session-meta 文件内容 +
+#     debug-runs 登记表版本 + debug_run 参数 → rows / sig / 序列化字节。
+#     with_cursors 读的每个文件（主会话、子代理、grok chat）都在 inventory 里，
+#     size/mtime/inode 一变就换新快照；timeline 回滚会改写 session-meta。
+#   - /api/live：/proc 扫描版本（live.snapshot 自带 TTL）+ 列表快照 +
+#     受管会话列表版本 + debug_run。
+#   - /api/term/list：受管会话列表版本 + 列表快照 + debug_run → pane ↔ uid。
+# 受管会话列表本身按 PANES_TTL 复用；本进程改动会话时 term.generation() 推进，
+# 缓存立即作废。force=1 总是绕过全部缓存。预热线程在有人轮询时把 inventory
+# 与 /proc 扫描保持新鲜，轮询请求就几乎不再自己扫盘。
+PANES_TTL = 2.0
+# 不取 3 s / 8 s 的约数：浏览器的 setInterval 与预热节奏一旦锁相，每次轮询都
+# 会撞上预热线程正在扫描的那几十毫秒（等 GIL），实测把 1.5 ms 的轮询拖到 4 ms。
+WARM_INTERVAL = 1.1
+WARM_IDLE = 30.0          # 最近这么久没有列表 / 判活轮询就停止预热
+_poll_seen = {"sessions": 0.0, "live": 0.0}
+_poll_cache_lock = threading.Lock()
+# (列出时刻, term.generation(), TERMINAL, rows)；整体替换，读者不会看到半新半旧
+_panes_cache = {"entry": (0.0, -1, None, [])}
+_sessions_views: dict[str, "_SessionsView"] = {}
+_live_views: dict[str, "_LiveView"] = {}
+_term_link_views: dict[str, "_TermLinks"] = {}
+
+
+def _note_poll(kind: str) -> None:
+    _poll_seen[kind] = time.monotonic()
+
+
+def _polled_recently(kind: str, within: float = WARM_IDLE) -> bool:
+    return time.monotonic() - _poll_seen[kind] <= within
+
+
+def _panes_fresh(entry: tuple, force: bool, generation: int) -> bool:
+    at, listed_generation, terminal, _rows = entry
+    return (not force and listed_generation == generation and terminal is TERMINAL
+            and at > 0 and time.monotonic() - at <= PANES_TTL)
+
+
+def _panes(force: bool = False) -> list[dict]:
+    """受管会话列表（两个后端合并），按 PANES_TTL 复用；改动或 force 立即重列。
+
+    返回的 list 对象在缓存有效期内保持同一身份，下游缓存以它作键。
+    """
+    if not TERMINAL:
+        return []
+    generation = term.generation()
+    entry = _panes_cache["entry"]
+    if _panes_fresh(entry, force, generation):
+        return entry[3]
+    with _poll_cache_lock:
+        entry = _panes_cache["entry"]
+        if _panes_fresh(entry, force, generation):
+            return entry[3]
+        rows = term.list_sessions()
+        # generation 取列表开始前的值：列表期间发生的改动会让下一次重列。
+        _panes_cache["entry"] = (time.monotonic(), generation, TERMINAL, rows)
+        return rows
+
+
+class _SessionsView:
+    """一个已发布 inventory 快照对应的列表响应：rows、sig 与序列化结果。"""
+
+    __slots__ = ("sessions", "built_at", "meta_sig", "debug_stamp", "rows", "sig",
+                 "obj", "body", "_gzip", "_audit", "_lock")
+
+    def __init__(self, sessions, built_at, meta_sig, debug_stamp, rows, sig):
+        self.sessions = sessions
+        self.built_at = built_at
+        self.meta_sig = meta_sig
+        self.debug_stamp = debug_stamp
+        self.rows = rows
+        self.sig = sig
+        self.obj = {"sessions": rows, "sig": sig, "built_at": built_at}
+        self.body = json.dumps(self.obj, ensure_ascii=False).encode()
+        self._gzip = None
+        self._audit = None
+        self._lock = threading.Lock()
+
+    def matches(self, sessions, built_at, meta_sig, debug_stamp) -> bool:
+        return (self.sessions is sessions and self.built_at == built_at
+                and self.meta_sig == meta_sig and self.debug_stamp == debug_stamp)
+
+    def gzip(self) -> bytes | None:
+        """压缩后的响应体；比原文还大就返回 None。只压一次。"""
+        with self._lock:
+            if self._gzip is None:
+                packed = gzip.compress(self.body, compresslevel=JSON_GZIP_LEVEL, mtime=0)
+                self._gzip = packed if len(packed) < len(self.body) else b""
+            return self._gzip or None
+
+    def audit_content(self):
+        """与 _json() 记录同一份响应内容，但 redact/dumps/压缩只做一次。"""
+        with self._lock:
+            if self._audit is None:
+                self._audit = (audit.prepare_content(self.obj)
+                               if len(self.body) <= 512 * 1024 else False)
+            return self._audit or None
+
+    def prepare(self) -> None:
+        """预热线程调用：把压缩与审计 blob 也提前算好，浏览器取整份列表时不再等。"""
+        self.gzip()
+        self.audit_content()
+
+
+def _sessions_view(sessions: list[dict], built_at: float, run_id: str,
+                   force: bool = False) -> _SessionsView:
+    """按 (快照身份, session-meta, debug-runs, run_id) 复用列表响应；force 一律重算。"""
+    meta_sig = session_meta.signature()
+    debug_stamp = debug_runs.stamp()
+    view = _sessions_views.get(run_id)
+    if not force and view is not None and view.matches(
+            sessions, built_at, meta_sig, debug_stamp):
+        return view
+    with _poll_cache_lock:
+        view = _sessions_views.get(run_id)
+        if not force and view is not None and view.matches(
+                sessions, built_at, meta_sig, debug_stamp):
+            return view
+        filtered = debug_runs.filter_rows(sessions, run_id)
+        rows = session_meta.enrich(index.with_cursors(filtered), filtered)
+        view = _SessionsView(sessions, built_at, meta_sig, debug_stamp, rows,
+                             _view_signature(rows, run_id))
+        if len(_sessions_views) >= 8 and run_id not in _sessions_views:
+            _sessions_views.clear()          # 只限制 debug_run 参数的花样
+        _sessions_views[run_id] = view
+        return view
+
+
+class _LiveView:
+    __slots__ = ("scan_at", "sessions", "panes", "response")
+
+    def __init__(self, scan_at, sessions, panes, response):
+        self.scan_at, self.sessions, self.panes, self.response = (
+            scan_at, sessions, panes, response)
+
+    def matches(self, scan_at, sessions, panes) -> bool:
+        return (self.scan_at == scan_at and self.sessions is sessions
+                and self.panes is panes)
+
+
+def _assemble_live(sessions: list[dict], panes: list[dict],
+                   topology: list[dict] | None = None, force: bool = False) -> dict:
+    """/api/live 的响应体；sessions 是本视图的行，topology 是找续写原会话用的全表。"""
+    uids, owned_pids = live.active_processes(sessions, force=force)
+    _record_spawn_parents(sessions, owned_pids)   # 趁每次判活顺手记下
+    live_set = set(uids)
+    # 受管 = 它自己就是某个 pane 里的 CLI，或是续写过继了原会话的 pane；
+    # pane 里的 CLI 派出的孙辈会话不算，它们没有自己的控制台。
+    linker = _PaneLinker(panes, topology) if panes else None
+    ancestry = linker.ancestry if linker else term.ancestry()
+    # 终端关闭时 panes 是空表而不是"没有宿主会话"，让后端照旧自己判断。
+    known_panes = panes if TERMINAL else None
+    tmux_uids = [s["uid"] for s in sessions
+                 if s["uid"] in live_set
+                 and (term.in_tmux(owned_pids.get(s["uid"], []), known_panes, ancestry)
+                      or (linker is not None and linker.pane_for(
+                          s, owned_pids.get(s["uid"], [])) is not None))]
+    started_at = {}
+    for s in sessions:
+        if s["uid"] not in live_set:
+            continue
+        value = live.started_at(s, pids=owned_pids.get(s["uid"], []))
+        if value is not None:
+            started_at[s["uid"]] = value
+    return {"uids": uids, "tmux_uids": tmux_uids, "started_at": started_at}
+
+
+def _live_view(run_id: str, force: bool = False) -> dict:
+    """/api/live 的响应；扫描版本、列表快照、受管会话列表都没变就复用。"""
+    all_sessions = index.cached()
+    panes = _panes(force=force)
+    scan_at = live.scan_stamp()
+    view = _live_views.get(run_id)
+    if not force and view is not None and view.matches(scan_at, all_sessions, panes):
+        return view.response
+    with _poll_cache_lock:
+        view = _live_views.get(run_id)
+        scan_at = live.scan_stamp()
+        if not force and view is not None and view.matches(scan_at, all_sessions, panes):
+            return view.response
+        sessions = debug_runs.filter_rows(all_sessions, run_id)
+        response = _assemble_live(sessions, panes, all_sessions, force=force)
+        if force:
+            scan_at = live.scan_stamp()      # force 自己刚扫过；否则沿用装配前的版本，
+        #                                     装配期间若有新扫描，下次请求会重装。
+        if len(_live_views) >= 8 and run_id not in _live_views:
+            _live_views.clear()
+        _live_views[run_id] = _LiveView(scan_at, all_sessions, panes, response)
+        return response
+
+
+class _TermLinks:
+    __slots__ = ("sessions", "panes", "linked")
+
+    def __init__(self, sessions, panes, linked):
+        self.sessions, self.panes, self.linked = sessions, panes, linked
+
+
+def _term_links(run_id: str, panes: list[dict], force: bool = False) -> dict[str, str]:
+    """pane 名 → 当前列表 uid。前端不能只从 pane 名猜 UUID，因为 Codex 回退
+    分支会沿用父会话启动时的旧名字。"""
+    all_sessions = index.cached()
+    links = _term_link_views.get(run_id)
+    if (not force and links is not None and links.sessions is all_sessions
+            and links.panes is panes):
+        return links.linked
+    with _poll_cache_lock:
+        links = _term_link_views.get(run_id)
+        if (not force and links is not None and links.sessions is all_sessions
+                and links.panes is panes):
+            return links.linked
+        linker = _PaneLinker(panes, all_sessions)
+        chosen: dict[str, dict] = {}
+        for session in debug_runs.filter_rows(all_sessions, run_id):
+            pane = linker.pane_for(session)
+            if pane and (pane["name"] not in chosen
+                         or session["updated"] > chosen[pane["name"]]["updated"]):
+                chosen[pane["name"]] = session
+        linked = {name: session["uid"] for name, session in chosen.items()}
+        if len(_term_link_views) >= 8 and run_id not in _term_link_views:
+            _term_link_views.clear()
+        _term_link_views[run_id] = _TermLinks(all_sessions, panes, linked)
+        return linked
+
+
+def _poll_warm_tick() -> None:
+    """有人在轮询时替它们把慢的来源刷新好：inventory 扫描与列表视图、
+    /proc 扫描与 /api/live 装配、受管会话列表与 pane 关联。
+
+    只装配默认视图（没有 debug_run 参数）；来源没变时这些调用都是廉价的
+    命中检查，真正的重算只在快照 / 扫描 / 会话列表变化后发生一次。
+    """
+    if _polled_recently("sessions"):
+        index.load()
+        sessions, _sig, built_at = index.load_snapshot(ttl=index.POLL_TTL)
+        _sessions_view(sessions, built_at, "").prepare()
+    if _polled_recently("live"):
+        live.snapshot()
+        _live_view("")
+        panes = _panes()
+        if panes:
+            _term_links("", panes)
+
+
+def _poll_warm_loop(stop: threading.Event | None = None,
+                    interval: float = WARM_INTERVAL) -> None:
+    while not (stop and stop.is_set()):
+        try:
+            _poll_warm_tick()
+        except Exception:
+            pass                                  # 预热失败不能拖垮服务
+        if stop:
+            stop.wait(interval)
+        else:
+            time.sleep(interval)
 
 
 def _codex_prompt(session: dict, pane_name: str = "") -> dict | None:
@@ -615,6 +911,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.headers.get("Accept-Encoding", "")):
             packed = gzip.compress(body, compresslevel=JSON_GZIP_LEVEL, mtime=0)
             if len(packed) < len(body):
+                body = packed
+                headers["Content-Encoding"] = "gzip"
+        self._send(code, body, "application/json; charset=utf-8", headers)
+
+    def _json_prepared(self, view: _SessionsView, code: int = 200):
+        """与 _json 相同的响应与审计记录，但序列化 / 压缩 / 审计 blob 取自缓存。"""
+        body = view.body
+        self._audit_json_response = view.audit_content()
+        headers = {
+            "Vary": "Accept-Encoding",
+            "X-AgentHub-Decoded-Length": str(len(body)),
+        }
+        if len(body) >= JSON_GZIP_MIN and _accepts_gzip(
+                self.headers.get("Accept-Encoding", "")):
+            packed = view.gzip()
+            if packed is not None:
                 body = packed
                 headers["Content-Encoding"] = "gzip"
         self._send(code, body, "application/json; charset=utf-8", headers)
@@ -1241,58 +1553,34 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             force = q.get("force", ["0"])[0] == "1"
             known = q.get("sig", [""])[0]
+            _note_poll("sessions")
             # load 是唯一会扫 inventory 的入口；签名必须与这批 rows 属于同一
             # 已发布快照，不能 signature → load → signature 制造 TOCTOU。
-            sessions, index_sig, built_at = index.load_snapshot(force=force)
-            run_id = _debug_run(q)
-            sessions = debug_runs.filter_rows(sessions, run_id)
-            rows = session_meta.enrich(index.with_cursors(sessions), sessions)
-            current_sig = _view_signature(rows, run_id)
-            if known and not force and known == current_sig:
+            # 轮询接受 POLL_TTL 内的快照，预热线程负责把它保持新鲜。
+            sessions, _index_sig, built_at = index.load_snapshot(
+                force=force, ttl=None if force else index.POLL_TTL)
+            view = _sessions_view(sessions, built_at, _debug_run(q), force=force)
+            if known and not force and known == view.sig:
                 return self._json({"unchanged": True, "sig": known})
-            return self._json({"sessions": rows, "sig": current_sig,
-                               "built_at": built_at})
+            return self._json_prepared(view)
 
         if path == "/api/live":
             force = q.get("force", ["0"])[0] == "1"
-            sessions = debug_runs.filter_rows(index.cached(), _debug_run(q))
-            uids, owned_pids = live.active_processes(sessions, force=force)
-            _record_spawn_parents(sessions, owned_pids)   # 趁每次判活顺手记下
-            live_set = set(uids)
-            # 受管 = 它自己就是某个 pane 里的 CLI，或是续写过继了原会话的 pane；
-            # pane 里的 CLI 派出的孙辈会话不算，它们没有自己的控制台。
-            panes = term.list_sessions() if TERMINAL else []
-            tmux_uids = [s["uid"] for s in sessions
-                         if s["uid"] in live_set
-                         and (term.in_tmux(owned_pids.get(s["uid"], []))
-                              or (panes and _pane_for_session(
-                                  s, panes, owned_pids.get(s["uid"], [])) is not None))]
-            started_at = {}
-            for s in sessions:
-                if s["uid"] not in live_set:
-                    continue
-                value = live.started_at(s, pids=owned_pids.get(s["uid"], []))
-                if value is not None:
-                    started_at[s["uid"]] = value
-            return self._json({"uids": uids, "tmux_uids": tmux_uids,
-                               "started_at": started_at})
+            _note_poll("live")
+            return self._json(_live_view(_debug_run(q), force=force))
 
         if path == "/api/term/list":
-            tmux_sessions = term.list_sessions() if TERMINAL else []
+            _note_poll("live")
+            force = q.get("force", ["0"])[0] == "1"
+            panes = _panes(force=force)
             run_id = _debug_run(q)
-            tmux_sessions = debug_runs.filter_rows(tmux_sessions, run_id)
+            tmux_sessions = debug_runs.filter_rows(panes, run_id)
             if tmux_sessions:
-                # 把 tmux pane 映射回当前列表 uid。前端不能只从 pane 名猜 UUID，
-                # 因为 Codex 回退分支会沿用父会话启动时的旧名字。
-                linked: dict[str, dict] = {}
-                for session in debug_runs.filter_rows(index.cached(), run_id):
-                    pane = _pane_for_session(session, tmux_sessions)
-                    if pane and (pane["name"] not in linked
-                                 or session["updated"] > linked[pane["name"]]["updated"]):
-                        linked[pane["name"]] = session
-                for pane in tmux_sessions:
-                    if pane["name"] in linked:
-                        pane["uid"] = linked[pane["name"]]["uid"]
+                # 缓存的 pane 行不能就地改；关联关系随列表快照变化。
+                linked = _term_links(run_id, panes, force=force)
+                tmux_sessions = [
+                    {**pane, "uid": linked[pane["name"]]} if pane["name"] in linked
+                    else pane for pane in tmux_sessions]
             pending = pending_store.active({x["name"] for x in tmux_sessions}) if TERMINAL else []
             pending = debug_runs.filter_rows(pending, run_id)
             public_pending = [{k: row.get(k) for k in
@@ -2614,6 +2902,7 @@ def main():
 
     threading.Thread(target=index.load, daemon=True).start()  # 后台预热索引
     threading.Thread(target=_spawn_watch_loop, daemon=True, name="agenthub-spawn-watch").start()
+    threading.Thread(target=_poll_warm_loop, daemon=True, name="agenthub-poll-warm").start()
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
