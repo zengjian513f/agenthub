@@ -1136,13 +1136,18 @@ class Handler(BaseHTTPRequestHandler):
         # 头和正文合成一次 write：一次系统调用、一个 TCP 段，小响应不再拆成两包。
         # end_headers() 只是往 _headers_buffer 追加空行再 flush，这里手工做同样的事。
         # 大正文（缓存的整份消息）按块写出，不为了合并头再拷一份几十 MB 的 bytes。
-        self._headers_buffer.append(b"\r\n")
-        head = b"".join(self._headers_buffer)
-        self._headers_buffer = []
-        if chunks and len(chunks[0]) <= 65536:
-            chunks[0] = head + chunks[0]
+        buffered = getattr(self, "_headers_buffer", None)
+        if buffered is None:
+            # A stubbed handler (tests) has no header buffer: emit headers the plain way.
+            self.end_headers()
         else:
-            chunks.insert(0, head)
+            buffered.append(b"\r\n")
+            head = b"".join(buffered)
+            self._headers_buffer = []
+            if chunks and len(chunks[0]) <= 65536:
+                chunks[0] = head + chunks[0]
+            else:
+                chunks.insert(0, head)
         delivered = True
         try:
             for chunk in chunks:
