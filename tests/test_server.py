@@ -888,8 +888,11 @@ class PollCacheTests(unittest.TestCase):
         self.assertEqual(extra2.get("Content-Encoding"), "gzip")
         self.assertEqual(extra2["X-AgentHub-Decoded-Length"],
                          str(len(json.dumps(doc, ensure_ascii=False).encode())))
-        prepared = handler2._audit_json_response
+        deferred = handler2._audit_json_response
+        self.assertIsInstance(deferred, server.audit.DeferredContent)
+        prepared = deferred.prepare()            # 写线程才会真正算；算出来必须一致
         self.assertIsInstance(prepared, server.audit.PreparedContent)
+        self.assertIs(handler._audit_json_response.prepare(), prepared)   # 只算一次
         raw = server.audit._json_bytes(doc)
         self.assertEqual(prepared.sha256, server.hashlib.sha256(raw).hexdigest())
         self.assertEqual(prepared.mime, "application/json")

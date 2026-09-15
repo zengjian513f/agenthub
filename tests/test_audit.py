@@ -55,6 +55,32 @@ class AuditStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM blobs").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT mime FROM blobs").fetchone()[0], "application/json")
 
+    def test_deferred_content_is_prepared_by_the_writer_and_stored_identically(self):
+        content = {"sessions": [{"uid": "claude:a"}], "sig": "s"}
+        calls = []
+
+        def prepare():
+            calls.append(1)
+            return audit.prepare_content(content)
+
+        self.assertTrue(self.store.record("list.plain", uid="claude:d", content=content))
+        self.assertTrue(self.store.record("list.deferred", uid="claude:d",
+                                          content=audit.DeferredContent(prepare)))
+        self.assertTrue(self.store.record(
+            "list.broken", uid="claude:d",
+            content=audit.DeferredContent(lambda: (_ for _ in ()).throw(RuntimeError("x")))))
+        self.assertEqual(calls, [])              # 请求线程没有算
+        self.assertTrue(self.store.flush())
+        self.assertEqual(calls, [1])
+        rows = self.store.query(uid="claude:d", include_content=True)
+        self.assertEqual([row["event"] for row in rows],
+                         ["list.plain", "list.deferred", "list.broken"])
+        self.assertEqual(rows[0]["content_sha256"], rows[1]["content_sha256"])
+        self.assertEqual(json.loads(rows[1]["content"]), content)
+        self.assertEqual(rows[2]["content_sha256"], "")   # 算不出就当没有内容，事件照记
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM blobs").fetchone()[0], 1)
+
     def test_sensitive_metadata_is_redacted(self):
         self.store.record("browser.state", data={
             "headers": {"Authorization": "Bearer secret", "Cookie": "sid=x"},

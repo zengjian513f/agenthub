@@ -951,7 +951,8 @@ class Handler(BaseHTTPRequestHandler):
     def _json_prepared(self, view: _SessionsView, code: int = 200):
         """与 _json 相同的响应与审计记录，但序列化 / 压缩 / 审计 blob 取自缓存。"""
         body = view.body
-        self._audit_json_response = view.audit_content()
+        # 与 _json 记录同一份内容；redact/压缩留给审计写线程，不占请求时间。
+        self._audit_json_response = audit.DeferredContent(view.audit_content)
         headers = {
             "Vary": "Accept-Encoding",
             "X-AgentHub-Decoded-Length": str(len(body)),

@@ -19,7 +19,7 @@ import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DATA_DIR = Path.home() / ".local" / "share" / "agenthub"
@@ -98,9 +98,35 @@ def prepare_content(content: Any) -> PreparedContent:
 
 
 @dataclass(frozen=True)
+class DeferredContent:
+    """由写线程而不是请求线程去算的 content blob。
+
+    只适用于记录之后绝不会再改的内容（例如缓存的列表响应对象）：写线程调用
+    prepare() 得到 PreparedContent，事件行里的 content_sha256 到那时才填。
+    """
+    prepare: Callable[[], PreparedContent | None]
+
+
+@dataclass(frozen=True)
 class _QueuedEvent:
     row: tuple
     blob: tuple[str, str, int, bytes] | None
+    deferred: Callable[[], PreparedContent | None] | None = None
+
+    def resolved(self) -> "_QueuedEvent":
+        """把推迟的 blob 算出来并补进行尾的 content_sha256；失败就当没有内容。"""
+        if self.deferred is None:
+            return self
+        prepared = None
+        try:
+            prepared = self.deferred()
+        except Exception:
+            prepared = None
+        if prepared is None:
+            return _QueuedEvent(self.row[:-1] + ("",), None)
+        return _QueuedEvent(
+            self.row[:-1] + (prepared.sha256,),
+            (prepared.sha256, prepared.mime, prepared.size, prepared.payload))
 
 
 @dataclass(frozen=True)
@@ -148,7 +174,10 @@ class EventStore:
                                    separators=(",", ":"), sort_keys=True)
             blob = None
             blob_hash = ""
-            if isinstance(content, PreparedContent):
+            deferred = None
+            if isinstance(content, DeferredContent):
+                deferred = content.prepare
+            elif isinstance(content, PreparedContent):
                 blob_hash = content.sha256
                 blob = (blob_hash, content.mime, content.size, content.payload)
             elif content is not None:
@@ -167,7 +196,7 @@ class EventStore:
                 str(build or "")[:128], data_json, blob_hash,
             )
             self._ensure_started()
-            self._queue.put_nowait(_QueuedEvent(row, blob))
+            self._queue.put_nowait(_QueuedEvent(row, blob, deferred))
             return True
         except (OSError, TypeError, ValueError, queue.Full):
             self._dropped += 1
@@ -308,6 +337,7 @@ class EventStore:
     def _write_batch(db: sqlite3.Connection,
                      events: list[_QueuedEvent]) -> None:
         for item in events:
+            item = item.resolved()
             if item.blob:
                 sha, mime, original_bytes, payload = item.blob
                 db.execute(
