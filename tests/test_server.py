@@ -953,8 +953,12 @@ class PollCacheTests(unittest.TestCase):
             holder["panes"] = []                  # 受管会话列表换了对象
             server._live_view("")
             self.assertEqual(active.call_count, 3)
-            holder["sessions"] = list(self.ROWS)  # 列表快照换了对象
-            server._live_view("")
+            holder["sessions"] = [dict(r, updated="9", size=5) for r in self.ROWS]
+            server._live_view("")                 # 只是追加：拓扑没变，不重装
+            self.assertEqual(active.call_count, 3)
+            holder["sessions"] = [*self.ROWS, {"uid": "grok:c", "source": "grok",
+                                               "sid": "sid-c", "updated": "3"}]
+            server._live_view("")                 # 多了一条会话：重装
             self.assertEqual(active.call_count, 4)
             server._live_view("", force=True)
             self.assertEqual(active.call_count, 5)
@@ -976,6 +980,7 @@ class PollCacheTests(unittest.TestCase):
                 patch.object(server.term, "backend_name", return_value="ptyhost"), \
                 patch.object(server.term, "backends", return_value=[]), \
                 patch.object(server.debug_runs, "filter_rows", side_effect=lambda rows, _="": list(rows)), \
+                patch.object(server.debug_runs, "stamp", return_value=1), \
                 patch.object(server, "_PaneLinker", wraps=server._PaneLinker) as linker:
             handler = self.handler()
             handler._api_get("/api/term/list", {})
@@ -986,9 +991,20 @@ class PollCacheTests(unittest.TestCase):
             self.assertEqual(linker.call_count, 1)
             handler._api_get("/api/term/list", {"force": ["1"]})
             self.assertEqual(linker.call_count, 2)
-            holder["sessions"] = list(self.ROWS)
+            holder["sessions"] = [dict(r, updated="9") for r in self.ROWS]
+            handler._api_get("/api/term/list", {})
+            self.assertEqual(linker.call_count, 2)   # 只是追加：进程树匹配不重做
+            # 同一 pane 被两条会话认领时取最近更新的那条，且按当前 updated 现算
+            holder["sessions"] = [dict(self.ROWS[0], updated="1"),
+                                  dict(self.ROWS[1], sid="sid-a", updated="5")]
+            handler._api_get("/api/term/list", {})
+            self.assertEqual(linker.call_count, 3)   # 拓扑变了：重做
+            self.assertEqual(json.loads(handler.sent[-1][1])["sessions"][0]["uid"], "claude:b")
+            holder["sessions"] = [dict(self.ROWS[0], updated="7"),
+                                  dict(self.ROWS[1], sid="sid-a", updated="5")]
             handler._api_get("/api/term/list", {})
             self.assertEqual(linker.call_count, 3)
+            self.assertEqual(json.loads(handler.sent[-1][1])["sessions"][0]["uid"], "claude:a")
 
     def test_warm_tick_only_works_for_recent_pollers(self):
         with patch.object(server.index, "load") as load, \
@@ -1003,7 +1019,8 @@ class PollCacheTests(unittest.TestCase):
             server._note_poll("sessions")
             server._poll_warm_tick()
             load.assert_called_once()
-            view.return_value.prepare.assert_called_once()
+            view.assert_called_once()
+            view.return_value.gzip.assert_not_called()   # 压缩留给真正取列表的请求
             snapshot.assert_not_called()
             server._note_poll("live")
             server._poll_warm_tick()

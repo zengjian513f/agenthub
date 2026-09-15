@@ -448,9 +448,11 @@ def _continued_origin(session: dict) -> dict | None:
 # 缓存立即作废。force=1 总是绕过全部缓存。预热线程在有人轮询时把 inventory
 # 与 /proc 扫描保持新鲜，轮询请求就几乎不再自己扫盘。
 PANES_TTL = 2.0
-# 不取 3 s / 8 s 的约数：浏览器的 setInterval 与预热节奏一旦锁相，每次轮询都
-# 会撞上预热线程正在扫描的那几十毫秒（等 GIL），实测把 1.5 ms 的轮询拖到 4 ms。
-WARM_INTERVAL = 1.1
+# 预热节奏要低于 index.POLL_TTL 和 PANES_TTL，让轮询总能命中；又不取 3 s / 8 s
+# 的约数：浏览器的 setInterval 与预热一旦锁相，每次轮询都会撞上预热线程正在
+# 扫描的那几十毫秒（等 GIL），实测把 1.5 ms 的轮询拖到 4 ms。活跃会话每秒都在
+# 追加，每一轮发现变化都要重解析、重建视图，所以也不宜更密。
+WARM_INTERVAL = 1.7
 WARM_IDLE = 30.0          # 最近这么久没有列表 / 判活轮询就停止预热
 _poll_seen = {"sessions": 0.0, "live": 0.0}
 _poll_cache_lock = threading.Lock()
@@ -535,11 +537,6 @@ class _SessionsView:
                                if len(self.body) <= 512 * 1024 else False)
             return self._audit or None
 
-    def prepare(self) -> None:
-        """预热线程调用：把压缩与审计 blob 也提前算好，浏览器取整份列表时不再等。"""
-        self.gzip()
-        self.audit_content()
-
 
 def _sessions_view(sessions: list[dict], built_at: float, run_id: str,
                    force: bool = False) -> _SessionsView:
@@ -565,15 +562,34 @@ def _sessions_view(sessions: list[dict], built_at: float, run_id: str,
         return view
 
 
+_TOPOLOGY_FIELDS = ("uid", "source", "sid", "path", "cwd", "created",
+                    "forked_from_id", "continued_in")
+_topology_key_cache: dict[int, tuple[list[dict], tuple]] = {}
+
+
+def _topology_key(sessions: list[dict]) -> tuple:
+    """判活结果依赖的那几个字段。活跃会话每秒追加都会换一个快照对象，但只要
+    这些字段没变，/api/live 的答案就没变，不必为每次追加重新装配。"""
+    hit = _topology_key_cache.get(id(sessions))
+    if hit is not None and hit[0] is sessions:
+        return hit[1]
+    key = tuple((row.get(field) for field in _TOPOLOGY_FIELDS) for row in sessions)
+    key = tuple(tuple(item) for item in key)
+    if len(_topology_key_cache) >= 4:
+        _topology_key_cache.clear()
+    _topology_key_cache[id(sessions)] = (sessions, key)   # 留住引用，id 不会被复用
+    return key
+
+
 class _LiveView:
-    __slots__ = ("scan_at", "sessions", "panes", "response")
+    __slots__ = ("scan_at", "topology", "panes", "response")
 
-    def __init__(self, scan_at, sessions, panes, response):
-        self.scan_at, self.sessions, self.panes, self.response = (
-            scan_at, sessions, panes, response)
+    def __init__(self, scan_at, topology, panes, response):
+        self.scan_at, self.topology, self.panes, self.response = (
+            scan_at, topology, panes, response)
 
-    def matches(self, scan_at, sessions, panes) -> bool:
-        return (self.scan_at == scan_at and self.sessions is sessions
+    def matches(self, scan_at, topology, panes) -> bool:
+        return (self.scan_at == scan_at and self.topology == topology
                 and self.panes is panes)
 
 
@@ -605,17 +621,18 @@ def _assemble_live(sessions: list[dict], panes: list[dict],
 
 
 def _live_view(run_id: str, force: bool = False) -> dict:
-    """/api/live 的响应；扫描版本、列表快照、受管会话列表都没变就复用。"""
+    """/api/live 的响应；扫描版本、会话拓扑、受管会话列表都没变就复用。"""
     all_sessions = index.cached()
     panes = _panes(force=force)
     scan_at = live.scan_stamp()
+    topology = _topology_key(all_sessions)
     view = _live_views.get(run_id)
-    if not force and view is not None and view.matches(scan_at, all_sessions, panes):
+    if not force and view is not None and view.matches(scan_at, topology, panes):
         return view.response
     with _poll_cache_lock:
         view = _live_views.get(run_id)
         scan_at = live.scan_stamp()
-        if not force and view is not None and view.matches(scan_at, all_sessions, panes):
+        if not force and view is not None and view.matches(scan_at, topology, panes):
             return view.response
         sessions = debug_runs.filter_rows(all_sessions, run_id)
         response = _assemble_live(sessions, panes, all_sessions, force=force)
@@ -624,42 +641,56 @@ def _live_view(run_id: str, force: bool = False) -> dict:
         #                                     装配期间若有新扫描，下次请求会重装。
         if len(_live_views) >= 8 and run_id not in _live_views:
             _live_views.clear()
-        _live_views[run_id] = _LiveView(scan_at, all_sessions, panes, response)
+        _live_views[run_id] = _LiveView(scan_at, topology, panes, response)
         return response
 
 
 class _TermLinks:
-    __slots__ = ("sessions", "panes", "linked")
+    """uid → pane 名的匹配结果；按会话拓扑与 pane 表缓存，谁赢得同名 pane 每次现算。"""
 
-    def __init__(self, sessions, panes, linked):
-        self.sessions, self.panes, self.linked = sessions, panes, linked
+    __slots__ = ("topology", "debug_stamp", "panes", "mapping")
+
+    def __init__(self, topology, debug_stamp, panes, mapping):
+        self.topology, self.debug_stamp, self.panes, self.mapping = (
+            topology, debug_stamp, panes, mapping)
+
+    def matches(self, topology, debug_stamp, panes) -> bool:
+        return (self.topology == topology and self.debug_stamp == debug_stamp
+                and self.panes is panes)
 
 
 def _term_links(run_id: str, panes: list[dict], force: bool = False) -> dict[str, str]:
     """pane 名 → 当前列表 uid。前端不能只从 pane 名猜 UUID，因为 Codex 回退
-    分支会沿用父会话启动时的旧名字。"""
+    分支会沿用父会话启动时的旧名字。
+
+    进程树匹配（贵）只在拓扑或 pane 表变化时重做；两条会话对上同一个 pane 时
+    取最近更新的那条，这一步便宜，按当前 updated 每次现算。
+    """
     all_sessions = index.cached()
+    topology = _topology_key(all_sessions)
+    debug_stamp = debug_runs.stamp()
     links = _term_link_views.get(run_id)
-    if (not force and links is not None and links.sessions is all_sessions
-            and links.panes is panes):
-        return links.linked
-    with _poll_cache_lock:
-        links = _term_link_views.get(run_id)
-        if (not force and links is not None and links.sessions is all_sessions
-                and links.panes is panes):
-            return links.linked
-        linker = _PaneLinker(panes, all_sessions)
-        chosen: dict[str, dict] = {}
-        for session in debug_runs.filter_rows(all_sessions, run_id):
-            pane = linker.pane_for(session)
-            if pane and (pane["name"] not in chosen
-                         or session["updated"] > chosen[pane["name"]]["updated"]):
-                chosen[pane["name"]] = session
-        linked = {name: session["uid"] for name, session in chosen.items()}
-        if len(_term_link_views) >= 8 and run_id not in _term_link_views:
-            _term_link_views.clear()
-        _term_link_views[run_id] = _TermLinks(all_sessions, panes, linked)
-        return linked
+    if force or links is None or not links.matches(topology, debug_stamp, panes):
+        with _poll_cache_lock:
+            links = _term_link_views.get(run_id)
+            if force or links is None or not links.matches(topology, debug_stamp, panes):
+                linker = _PaneLinker(panes, all_sessions)
+                mapping = {}
+                for session in debug_runs.filter_rows(all_sessions, run_id):
+                    pane = linker.pane_for(session)
+                    if pane:
+                        mapping[session["uid"]] = pane["name"]
+                links = _TermLinks(topology, debug_stamp, panes, mapping)
+                if len(_term_link_views) >= 8 and run_id not in _term_link_views:
+                    _term_link_views.clear()
+                _term_link_views[run_id] = links
+    chosen: dict[str, dict] = {}
+    for session in all_sessions:
+        name = links.mapping.get(session["uid"])
+        if name and (name not in chosen
+                     or session["updated"] > chosen[name]["updated"]):
+            chosen[name] = session
+    return {name: session["uid"] for name, session in chosen.items()}
 
 
 def _poll_warm_tick() -> None:
@@ -672,7 +703,9 @@ def _poll_warm_tick() -> None:
     if _polled_recently("sessions"):
         index.load()
         sessions, _sig, built_at = index.load_snapshot(ttl=index.POLL_TTL)
-        _sessions_view(sessions, built_at, "").prepare()
+        # 只重建 rows / sig，让 sig 轮询立刻能答；gzip 与审计 blob 留到浏览器
+        # 真的来取整份列表时再算（sig 变了才会取，远少于快照变化的次数）。
+        _sessions_view(sessions, built_at, "")
     if _polled_recently("live"):
         live.snapshot()
         _live_view("")
