@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import _sre
 import copy
 import gzip
 import hashlib
@@ -9,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -568,20 +570,28 @@ _window_cache_locks: dict[str, threading.Lock] = {}
 _window_cache_guard = threading.Lock()
 
 
+_identity_cache: dict[tuple[str, str, str], str] = {}
+
+
 def _window_cache_identity(s: dict) -> str:
     """缓存文件名只暴露散列，不把会话路径或 uid 写进目录项。"""
-    raw = "\0".join((str(s.get("source") or ""), str(data_file(s)),
-                     str(s.get("agent_id") or "")))
-    return hashlib.sha256(raw.encode()).hexdigest()
+    probe = (str(s.get("source") or ""), str(s.get("path") or ""),
+             str(s.get("agent_id") or ""))
+    identity = _identity_cache.get(probe)
+    if identity is None:
+        raw = "\0".join((probe[0], str(data_file(s)), probe[2]))
+        identity = _identity_cache[probe] = hashlib.sha256(raw.encode()).hexdigest()
+    return identity
 
 
 def _window_dependency(path: str | Path, role: str,
                        limit: int | None = None) -> dict:
     """记录能识别内部改写、截断和路径替换的文件身份。"""
-    path = Path(path)
-    row = {"role": role, "path": str(path), "limit": limit}
+    # 字符串输入只来自本模块已经规范化过的记录, 不再经 pathlib 往返。
+    path = path if isinstance(path, str) else str(path)
+    row = {"role": role, "path": path, "limit": limit}
     try:
-        st = path.stat()
+        st = os.stat(path)
     except OSError:
         return {**row, "missing": True}
     return {**row, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
@@ -595,11 +605,10 @@ def _window_cache_stamp(s: dict, ad) -> dict:
     也可能在中间增、删、等长改写。mtime/ctime/inode 共同保证这些变化令旧
     缓存失效；继承段的路径和截止偏移也属于版本的一部分。
     """
-    dependencies = []
     if s.get("source") == "codex":
-        for parent, limit in ad._history_segments(s["path"]):
-            dependencies.append(_window_dependency(parent, "history", int(limit)))
-    dependencies.append(_window_dependency(data_file(s), "current"))
+        dependencies = _codex_dependencies(s, ad)
+    else:
+        dependencies = [_window_dependency(data_file(s), "current")]
 
     semantic = {}
     if isinstance(ad, ClaudeAdapter):
@@ -1077,8 +1086,7 @@ def delete(uid: str) -> str:
         # 不用移动后的新 inventory 给尚未协调的其他变化背书；下一次 load
         # 会从旧 files 做完整 diff，保留其他 Codex 分支和父项。
         _publish(raw, sessions, _state["files"], None, time.time(), 0.0, True)
-        with _search_text_lock:
-            _search_text_cache.pop(uid, None)
+        _search_cache_pop(uid)
     return str(dest)
 
 
@@ -1087,10 +1095,19 @@ HIT_CAP = 200   # 单会话命中计数上限, 超过只报 "200+"
 SEARCH_ROLES = frozenset({"user", "assistant", "user·subagent",
                           "assistant·subagent", "thinking", "question", "answer"})
 SEARCH_CACHE_VERSION = 1
-SEARCH_CACHE_MEMORY_BYTES = 64 * 1024 * 1024
-_search_text_cache = OrderedDict()
+# 正文与其折叠副本一起计入(按 sys.getsizeof 的真实字节数)。每次搜索都会
+# 触碰全部会话, 语料超出预算后 LRU 只会整体退化成逐条读盘, 所以预算要留
+# 出语料增长的余量。
+SEARCH_CACHE_MEMORY_BYTES = 96 * 1024 * 1024
+# uid -> (stamp, 正文, 折叠副本, 上次校验时的 epoch)
+_search_text_cache: OrderedDict[str, tuple[dict, str, str | None, tuple | None]] = OrderedDict()
+_search_cache_bytes = 0
 _search_text_lock = threading.Lock()
 _search_parse_locks = [threading.Lock() for _ in range(16)]
+# Codex 继承链: path -> 上次解析时链上各文件(含当前)的 _window_dependency。
+# 这些 stat 字段没变就不必再读文件头。
+_history_memo: dict[str, list[dict]] = {}
+_history_memo_lock = threading.Lock()
 
 
 def invalidate() -> None:
@@ -1115,35 +1132,272 @@ def build_pattern(query: str, word=False, case=False, regex=False) -> re.Pattern
     return re.compile(src, flags)
 
 
+def _build_fold_table() -> dict[int, int] | None:
+    """由 re 自己的忽略大小写等价表推出"非代表成员 -> 代表"的映射。
+
+    sre 在 IGNORECASE 下把字符 c 与模式字符 q 视为相等, 当且仅当二者的简单
+    小写相同, 或落在 re._casefix 列出的同一等价类里。这里给每个等价类挑一
+    个代表(优先取 upper→lower 往返稳定的成员, 即普通文本里常见的那个),
+    其余成员在折叠时改写成代表。表缺失时返回 None, 搜索退回纯正则路径。
+    """
+    try:
+        from re import _casefix
+        extra = _casefix._EXTRA_CASES
+        tolower = _sre.unicode_tolower
+    except (ImportError, AttributeError):
+        return None
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent.get(x, x) != x:
+            x = parent[x]
+        return x
+
+    members: set[int] = set()
+    for key, values in extra.items():
+        members.add(key)
+        for value in values:
+            members.add(value)
+            a, b = find(key), find(value)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+    classes: dict[int, set[int]] = {}
+    for m in members:
+        classes.setdefault(find(m), set()).add(m)
+    table: dict[int, int] = {}
+    for cls in classes.values():
+        stable = {m for m in cls if len(chr(m).upper()) == 1
+                  and tolower(ord(chr(m).upper())) == m}
+        rep = min(stable) if len(stable) == 1 else min(cls)
+        for m in cls:
+            if m != rep:
+                table[m] = rep
+    if any(tolower(m) != m for m in members):
+        return None  # 等价表成员不再是各自的小写, 折叠推导不成立
+    return table
+
+
+_FOLD_TABLE = _build_fold_table()
+_FOLD_SPECIAL = (re.compile("[" + "".join(re.escape(chr(c)) for c in _FOLD_TABLE) + "]")
+                 if _FOLD_TABLE else None)
+
+
+def _fold(text: str) -> str:
+    """把文本逐字符映射到 re.IGNORECASE 的等价类代表, 长度与位置保持不变。
+
+    str.lower() 与 sre 的简单小写映射只在 U+0130 上不同(它展开成两个字
+    符), 先单独替换; Final_Sigma 上下文产生的 ς 与 σ 同类, 由表统一。
+    对折叠后的正文做子串查找, 是原模式能命中的必要条件, 且命中位置一致。
+    """
+    if "\u0130" in text:
+        text = text.replace("\u0130", "i")
+    low = text.lower()
+    if len(low) != len(text):
+        # 将来 Unicode 若再添多字符小写映射, 退回逐字符简单映射, 只慢不错。
+        low = "".join(map(chr, map(_sre.unicode_tolower, map(ord, text))))
+    if _FOLD_SPECIAL.search(low):
+        low = low.translate(_FOLD_TABLE)
+    return low
+
+
+def _required_literals(query: str, regex: bool) -> list[str]:
+    """返回模式必然包含的折叠后字面量片段, 按长度降序; 无法判定时为空。
+
+    非正则查询整个就是字面量。正则只取顶层拼接里连续的 LITERAL 节点:
+    分支、分组、量词、断言一律截断片段, 只会漏掉可用的前置过滤, 不会误伤。
+    """
+    if _FOLD_TABLE is None:
+        return []
+    if not regex:
+        return [_fold(query)]
+    try:
+        from re import _constants, _parser
+        parsed = list(_parser.parse(query))
+    except Exception:
+        return []
+    runs, run = [], []
+    for op, av in parsed:
+        if op is _constants.LITERAL:
+            run.append(chr(av))
+        elif run:
+            runs.append("".join(run))
+            run = []
+    if run:
+        runs.append("".join(run))
+    return sorted((_fold(r) for r in runs), key=len, reverse=True)
+
+
 def _search_text(s: dict) -> str:
     """返回与会话页语义一致的对话正文，并按文件版本缓存在内存中。
 
     原始 JSONL 还含工具协议、系统注入、compact 摘要和 JSON 包装，直接扫文件会
     产生大量用户在对话正文里看不到的假命中。
     """
+    return _search_entry(s)[0]
+
+
+def _search_entry(s: dict, epoch: tuple | None = None) -> tuple[str, str | None]:
+    """返回 (正文, 折叠副本)。折叠副本为 None 时只能走纯正则路径。
+
+    epoch 是本次搜索所依据的 (inventory 签名, 会话元数据文件身份)。内存
+    条目上次就是在同一 epoch 下校验过的, 说明磁盘上没有任何会话文件、Codex
+    索引或时间线元数据变化, 直接复用, 免去逐会话 stat 与 stamp 重建。
+    """
+    if epoch is not None:
+        with _search_text_lock:
+            cached = _search_text_cache.get(s["uid"])
+            if cached and cached[3] == epoch:
+                _search_text_cache.move_to_end(s["uid"])
+                return cached[1], cached[2]
     identity = _window_cache_identity(s)
     # Concurrent searches share parsed text without a global scan lock.
     with _search_parse_locks[int(identity[:8], 16) % len(_search_parse_locks)]:
-        return _cached_search_text(s, identity)
+        return _cached_search_text(s, identity, epoch)
 
 
-def _cached_search_text(s: dict, identity: str) -> str:
+def _search_epoch() -> tuple[list[dict], tuple | None]:
+    """返回搜索池与其磁盘身份; 签名不可用(dirty/未发布)时身份为 None, 逐条校验。"""
+    sessions, sig, _ = load_snapshot()
+    if not sig:
+        return sessions, None
+    return sessions, (sig, session_meta.file_identity())
+
+
+def _search_cache_put(uid: str, key: dict, text: str, folded: str | None,
+                      epoch: tuple | None) -> None:
+    global _search_cache_bytes
+    size = sys.getsizeof(text) + (sys.getsizeof(folded) if folded is not None else 0)
+    with _search_text_lock:
+        old = _search_text_cache.pop(uid, None)
+        if old is not None:
+            _search_cache_bytes -= _search_cache_entry_bytes(old)
+        if not _search_text_cache:
+            _search_cache_bytes = 0   # 测试直接 .clear() 后计数归零
+        _search_text_cache[uid] = (key, text, folded, epoch)
+        _search_cache_bytes += size
+        while _search_cache_bytes > SEARCH_CACHE_MEMORY_BYTES and len(_search_text_cache) > 1:
+            _, removed = _search_text_cache.popitem(last=False)
+            _search_cache_bytes -= _search_cache_entry_bytes(removed)
+
+
+def _search_cache_entry_bytes(entry: tuple) -> int:
+    return sys.getsizeof(entry[1]) + (sys.getsizeof(entry[2]) if entry[2] is not None else 0)
+
+
+def _search_cache_pop(uid: str) -> None:
+    global _search_cache_bytes
+    with _search_text_lock:
+        old = _search_text_cache.pop(uid, None)
+        if old is not None:
+            _search_cache_bytes -= _search_cache_entry_bytes(old)
+
+
+def _search_cache_clear() -> None:
+    global _search_cache_bytes
+    with _search_text_lock:
+        _search_text_cache.clear()
+        _search_cache_bytes = 0
+
+
+def _search_disk_path(identity: str) -> Path:
+    return CACHE_FILE.parent / "search-text" / f"{identity}.txt"
+
+
+def _search_legacy_path(path: Path) -> Path:
+    return path.with_name(path.name[:-len(".txt")] + ".json.gz")
+
+
+def _search_disk_read(path: Path) -> tuple[dict, str] | None:
+    """磁盘正文缓存: 第一行是 JSON stamp, 其后是未压缩的 UTF-8 正文。
+
+    不压缩、不做 JSON 转义, 冷启动后首次搜索只付一次 read + decode。
+    新格式缺失时回读旧的 gzip JSON 条目, 让升级后的首次搜索不必重建全部
+    正文; 命中后由写入方换成新格式并删除旧文件。
+    """
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        head, _, body = blob.partition(b"\n")
+        stamp = json.loads(head)
+        if not isinstance(stamp, dict):
+            return None
+        return stamp, body.decode("utf-8")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return None
+    try:
+        with gzip.open(_search_legacy_path(path), "rt", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if isinstance(saved.get("stamp"), dict) and isinstance(saved.get("text"), str):
+            return saved["stamp"], saved["text"]
+    except (OSError, ValueError, EOFError, AttributeError):
+        pass
+    return None
+
+
+def _search_disk_write(path: Path, key: dict, text: str) -> None:
+    temp = None
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, temp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(json.dumps(key, ensure_ascii=True).encode())
+            fh.write(b"\n")
+            fh.write(text.encode("utf-8"))
+        os.replace(temp, path)
+        # 旧格式(gzip JSON)同名条目已无用, 顺手清掉。
+        legacy = _search_legacy_path(path)
+        if legacy.exists():
+            legacy.unlink()
+    except OSError:
+        pass  # Read-only/full cache storage must not prevent searching.
+    finally:
+        if temp and os.path.exists(temp):
+            os.unlink(temp)
+
+
+def _seed_history_memo(s: dict, stamp: dict) -> None:
+    """冷启动时用磁盘 stamp 里记录的继承链预填 memo; 真伪由随后的 stat 校验。"""
+    deps = stamp.get("dependencies") if isinstance(stamp, dict) else None
+    if not isinstance(deps, list) or not deps or not all(
+            isinstance(d, dict) and {"path", "role", "limit"} <= d.keys() for d in deps):
+        return
+    if deps[-1].get("role") != "current" or deps[-1].get("path") != str(data_file(s)):
+        return
+    if any(d.get("role") != "history" for d in deps[:-1]):
+        return
+    with _history_memo_lock:
+        _history_memo.setdefault(str(s["path"]), deps)
+
+
+def _cached_search_text(s: dict, identity: str,
+                        epoch: tuple | None = None) -> tuple[str, str | None]:
     ad = ADAPTERS[s["source"]]
+    disk_path = _search_disk_path(identity)
+    saved = None
+    if s["source"] == "codex":
+        with _history_memo_lock:
+            seeded = str(s["path"]) in _history_memo
+        if not seeded:
+            # 进程内第一次见到这个 Codex 会话: 先读磁盘缓存, 用其中记录的继承
+            # 链免去读文件头; 链上任一文件变了会在 stat 校验时被推翻。
+            saved = _search_disk_read(disk_path)
+            if saved is not None:
+                _seed_history_memo(s, saved[0])
     key = {**_window_cache_stamp(s, ad), "search_schema": SEARCH_CACHE_VERSION}
-    path = CACHE_FILE.parent / "search-text" / f"{identity}.json.gz"
     with _search_text_lock:
         cached = _search_text_cache.get(s["uid"])
         if cached and cached[0] == key:
+            if epoch is not None and cached[3] != epoch:
+                _search_text_cache[s["uid"]] = (key, cached[1], cached[2], epoch)
             _search_text_cache.move_to_end(s["uid"])
-            return cached[1]
-    text = None
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            saved = json.load(fh)
-        if saved.get("stamp") == key and isinstance(saved.get("text"), str):
-            text = saved["text"]
-    except (OSError, ValueError, EOFError, AttributeError):
-        pass
+            return cached[1], cached[2]
+    if saved is None:
+        saved = _search_disk_read(disk_path)
+    text = saved[1] if saved is not None and saved[0] == key else None
+    if text is not None and not disk_path.exists():
+        _search_disk_write(disk_path, key, text)   # 旧格式条目就地升级
     if text is None:
         if isinstance(ad, ClaudeAdapter):
             timeline = (session_meta.timeline(str(s.get("uid") or ""))
@@ -1158,29 +1412,52 @@ def _cached_search_text(s: dict, identity: str) -> str:
                          if m.get("role") in SEARCH_ROLES and m.get("text"))
         # Do not persist a parse under a version that changed while reading it.
         if key != {**_window_cache_stamp(s, ad), "search_schema": SEARCH_CACHE_VERSION}:
-            return text
-        temp = None
-        try:
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fd, temp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-            with os.fdopen(fd, "wb") as raw:
-                with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1) as fh:
-                    fh.write(json.dumps({"stamp": key, "text": text},
-                                        ensure_ascii=False).encode())
-            os.replace(temp, path)
-        except OSError:
-            pass  # Read-only/full cache storage must not prevent searching.
-        finally:
-            if temp and os.path.exists(temp):
-                os.unlink(temp)
-    with _search_text_lock:
-        _search_text_cache[s["uid"]] = (key, text)
-        _search_text_cache.move_to_end(s["uid"])
-        size = sum(len(value[1]) * 4 for value in _search_text_cache.values())
-        while size > SEARCH_CACHE_MEMORY_BYTES and _search_text_cache:
-            _, (_, removed) = _search_text_cache.popitem(last=False)
-            size -= len(removed) * 4
-    return text
+            return text, None
+        _search_disk_write(disk_path, key, text)
+    folded = _fold(text) if _FOLD_TABLE is not None else None
+    _search_cache_put(s["uid"], key, text, folded, epoch)
+    return text, folded
+
+
+def _codex_dependencies(s: dict, ad) -> list[dict]:
+    """Codex 正文依赖 = 继承的父文件前缀 + 当前文件, 顺序与 stamp 约定一致。
+
+    继承链只由链上各文件的文件头决定; 上次记录的每个依赖的 stat 字段都没变,
+    就直接复用, 否则重新读头解析。
+    """
+    path = str(s["path"])
+    with _history_memo_lock:
+        memo = _history_memo.get(path)
+    if memo is not None:
+        fresh = [_window_dependency(d["path"], d["role"], d["limit"]) for d in memo]
+        if fresh == memo:
+            return fresh
+    deps = [_window_dependency(parent, "history", int(limit))
+            for parent, limit in ad._history_segments(s["path"])]
+    deps.append(_window_dependency(data_file(s), "current"))
+    with _history_memo_lock:
+        _history_memo[path] = deps
+    return deps
+
+
+def _scan_literal(pat: re.Pattern, hay: str, folded: str, needle: str):
+    """以折叠副本上的子串定位候选位置, 再由原模式在原文上逐一确认。
+
+    与 pat.finditer(hay) 的结果完全一致: 模式能在 p 命中则折叠副本在 p 处
+    必然出现 needle; 确认失败从 p+1 继续, 成功从 m.end() 继续, 正是
+    finditer 的推进规则。
+    """
+    pos, find, match = 0, folded.find, pat.match
+    while True:
+        p = find(needle, pos)
+        if p < 0:
+            return
+        m = match(hay, p)
+        if m is None:
+            pos = p + 1
+            continue
+        yield m
+        pos = m.end()
 
 
 def search(query: str, sources=None, limit: int = 60,
@@ -1189,8 +1466,10 @@ def search(query: str, sources=None, limit: int = 60,
     if not query.strip():
         return {"results": [], "truncated": False, "total_pool": 0, "scanned": 0}
     pat = build_pattern(query, word, case, regex)
+    needles = _required_literals(query, regex)
     hits, truncated, scanned = [], False, 0
-    pool = [s for s in load() if not sources or s["source"] in sources]
+    sessions, epoch = _search_epoch()
+    pool = [s for s in sessions if not sources or s["source"] in sources]
     if progress:
         progress(0, len(pool))
     for done, s in enumerate(pool, 1):
@@ -1198,8 +1477,16 @@ def search(query: str, sources=None, limit: int = 60,
             truncated = True     # 还有没扫的会话, 结果不完整
             break
         snippet, count, capped = None, 0, False
-        hay = _search_text(s)
-        for m in pat.finditer(hay):
+        hay, folded = _search_entry(s, epoch)
+        if folded is None or not needles:
+            found = pat.finditer(hay)
+        elif any(needle not in folded for needle in needles):
+            found = ()           # 必要字面量都不在, 模式不可能命中
+        elif regex:
+            found = pat.finditer(hay)
+        else:
+            found = _scan_literal(pat, hay, folded, needles[0])
+        for m in found:
             count += 1
             if snippet is None:
                 # 命中词靠前, 否则片段在窄侧栏里会被右侧省略号吃掉

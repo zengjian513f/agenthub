@@ -1950,15 +1950,26 @@ class Handler(BaseHTTPRequestHandler):
                     enqueue({"type": "error", "error": f"{type(e).__name__}: {e}"})
 
         threading.Thread(target=scan, name="session-search", daemon=True).start()
+        final = {"result", "error"}
         try:
             while True:
                 try:
                     event = events.get(timeout=1)
                 except queue.Empty:
                     event = {"type": "heartbeat"}
-                self.wfile.write(json.dumps(event, ensure_ascii=False).encode() + b"\n")
+                # 扫描线程每个会话推一条 progress; 已经排队的事件合并成一次
+                # write, 行内容与顺序不变, 只省掉逐行 syscall 与线程切换。
+                batch = [event]
+                while event["type"] not in final:
+                    try:
+                        event = events.get_nowait()
+                    except queue.Empty:
+                        break
+                    batch.append(event)
+                self.wfile.write(b"".join(
+                    json.dumps(item, ensure_ascii=False).encode() + b"\n" for item in batch))
                 self.wfile.flush()
-                if event["type"] in {"result", "error"}:
+                if event["type"] in final:
                     break
         except (BrokenPipeError, ConnectionResetError):
             pass
