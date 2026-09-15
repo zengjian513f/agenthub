@@ -152,6 +152,31 @@ class WindowsCliLookupTests(unittest.TestCase):
                          "C:\\Users\\zj\\codex.exe")
 
 
+class TmuxListingTests(unittest.TestCase):
+    def test_missing_server_socket_skips_the_tmux_subprocess(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "agenthub"
+            with patch.object(term_tmux, "_server_socket", return_value=missing), \
+                    patch.object(term_tmux, "_tmux") as tmux:
+                self.assertEqual(term_tmux._list_server("agenthub"), [])
+                tmux.assert_not_called()
+            present = Path(tmp) / "default"
+            present.write_text("")
+            line = "agenthub-x\t1\t0\t42\t/work\tclaude\t120\t32\n"
+            with patch.object(term_tmux, "_server_socket", return_value=present), \
+                    patch.object(term_tmux, "_tmux", return_value=line) as tmux:
+                rows = term_tmux._list_server("default")
+                tmux.assert_called_once()
+            self.assertEqual(rows[0]["name"], "agenthub-x")
+            self.assertEqual(rows[0]["pid"], 42)
+            with patch.object(term_tmux, "_server_socket", return_value=None), \
+                    patch.object(term_tmux, "_tmux", return_value="") as tmux:
+                term_tmux._list_server("default")
+                tmux.assert_called_once()        # 算不出 socket 路径就照旧问 tmux
+
+
 class TerminalSubmitTests(unittest.TestCase):
     def test_new_session_uses_fallback_size_only_as_its_initial_size(self):
         with patch.object(term_tmux, "has_session", return_value=False), \

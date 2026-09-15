@@ -16,6 +16,7 @@ import os
 import shlex
 import shutil
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -51,6 +52,22 @@ BACKEND_FILE = Path.home() / ".local" / "share" / "agenthub" / "terminal-backend
 _default: str | None = None        # 启动参数给的初始默认值
 _chosen: str | None = None         # 网页里选过的值, 覆盖默认
 _loaded = False                    # 是否已经尝试读过持久化的选择
+# 本进程每次改动受管会话 (新建 / 结束 / 改名 / 切后端 / 杀进程) 都加一。轮询路径
+# 缓存的会话列表以它为键, 改动一发生就作废, 不用等 TTL。外部 (别的进程) 造成的
+# 变化只能靠 TTL 发现。
+_generation = 0
+_generation_lock = threading.Lock()
+
+
+def generation() -> int:
+    """受管会话的改动代数; 缓存 list_sessions() 结果的一方用它判断是否作废。"""
+    return _generation
+
+
+def _touch() -> None:
+    global _generation
+    with _generation_lock:
+        _generation += 1
 
 
 class DirectoryCreationRequired(ValueError):
@@ -143,6 +160,7 @@ def set_backend(name: str) -> str:
             raise ValueError(f"无法保存终端后端选择：{getattr(e, 'strerror', None) or e}") from None
     _chosen = value
     _loaded = True
+    _touch()
     return value
 
 
@@ -442,7 +460,11 @@ def new_session(name: str, cmd: str | list[str], cwd: str | None = None,
     full = name if name.startswith(PREFIX) else PREFIX + name
     if has_session(full):
         raise RuntimeError(f"tmux 会话已存在: {full}")
-    return primary().new_session(full, cmd, cwd, cols, rows, meta=meta)
+    _touch()
+    try:
+        return primary().new_session(full, cmd, cwd, cols, rows, meta=meta)
+    finally:
+        _touch()
 
 
 launch_meta = term_host.launch_meta
@@ -452,19 +474,28 @@ def bind_native(name: str, sid: str, uid: str) -> bool:
     """CLI 落盘后把宿主绑到它的原生会话; tmux 后端没有实例身份, 返回 False。"""
     module = _require(name)
     bind = getattr(module, "bind_native", None)
+    _touch()
     return bool(bind(name, sid, uid)) if bind else False
 
 
 def kill_session(name: str) -> bool:
     module = _owner(name)
-    return module.kill_session(name) if module else False
+    _touch()
+    try:
+        return module.kill_session(name) if module else False
+    finally:
+        _touch()
 
 
 def rename_session(old: str, new: str) -> str:
     full = new if new.startswith(PREFIX) else PREFIX + new
     if full != old and has_session(full):
         raise RuntimeError(f"tmux 会话已存在: {full}")
-    return _require(old).rename_session(old, full)
+    _touch()
+    try:
+        return _require(old).rename_session(old, full)
+    finally:
+        _touch()
 
 
 def send_text(name: str, text: str) -> None:
@@ -522,18 +553,32 @@ def Attach(name: str, cols: int = 120, rows: int = 32):   # noqa: N802 - 保持�
 
 
 # ----------------------------------------------------------------- 进程
-def process_belongs_to(pid: int, root_pid: int) -> bool:
+def ancestry() -> procs.Ancestry:
+    """一次请求内共用的进程树记忆, 以 CLI 主进程为 barrier; 别跨请求保存。"""
+    return procs.Ancestry(barrier=live.is_cli_process)
+
+
+def process_belongs_to(pid: int, root_pid: int,
+                       ancestry: procs.Ancestry | None = None) -> bool:
     """pid 是否等于或派生自指定会话的根进程。
 
     中间隔着别的 CLI 主进程就不算: pane 里的 Claude 派出的 `grok -p` 仍在这棵进程树
     下, 但那是 Claude 的控制台, 不是 Grok 会话的。
     """
+    if ancestry is not None:
+        return ancestry.descendant_of(pid, root_pid)
     return procs.descendant_of(pid, root_pid, barrier=live.is_cli_process)
 
 
-def in_tmux(pids: list[int]) -> bool:
-    """这些进程是不是跑在某个受管会话里 (tmux 或宿主)。"""
-    return any(module.hosts(pids) for module in _backends())
+def in_tmux(pids: list[int], panes: list[dict] | None = None,
+            ancestry: procs.Ancestry | None = None) -> bool:
+    """这些进程是不是跑在某个受管会话里 (tmux 或宿主)。
+
+    轮询路径已经拿到 list_sessions() 的结果时通过 panes 传入, 免得每条会话
+    再各列一遍; ancestry 同理复用祖先链。
+    """
+    return any(module.hosts(pids, panes=panes, ancestry=ancestry)
+               for module in _backends())
 
 
 def gone(pid: int) -> bool:
@@ -541,7 +586,11 @@ def gone(pid: int) -> bool:
 
 
 def kill_pids(pids: list[int], timeout: float = 6.0) -> list[int]:
-    return procs.kill_pids(pids, timeout)
+    _touch()
+    try:
+        return procs.kill_pids(pids, timeout)
+    finally:
+        _touch()
 
 
 def graceful_stop(name: str, pids: list[int], timeout: float = 2.4) -> list[int]:
@@ -556,8 +605,10 @@ def graceful_stop(name: str, pids: list[int], timeout: float = 2.4) -> list[int]
         return not has_session(name) and all(gone(p) for p in targets)
 
     each = max(0.0, timeout) / 2
+    _touch()
     for _ in range(2):
         if settled():
+            _touch()
             return targets
         try:
             send_keys(name, "C-d")
@@ -573,4 +624,5 @@ def graceful_stop(name: str, pids: list[int], timeout: float = 2.4) -> list[int]
     killed = kill_pids(targets)
     if has_session(name):
         kill_session(name)
+    _touch()
     return killed

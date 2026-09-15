@@ -37,6 +37,7 @@ except ImportError:                     # pragma: no cover - 只在 Windows 命�
     fcntl = pty = termios = None        # type: ignore[assignment]
 
 from . import audit, live, term_submit
+from .host import procs
 
 PREFIX = "agenthub-"          # agenthub 起的会话用这个前缀, 便于识别
 MANAGED_SERVER = "agenthub"   # 独立 socket，不继承用户默认 tmux server 的交互配置
@@ -86,8 +87,25 @@ def _configure_managed() -> None:
         _managed_configured = True
 
 
+def _server_socket(server: str) -> Path | None:
+    """tmux 为 -L 命名 server 用的 socket 路径 (与 tmux 自己的规则一致)。"""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:                    # Windows 没有 tmux, 也没有 uid
+        return None
+    base = os.environ.get("TMUX_TMPDIR") or "/tmp"
+    return Path(base) / f"tmux-{getuid()}" / server
+
+
 def _list_server(server: str) -> list[dict]:
     fmt = "#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{window_width}\t#{window_height}"
+    # socket 都不存在时 tmux -N 只会报 "error connecting"; 列表每几秒轮询一次,
+    # 省掉这次注定失败的子进程 (fork 一个几百 MB 的服务进程并不便宜)。
+    sock = _server_socket(server)
+    try:
+        if sock is not None and not sock.exists():
+            return []
+    except OSError:
+        pass
     try:
         out = _tmux("list-sessions", "-F", fmt, server=server, no_start=True)
     except Exception:
@@ -364,24 +382,26 @@ def set_window_size_policy(name: str, policy: str = "latest") -> bool:
     return True
 
 
-def hosts(pids: list[int]) -> bool:
+def hosts(pids: list[int], panes: list[dict] | None = None,
+          ancestry: procs.Ancestry | None = None) -> bool:
     """这些进程是不是跑在 tmux 里 (祖先有 tmux server, 且中途没有别的 CLI 主进程)。
 
     pane 里的 CLI 再派出的 `grok -p` / `codex exec` 孙辈不算: 它们的控制台是父 CLI 的。
+    panes 在这里用不上 (判定只看进程树), 签名与宿主后端保持一致; ancestry 复用
+    同一请求里已经读过的祖先链。
     """
+    if ancestry is None:
+        ancestry = procs.Ancestry(barrier=live.is_cli_process)
     for pid in pids:
         cur = abs(pid)
         for step in range(12):
-            try:
-                with open(f"/proc/{cur}/stat") as fh:
-                    st = fh.read()
-                name = st[st.index("(") + 1:st.rindex(")")]
-                ppid = int(st[st.rindex(")") + 2:].split()[1])
-            except (OSError, ValueError):
+            ppid = ancestry.parent(cur)
+            if ppid is None:
                 break
+            name = ancestry.name(cur)
             if name.startswith("tmux"):
                 return True
-            if step and live.is_cli_process(cur):
+            if step and ancestry.is_barrier(cur):
                 break
             if ppid <= 1:
                 break

@@ -466,6 +466,32 @@ class PaneOwnershipTests(unittest.TestCase):
         # 由 grok 自己的角度看，它的子进程仍属于它
         self.assertTrue(term.process_belongs_to(14, 13))
 
+    def test_shared_ancestry_gives_the_same_answers_with_one_read_per_process(self):
+        """一次请求里几十个 pid 对几十个 pane：父进程与 barrier 各只读一次。"""
+        from agenthub.host import procs
+        ancestry = term.ancestry()
+        panes = [{"pid": 10, "backend": "ptyhost"}, {"pid": 99, "server": "agenthub"}]
+        with patch.object(procs, "parent_pid", wraps=procs.parent_pid) as parents, \
+                patch.object(term, "_backends", return_value=[term_host, term_tmux]), \
+                patch.object(term_host.live, "is_cli_process",
+                             wraps=term_host.live.is_cli_process) as barrier:
+            answers = [(pid, root, term.process_belongs_to(pid, root, ancestry))
+                       for pid in (11, 12, 13, 14) for root in (10, 13, 99)]
+            self.assertTrue(term_host.hosts([11], panes=panes, ancestry=ancestry))
+            self.assertFalse(term_host.hosts([13], panes=panes, ancestry=ancestry))
+            self.assertTrue(term.in_tmux([11], panes=panes, ancestry=ancestry))
+            self.assertFalse(term.in_tmux([14], panes=panes, ancestry=ancestry))
+        # bash 12 属于 claude 11 而不是 pane 根 10（中间隔着 CLI），与逐次读取的答案一致
+        self.assertEqual([a for a in answers if a[2]],
+                         [(11, 10, True), (13, 13, True), (14, 13, True)])
+        self.assertTrue(term.process_belongs_to(12, 11, ancestry))
+        self.assertEqual(sorted(c.args[0] for c in parents.call_args_list),
+                         sorted(set(c.args[0] for c in parents.call_args_list)))
+        self.assertEqual(sorted(c.args[0] for c in barrier.call_args_list),
+                         sorted(set(c.args[0] for c in barrier.call_args_list)))
+        # 没给 panes 时宿主后端自己列一遍会话，行为与从前一致
+        self.assertTrue(term_host.hosts([11], ancestry=ancestry))
+
 
 if __name__ == "__main__":
     unittest.main()

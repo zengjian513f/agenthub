@@ -335,15 +335,22 @@ def cursor_position(name: str) -> tuple[int, int]:
     return int(reply["x"]), int(reply["y"])
 
 
-def hosts(pids: list[int]) -> bool:
+def hosts(pids: list[int], panes: list[dict] | None = None,
+          ancestry: procs.Ancestry | None = None) -> bool:
     """这些进程是否就是某个宿主会话里的那条 CLI (祖先链直达会话根进程, 中途没有别的 CLI)。
 
     pane 里的 CLI 再派出的 `grok -p` / `codex exec` 孙辈不算: 它们的控制台是父 CLI 的。
+    panes 是调用方已经拿到的 term.list_sessions() 结果 (两个后端合并), 这里只看
+    宿主后端的行; 没给就自己列一遍。
     """
-    roots = {row["pid"] for row in list_sessions() if row["pid"] > 0}
+    rows = list_sessions() if panes is None else [
+        row for row in panes if row.get("backend") == "ptyhost"]
+    roots = {row["pid"] for row in rows if row["pid"] > 0}
     if not roots:
         return False
-    return any(procs.ancestor_matches(pid, lambda p: p in roots, barrier=live.is_cli_process)
+    if ancestry is None:
+        ancestry = procs.Ancestry(barrier=live.is_cli_process)
+    return any(ancestry.ancestor_matches(pid, lambda p: p in roots)
                for pid in pids if pid > 0)
 
 

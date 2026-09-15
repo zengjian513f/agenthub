@@ -112,43 +112,92 @@ def gone(pid: int) -> bool:
         return True
 
 
-def descendant_of(pid: int, root_pid: int, depth: int = 16, barrier=None) -> bool:
+class Ancestry:
+    """一批进程树查询共用的父进程 / 进程名 / barrier 记忆。
+
+    列表轮询要把几十个 pid 逐一和几十个 pane 根进程比对, 每次比对都从头读
+    /proc 祖先链的话是 pid × pane × 深度次读取; 同一请求里进程树不会变, 记住
+    每个 pid 的父进程与 barrier 判定后只剩 pid × 深度次。对象只在一次请求
+    (或一次扫描) 内使用, 不跨请求复用, 因而不需要锁, 也不会把已退出的进程
+    当成还活着。
+    """
+
+    def __init__(self, barrier=None):
+        self.barrier = barrier
+        self._parents: dict[int, int | None] = {}
+        self._names: dict[int, str] = {}
+        self._barriers: dict[int, bool] = {}
+
+    def parent(self, pid: int) -> int | None:
+        try:
+            return self._parents[pid]
+        except KeyError:
+            value = self._parents[pid] = parent_pid(pid)
+            return value
+
+    def name(self, pid: int) -> str:
+        try:
+            return self._names[pid]
+        except KeyError:
+            value = self._names[pid] = name_of(pid)
+            return value
+
+    def is_barrier(self, pid: int) -> bool:
+        if self.barrier is None:
+            return False
+        try:
+            return self._barriers[pid]
+        except KeyError:
+            value = self._barriers[pid] = bool(self.barrier(pid))
+            return value
+
+    def descendant_of(self, pid: int, root_pid: int, depth: int = 16) -> bool:
+        cur = abs(int(pid))
+        root = abs(int(root_pid))
+        if root <= 0:
+            return False
+        for step in range(depth):
+            if cur == root:
+                return True
+            if step and self.is_barrier(cur):
+                return False
+            parent = self.parent(cur)
+            if parent is None:
+                return False
+            if parent <= 1:
+                return parent == root
+            cur = parent
+        return False
+
+    def ancestor_matches(self, pid: int, predicate, depth: int = 16) -> bool:
+        cur = abs(int(pid))
+        for step in range(depth):
+            if predicate(cur):
+                return True
+            if step and self.is_barrier(cur):
+                return False
+            parent = self.parent(cur)
+            if parent is None or parent <= 1:
+                return False
+            cur = parent
+        return False
+
+
+def descendant_of(pid: int, root_pid: int, depth: int = 16, barrier=None,
+                  ancestry: Ancestry | None = None) -> bool:
     """pid 是否等于或派生自 root_pid。
 
     barrier(p) 为真的中间进程 (不含起点与根) 会切断关系: 会话 A 的 CLI 在自己的
     pane 里再起一条会话 B 时, B 的进程树虽在 A 的根下面, 但不属于 A 的 pane。
+    传入 ancestry 时沿用它记住的进程树 (barrier 以 ancestry 自己的为准)。
     """
-    cur = abs(int(pid))
-    root = abs(int(root_pid))
-    if root <= 0:
-        return False
-    for step in range(depth):
-        if cur == root:
-            return True
-        if step and barrier is not None and barrier(cur):
-            return False
-        parent = parent_pid(cur)
-        if parent is None:
-            return False
-        if parent <= 1:
-            return parent == root
-        cur = parent
-    return False
+    return (ancestry or Ancestry(barrier)).descendant_of(pid, root_pid, depth)
 
 
-def ancestor_matches(pid: int, predicate, depth: int = 16, barrier=None) -> bool:
+def ancestor_matches(pid: int, predicate, depth: int = 16, barrier=None,
+                     ancestry: Ancestry | None = None) -> bool:
     """从 pid 起沿祖先链找满足 predicate 的进程; 中途 (不含起点) 撞到 barrier 即失败。"""
-    cur = abs(int(pid))
-    for step in range(depth):
-        if predicate(cur):
-            return True
-        if step and barrier is not None and barrier(cur):
-            return False
-        parent = parent_pid(cur)
-        if parent is None or parent <= 1:
-            return False
-        cur = parent
-    return False
+    return (ancestry or Ancestry(barrier)).ancestor_matches(pid, predicate, depth)
 
 
 def terminate(pid: int, force: bool = False) -> bool:
