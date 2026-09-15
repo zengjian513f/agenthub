@@ -147,6 +147,24 @@ def _process_started_at(pid: int) -> float | None:
         return None
 
 
+def _read_proc(spid: str, name: str) -> bytes:
+    """读 /proc/<pid>/<name> 的全部内容; 读不到抛 OSError。
+
+    全量扫描要给几千个进程各读一次 cmdline, Path.read_bytes() 每次构造 Path
+    再开 io 对象的开销是这里的大头; 直接 os.open/os.read 快两倍多。
+    """
+    fd = os.open(os.path.join(str(PROC_FS), spid, name), os.O_RDONLY)
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
 def _process_cmdline(pid: int) -> str | None:
     """进程的完整命令行；读不到就返回 None。"""
     if not HAS_PROC:
@@ -158,7 +176,7 @@ def _process_cmdline(pid: int) -> str | None:
         except Exception:
             return None
     try:
-        return (PROC_FS / str(pid) / "cmdline").read_bytes() \
+        return _read_proc(str(pid), "cmdline") \
             .replace(b"\0", b" ").decode("utf8", "replace")
     except OSError:
         return None
@@ -269,7 +287,7 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
             continue
         pid = int(spid)
         try:
-            cmd = (PROC_FS / spid / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf8", "replace")
+            cmd = _read_proc(spid, "cmdline").replace(b"\0", b" ").decode("utf8", "replace")
         except OSError:
             continue
         if not any(k in cmd.lower() for k in _KEYWORDS):
@@ -298,10 +316,10 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
 
         argv0 = cmd.strip().split(" ", 1)[0]
         try:
-            for e in (PROC_FS / spid / "environ").read_bytes().decode("utf8", "replace").split("\0"):
-                matched = next((prefix for prefix in _ENV_SID if e.startswith(prefix)), None)
-                if not matched:
+            for e in _read_proc(spid, "environ").decode("utf8", "replace").split("\0"):
+                if not e.startswith(_ENV_SID):
                     continue
+                matched = next(prefix for prefix in _ENV_SID if e.startswith(prefix))
                 env_sid = e.split("=", 1)[1].strip().lower()
                 owner = _env_owner(pid, main=main, argv0=argv0, cmd_sids=cmd_sids,
                                    env_key=matched, env_sid=env_sid)
@@ -315,14 +333,14 @@ def _scan() -> tuple[dict[str, set[int]], dict[str, set[int]], dict[int, tuple[s
         except OSError:
             pass
 
-        fd_dir = PROC_FS / spid / "fd"
+        fd_dir = os.path.join(str(PROC_FS), spid, "fd")
         try:
             fds = os.listdir(fd_dir)
         except OSError:
             continue
         for fd in fds:
             try:
-                t = os.readlink(fd_dir / fd)
+                t = os.readlink(os.path.join(fd_dir, fd))
             except OSError:
                 continue
             if t.endswith(".jsonl") and (
@@ -439,6 +457,11 @@ def snapshot(force: bool = False):
     return _cache["sids"], _cache["paths"]
 
 
+def scan_stamp() -> float:
+    """最近一次 /proc 扫描完成的时刻 (monotonic)；缓存判活结果的一方以它作键。"""
+    return _cache["at"]
+
+
 def _bare_claude_pids(session: dict) -> set[int]:
     """以 cwd + 启动时间识别没有显式 session id 的新建 Claude。
 
@@ -447,12 +470,15 @@ def _bare_claude_pids(session: dict) -> set[int]:
     """
     if session.get("source") != "claude" or not session.get("cwd"):
         return set()
+    candidates = _cache.get("bare_claude", {})
+    if not candidates:
+        return set()          # 没有裸 claude 进程时不必为每条会话 resolve cwd
     try:
         cwd = str(Path(session["cwd"]).expanduser().resolve())
         created = datetime.fromisoformat(str(session.get("created", "")).replace("Z", "+00:00")).timestamp()
     except (OSError, RuntimeError, TypeError, ValueError):
         return set()
-    return {pid for pid, (proc_cwd, started) in _cache.get("bare_claude", {}).items()
+    return {pid for pid, (proc_cwd, started) in candidates.items()
             if proc_cwd == cwd and -5 <= created - started <= 30}
 
 
