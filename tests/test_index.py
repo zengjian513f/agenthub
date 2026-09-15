@@ -135,12 +135,30 @@ class IsolatedIndexTests(unittest.TestCase):
         path.write_text(path.read_text().replace("old", "new"))
         self.assertNotIn("old", index._search_text(row))
         self.assertIn("new", index._search_text(row))
-        cached = list((self.cache_file.parent / "search-text").glob("*.gz"))
+        cached = list((self.cache_file.parent / "search-text").glob("*.txt"))
         self.assertEqual(len(cached), 1)
         self.assertEqual(cached[0].stat().st_mode & 0o777, 0o600)
-        cached[0].write_bytes(b"invalid gzip")
+        cached[0].write_bytes(b"invalid stamp line\n\xff\xfe not utf-8")
         index._search_text_cache.clear()
         self.assertIn("new", index._search_text(row))
+        # Upgrading from the gzip-JSON format: a valid legacy entry is reused
+        # without re-parsing the session, rewritten in the new format and removed.
+        legacy = cached[0].with_name(cached[0].name[:-4] + ".json.gz")
+        stamp = json.loads(cached[0].read_bytes().split(b"\n", 1)[0])
+        import gzip
+        with gzip.open(legacy, "wt", encoding="utf-8") as fh:
+            json.dump({"stamp": stamp, "text": "legacy body new"}, fh)
+        cached[0].unlink()
+        index._search_text_cache.clear()
+        with patch.object(ad, "read", side_effect=AssertionError("must reuse legacy text")):
+            self.assertEqual(index._search_text(row), "legacy body new")
+        self.assertTrue(cached[0].exists())
+        self.assertFalse(legacy.exists())
+        # A corrupt legacy entry is ignored and replaced by a fresh parse.
+        legacy.write_bytes(b"old format")
+        path.write_text(path.read_text().replace("new", "newer"))
+        self.assertIn("newer", index._search_text(row))
+        self.assertFalse(legacy.exists())
 
     def test_search_cache_invalidates_inherited_parent_and_streams_matches(self):
         parent = self.codex_session("search-parent", "parentneedle")

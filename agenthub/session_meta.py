@@ -17,9 +17,34 @@ VERSION = 1
 _lock = threading.RLock()
 _activity_revisions: dict[str, int] = {}
 _timeline_revisions: dict[str, int] = {}
+# (path, size, mtime_ns, ctime_ns, inode) -> parsed rows of the last read. _write
+# replaces the file atomically, so any change of the stored file shows up here.
+_read_cache: tuple[tuple, dict] | None = None
+
+
+def file_identity() -> tuple | None:
+    """元数据文件的 (路径, 大小, mtime, ctime, inode)；缺失或不可读时为 None。"""
+    try:
+        st = META_FILE.stat()
+    except OSError:
+        return None
+    return (str(META_FILE), st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+            int(getattr(st, "st_ino", 0)))
 
 
 def _read() -> dict:
+    """返回元数据行的浅拷贝；文件未变时复用上次解析，搜索/列表按会话反复调用。"""
+    global _read_cache
+    key = file_identity()
+    cached = _read_cache
+    if key is not None and cached is not None and cached[0] == key:
+        return dict(cached[1])
+    rows = _read_file()
+    _read_cache = (key, rows) if key is not None else None
+    return dict(rows)
+
+
+def _read_file() -> dict:
     try:
         data = json.loads(META_FILE.read_text())
     except (OSError, ValueError, TypeError):
