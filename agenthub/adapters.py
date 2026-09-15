@@ -17,7 +17,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import media
+from . import fastjson, media
 
 HOME = Path.home()
 CLAUDE_ROOT = HOME / ".claude" / "projects"
@@ -80,7 +80,7 @@ def _head_lines(path: Path, limit: int = 40, *, strict: bool = False):
         if not raw:
             continue
         try:
-            out.append(json.loads(raw))
+            out.append(fastjson.loads(raw))
         except Exception:
             continue
     return out
@@ -107,7 +107,7 @@ def _tail_lines(path: Path, *, strict: bool = False):
         if not raw:
             continue
         try:
-            out.append(json.loads(raw))
+            out.append(fastjson.loads(raw))
         except Exception:
             continue
     return out
@@ -162,7 +162,7 @@ def _iter_records_reversed(path: Path):
                 if not raw:
                     continue
                 try:
-                    yield json.loads(raw)
+                    yield fastjson.loads(raw)
                 except Exception:
                     continue
             cursor = lo
@@ -250,7 +250,7 @@ def _collect_agent_stops(raw: bytes, entry: dict) -> None:
     if not (has_notice or has_result):
         return
     try:
-        rec = json.loads(raw)
+        rec = fastjson.loads(raw)
     except ValueError:
         return
     if not isinstance(rec, dict):
@@ -334,7 +334,7 @@ def _iter_records(path, start: int = 0):
             if not raw:
                 continue
             try:
-                rec = json.loads(raw)
+                rec = fastjson.loads(raw)
             except Exception:
                 continue
             yield rec, off
@@ -359,7 +359,7 @@ def _json_value(v):
     if not isinstance(v, str):
         return v
     try:
-        return json.loads(v)
+        return fastjson.loads(v)
     except Exception:
         return v
 
@@ -461,7 +461,7 @@ def _tool_summary(name: str, value) -> str | None:
         cmds = []
         for m in _EXEC_CMD.finditer(data):
             try:
-                cmds.append(_shell_cmd(json.loads(m.group(1))))
+                cmds.append(_shell_cmd(fastjson.loads(m.group(1))))
             except (TypeError, ValueError):
                 continue
         if cmds:
@@ -543,7 +543,7 @@ def _quoted_apply_patch(text: str) -> str | None:
     # 猜测变量名可靠，也不会把后面的 JS 包装代码混进补丁。
     for match in re.finditer(r'"(?:\\.|[^"\\])*"', text, re.S):
         try:
-            value = json.loads(match.group())
+            value = fastjson.loads(match.group())
         except (TypeError, ValueError):
             continue
         if isinstance(value, str) and value.lstrip().startswith("*** Begin Patch"):
@@ -954,7 +954,7 @@ def _tool_output(name: str | None, value) -> tuple[str, dict]:
             starts.extend(m.start() for m in re.finditer(r"(?m)^[ \t]*\{", payload))
             for start in reversed(dict.fromkeys(starts)):
                 try:
-                    parsed = json.loads(payload[start:].strip())
+                    parsed = fastjson.loads(payload[start:].strip())
                 except (TypeError, ValueError):
                     continue
                 if isinstance(parsed, dict) and "output" in parsed \
@@ -1232,7 +1232,7 @@ class ClaudeAdapter:
                         if not raw:
                             continue
                         try:
-                            rec = json.loads(raw)
+                            rec = fastjson.loads(raw)
                         except Exception:
                             continue
                         signal = cls._lineage_signal(rec, agent)
@@ -1319,7 +1319,7 @@ class ClaudeAdapter:
                         if not raw:
                             continue
                         try:
-                            rec = json.loads(raw)
+                            rec = fastjson.loads(raw)
                         except Exception:
                             continue
                         signal = cls._lineage_signal(rec, agent)
@@ -1363,7 +1363,7 @@ class ClaudeAdapter:
                         if not raw:
                             continue
                         try:
-                            rec = json.loads(raw)
+                            rec = fastjson.loads(raw)
                         except Exception:
                             continue
                         if (rec.get("type") == "custom-title"
@@ -1494,7 +1494,7 @@ class ClaudeAdapter:
             agent_id = af.stem.removeprefix("agent-")
             meta_file = af.with_suffix(".meta.json")
             try:
-                info = json.loads(meta_file.read_text(errors="replace"))
+                info = fastjson.loads(meta_file.read_text(errors="replace"))
                 meta_mtime = meta_file.stat().st_mtime
             except FileNotFoundError:
                 info, meta_mtime = {}, None
@@ -1900,7 +1900,7 @@ class CodexAdapter:
                     with open(CODEX_INDEX, "r", errors="replace") as fh:
                         for line in fh:
                             try:
-                                r = json.loads(line)
+                                r = fastjson.loads(line)
                             except Exception:
                                 continue
                             if r.get("id") and r.get("thread_name"):
@@ -2323,7 +2323,7 @@ def _pretty_json(v) -> str:
         return json.dumps(v, ensure_ascii=False, indent=2)
     s = str(v)
     try:
-        return json.dumps(json.loads(s), ensure_ascii=False, indent=2)
+        return json.dumps(fastjson.loads(s), ensure_ascii=False, indent=2)
     except Exception:
         return s
 
@@ -2364,7 +2364,7 @@ class GrokAdapter:
         except OSError:
             raise
         try:
-            info = json.loads(sj.read_text(errors="replace"))
+            info = fastjson.loads(sj.read_text(errors="replace"))
         except OSError:
             raise
         except (TypeError, ValueError):

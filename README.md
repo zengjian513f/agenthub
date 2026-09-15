@@ -1,6 +1,6 @@
 # AgentHub
 
-Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务。后端只用 Python 标准库；前端为原生 JS，KaTeX 与 xterm.js 静态内置，无在线依赖和构建步骤。
+Claude Code / Codex / Grok 三家 CLI 会话的统一网页浏览与管理服务。后端只用 Python 标准库（可选装 `orjson`：`pip install orjson`，有预编译 wheel，装了之后会话文件逐行解析快 2.6–2.8 倍，没装则走标准库，行为相同——差异只有超过 64 位的整数会以浮点返回，见 `agenthub/fastjson.py`）；前端为原生 JS，KaTeX 与 xterm.js 静态内置，无在线依赖和构建步骤。
 
 支持多机器聚合：在中央服务器运行 `python3 -m agenthub.hub`，注册各机器的 AgentHub，
 统一筛选机器、搜索和管理会话；本地 Web 仍可独立运行。部署与协议说明见

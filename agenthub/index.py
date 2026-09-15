@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .adapters import ADAPTERS, ClaudeAdapter
-from . import audit, media, session_meta, trash
+from . import audit, fastjson, media, session_meta, trash
 
 CACHE_DIR = Path.home() / ".cache" / "agenthub"
 CACHE_FILE = CACHE_DIR / "index.json"
@@ -316,7 +316,7 @@ def _read_cache() -> tuple[dict, dict, str, float] | None:
     if not CACHE_FILE.exists():
         return None
     try:
-        cached = json.loads(CACHE_FILE.read_text())
+        cached = fastjson.loads(CACHE_FILE.read_text())
         if not isinstance(cached, dict):
             return None
         if cached.get("version") != CACHE_VERSION or not cached.get("sig"):
@@ -1680,7 +1680,7 @@ def _search_disk_read(path: Path) -> tuple[dict, str] | None:
         with open(path, "rb") as fh:
             blob = fh.read()
         head, _, body = blob.partition(b"\n")
-        stamp = json.loads(head)
+        stamp = fastjson.loads(head)
         if not isinstance(stamp, dict):
             return None
         return stamp, body.decode("utf-8")
