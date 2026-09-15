@@ -174,6 +174,13 @@ def _build_index(runs: dict) -> dict:
     return {"roots": roots, **tables}
 
 
+def stamp() -> int | None:
+    """登记表的版本（文件 mtime_ns；没有文件是 None），供缓存 filter_rows 结果的一方作键。"""
+    with _lock:
+        _read()
+        return _cache_mtime
+
+
 def _runs_index() -> dict:
     global _index, _index_of
     with _lock:

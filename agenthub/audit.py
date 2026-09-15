@@ -76,6 +76,28 @@ def _json_bytes(value: Any) -> bytes:
 
 
 @dataclass(frozen=True)
+class PreparedContent:
+    """已经序列化、散列并压缩好的 content blob，可以跨多次 record() 复用。
+
+    列表轮询每次返回同一份几百 KB 的响应时，逐次重做 redact + dumps + sha256 +
+    zlib 是纯浪费；调用方用 prepare_content() 算一次，之后每次 record() 只
+    排队一个引用。落库内容与直接传对象时逐字节相同。
+    """
+    sha256: str
+    mime: str
+    size: int
+    payload: bytes
+
+
+def prepare_content(content: Any) -> PreparedContent:
+    raw = _json_bytes(content)
+    mime = "application/json" if not isinstance(content, (str, bytes)) \
+        else "text/plain; charset=utf-8"
+    return PreparedContent(hashlib.sha256(raw).hexdigest(), mime, len(raw),
+                           zlib.compress(raw, level=3))
+
+
+@dataclass(frozen=True)
 class _QueuedEvent:
     row: tuple
     blob: tuple[str, str, int, bytes] | None
@@ -126,7 +148,10 @@ class EventStore:
                                    separators=(",", ":"), sort_keys=True)
             blob = None
             blob_hash = ""
-            if content is not None:
+            if isinstance(content, PreparedContent):
+                blob_hash = content.sha256
+                blob = (blob_hash, content.mime, content.size, content.payload)
+            elif content is not None:
                 raw = _json_bytes(content)
                 blob_hash = hashlib.sha256(raw).hexdigest()
                 mime = "application/json" if not isinstance(content, (str, bytes)) \

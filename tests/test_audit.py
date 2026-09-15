@@ -40,6 +40,21 @@ class AuditStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM blobs").fetchone()[0], 1)
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
+    def test_prepared_content_stores_the_same_blob_as_the_object(self):
+        content = {"sessions": [{"uid": "claude:a", "api_key": "hidden"}], "sig": "s"}
+        prepared = audit.prepare_content(content)
+        self.assertTrue(self.store.record("list.plain", uid="claude:a", content=content))
+        self.assertTrue(self.store.record("list.prepared", uid="claude:a", content=prepared))
+        self.assertTrue(self.store.record("list.prepared", uid="claude:a", content=prepared))
+        self.assertTrue(self.store.flush())
+        rows = self.store.query(uid="claude:a", include_content=True)
+        self.assertEqual({row["content_sha256"] for row in rows}, {prepared.sha256})
+        self.assertEqual(json.loads(rows[0]["content"])["sessions"][0]["api_key"], "<redacted>")
+        self.assertEqual(json.loads(rows[0]["content"]), json.loads(rows[2]["content"]))
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM blobs").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT mime FROM blobs").fetchone()[0], "application/json")
+
     def test_sensitive_metadata_is_redacted(self):
         self.store.record("browser.state", data={
             "headers": {"Authorization": "Bearer secret", "Cookie": "sid=x"},
