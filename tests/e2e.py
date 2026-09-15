@@ -77,6 +77,28 @@ def term_rows():
     return json.loads(urllib.request.urlopen(BASE + "/api/term/list", timeout=30).read())["sessions"]
 
 
+def wait_term_row(name, timeout=10.0):
+    """A tmux session created behind the server's back (not through the API) surfaces
+    once the pane-list cache (server PANES_TTL, 2 s) turns over; wait for that."""
+    deadline = time.time() + timeout
+    while True:
+        row = next((x for x in term_rows() if x["name"] == name), None)
+        if row is not None or time.time() >= deadline:
+            return row
+        time.sleep(0.5)
+
+
+def open_pending_when_listed(p, name, timeout=15000):
+    """Same for the page: reload the terminal list until the out-of-band pending
+    session is in it (the pane list behind it is cached for PANES_TTL), then open
+    it in the same tick so the page's own list refresh cannot race the lookup."""
+    p.wait_for_function("""async n => { await loadTermList();
+      const row = pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n);
+      if (!row) return false;
+      openPendingSession(row);
+      return true; }""", arg=name, timeout=timeout, polling=500)
+
+
 def term_server(name):
     row = next((x for x in term_rows() if x["name"] == name), None)
     if not row:
@@ -3174,11 +3196,14 @@ def run(pw):
             "uuid": "n2", "parentUuid": "n1", "timestamp": "2026-08-07T09:00:01.000Z",
             "cwd": "/tmp/agenthub-selftest", "sessionId": extra.stem,
         }, ensure_ascii=False) + "\n")
-    # 服务端会在 500ms 内复用刚发布的 inventory；这里明确跨过该去抖窗口，
-    # 测的是后台增量/未读，而不是同一瞬间重复刷新是否重扫磁盘。
-    p.wait_for_timeout(600)
-    p.evaluate("pollSessions()")
-    p.wait_for_timeout(3000)
+    # 列表轮询复用已发布的 inventory 快照（服务端 POLL_TTL 2 s，预热线程每 1.7 s
+    # 刷新）；这里按页面自己的节奏反复轮询直到该会话的游标前移，测的是后台
+    # 增量/未读会在一个轮询周期内到达，而不是某个固定的去抖窗口。
+    p.wait_for_function("""uid => { pollSessions();
+      const s = S.sessions.find(x => x.uid === uid);
+      return !!s && s.cursor && s.cursor.end > 0 && (S.unread.get(uid)?.count || 0) > 0; }""",
+                        arg=extra_uid, timeout=15000, polling=700)
+    p.wait_for_timeout(500)
     extra_badge = p.locator(f'.item[data-uid="{extra_uid}"] .item-status')
     unread_debug = p.evaluate("""uid => ({
       badge: document.querySelector(`.item[data-uid="${uid}"] .item-status`)?.textContent,
@@ -3371,7 +3396,7 @@ def run(pw):
         legacy_name = "agenthub-e2e-legacycompat"
         tmux_run("default", "kill-session", "-t", legacy_name, capture_output=True)
         tmux_run("default", "new-session", "-d", "-s", legacy_name, "sleep 60", check=True)
-        legacy_row = next((x for x in term_rows() if x["name"] == legacy_name), None)
+        legacy_row = wait_term_row(legacy_name)
         check("默认 server 的旧 agenthub 会话仍可见",
               legacy_row is not None and legacy_row.get("server") == "default", legacy_row)
         urllib.request.urlopen(urllib.request.Request(
@@ -3537,10 +3562,9 @@ def run(pw):
             "token": "e2e-pending", "before": [], "started": time.time(),
             "cols": 100, "rows": 30,
         })
-        p.evaluate("async () => { await loadTermList(); }")
         viewport(390, 780)
-        p.evaluate("""n => openPendingSession(
-          pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n))""", PENDING_TERM)
+        p.wait_for_timeout(500)             # 让视口切换的重排结束，别让它打断随后的打开
+        open_pending_when_listed(p, PENDING_TERM)
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
         open_session_menu(p)
         check("手机新建临时会话菜单显示关机按钮",
@@ -3610,9 +3634,7 @@ def run(pw):
             "token": "e2e-exit", "before": [], "started": time.time(),
             "cols": 100, "rows": 30,
         })
-        p.evaluate("async () => { await loadTermList(); }")
-        p.evaluate("""n => openPendingSession(
-          pendingTmuxSessions().find(x => x.name === n || x.tmuxName === n))""", PENDING_EXIT_TERM)
+        open_pending_when_listed(p, PENDING_EXIT_TERM)
         p.wait_for_function("T.ws && T.ws.readyState === 1", timeout=30000)
         tmux_run("agenthub", "kill-session", "-t", PENDING_EXIT_TERM, check=True)
         p.wait_for_function("n => S.sel !== pendingUid(n)", arg=PENDING_EXIT_TERM, timeout=30000)
