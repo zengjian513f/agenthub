@@ -15,8 +15,10 @@ import secrets
 import socket
 import threading
 import queue
+import struct
 import time
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
@@ -398,14 +400,37 @@ def _continued_origin(session: dict) -> dict | None:
                  if row.get("continued_in") == uid and row.get("uid") != uid), None)
 
 
+_CODEX_PANE_TTL = 2.0
+_codex_pane_cache: dict[str, tuple[float, str]] = {}
+_codex_pane_lock = threading.Lock()
+
+
+def _codex_pane_name(session: dict) -> str:
+    """按 uid 短暂缓存 pane 名称：每次 /api/messages 都列 tmux 会话太贵。"""
+    uid = str(session.get("uid") or "")
+    now = time.monotonic()
+    with _codex_pane_lock:
+        cached = _codex_pane_cache.get(uid)
+        if cached and cached[0] > now:
+            return cached[1]
+    pane = _pane_for_session(session, term.list_sessions())
+    name = str(pane.get("name") or "") if pane else ""
+    with _codex_pane_lock:
+        _codex_pane_cache[uid] = (now + _CODEX_PANE_TTL, name)
+        if len(_codex_pane_cache) > 4096:
+            for stale in [key for key, (expires, _) in _codex_pane_cache.items()
+                          if expires <= now]:
+                _codex_pane_cache.pop(stale, None)
+    return name
+
+
 def _codex_prompt(session: dict, pane_name: str = "") -> dict | None:
     """Read a Codex approval that exists only on the live TUI screen."""
     if session.get("agent_id") or session.get("source") != "codex":
         return None
     try:
         if not pane_name:
-            pane = _pane_for_session(session, term.list_sessions())
-            pane_name = str(pane.get("name") or "") if pane else ""
+            pane_name = _codex_pane_name(session)
         if not pane_name:
             return None
         return codex_bridge.approval_prompt(term.capture_plain(pane_name, 80))
@@ -424,6 +449,80 @@ def _session_prompt(session: dict, messages: list[dict],
     if session.get("source") == "codex":
         return _codex_prompt(session, codex_pane)
     return None
+
+
+_GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+_CRC_ZERO_BYTES: list[list[int]] = []
+_crc_lock = threading.Lock()
+
+
+def _gf2_times(matrix: list[int], vector: int) -> int:
+    total = 0
+    index = 0
+    while vector:
+        if vector & 1:
+            total ^= matrix[index]
+        vector >>= 1
+        index += 1
+    return total
+
+
+def _gf2_square(matrix: list[int]) -> list[int]:
+    return [_gf2_times(matrix, matrix[n]) for n in range(32)]
+
+
+def _crc_zero_operator(power: int) -> list[int]:
+    """CRC-32 在末尾追加 2**power 个零字节的线性算子 (zlib crc32_combine)。"""
+    with _crc_lock:
+        if not _CRC_ZERO_BYTES:
+            odd = [0xEDB88320] + [1 << n for n in range(31)]
+            even = _gf2_square(odd)       # 2 个零比特
+            odd = _gf2_square(even)       # 4 个零比特
+            _CRC_ZERO_BYTES.append(_gf2_square(odd))   # 1 个零字节
+        while len(_CRC_ZERO_BYTES) <= power:
+            _CRC_ZERO_BYTES.append(_gf2_square(_CRC_ZERO_BYTES[-1]))
+        return _CRC_ZERO_BYTES[power]
+
+
+def _crc32_combine(crc1: int, crc2: int, length2: int) -> int:
+    """crc32(a + b) 由 crc32(a)、crc32(b) 和 len(b) 合成，不重读 b。"""
+    if length2 <= 0:
+        return crc1
+    power = 0
+    while length2:
+        if length2 & 1:
+            crc1 = _gf2_times(_crc_zero_operator(power), crc1)
+        length2 >>= 1
+        power += 1
+    return crc1 ^ crc2
+
+
+def _spliced_json(obj: dict) -> tuple[bytes, bytes, bytes] | None:
+    """把已缓存的消息正文原样拼进响应，不再对几万条消息重新 json.dumps。"""
+    messages = obj.get("messages")
+    raw = getattr(messages, "json_bytes", None)
+    if raw is None:
+        return None
+    marker = "agenthub-messages-" + uuid.uuid4().hex
+    text = json.dumps({**obj, "messages": marker}, ensure_ascii=False)
+    at = text.index('"' + marker + '"')
+    prefix = text[:at].encode()
+    suffix = text[at + len(marker) + 2:].encode()
+    return prefix, raw, suffix
+
+
+def _gzip_spliced(prefix: bytes, messages, suffix: bytes, level: int) -> list[bytes]:
+    """按 gzip 成员格式拼接：前后缀各自压缩，正文沿用缓存的 deflate 流。"""
+    chunk, chunk_crc, chunk_len = messages.deflate(level)
+    packer = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
+    head = packer.compress(prefix) + packer.flush(zlib.Z_SYNC_FLUSH)
+    tail_plain = b"]" + suffix
+    packer = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
+    tail = packer.compress(tail_plain) + packer.flush(zlib.Z_FINISH)
+    crc = _crc32_combine(zlib.crc32(prefix), chunk_crc, chunk_len)
+    crc = zlib.crc32(tail_plain, crc)
+    size = (len(prefix) + chunk_len + len(tail_plain)) & 0xFFFFFFFF
+    return [_GZIP_HEADER, head, chunk, tail, struct.pack("<II", crc, size)]
 
 
 def _accepts_gzip(value: str) -> bool:
@@ -560,16 +659,19 @@ class Handler(BaseHTTPRequestHandler):
             else body,
         )
 
-    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
+    def _send(self, code: int, body, ctype: str, extra: dict | None = None):
+        chunks = [body] if isinstance(body, (bytes, bytearray)) else list(body)
+        length = sum(len(chunk) for chunk in chunks)
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(length))
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
         delivered = True
         try:
-            self.wfile.write(body)
+            for chunk in chunks:
+                self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError):
             delivered = False
         if (hasattr(self, "_audit_started")
@@ -589,7 +691,7 @@ class Handler(BaseHTTPRequestHandler):
                 data={
                     "method": getattr(self, "_audit_method", ""),
                     "path": getattr(self, "_audit_path", ""), "status": code,
-                    "bytes": len(body), "content_type": ctype,
+                    "bytes": length, "content_type": ctype,
                     "delivered": delivered,
                     "content_encoding": (extra or {}).get("Content-Encoding", ""),
                     "duration_ms": round(
@@ -599,22 +701,34 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def _json(self, obj, code: int = 200):
-        body = json.dumps(obj, ensure_ascii=False).encode()
-        decoded_length = len(body)
+        spliced = _spliced_json(obj) if isinstance(obj, dict) else None
+        if spliced is None:
+            body = json.dumps(obj, ensure_ascii=False).encode()
+            decoded_length = len(body)
+        else:
+            body = spliced
+            decoded_length = sum(len(part) for part in spliced)
         # Full small responses are invaluable for distinguishing a server reply
         # from what the browser later rendered. Large history windows keep only
         # their byte/count metadata and are represented by parser/SSE events.
-        self._audit_json_response = obj if len(body) <= 512 * 1024 else None
+        self._audit_json_response = obj if decoded_length <= 512 * 1024 else None
         # Fetch 会把 gzip 解压后的字节交给 ReadableStream，但保留压缩后
         # Content-Length。单独传递解压长度，让前端进度的分子分母同口径。
         headers = {
             "Vary": "Accept-Encoding",
             "X-AgentHub-Decoded-Length": str(decoded_length),
         }
-        if len(body) >= JSON_GZIP_MIN and _accepts_gzip(
+        if decoded_length >= JSON_GZIP_MIN and _accepts_gzip(
                 self.headers.get("Accept-Encoding", "")):
-            packed = gzip.compress(body, compresslevel=JSON_GZIP_LEVEL, mtime=0)
-            if len(packed) < len(body):
+            if spliced is None:
+                packed = gzip.compress(body, compresslevel=JSON_GZIP_LEVEL, mtime=0)
+            else:
+                prefix, _raw, suffix = spliced
+                packed = _gzip_spliced(prefix, obj["messages"], suffix,
+                                       JSON_GZIP_LEVEL)
+            packed_length = (sum(len(part) for part in packed)
+                             if isinstance(packed, list) else len(packed))
+            if packed_length < decoded_length:
                 body = packed
                 headers["Content-Encoding"] = "gzip"
         self._send(code, body, "application/json; charset=utf-8", headers)
